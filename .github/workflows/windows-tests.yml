@@ -28,7 +28,7 @@ jobs:
       RESULTS: C:\ci-fixtures
       PYTHONDONTWRITEBYTECODE: '1'
       CANDIDATE_BACKEND_SHA: ${{ github.sha }}
-      CANDIDATE_SHELL_SHA: f427d95bda044891c7bb0132a911d3e29a6c8245
+      CANDIDATE_SHELL_SHA: a9d0a144914104eb7190a2897d25c3a9e9bca139
 
     steps:
       - name: Checkout sources
