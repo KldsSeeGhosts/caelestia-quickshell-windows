@@ -20,6 +20,13 @@ unclassified, classified twice, or a tier names a fixture that does not exist.
 
 All fixtures are built in CI, so every tier is at least compile-checked.
 
+`runtime_paths_test` compiles the production `src/core/paths.cpp` and runs
+base-, instance-, shell-only failure cases plus a valid runtime in isolated
+child processes. It uses regular-file blockers rather than changing ACLs. The
+fixture checks for controlled diagnostics, no access violation, no relative
+lock/log fallback, and no partial runtime links. It is deterministic coverage
+of the path failure contract, not a Windows permission-denial launch test.
+
 ## Building
 
 From a Visual Studio x64 developer shell with Qt 6.11, clang-cl, CMake and
