@@ -89,8 +89,11 @@ artifact. No complete artifact is promised for those cases.
 
 Consumers must also require the actual upstream job/run conclusion to be success,
 compare both requested/resolved identities against their independently selected
-pair, check artifact/run provenance and execute a trusted version of the
-validator. A JSON receipt is not a signature or proof that arbitrary PR code
+pair, recompute both toolchain digests from their trusted shell checkout, check
+artifact/run provenance and execute a trusted version of the validator. Use the
+validator's `--kind`, `--backend-sha`, `--shell-sha`, `--contract-sha256` and
+`--spec-sha256` expectations rather than relying on a receipt's self-consistency.
+A JSON receipt is not a signature or proof that arbitrary PR code
 honestly executed. Never trust a PR-supplied validator as an authorization boundary.
 
 ## Interface and clean commands
@@ -125,8 +128,13 @@ python -B .github/scripts/candidate_contract.py --receipt <results>/candidate-re
 
 `finalize` returns nonzero on non-pass but writes the receipt first. Its two
 source arguments are required to detect mid-run dirt. `run` returns the actual
-command exit code (or a nonzero validation/launch failure) and never streams raw
-command output. Results/build roots must be outside source checkouts. Set
+command exit code (or a nonzero validation/launch failure). Raw command output is
+suppressed by default. The isolated hosted workflow opts into `run --echo` for
+useful job diagnostics; retained JSON/JUnit still contain no raw output. Never
+enable echo for commands with access to personal data or secrets. Bootstrap
+receipt/source actions support Python 3.9+ before setup-python; passing final
+receipts require the recorded Python 3.12 identity.
+Results/build roots must be outside source checkouts. Set
 `PYTHONDONTWRITEBYTECODE=1` or use `-B` to avoid Python source dirt.
 Every fresh attempt requires a new result directory; `init` refuses overwrite.
 The producer fixtures use synthetic metadata and disposable files only, not a
@@ -144,8 +152,8 @@ failure/skip categories. Failure diagnostics retain exit codes, compiler error
 codes, fixed compile/link/assertion/prerequisite categories and excluded-output
 byte counts, never arbitrary output text. Qt optional
 shader/layer-rule skips get explicit configured-prerequisite reasons.
-Detailed raw output is deliberately not retained; reproduce with synthetic data
-locally when more diagnosis is required.
+Detailed raw output is not retained in artifacts. Hosted job logs opt into it
+for compiler/CTest diagnosis on the isolated, read-only runner.
 
 Permissions stay read-only; checkout persists no credentials. PRs cannot save
 the trusted-main tooling cache, obtain release secrets or access a desktop.

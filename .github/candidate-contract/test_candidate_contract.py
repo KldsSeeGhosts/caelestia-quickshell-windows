@@ -1,9 +1,11 @@
 """Producer-only fixtures: synthetic receipts and commands, no shell consumer."""
 
 import argparse
+import contextlib
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -59,6 +61,81 @@ class ContractTests(unittest.TestCase):
 
     def test_downstream_success(self):
         c.validate(passing("downstream"))
+
+    def test_consumer_expected_pair_kind_and_digests(self):
+        c.validate(passing("downstream"), kind="downstream", backend_sha="a" * 40,
+                   shell_sha="b" * 40, contract_sha256="c" * 64, spec_sha256="e" * 64)
+        for kwargs in ({"kind": "downstream"}, {"backend_sha": "d" * 40},
+                       {"shell_sha": "d" * 40}, {"backend_sha": "main"},
+                       {"contract_sha256": "d" * 64}, {"spec_sha256": "d" * 64},
+                       {"contract_sha256": "invalid"}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                c.validate(passing(), **kwargs)
+
+    def test_cli_consumer_expectations(self):
+        path = self.root / "receipt.json"
+        c.write(path, passing("downstream"))
+        command = [sys.executable, "-B", str(HELPER), "--receipt", str(path), "validate",
+                   "--kind", "downstream", "--backend-sha", "a" * 40,
+                   "--shell-sha", "b" * 40, "--contract-sha256", "c" * 64,
+                   "--spec-sha256", "e" * 64]
+        self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)
+        command[command.index("downstream")] = "standalone"
+        self.assertEqual(subprocess.run(command, capture_output=True).returncode, 1)
+
+    def test_finalize_writes_nonpass_for_invalid_or_missing_toolchain(self):
+        for content in ("{invalid", "[]", "null", None):
+            with self.subTest(content=content):
+                path = self.root / "receipt.json"
+                toolchain = self.root / "toolchain.json"
+                c.write(path, passing())
+                if content is None:
+                    toolchain.unlink(missing_ok=True)
+                else:
+                    toolchain.write_text(content, encoding="utf-8")
+                argv = ["candidate-contract", "--receipt", str(path), "finalize",
+                        "--workflow-outcome", "success", "--toolchain", str(toolchain),
+                        "--backend", "synthetic-backend", "--shell", "synthetic-shell"]
+                with patch.object(sys, "argv", argv), patch.object(c, "resolve_sources"):
+                    self.assertEqual(c.main(), 1)
+                result = c.read(path)
+                self.assertEqual(result["workflowOutcome"], "success")
+                self.assertEqual(result["result"], "non-pass")
+                self.assertIsNotNone(result["finishedAt"])
+                self.assertEqual(result["toolchain"]["actual"], {})
+                self.assertEqual(result["stages"]["prepare"]["diagnostics"]["finalToolchain"],
+                                 "unavailable-or-invalid")
+
+    def test_final_source_type_error_preserves_original_diagnostics_and_writes(self):
+        path, toolchain = self.root / "receipt.json", self.root / "toolchain.json"
+        receipt = passing()
+        receipt["stages"]["sources"]["diagnostics"] = {"reason": "initial-source-result"}
+        c.write(path, receipt)
+        c.write(toolchain, receipt["toolchain"]["actual"])
+        argv = ["candidate-contract", "--receipt", str(path), "finalize",
+                "--workflow-outcome", "failure", "--toolchain", str(toolchain),
+                "--backend", "synthetic-backend", "--shell", "synthetic-shell"]
+        with patch.object(sys, "argv", argv), patch.object(c, "resolve_sources", side_effect=TypeError):
+            self.assertEqual(c.main(), 1)
+        result = c.read(path)
+        self.assertEqual(result["workflowOutcome"], "failure")
+        self.assertEqual(result["result"], "non-pass")
+        self.assertEqual(result["stages"]["sources"]["diagnostics"],
+                         {"reason": "initial-source-result", "finalVerification": "failed"})
+
+    def test_inventory_failure_retains_reason_and_cannot_reuse_old_counts(self):
+        path = self.root / "receipt.json"
+        c.write(path, passing())
+        argv = ["candidate-contract", "--receipt", str(path), "inventory",
+                "--ctest", "synthetic-ctest", "--build", "synthetic-build"]
+        with patch.object(sys, "argv", argv), patch.object(
+                c.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"private")):
+            self.assertEqual(c.main(), 1)
+        result = c.read(path)
+        self.assertEqual(result["omittedTiers"], {})
+        self.assertEqual(result["stages"]["configure"]["diagnostics"]["inventory"],
+                         "unavailable-or-invalid")
+        self.assertFalse(c.finalize(result, "success"))
 
     def test_initial_and_running_receipts_are_not_passes(self):
         receipt = c.new_receipt("standalone", "a" * 40, "b" * 40)
@@ -264,13 +341,22 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(set(schema["$defs"]["stage"]["required"]),
                          set(receipt["stages"]["build"]))
 
-    def run_fixture(self, code, junit=None, unittest_mode=False):
+    def run_fixture(self, code, junit=None, unittest_mode=False, echo=False):
         receipt = c.new_receipt("standalone", "a" * 40, "b" * 40)
         args = argparse.Namespace(
             receipt=str(self.root / "result.json"), stage="portable", junit=junit,
-            unittest=unittest_mode, command=[sys.executable, "-B", "-c", code])
+            unittest=unittest_mode, echo=echo, command=[sys.executable, "-B", "-c", code])
         result = c.run_command(args, receipt)
         return result, c.read(args.receipt)
+
+    def test_raw_output_echo_is_opt_in_and_never_enters_receipt(self):
+        for echo in (False, True):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code, receipt = self.run_fixture("print('synthetic-private-output')", echo=echo)
+            self.assertEqual(code, 0)
+            self.assertEqual("synthetic-private-output" in output.getvalue(), echo)
+            self.assertNotIn("synthetic-private-output", json.dumps(receipt))
 
     def test_actual_process_failure_preserves_exit_code(self):
         code, receipt = self.run_fixture("print('private-title');raise SystemExit(7)")

@@ -1,6 +1,8 @@
-"""Version 1 candidate/result producer. Python 3.12 stdlib only, fail closed.
+"""Version 1 candidate/result producer. Python stdlib only, fail closed.
 
 No raw command output, environment, source paths or JUnit system-out is retained.
+Bootstrap actions support Python 3.9+; a passing final receipt requires 3.12.
+Raw output is echoed only with an explicit opt-in for isolated hosted job logs.
 The JSON format and trust boundary are documented in ../candidate-contract/README.md.
 """
 
@@ -232,7 +234,8 @@ def finish(receipt, stage, code, elapsed, diagnostic=None):
         finishedAt=now(), durationSeconds=round(elapsed, 6), diagnostics=diagnostic or {})
 
 
-def validate(receipt):
+def validate(receipt, *, kind=None, backend_sha=None, shell_sha=None,
+             contract_sha256=None, spec_sha256=None):
     """Validate a PASS claim, not merely JSON shape. Any uncertainty is non-pass."""
     require(isinstance(receipt, dict) and set(receipt) == {
         "schemaVersion", "kind", "evidenceClass", "createdAt", "finishedAt",
@@ -243,6 +246,15 @@ def validate(receipt):
     require(receipt["evidenceClass"] == "component-offscreen", "invalid evidence class")
     require(receipt["flags"] == FLAGS, "canonical flags mismatch")
     check_sources(receipt)
+    if kind is not None:
+        require(receipt["kind"] == kind, "unexpected candidate kind")
+    for key, expected_sha in (("backend", backend_sha), ("shell", shell_sha)):
+        if expected_sha is not None:
+            require(isinstance(expected_sha, str) and SHA.fullmatch(expected_sha),
+                    "invalid expected source SHA")
+            require(receipt["sources"][key]["requested"] == expected_sha
+                    and receipt["sources"][key]["resolved"] == expected_sha,
+                    "unexpected source SHA")
     require(receipt["workflowOutcome"] == "success", "workflow did not succeed")
     require(receipt["result"] == "pass" and receipt["finishedAt"], "result is not complete pass")
     created, finished = (dt.datetime.fromisoformat(receipt[key])
@@ -276,6 +288,12 @@ def validate(receipt):
     require(set(expected) == {"contractId", *TOOLS}, "missing expected tool identities")
     require(isinstance(toolchain["contractSha256"], str)
             and DIGEST.fullmatch(toolchain["contractSha256"]), "invalid combined contract digest")
+    for key, expected_digest in (("contractSha256", contract_sha256),
+                                 ("specSha256", spec_sha256)):
+        if expected_digest is not None:
+            require(isinstance(expected_digest, str) and DIGEST.fullmatch(expected_digest),
+                    "invalid expected toolchain digest")
+            require(toolchain[key] == expected_digest, "unexpected toolchain digest")
     require(actual.get("contractSha256") == toolchain["contractSha256"],
             "toolchain digest mismatch")
     require(type(actual.get("schemaVersion")) is int and actual["schemaVersion"] == 1,
@@ -339,6 +357,11 @@ def run_command(args, receipt):
             (Path(args.receipt).parent / f"{args.stage}.xml").unlink(missing_ok=True)
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         code, output = result.returncode, result.stdout
+        if getattr(args, "echo", False):
+            # Opt-in job diagnostics are not copied into retained artifacts.
+            # Never enable this for commands that can read personal data/secrets.
+            sys.stdout.write(output.decode("utf-8", errors="replace"))
+            sys.stdout.flush()
         if args.unittest:
             match = re.search(rb"(?m)^Ran (\d+) tests? in ", output)
             require(match is not None, "unittest count missing")
@@ -396,6 +419,7 @@ def main():
     run.add_argument("--stage", required=True)
     run.add_argument("--junit")
     run.add_argument("--unittest", action="store_true")
+    run.add_argument("--echo", action="store_true")
     run.add_argument("command", nargs=argparse.REMAINDER)
     inventory = sub.add_parser("inventory")
     inventory.add_argument("--ctest", required=True)
@@ -406,7 +430,12 @@ def main():
     end.add_argument("--toolchain")
     end.add_argument("--backend", required=True)
     end.add_argument("--shell", required=True)
-    sub.add_parser("validate")
+    expected = sub.add_parser("validate")
+    expected.add_argument("--kind", choices=("standalone", "downstream"))
+    expected.add_argument("--backend-sha")
+    expected.add_argument("--shell-sha")
+    expected.add_argument("--contract-sha256")
+    expected.add_argument("--spec-sha256")
     args = parser.parse_args()
     try:
         if args.action == "init":
@@ -422,34 +451,44 @@ def main():
             began = time.monotonic()
             try:
                 resolve_sources(receipt, args.backend, args.shell)
-            except (ValueError, KeyError, OSError):
+            except (ValueError, KeyError, TypeError, OSError):
                 finish(receipt, "sources", 1, time.monotonic() - began,
                        {"reason": "source-or-spec-verification-failed"})
                 write(args.receipt, receipt)
                 raise ValueError("source-or-spec-verification-failed") from None
             finish(receipt, "sources", 0, time.monotonic() - began)
         elif args.action == "inventory":
-            result = subprocess.run([args.ctest, "--test-dir", args.build, "--show-only=json-v1"],
-                                    capture_output=True)
-            require(result.returncode == 0, "CTest inventory failed")
-            tests = json.loads(result.stdout)["tests"]
-            for label in ("native", "desktop", "gpu", "machine"):
-                count = sum(label in prop["value"] for test in tests
-                            for prop in test["properties"] if prop["name"] == "LABELS")
-                receipt["omittedTiers"][label] = {
-                    "count": count, "reason": "outside-portable-gate; trusted-separate-acceptance"}
+            try:
+                result = subprocess.run([args.ctest, "--test-dir", args.build, "--show-only=json-v1"],
+                                        capture_output=True)
+                require(result.returncode == 0, "CTest inventory failed")
+                tests = json.loads(result.stdout)["tests"]
+                require(isinstance(tests, list) and tests, "CTest inventory is empty")
+                for label in ("native", "desktop", "gpu", "machine"):
+                    count = sum(label in prop["value"] for test in tests
+                                for prop in test["properties"] if prop["name"] == "LABELS")
+                    receipt["omittedTiers"][label] = {
+                        "count": count, "reason": "outside-portable-gate; trusted-separate-acceptance"}
+            except (ValueError, KeyError, TypeError, OSError):
+                receipt["omittedTiers"] = {}
+                receipt["stages"]["configure"]["diagnostics"]["inventory"] = "unavailable-or-invalid"
+                write(args.receipt, receipt)
+                raise ValueError("inventory-unavailable-or-invalid") from None
         elif args.action == "finalize":
             # Recheck after execution as well: generated files must stay out of
             # the source roots and a mid-run edit must not become a clean pass.
             try:
                 resolve_sources(receipt, args.backend, args.shell)
-            except (ValueError, KeyError, OSError):
+            except (ValueError, KeyError, TypeError, OSError):
                 receipt["stages"]["sources"]["outcome"] = "failure"
                 receipt["stages"]["sources"]["exitCode"] = 1
-                receipt["stages"]["sources"]["diagnostics"] = {
-                    "reason": "final-source-verification-failed"}
-            if args.toolchain and Path(args.toolchain).exists():
-                actual = read(args.toolchain)
+                # Preserve the original stage diagnostics and timing; this is a
+                # separate final recheck, not a replacement initial execution.
+                receipt["stages"]["sources"]["diagnostics"]["finalVerification"] = "failed"
+            receipt["toolchain"]["actual"] = {}
+            try:
+                actual = read(args.toolchain) if args.toolchain else {}
+                require(isinstance(actual, dict), "invalid toolchain object")
                 # Allowlist only public version/hash fields, never paths or arbitrary data.
                 receipt["toolchain"]["actual"] = {
                     key: actual[key] for key in ("schemaVersion", "contractId", "contractSha256",
@@ -457,13 +496,17 @@ def main():
                     and (type(actual[key]) is int or
                          isinstance(actual[key], str) and IDENTIFIER.fullmatch(actual[key]))
                 }
+            except (ValueError, KeyError, TypeError, OSError):
+                receipt["stages"]["prepare"]["diagnostics"]["finalToolchain"] = "unavailable-or-invalid"
             receipt["producer"] = {"pythonVersion": ".".join(map(str, sys.version_info[:3]))}
             passed = finalize(receipt, args.workflow_outcome)
             write(args.receipt, receipt)
             print("candidate result: " + receipt["result"])
             return 0 if passed else 1
         elif args.action == "validate":
-            validate(receipt)
+            validate(receipt, kind=args.kind, backend_sha=args.backend_sha,
+                     shell_sha=args.shell_sha, contract_sha256=args.contract_sha256,
+                     spec_sha256=args.spec_sha256)
             print("valid complete pass")
             return 0
         write(args.receipt, receipt)
