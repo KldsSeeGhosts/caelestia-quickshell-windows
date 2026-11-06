@@ -218,28 +218,34 @@ ShellRoot {
     } catch {
         $receipt.error = Protect-FixtureEvidence $_.Exception.Message
     } finally {
-        if ($pipe) { $pipe.Dispose() }
-        if ($process) {
-            if ($started -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
-            # Drain and preserve output even after a timeout or failed assertion.
-            # Successful and failed logs are scrubbed before being written.
-            if ($started -and $stdout -and $stderr) {
-                [IO.File]::WriteAllText((Join-Path $EvidenceRoot "$scenario.log"),
-                    (Protect-FixtureEvidence ($stdout.Result + $stderr.Result)))
+        try {
+            if ($pipe) { $pipe.Dispose() }
+            if ($process) {
+                try {
+                    if ($started -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
+                    # Drain and preserve output even after a timeout or failure.
+                    if ($started -and $stdout -and $stderr) {
+                        [IO.File]::WriteAllText((Join-Path $EvidenceRoot "$scenario.log"),
+                            (Protect-FixtureEvidence ($stdout.Result + $stderr.Result)))
+                    }
+                } finally { $process.Dispose() }
             }
-            $process.Dispose()
-        }
-        if ($originalAcl) {
-            Set-Acl -LiteralPath $runtime -AclObject $originalAcl
-            # Windows may normalize the DACL auto-inheritance control bit on
-            # Set-Acl. Compare effective rules, protection, owner and group,
-            # not the byte spelling of the SDDL control flags.
-            $restored = Get-Acl -LiteralPath $runtime
-            $receipt.aclRestored = ((Get-RuleFingerprint $restored) -eq (Get-RuleFingerprint $originalAcl) -and
-                $restored.AreAccessRulesProtected -eq $originalAcl.AreAccessRulesProtected -and
-                $restored.Owner -eq $originalAcl.Owner -and $restored.Group -eq $originalAcl.Group)
-            if (-not $receipt.aclRestored) { throw 'Fixture ACL restoration failed' }
-            [IO.Directory]::CreateDirectory((Join-Path $runtime 'restoration-probe')) | Out-Null
+        } catch {
+            $receipt.passed = $false
+            $receipt.evidenceError = Protect-FixtureEvidence $_.Exception.Message
+        } finally {
+            # Evidence storage is fallible. It must never bypass restoration
+            # of the fixture's access rules, even on a full/refusing volume.
+            if ($originalAcl) {
+                Set-Acl -LiteralPath $runtime -AclObject $originalAcl
+                # Windows may normalize the DACL inheritance control bit.
+                $restored = Get-Acl -LiteralPath $runtime
+                $receipt.aclRestored = ((Get-RuleFingerprint $restored) -eq (Get-RuleFingerprint $originalAcl) -and
+                    $restored.AreAccessRulesProtected -eq $originalAcl.AreAccessRulesProtected -and
+                    $restored.Owner -eq $originalAcl.Owner -and $restored.Group -eq $originalAcl.Group)
+                if (-not $receipt.aclRestored) { throw 'Fixture ACL restoration failed' }
+                [IO.Directory]::CreateDirectory((Join-Path $runtime 'restoration-probe')) | Out-Null
+            }
         }
         # Keep failed synthetic profiles locally for diagnosis, after restoring
         # ACLs. They can contain absolute QML paths: never upload this folder.
