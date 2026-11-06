@@ -58,6 +58,19 @@ QML/plugin initialization or IPC startup. This does not alter data/state/cache
 path policy. File-backed runtime links alone are not live-instance readiness:
 discovery also requires a held instance lock.
 
+The lock indicates process liveness, not IPC readiness: it is held during Qt
+and plugin startup, so a client may briefly see a live instance whose IPC
+endpoint is not listening yet. A later bookkeeping refusal can leave unheld
+runtime links or an empty lock file; those are not a live/ready instance.
+Existing early-log temporary files are outside this fixture's runtime-log
+assertion and are not claimed to be eliminated by this repair.
+
+The launch harness records only a named-pipe connection, not a command
+round trip. Its receipt and per-case logs scrub fixture/profile/tool paths
+and omit security descriptors. On failure, process output is retained even
+after a timeout; the failed synthetic profile is kept locally with restored
+ACLs. Do not upload that profile directory or older unsanitized receipts.
+
 ## Building
 
 From a Visual Studio x64 developer shell with Qt 6.11, clang-cl, CMake and

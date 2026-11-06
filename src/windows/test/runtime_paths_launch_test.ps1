@@ -2,7 +2,10 @@
 param(
     [Parameter(Mandatory)][string]$BackendExe,
     [Parameter(Mandatory)][string]$QtPrefix,
-    [Parameter(Mandatory)][string]$EvidenceRoot
+    [Parameter(Mandatory)][string]$EvidenceRoot,
+    [ValidateSet('base-file', 'base-denied', 'instance-file', 'shell-file', 'pid-file', 'path-file', 'valid')]
+    [string[]]$Scenarios = @('base-file', 'base-denied', 'instance-file', 'shell-file', 'pid-file', 'path-file', 'valid'),
+    [ValidateRange(1, 60000)][int]$LaunchTimeoutMs = 15000
 )
 # Real qs.exe launch acceptance, separate from the deterministic paths.cpp fixture.
 # Never installs or launches the user's shell. Only a windowless synthetic QML
@@ -13,13 +16,30 @@ $QtPrefix = (Resolve-Path -LiteralPath $QtPrefix).Path
 $EvidenceRoot = [IO.Path]::GetFullPath($EvidenceRoot)
 if (Test-Path -LiteralPath $EvidenceRoot) { throw "EvidenceRoot must not exist: $EvidenceRoot" }
 New-Item -ItemType Directory -Path $EvidenceRoot | Out-Null
-$cases = @('base-file', 'base-denied', 'instance-file', 'shell-file', 'pid-file', 'path-file', 'valid')
+$cases = @($Scenarios | Select-Object -Unique)
+if (-not $cases.Count) { throw 'At least one launch scenario must be selected.' }
 $receipts = @()
 
 function Get-RuleFingerprint($Acl) {
     (@($Acl.Access | ForEach-Object {
         "$($_.IdentityReference)|$($_.FileSystemRights)|$($_.InheritanceFlags)|$($_.PropagationFlags)|$($_.AccessControlType)|$($_.IsInherited)"
     } | Sort-Object) -join "`n")
+}
+
+function Protect-FixtureEvidence([string]$Text) {
+    $mappings = @(
+        @{ value = $BackendExe; label = '<backend-executable>' },
+        @{ value = $EvidenceRoot; label = '<fixture>' },
+        @{ value = $QtPrefix; label = '<qt>' },
+        @{ value = $env:USERPROFILE; label = '<profile>' }
+    ) | Sort-Object { $_.value.Length } -Descending
+    foreach ($mapping in $mappings) {
+        if (-not $mapping.value) { continue }
+        foreach ($spelling in @($mapping.value, $mapping.value.Replace('\', '/'))) {
+            $Text = [regex]::Replace($Text, [regex]::Escape($spelling), $mapping.label, 'IgnoreCase')
+        }
+    }
+    return [regex]::Replace($Text, 'S-1-(?:[0-9]+-)*[0-9]+', '<sid>')
 }
 
 foreach ($scenario in $cases) {
@@ -30,6 +50,8 @@ foreach ($scenario in $cases) {
     $process = $null
     $started = $false
     $pipe = $null
+    $stdout = $null
+    $stderr = $null
     $receipt = [ordered]@{ scenario = $scenario; evidenceClass = 'actual-offscreen-launch'; passed = $false }
     try {
         New-Item -ItemType Directory -Path $working | Out-Null
@@ -73,7 +95,7 @@ ShellRoot {
                 $deniedAcl.AddAccessRule($rule)
                 Set-Acl -LiteralPath $runtime -AclObject $deniedAcl
                 $receipt.failureKind = 'ACL-denied-creation'
-                $receipt.deniedAcl = (Get-Acl -LiteralPath $runtime).Sddl
+                $receipt.deniedRule = 'Deny CreateDirectories (current user, fixture directory only)'
                 try {
                     [IO.Directory]::CreateDirectory((Join-Path $runtime 'denial-probe')) | Out-Null
                     throw 'ACL denial was ineffective'
@@ -157,12 +179,14 @@ ShellRoot {
                 if ($process.HasExited) { break }
                 Start-Sleep -Milliseconds 25
             } while ([DateTime]::UtcNow -lt $deadline)
-            $receipt.ipcConnected = ($null -ne $pipe -and $pipe.IsConnected)
+            $receipt.ipcEndpointConnected = ($null -ne $pipe -and $pipe.IsConnected)
             if ($pipe) { $pipe.Dispose(); $pipe = $null }
         }
-        if (-not $process.WaitForExit(15000)) { throw 'qs.exe timed out' }
+        if (-not $process.WaitForExit($LaunchTimeoutMs)) {
+            $receipt.timedOut = $true
+            throw 'qs.exe timed out'
+        }
         $text = $stdout.Result + $stderr.Result
-        [IO.File]::WriteAllText((Join-Path $EvidenceRoot "$scenario.log"), $text)
         $receipt.exitCode = $process.ExitCode
         $receipt.relativeArtifacts = @(Get-ChildItem -LiteralPath $working -Force | Select-Object -ExpandProperty Name)
         $receipt.runtimeFiles = @(if (Test-Path -LiteralPath $runtime -PathType Container) {
@@ -171,7 +195,7 @@ ShellRoot {
         if ($receipt.relativeArtifacts.Count) { throw 'Unexpected working-directory artifact' }
         if ($scenario -eq 'valid') {
             if ($process.ExitCode -ne 0 -or $text -notmatch 'RUNTIME_PATH_CONTROL_READY' -or
-                $text -notmatch 'Configuration Loaded' -or -not $receipt.ipcConnected) {
+                $text -notmatch 'Configuration Loaded' -or -not $receipt.ipcEndpointConnected) {
                 throw 'Valid launch failed its QML/exit/IPC control'
             }
             foreach ($leaf in @('instance.lock', 'log.log', 'log.qslog')) {
@@ -192,11 +216,17 @@ ShellRoot {
         }
         $receipt.passed = $true
     } catch {
-        $receipt.error = $_.Exception.Message
+        $receipt.error = Protect-FixtureEvidence $_.Exception.Message
     } finally {
         if ($pipe) { $pipe.Dispose() }
         if ($process) {
             if ($started -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
+            # Drain and preserve output even after a timeout or failed assertion.
+            # Successful and failed logs are scrubbed before being written.
+            if ($started -and $stdout -and $stderr) {
+                [IO.File]::WriteAllText((Join-Path $EvidenceRoot "$scenario.log"),
+                    (Protect-FixtureEvidence ($stdout.Result + $stderr.Result)))
+            }
             $process.Dispose()
         }
         if ($originalAcl) {
@@ -211,17 +241,19 @@ ShellRoot {
             if (-not $receipt.aclRestored) { throw 'Fixture ACL restoration failed' }
             [IO.Directory]::CreateDirectory((Join-Path $runtime 'restoration-probe')) | Out-Null
         }
-        # Keep receipts, not synthetic profiles. Validate the exact deletion target.
+        # Keep failed synthetic profiles locally for diagnosis, after restoring
+        # ACLs. They can contain absolute QML paths: never upload this folder.
         $resolvedCase = [IO.Path]::GetFullPath($caseRoot)
         if ([IO.Path]::GetDirectoryName($resolvedCase) -ne $EvidenceRoot) { throw 'Unsafe cleanup target' }
-        Remove-Item -LiteralPath $resolvedCase -Recurse -Force
+        if ($receipt.passed) { Remove-Item -LiteralPath $resolvedCase -Recurse -Force }
+        else { $receipt.privateFailureFixturePreserved = $true }
     }
     $receipts += [pscustomobject]$receipt
 }
 $result = [ordered]@{
-    backendExe = $BackendExe
+    backendFile = [IO.Path]::GetFileName($BackendExe)
     backendSha256 = (Get-FileHash -LiteralPath $BackendExe -Algorithm SHA256).Hash
-    qtPrefix = $QtPrefix
+    qtVersion = (& (Join-Path $QtPrefix 'bin/qtpaths.exe') --qt-version | Select-Object -First 1)
     platform = [Environment]::OSVersion.VersionString
     cases = $receipts
     passed = @($receipts | Where-Object { $_.passed }).Count
