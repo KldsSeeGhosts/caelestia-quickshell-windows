@@ -37,7 +37,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: KldsSeeGhosts/caelestia-windows
-          ref: 7d7d5279b73195a70d13fddb46ecfcab776a07e4
+          ref: 55a236ee72fc36bdf0ba8a499a1039fe997fe2c9
           path: toolchain-contract
           persist-credentials: false
 
