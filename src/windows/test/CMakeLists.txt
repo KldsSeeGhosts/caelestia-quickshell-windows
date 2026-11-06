@@ -398,6 +398,18 @@ target_include_directories(virtual_desktops_test PRIVATE ${QS_WINDOWS_SRC})
 target_link_libraries(virtual_desktops_test PRIVATE Qt6::Gui Qt6::Qml Qt6::Test ole32)
 add_test(NAME virtual_desktops COMMAND virtual_desktops_test)
 
+# Exercise the real core runtime-path implementation in separate processes so
+# each failure case gets fresh directory state and an isolated working folder.
+qs_add_test_executable(runtime_paths_test
+	runtime_paths_test.cpp
+	${QS_WINDOWS_SRC}/../core/paths.cpp
+	${QS_WINDOWS_SRC}/../core/instanceinfo.cpp
+	${QS_WINDOWS_SRC}/../core/winfilelock.cpp
+)
+target_compile_definitions(runtime_paths_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(runtime_paths_test PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME runtime_paths COMMAND runtime_paths_test)
+
 enable_testing()
 
 qs_add_test_executable(tray_hook_test
@@ -938,7 +950,7 @@ set(QS_TESTS_PORTABLE
 	transition_trace foreground_observer activation_policy fullscreen_app_state
 	panel_topmost power_profiles brightness_route display_identity
 	native_desktop_recovery pw_session_worker idle_request input_settle
-	super_drag_wait network_wifi_route
+	super_drag_wait network_wifi_route runtime_paths
 	fullscreen_ownership display_transaction clipboard_capture capture_dimensions
 	erm625_native_desktop_facade network_wifi_identity
 )
