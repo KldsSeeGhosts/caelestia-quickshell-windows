@@ -2,7 +2,7 @@
 
 The producer workflow consumes the shell repository's canonical public
 `windows/toolchain.json`, Python locks and shared PowerShell helpers at
-`0346d61f1789ddcf3ff3b101de729887f6065e6f`. There is no second compiler,
+`7d7d5279b73195a70d13fddb46ecfcab776a07e4`. There is no second compiler,
 Rust or runtime policy in this repository. Updating that contract source is
 a deliberate reviewed toolchain upgrade, not a floating branch checkout.
 
@@ -17,6 +17,13 @@ the shared helper selects VC tools 14.44.35207 and Windows SDK 10.0.26100.0
 explicitly, binds the x64 linker, and asserts actual clang-cl, Rust/target, Qt,
 CMake, Ninja and CLI11 versions. Preparation verifies committed public download
 hashes, including the Python tools, Qt archives and Rust release manifest.
+Serviced compiler/linker versions and the official Rust commit are exact
+requirements. The VS redist marker must select CRT DLLs whose actual versions
+match the qualified `vcRedistVersion` and do not exceed the runtime floor.
+An extracted tooling cache is trusted only through the existing trusted-main
+writer boundary; archive checksums do not reauthenticate every cached file.
+Qt's checked supplier SBOM build-tool versions are not a declared minimum CRT
+requirement or a clean-VM qualification.
 
 Public receipts contain only version/hash fields, backend and contract-source
 revisions, and the separate VS installation version. They exclude raw paths,
