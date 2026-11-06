@@ -47,9 +47,10 @@ boption(NO_PCH "Disable precompild headers (dev)" OFF)
 boption(BUILD_TESTING "Build tests (dev)" OFF)
 if (BUILD_TESTING)
 	message(FATAL_ERROR
-		"Private test sources are not shipped in this production tree. "
+		"The in-tree core, io and window test suites are not shipped. "
 		"Configure with -DBUILD_TESTING=OFF to build Quickshell; "
-		"run private validation from the separately maintained harness.")
+		"the Windows backend fixtures are a standalone project: "
+		"cmake -S src/windows/test (see src/windows/test/README.md).")
 endif()
 boption(ASAN "ASAN (dev)" OFF) # note: better output with gcc than clang
 boption(FRAME_POINTERS "Keep Frame Pointers (dev)" ${ASAN})
