@@ -1,6 +1,6 @@
 # Candidate/result contract v1
 
-The backend owns this producer contract. ERM641 can consume it without copying
+The backend owns this producer contract. The shell can consume it without copying
 the compiler policy or waiting for a shell-specific producer implementation.
 `../scripts/candidate_contract.py` is the normative stdlib validator.
 `v1.schema.json` describes the wire shape; JSON Schema alone is **not** a pass
@@ -23,7 +23,7 @@ Both source records are required, including for a standalone run:
 not a tested application pair. On PRs the backend requested SHA is `github.sha`,
 the exact GitHub synthetic merge commit, **not** the PR head. `kind: downstream`
 requires an additional `integration` stage and nonempty `integration` test
-results for the exact requested pair. Only ERM641's consumer can claim that
+results for the exact requested pair. Only the downstream shell consumer can claim that
 application integration was executed. Neither kind qualifies packages, CRT
 installation on a clean VM, interactive Windows 11 behavior or physical hardware.
 
@@ -179,4 +179,4 @@ Root-owned hosted acceptance still requires:
 
 Those hosted controls, independent review and branch-protection configuration
 are not supplied by local synthetic fixtures. End-to-end pair execution remains
-ERM641. Clean-VM runtime and trusted desktop/hardware acceptance remain separate.
+the shell integration gate. Clean-VM runtime and trusted desktop/hardware acceptance remain separate.

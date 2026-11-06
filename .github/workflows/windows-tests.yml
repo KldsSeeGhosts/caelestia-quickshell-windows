@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-fixtures-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: windows-fixtures-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   fixtures:
@@ -28,7 +28,7 @@ jobs:
       RESULTS: C:\ci-fixtures
       PYTHONDONTWRITEBYTECODE: '1'
       CANDIDATE_BACKEND_SHA: ${{ github.sha }}
-      CANDIDATE_SHELL_SHA: 55a236ee72fc36bdf0ba8a499a1039fe997fe2c9
+      CANDIDATE_SHELL_SHA: f427d95bda044891c7bb0132a911d3e29a6c8245
 
     steps:
       - name: Checkout sources
