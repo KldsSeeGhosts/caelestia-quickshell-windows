@@ -1,5 +1,6 @@
 #include "capture.hpp"
 #include "capture_device.hpp"
+#include "capture_dimensions.hpp"
 #include "capture_format.hpp"
 
 #include <chrono>
@@ -302,26 +303,34 @@ bool CaptureWorker::configure(const GraphicsCaptureSession& session, const Captu
 }
 
 QImage CaptureWorker::grabMonitor(HMONITOR monitor, int timeoutMs) {
-	if (!this->mReady) return {};
+	if (!this->mReady || timeoutMs <= 0) return {};
 	if (!this->prepareDevice()) return {};
 
 	struct Grab {
 		std::mutex mutex;
 		std::condition_variable cv;
 		bool done = false;
+		HRESULT error = S_OK;
 		QImage image;
 	};
 
 	auto grab = std::make_shared<Grab>();
+	const auto generation = this->mDevice.generation();
 
 	try {
 		auto item = this->createItem({.monitor = monitor});
+		const auto poolSize = item.Size();
+		size_t rowBytes = 0;
+		if (auto status = oneShotLayout(poolSize, rowBytes); status != OneShotStatus::Ready) {
+			qCWarning(logCapture) << "Monitor capture rejected:" << oneShotStatusName(status);
+			return {};
+		}
 
 		Direct3D11CaptureFramePool pool {nullptr};
 		const FrameFormat* format = nullptr;
 		winrt::hresult lastError {};
 		auto choice = chooseFrameFormat([&](const FrameFormat& candidate) {
-			pool = tryCreateFramePool(this->mDevice.winrtDevice(), candidate, 1, item.Size(), &lastError);
+			pool = tryCreateFramePool(this->mDevice.winrtDevice(), candidate, 1, poolSize, &lastError);
 			if (!pool) return false;
 			format = &candidate;
 			return true;
@@ -338,9 +347,11 @@ QImage CaptureWorker::grabMonitor(HMONITOR monitor, int timeoutMs) {
 
 		auto device = this->mDevice.d3d();
 		auto context = this->mDevice.context();
-		auto imageFormat = format->image;
 
-		auto token = pool.FrameArrived([grab, device, context, imageFormat](auto const& sender, auto const&) {
+		auto token = pool.FrameArrived([grab, device, context, format, poolSize](
+		                                   auto const& sender,
+		                                   auto const&
+		                               ) {
 			std::lock_guard lock(grab->mutex);
 			if (grab->done) return;
 
@@ -351,38 +362,56 @@ QImage CaptureWorker::grabMonitor(HMONITOR monitor, int timeoutMs) {
 				auto content = frame.ContentSize();
 				auto source = textureOf<ID3D11Texture2D>(frame.Surface());
 
-				D3D11_TEXTURE2D_DESC desc {};
-				source->GetDesc(&desc);
-				desc.Width = static_cast<UINT>(content.Width);
-				desc.Height = static_cast<UINT>(content.Height);
-				desc.Usage = D3D11_USAGE_STAGING;
-				desc.BindFlags = 0;
-				desc.MiscFlags = 0;
-				desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+				struct Readback {
+					winrt::com_ptr<ID3D11Device> device;
+					winrt::com_ptr<ID3D11DeviceContext> context;
+					winrt::com_ptr<ID3D11Texture2D> source;
+					winrt::com_ptr<ID3D11Texture2D> staging;
 
-				winrt::com_ptr<ID3D11Texture2D> staging;
-				winrt::check_hresult(device->CreateTexture2D(&desc, nullptr, staging.put()));
+					D3D11_TEXTURE2D_DESC description() const {
+						D3D11_TEXTURE2D_DESC desc {};
+						this->source->GetDesc(&desc);
+						return desc;
+					}
 
-				D3D11_BOX box {0, 0, 0, desc.Width, desc.Height, 1};
-				context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, source.get(), 0, &box);
+					void copy(const D3D11_TEXTURE2D_DESC& desc, const D3D11_BOX& box) {
+						winrt::check_hresult(
+						    this->device->CreateTexture2D(&desc, nullptr, this->staging.put())
+						);
+						this->context->CopySubresourceRegion(
+						    this->staging.get(),
+						    0,
+						    0,
+						    0,
+						    0,
+						    this->source.get(),
+						    0,
+						    &box
+						);
+					}
 
-				D3D11_MAPPED_SUBRESOURCE mapped {};
-				winrt::check_hresult(context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped));
+					D3D11_MAPPED_SUBRESOURCE map() {
+						D3D11_MAPPED_SUBRESOURCE mapped {};
+						winrt::check_hresult(
+						    this->context->Map(this->staging.get(), 0, D3D11_MAP_READ, 0, &mapped)
+						);
+						return mapped;
+					}
 
-				auto image = QImage(content.Width, content.Height, imageFormat);
-				auto rowBytes = static_cast<size_t>(content.Width) * 4;
-				for (int y = 0; y < content.Height; ++y) {
-					std::memcpy(
-					    image.scanLine(y),
-					    static_cast<const char*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch,
-					    rowBytes
-					);
-				}
+					void unmap() { this->context->Unmap(this->staging.get(), 0); }
+				};
 
-				context->Unmap(staging.get(), 0);
+				Readback readback {.device = device, .context = context, .source = source, .staging = {}};
+				auto result = readOneShotFrame(poolSize, content, *format, readback);
 				frame.Close();
-				grab->image = image;
+				if (result.status == OneShotStatus::Ready) {
+					grab->image = std::move(result.image);
+				} else {
+					qCWarning(logCapture) << "Monitor frame rejected; retry capture:"
+					                      << oneShotStatusName(result.status);
+				}
 			} catch (const winrt::hresult_error& e) {
+				grab->error = e.code().value;
 				qCWarning(logCapture) << "Monitor readback failed:" << hresultString(e);
 			}
 
@@ -406,7 +435,22 @@ QImage CaptureWorker::grabMonitor(HMONITOR monitor, int timeoutMs) {
 		this->recoverIfRemoved(e.code().value);
 	}
 
-	return grab->image;
+	HRESULT error = S_OK;
+	QImage image;
+	{
+		std::lock_guard lock(grab->mutex);
+		grab->done = true;
+		error = grab->error;
+		image = std::move(grab->image);
+	}
+
+	// Callback failures reach recovery only after its pool/session are closed.
+	// Never recover a replacement device from an earlier generation's failure.
+	if (FAILED(error) && recoveryStillApplies(this->mDevice, generation)) {
+		this->recoverIfRemoved(error);
+	}
+
+	return image;
 }
 
 struct SessionCore {
