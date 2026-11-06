@@ -351,12 +351,21 @@ class ContractTests(unittest.TestCase):
 
     def test_raw_output_echo_is_opt_in_and_never_enters_receipt(self):
         for echo in (False, True):
-            output = io.StringIO()
+            output = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
             with contextlib.redirect_stdout(output):
                 code, receipt = self.run_fixture("print('synthetic-private-output')", echo=echo)
             self.assertEqual(code, 0)
-            self.assertEqual("synthetic-private-output" in output.getvalue(), echo)
+            self.assertEqual(b"synthetic-private-output" in output.buffer.getvalue(), echo)
             self.assertNotIn("synthetic-private-output", json.dumps(receipt))
+
+    def test_echo_preserves_non_utf8_output_on_legacy_stdout(self):
+        output = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+        with contextlib.redirect_stdout(output):
+            code, receipt = self.run_fixture(
+                "import sys;sys.stdout.buffer.write(bytes([255, 129, 10]))", echo=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(output.buffer.getvalue(), bytes([255, 129, 10]))
+        self.assertEqual(receipt["stages"]["portable"]["exitCode"], 0)
 
     def test_actual_process_failure_preserves_exit_code(self):
         code, receipt = self.run_fixture("print('private-title');raise SystemExit(7)")
