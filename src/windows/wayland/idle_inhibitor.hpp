@@ -1,0 +1,57 @@
+#pragma once
+
+#include <qobject.h>
+#include <qpointer.h>
+#include <qproperty.h>
+#include <qqmlintegration.h>
+#include <qstring.h>
+#include <qtmetamacros.h>
+#include <windows.h>
+
+#include "idle_request.hpp"
+
+namespace qs::windows::wayland {
+
+class IdleInhibitor: public QObject {
+	Q_OBJECT;
+	// clang-format off
+	Q_PROPERTY(bool enabled READ default WRITE default NOTIFY enabledChanged BINDABLE bindableEnabled);
+	Q_PROPERTY(bool held READ held NOTIFY heldChanged);
+	Q_PROPERTY(QString error READ error NOTIFY errorChanged);
+	Q_PROPERTY(QObject* window READ window WRITE setWindow NOTIFY windowChanged);
+	// clang-format on
+	QML_ELEMENT;
+
+public:
+	explicit IdleInhibitor(QObject* parent = nullptr);
+	~IdleInhibitor() override;
+	Q_DISABLE_COPY_MOVE(IdleInhibitor);
+
+	[[nodiscard]] QObject* window() const { return this->mWindow; }
+	void setWindow(QObject* window);
+
+	[[nodiscard]] QBindable<bool> bindableEnabled() { return &this->bEnabled; }
+	[[nodiscard]] bool held() const { return this->state.held(); }
+	[[nodiscard]] QString error() const { return this->lastError; }
+
+signals:
+	void enabledChanged();
+	void heldChanged();
+	void errorChanged();
+	void windowChanged();
+
+private:
+	void update();
+	void publish();
+	void setError(const QString& message);
+
+	QPointer<QObject> mWindow;
+	HANDLE request = nullptr;
+	IdleRequestState state;
+	bool heldNotified = false;
+	QString lastError;
+
+	Q_OBJECT_BINDABLE_PROPERTY(IdleInhibitor, bool, bEnabled, &IdleInhibitor::enabledChanged);
+};
+
+} // namespace qs::windows::wayland
