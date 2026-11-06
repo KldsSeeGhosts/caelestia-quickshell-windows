@@ -19,6 +19,7 @@
 #include <qtypes.h>
 
 #include "fullscreen_geometry.hpp"
+#include "fullscreen_ownership.hpp"
 #include "window_style_snapshot.hpp"
 
 namespace qs::windows {
@@ -39,6 +40,7 @@ class TrackedWindow: public QObject {
 	Q_OBJECT;
 
 public:
+	~TrackedWindow() override;
 	[[nodiscard]] HWND hwnd() const { return this->mHwnd; }
 	[[nodiscard]] quint64 address() const;
 	[[nodiscard]] QString addressHex() const;
@@ -126,6 +128,7 @@ private:
 	void refreshTitle();
 	void refreshState();
 	void refreshDesktop(bool askShell);
+	void releaseFullscreenOwnership();
 
 	WindowTracker* tracker;
 	HWND mHwnd;
@@ -138,11 +141,9 @@ private:
 	QRect traceRect;
 	WindowStyleSnapshot styleSnapshot;
 
-	struct {
-		bool active = false;
-		LONG_PTR style = 0;
-		RECT rect {};
-	} fullscreenBackup;
+	fullscreen_ownership::NativeOps fullscreenOps;
+	fullscreen_ownership::Owner fullscreenOwner;
+	bool endingTracking = false;
 
 	// Exact fullscreen episode: the frame and monitor that were classified
 	// fullscreen. It bridges a display-mode or DPI change, where the monitor and
