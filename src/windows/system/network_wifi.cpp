@@ -1,6 +1,5 @@
 #include "network_wifi.hpp"
-
-#include <unordered_map>
+#include <vector>
 
 #include <qcoreapplication.h>
 #include <qhash.h>
@@ -12,13 +11,11 @@
 #include <qstringbuilder.h>
 #include <qstringview.h>
 #include <qthreadpool.h>
-
 #include <shellapi.h>
 
 #include "../../core/backgroundpool.hpp"
 #include "../../core/logcat.hpp"
 #include "../startup.hpp"
-#include "../redact.hpp"
 #include "network.hpp"
 #include "network_wifi_route.hpp"
 
@@ -26,13 +23,6 @@ namespace qs::windows::sys {
 
 namespace {
 QS_LOGGING_CATEGORY(logWifi, "quickshell.windows.network.wifi", QtWarningMsg);
-
-QString ssidToString(const DOT11_SSID& ssid) {
-	auto len = static_cast<int>(ssid.uSSIDLength);
-	if (len <= 0) return {};
-	if (len > static_cast<int>(sizeof(ssid.ucSSID))) len = static_cast<int>(sizeof(ssid.ucSSID));
-	return QString::fromUtf8(reinterpret_cast<const char*>(ssid.ucSSID), len); // NOLINT
-}
 
 QString macToString(const DOT11_MAC_ADDRESS& mac) {
 	return QStringLiteral("%1:%2:%3:%4:%5:%6")
@@ -45,72 +35,6 @@ QString macToString(const DOT11_MAC_ADDRESS& mac) {
 	    .toUpper();
 }
 
-QString securityLabel(DOT11_AUTH_ALGORITHM algo) {
-	switch (algo) {
-	case DOT11_AUTH_ALGO_80211_OPEN: return {};
-	case DOT11_AUTH_ALGO_80211_SHARED_KEY: return QStringLiteral("WEP");
-	case DOT11_AUTH_ALGO_WPA:
-	case DOT11_AUTH_ALGO_WPA_PSK: return QStringLiteral("WPA");
-	case DOT11_AUTH_ALGO_RSNA: return QStringLiteral("WPA2-Enterprise");
-	case DOT11_AUTH_ALGO_RSNA_PSK: return QStringLiteral("WPA2");
-	case DOT11_AUTH_ALGO_WPA3: return QStringLiteral("WPA3-Enterprise");
-	case DOT11_AUTH_ALGO_WPA3_SAE: return QStringLiteral("WPA3");
-	case DOT11_AUTH_ALGO_OWE: return QStringLiteral("OWE");
-	default: return QStringLiteral("Secured");
-	}
-}
-
-QString xmlEscape(const QString& s) {
-	auto out = s;
-	out.replace(QLatin1Char('&'), QStringLiteral("&amp;"));
-	out.replace(QLatin1Char('<'), QStringLiteral("&lt;"));
-	out.replace(QLatin1Char('>'), QStringLiteral("&gt;"));
-	out.replace(QLatin1Char('"'), QStringLiteral("&quot;"));
-	out.replace(QLatin1Char('\''), QStringLiteral("&apos;"));
-	return out;
-}
-
-QString buildProfileXml(const QString& ssid, const QString& password, bool secure, bool wpa3) {
-	auto escapedSsid = xmlEscape(ssid);
-	auto hexSsid = QString::fromLatin1(ssid.toUtf8().toHex()).toUpper();
-
-	QString authEncryption;
-	QString sharedKey;
-	if (!secure) {
-		authEncryption = QStringLiteral("<authEncryption>"
-		                                 "<authentication>open</authentication>"
-		                                 "<encryption>none</encryption>"
-		                                 "<useOneX>false</useOneX>"
-		                                 "</authEncryption>");
-	} else {
-		auto authentication = wpa3 ? QStringLiteral("WPA3SAE") : QStringLiteral("WPA2PSK");
-		authEncryption = QStringLiteral("<authEncryption>"
-		                                 "<authentication>%1</authentication>"
-		                                 "<encryption>AES</encryption>"
-		                                 "<useOneX>false</useOneX>"
-		                                 "</authEncryption>")
-		                     .arg(authentication);
-		sharedKey = QStringLiteral("<sharedKey>"
-		                            "<keyType>passPhrase</keyType>"
-		                            "<protected>false</protected>"
-		                            "<keyMaterial>%1</keyMaterial>"
-		                            "</sharedKey>")
-		                .arg(xmlEscape(password));
-	}
-
-	return QStringLiteral(
-	           "<?xml version=\"1.0\"?>"
-	           "<WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">"
-	           "<name>%1</name>"
-	           "<SSIDConfig><SSID><hex>%2</hex><name>%1</name></SSID></SSIDConfig>"
-	           "<connectionType>ESS</connectionType>"
-	           "<connectionMode>auto</connectionMode>"
-	           "<MSM><security>%3%4</security></MSM>"
-	           "</WLANProfile>"
-	)
-	    .arg(escapedSsid, hexSsid, authEncryption, sharedKey);
-}
-
 } // namespace
 
 NetworkWifiBackend::NetworkWifiBackend(Network* owner): mOwner(owner) {}
@@ -118,6 +42,7 @@ NetworkWifiBackend::NetworkWifiBackend(Network* owner): mOwner(owner) {}
 NetworkWifiBackend::~NetworkWifiBackend() { this->closeHandle(); }
 
 void NetworkWifiBackend::closeHandle() {
+	this->cancelConnection();
 	if (this->mHandle != nullptr) {
 		WlanCloseHandle(this->mHandle, nullptr);
 		this->mHandle = nullptr;
@@ -268,15 +193,15 @@ void NetworkWifiBackend::clearSelectedInterface() {
 	// The selected interface is gone or no longer enumerable, so a connection
 	// pending on it can never complete. End it as a failure before clearing the
 	// rest of the state; otherwise the shell stays busy and rejects new requests.
-	this->mOwner->backendEndPendingConnection();
-
+	this->cancelConnection();
 	this->mHasAdapter = false;
 	this->mInterfaceGuid = {};
+	this->mOwner->backendEndPendingConnection();
 	this->mScanRequested = false;
 	this->mOwner->backendSetWifiScanning(false);
 	this->mOwner->backendSetWifiRadioOn(false);
 	this->mOwner->backendSetWifiAdapterPresent(false);
-	this->mOwner->backendSetCurrentConnection({}, {}, 0, {}, false, false);
+	this->mOwner->backendSetCurrentConnection({}, false, false);
 	this->mOwner->backendUpdateAvailableNetworks({});
 }
 
@@ -376,27 +301,32 @@ void NetworkWifiBackend::refreshAvailableNetworks() {
 	}
 	this->mOwner->backendSetNeedsLocationPermission(false);
 
-	QHash<QString, RawWifiNetwork> byName;
+	QHash<QString, RawWifiNetwork> byIdentity;
 	for (DWORD i = 0; i < list->dwNumberOfItems; i++) {
 		const auto& net = list->Network[i]; // NOLINT
-		auto ssid = ssidToString(net.dot11Ssid);
-		if (ssid.isEmpty()) continue;
-
 		RawWifiNetwork raw;
-		raw.ssid = ssid;
+		raw.ssidBytes = wifi_identity::ssidBytes(net.dot11Ssid);
+		if (!wifi_identity::validSsid(raw.ssidBytes)) continue;
+		raw.ssid = QString::fromUtf8(raw.ssidBytes);
+		raw.interfaceGuid = this->mInterfaceGuid;
+		raw.authentication = net.dot11DefaultAuthAlgorithm;
+		raw.cipher = net.dot11DefaultCipherAlgorithm;
+		raw.bssType = net.dot11BssType;
+		raw.securityEnabled = net.bSecurityEnabled != FALSE;
 		raw.strength = static_cast<int>(net.wlanSignalQuality);
 		raw.active = (net.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED) != 0;
 		raw.hasProfile = (net.dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE) != 0;
-		raw.security = net.bSecurityEnabled ? securityLabel(net.dot11DefaultAuthAlgorithm) : QString();
+		raw.security = wifi_identity::securityLabel(raw);
 		if (raw.hasProfile) raw.profileName = QString::fromWCharArray(net.strProfileName);
 
-		auto existing = byName.constFind(ssid);
-		if (existing == byName.constEnd()) {
-			byName.insert(ssid, raw);
+		const auto key = wifi_identity::selectionId(raw);
+		auto existing = byIdentity.constFind(key);
+		if (existing == byIdentity.constEnd()) {
+			byIdentity.insert(key, raw);
 		} else if (raw.active && !existing->active) {
-			byName.insert(ssid, raw);
+			byIdentity.insert(key, raw);
 		} else if (!raw.active && !existing->active && raw.strength > existing->strength) {
-			byName.insert(ssid, raw);
+			byIdentity.insert(key, raw);
 		}
 	}
 	WlanFreeMemory(list);
@@ -414,27 +344,26 @@ void NetworkWifiBackend::refreshAvailableNetworks() {
 	if (result == ERROR_ACCESS_DENIED) {
 		this->mOwner->backendSetNeedsLocationPermission(true);
 	} else if (result == ERROR_SUCCESS && bssList != nullptr) {
-		std::unordered_map<std::wstring, LONG> bestRssi;
+		QHash<QByteArray, LONG> bestRssi;
 		for (DWORD i = 0; i < bssList->dwNumberOfItems; i++) {
 			const auto& bss = bssList->wlanBssEntries[i]; // NOLINT
-			auto ssid = ssidToString(bss.dot11Ssid);
-			auto it = byName.find(ssid);
-			if (it == byName.end()) continue;
-
-			auto key = ssid.toStdWString();
-			auto best = bestRssi.find(key);
-			if (best != bestRssi.end() && best->second >= bss.lRssi) continue;
-			bestRssi[key] = bss.lRssi;
-
-			it->bssid = macToString(bss.dot11Bssid);
-			it->frequency = static_cast<int>(bss.ulChCenterFrequency / 1000);
+			const auto bytes = wifi_identity::ssidBytes(bss.dot11Ssid);
+			if (!wifi_identity::validSsid(bytes)) continue;
+			auto best = bestRssi.constFind(bytes);
+			if (best != bestRssi.constEnd() && *best >= bss.lRssi) continue;
+			bestRssi[bytes] = bss.lRssi;
+			for (auto& raw: byIdentity) {
+				if (raw.ssidBytes != bytes) continue;
+				raw.bssid = macToString(bss.dot11Bssid);
+				raw.frequency = static_cast<int>(bss.ulChCenterFrequency / 1000);
+			}
 		}
 		WlanFreeMemory(bssList);
 	}
 
 	std::vector<RawWifiNetwork> raw;
-	raw.reserve(static_cast<size_t>(byName.size()));
-	for (auto it = byName.constBegin(); it != byName.constEnd(); ++it) raw.push_back(it.value());
+	raw.reserve(static_cast<size_t>(byIdentity.size()));
+	for (const auto& network: byIdentity) raw.push_back(network);
 
 	// One completed query, one snapshot: the model holds these rows before the
 	// generation advances, so a consumer may read it from the change handler.
@@ -443,7 +372,7 @@ void NetworkWifiBackend::refreshAvailableNetworks() {
 
 void NetworkWifiBackend::refreshCurrentConnection() {
 	if (!this->mHasAdapter) {
-		this->mOwner->backendSetCurrentConnection({}, {}, 0, {}, false, false);
+		this->mOwner->backendSetCurrentConnection({}, false, false);
 		return;
 	}
 
@@ -463,44 +392,53 @@ void NetworkWifiBackend::refreshCurrentConnection() {
 		return;
 	}
 	if (result != ERROR_SUCCESS || data == nullptr) {
-		this->mOwner->backendSetCurrentConnection({}, {}, 0, {}, false, false);
+		this->mOwner->backendSetCurrentConnection({}, false, false);
 		return;
 	}
 
 	auto* conn = static_cast<PWLAN_CONNECTION_ATTRIBUTES>(data);
 	auto connected = conn->isState == wlan_interface_state_connected;
 	auto connecting = conn->isState == wlan_interface_state_associating
-	                || conn->isState == wlan_interface_state_discovering
-	                || conn->isState == wlan_interface_state_authenticating;
-	auto ssid = ssidToString(conn->wlanAssociationAttributes.dot11Ssid);
-	auto bssid = macToString(conn->wlanAssociationAttributes.dot11Bssid);
-	auto quality = static_cast<int>(conn->wlanAssociationAttributes.wlanSignalQuality);
-	auto security = conn->wlanSecurityAttributes.bSecurityEnabled
-	                  ? securityLabel(conn->wlanSecurityAttributes.dot11AuthAlgorithm)
-	                  : QString();
+	               || conn->isState == wlan_interface_state_discovering
+	               || conn->isState == wlan_interface_state_authenticating;
+	RawWifiNetwork current;
+	current.ssidBytes = wifi_identity::ssidBytes(conn->wlanAssociationAttributes.dot11Ssid);
+	current.ssid = QString::fromUtf8(current.ssidBytes);
+	current.interfaceGuid = this->mInterfaceGuid;
+	current.bssid = macToString(conn->wlanAssociationAttributes.dot11Bssid);
+	current.strength = static_cast<int>(conn->wlanAssociationAttributes.wlanSignalQuality);
+	current.authentication = conn->wlanSecurityAttributes.dot11AuthAlgorithm;
+	current.cipher = conn->wlanSecurityAttributes.dot11CipherAlgorithm;
+	current.securityEnabled = conn->wlanSecurityAttributes.bSecurityEnabled != FALSE;
+	current.security = wifi_identity::securityLabel(current);
+	current.bssType = conn->wlanAssociationAttributes.dot11BssType;
+	current.profileName = QString::fromWCharArray(conn->strProfileName);
+	current.hasProfile = !current.profileName.isEmpty();
 	WlanFreeMemory(data);
 
-	this->mOwner->backendSetCurrentConnection(ssid, bssid, quality, security, connected, connecting);
+	this->mOwner->backendSetCurrentConnection(current, connected, connecting);
 }
 
 void NetworkWifiBackend::connectToNetwork(
-    const QString& ssid,
-    const QString& profileName,
+    const RawWifiNetwork& network,
     const QString& password,
-    bool hasProfile,
-    bool secure,
-    bool wpa3
+    quint64 requestId
 ) {
-	if (!this->mHasAdapter) {
-		this->mOwner->backendWifiConnectResult(ssid, false, QStringLiteral("other"));
+	if (!this->ownsInterface(network.interfaceGuid) || !wifi_identity::validSsid(network.ssidBytes)) {
+		this->mOwner->backendWifiConnectResult(requestId, false, QStringLiteral("stale-selection"));
 		return;
 	}
 
-	auto targetProfile = ssid;
+	auto targetProfile = network.profileName;
 
-	if (!hasProfile) {
-		auto xml = buildProfileXml(ssid, password, secure, wpa3);
-		auto wxml = xml.toStdWString();
+	if (!network.hasProfile) {
+		const auto profile = wifi_identity::newProfile(network, password);
+		if (!profile.reason.isEmpty()) {
+			this->mOwner->backendWifiConnectResult(requestId, false, profile.reason);
+			return;
+		}
+		targetProfile = profile.name;
+		auto wxml = profile.xml.toStdWString();
 		DWORD reason = 0;
 		auto setResult = WlanSetProfile(
 		    this->mHandle,
@@ -508,46 +446,57 @@ void NetworkWifiBackend::connectToNetwork(
 		    0,
 		    wxml.c_str(),
 		    nullptr,
-		    TRUE,
+		    FALSE,
 		    nullptr,
 		    &reason
 		);
 		if (setResult != ERROR_SUCCESS) {
-			qCWarning(logWifi) << "WlanSetProfile failed for" << qs::windows::logId(ssid) << ":"
-			                   << setResult << "reason" << reason;
-			this->mOwner->backendWifiConnectResult(ssid, false, QStringLiteral("other"));
+			qCWarning(logWifi) << "WlanSetProfile failed:" << setResult << "reason" << reason;
+			this->mOwner->backendWifiConnectResult(requestId, false, QStringLiteral("profile-rejected"));
 			return;
 		}
-	} else if (!profileName.isEmpty()) {
-		targetProfile = profileName;
+	} else if (targetProfile.isEmpty() || targetProfile.contains(QChar(u'\0'))) {
+		this->mOwner->backendWifiConnectResult(requestId, false, QStringLiteral("invalid-profile"));
+		return;
 	}
 
+	this->mPendingConnection = PendingConnection {network, targetProfile, requestId};
+	this->mCallbackRequestId.store(requestId);
 	auto profile = targetProfile.toStdWString();
 	WLAN_CONNECTION_PARAMETERS params {};
 	params.wlanConnectionMode = wlan_connection_mode_profile;
 	params.strProfile = profile.c_str();
 	params.pDot11Ssid = nullptr;
 	params.pDesiredBssidList = nullptr;
-	params.dot11BssType = dot11_BSS_type_infrastructure;
+	params.dot11BssType = network.bssType;
 	params.dwFlags = 0;
 
 	auto result = WlanConnect(this->mHandle, &this->mInterfaceGuid, &params, nullptr);
 	if (result != ERROR_SUCCESS) {
-		qCWarning(logWifi) << "WlanConnect failed for" << qs::windows::logId(ssid) << "(profile"
-		                   << qs::windows::logId(targetProfile) << "):" << result;
-		this->mOwner->backendWifiConnectResult(ssid, false, QStringLiteral("other"));
+		this->cancelConnection();
+		qCWarning(logWifi) << "WlanConnect failed:" << result;
+		this->mOwner->backendWifiConnectResult(requestId, false, QStringLiteral("command-rejected"));
 		return;
 	}
+	this->mOwner->backendWifiConnectAccepted(requestId);
+}
+
+void NetworkWifiBackend::cancelConnection() {
+	this->mCallbackRequestId.store(0);
+	this->mPendingConnection.reset();
 }
 
 void NetworkWifiBackend::disconnectActive() {
+	this->cancelConnection();
 	if (!this->mHasAdapter) return;
 	WlanDisconnect(this->mHandle, &this->mInterfaceGuid, nullptr);
 }
 
-void NetworkWifiBackend::forgetNetwork(const QString& ssid, const QString& profileName) {
-	if (!this->mHasAdapter) return;
-	auto name = (profileName.isEmpty() ? ssid : profileName).toStdWString();
+void NetworkWifiBackend::forgetNetwork(const RawWifiNetwork& network) {
+	if (!this->ownsInterface(network.interfaceGuid) || !network.hasProfile
+	    || network.profileName.isEmpty() || network.profileName.contains(QChar(u'\0')))
+		return;
+	auto name = network.profileName.toStdWString();
 	WlanDeleteProfile(this->mHandle, &this->mInterfaceGuid, name.c_str(), nullptr);
 }
 
@@ -565,21 +514,35 @@ void WINAPI NetworkWifiBackend::notificationCallback(PWLAN_NOTIFICATION_DATA dat
 		    && data->dwDataSize >= offsetof(WLAN_CONNECTION_NOTIFICATION_DATA, strProfileXml))
 		{
 			const auto* connData = static_cast<const WLAN_CONNECTION_NOTIFICATION_DATA*>(data->pData);
-			auto ssid = ssidToString(connData->dot11Ssid);
+			auto bytes = wifi_identity::ssidBytes(connData->dot11Ssid);
+			auto profile = QString::fromWCharArray(
+			    connData->strProfileName,
+			    static_cast<qsizetype>(wcsnlen(connData->strProfileName, WLAN_MAX_NAME_LENGTH))
+			);
+			const auto requestId = self->mCallbackRequestId.load();
 			auto success = code == wlan_notification_acm_connection_complete
 			            && connData->wlanReasonCode == WLAN_REASON_CODE_SUCCESS;
 			auto reasonCode = connData->wlanReasonCode;
 
 			QMetaObject::invokeMethod(
 			    self,
-			    [self, guid, ssid, success, reasonCode]() {
+			    [self, guid, bytes, profile, requestId, success, reasonCode]() {
 				    if (!self->ownsInterface(guid)) return;
-				    self->mOwner->backendWifiConnectResult(
-				        ssid,
-				        success,
-				        reasonCode != WLAN_REASON_CODE_SUCCESS ? QStringLiteral("auth")
-				                                                : QStringLiteral("other")
-				    );
+				    const auto& pending = self->mPendingConnection;
+				    if (requestId != 0 && pending && pending->requestId == requestId
+				        && pending->network.ssidBytes == bytes && pending->profileName == profile)
+				    {
+					    self->cancelConnection();
+					    self->mOwner->backendWifiConnectResult(
+					        requestId,
+					        success,
+					        success                                  ? QString()
+					        : reasonCode != WLAN_REASON_CODE_SUCCESS ? QStringLiteral("auth")
+					                                                 : QStringLiteral("other")
+					    );
+				    }
+				    // Windows UI and other clients also change the connection.
+				    // Observe those events without claiming our command completed.
 				    self->refreshCurrentConnection();
 				    self->refreshAvailableNetworks();
 			    },

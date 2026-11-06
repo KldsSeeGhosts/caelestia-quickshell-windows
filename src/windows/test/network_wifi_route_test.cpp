@@ -37,6 +37,7 @@ private slots:
 	void clearsSelectionWhenNoneRemain();
 	void notificationForAnotherInterfaceIsIgnored();
 	void notificationWithoutSelectionIsIgnored();
+	void completedRefreshPublishesOneSnapshot();
 };
 
 void NetworkWifiRouteTest::selectsConnectedInterface() {
@@ -172,30 +173,23 @@ void NetworkWifiRouteTest::notificationWithoutSelectionIsIgnored() {
 // The completed-refresh snapshot over the real Network state and its networks
 // model. The WLAN and connectivity backends are link stubs and are never
 // started, so no adapter, scan or notification is involved.
-class NetworkSnapshotTest: public QObject {
-	Q_OBJECT;
-
-private slots:
-	void completedRefreshPublishesOneSnapshot();
-};
-
-void NetworkSnapshotTest::completedRefreshPublishesOneSnapshot() {
+void NetworkWifiRouteTest::completedRefreshPublishesOneSnapshot() {
 	auto* network = qs::windows::sys::Network::createForTesting();
 	QSignalSpy snapshots(network, &qs::windows::sys::Network::wifiSnapshotChanged);
 	// What the model held when each generation reached a consumer.
 	QList<int> rowsAtPublish;
 	QObject::connect(network, &qs::windows::sys::Network::wifiSnapshotChanged, network, [&]() {
-		rowsAtPublish.append(
-		    static_cast<int>(network->networks()->rowCount(QModelIndex {}))
-		);
+		rowsAtPublish.append(static_cast<int>(network->networks()->rowCount(QModelIndex {})));
 	});
 
 	QCOMPARE(network->bindableWifiSnapshot().value(), 0);
 
 	std::vector<qs::windows::sys::RawWifiNetwork> rows(2);
 	rows[0].ssid = QStringLiteral("First");
+	rows[0].ssidBytes = QByteArrayLiteral("First");
 	rows[0].strength = 70;
 	rows[1].ssid = QStringLiteral("Second");
+	rows[1].ssidBytes = QByteArrayLiteral("Second");
 	rows[1].strength = 40;
 
 	network->backendPublishAvailableNetworks(rows);
@@ -216,15 +210,13 @@ void NetworkSnapshotTest::completedRefreshPublishesOneSnapshot() {
 
 	QCOMPARE(snapshots.count(), 3);
 	QCOMPARE(rowsAtPublish, (QList<int> {2, 2, 1}));
+	delete network;
 }
 
 int main(int argc, char** argv) {
 	QCoreApplication app(argc, argv);
 	NetworkWifiRouteTest route;
-	NetworkSnapshotTest snapshot;
-	const auto first = QTest::qExec(&route, argc, argv);
-	const auto second = QTest::qExec(&snapshot, argc, argv);
-	return first | second;
+	return QTest::qExec(&route, argc, argv);
 }
 
 #include "network_wifi_route_test.moc"
