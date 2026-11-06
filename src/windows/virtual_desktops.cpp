@@ -285,12 +285,16 @@ R VirtualDesktops::call(R fallback, R (*fn)(P...), A... args) const {
 
 void VirtualDesktops::accessorFailed() const {
 	auto& a = this->accessor;
-	if (!this->accessorLoaded()) return;
 	if (this->nativeAccessor) {
-		qCWarning(logDesktops) << "Native desktop provider raised an exception; the next dispatch retries it";
+		qCWarning(logDesktops) << "Native desktop provider raised an exception; invalidating interfaces"
+		                       << "and entering bounded recovery";
+		// Defense in depth for faults outside a native leaf guard, including
+		// local COM cleanup. Never let dispatch re-enable the stale provider.
+		invalidateNativeDesktopAccessor(E_UNEXPECTED);
 		this->setAccessorLoaded(false);
 		return;
 	}
+	if (!this->accessorLoaded()) return;
 
 	auto now = GetTickCount64();
 	if (a.restart != nullptr
