@@ -15,6 +15,7 @@ inline void fault() { RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
 template <typename Interface>
 struct FakeCom: Interface {
 	ULONG refs = 1;
+	int releases = 0;
 	bool faultOnRelease = false;
 	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override {
 		*out = nullptr;
@@ -22,11 +23,13 @@ struct FakeCom: Interface {
 	}
 	ULONG STDMETHODCALLTYPE AddRef() override { return ++this->refs; }
 	ULONG STDMETHODCALLTYPE Release() override {
+		++this->releases;
 		const auto remaining = --this->refs;
 		if (this->faultOnRelease) fault();
 		return remaining;
 	}
 };
+struct FakeView: FakeCom<IUnknown> {};
 struct FakeDesktop: FakeCom<Desktop> {
 	GUID id {};
 	bool faultOnId = false;
@@ -61,18 +64,32 @@ struct FakeManager: FakeCom<DesktopManager> {
 	bool faultOnEnumeration = false;
 	bool faultOnSwitch = false;
 	bool faultOnCreate = false;
+	bool faultOnCurrent = false;
+	bool faultOnCanMove = false;
+	bool faultOnMove = false;
+	int canMoves = 0;
+	int moves = 0;
+	HRESULT moveResult = S_OK;
+	ApplicationView* expectedView = nullptr;
 	FakeDesktop* current = nullptr;
 	FakeDesktop* created = nullptr;
 	HRESULT STDMETHODCALLTYPE GetCount(UINT* out) override { return this->array.GetCount(out); }
-	HRESULT STDMETHODCALLTYPE MoveViewToDesktop(ApplicationView*, Desktop*) override {
-		return E_NOTIMPL;
+	HRESULT STDMETHODCALLTYPE MoveViewToDesktop(ApplicationView* view, Desktop*) override {
+		++this->moves;
+		if (this->faultOnMove) fault();
+		return view == this->expectedView ? this->moveResult : E_INVALIDARG;
 	}
-	HRESULT STDMETHODCALLTYPE CanViewMoveDesktops(ApplicationView*, BOOL*) override {
-		return E_NOTIMPL;
+	HRESULT STDMETHODCALLTYPE CanViewMoveDesktops(ApplicationView* view, BOOL* out) override {
+		++this->canMoves;
+		if (this->faultOnCanMove) fault();
+		if (view != this->expectedView) return E_INVALIDARG;
+		*out = TRUE;
+		return S_OK;
 	}
 	HRESULT STDMETHODCALLTYPE GetCurrentDesktop(Desktop** out) override {
 		this->current->AddRef();
 		*out = this->current;
+		if (this->faultOnCurrent) fault();
 		return S_OK;
 	}
 	HRESULT STDMETHODCALLTYPE GetDesktops(IObjectArray** out) override {
@@ -104,12 +121,25 @@ struct FakeManager: FakeCom<DesktopManager> {
 	}
 };
 struct FakeViews: FakeCom<ViewCollection> {
+	FakeView view;
+	int gets = 0;
+	bool faultOnGet = false;
+	HRESULT result = S_OK;
 	HRESULT STDMETHODCALLTYPE GetViews(IObjectArray**) override { return E_NOTIMPL; }
 	HRESULT STDMETHODCALLTYPE GetViewsByZOrder(IObjectArray**) override { return E_NOTIMPL; }
 	HRESULT STDMETHODCALLTYPE GetViewsByAppUserModelId(PCWSTR, IObjectArray**) override {
 		return E_NOTIMPL;
 	}
-	HRESULT STDMETHODCALLTYPE GetViewForHwnd(HWND, ApplicationView**) override { return E_NOTIMPL; }
+	HRESULT STDMETHODCALLTYPE GetViewForHwnd(HWND, ApplicationView** out) override {
+		++this->gets;
+		// Failed calls deliberately leave a non-owning output. The caller must
+		// neither adopt nor release it without a successful ownership transfer.
+		*out = reinterpret_cast<ApplicationView*>(&this->view);
+		if (this->faultOnGet) fault();
+		if (FAILED(this->result)) return this->result;
+		this->view.AddRef();
+		return S_OK;
+	}
 };
 struct FakePublic: FakeCom<IVirtualDesktopManager> {
 	bool faultOnRead = false;
@@ -134,6 +164,17 @@ struct Fixture {
 		this->manager.array.desktops = {&this->one, &this->two};
 		this->manager.current = &this->one;
 		this->manager.created = &this->three;
+		this->manager.expectedView = reinterpret_cast<ApplicationView*>(&this->views.view);
+	}
+	void clearFaults() {
+		this->one.faultOnRelease = this->two.faultOnRelease = this->three.faultOnRelease = false;
+		this->one.faultOnId = this->two.faultOnId = this->three.faultOnId = false;
+		this->manager.faultOnRelease = this->manager.array.faultOnRelease = false;
+		this->manager.faultOnEnumeration = this->manager.faultOnSwitch = false;
+		this->manager.faultOnCreate = this->manager.faultOnCurrent = false;
+		this->manager.faultOnCanMove = this->manager.faultOnMove = false;
+		this->views.faultOnRelease = this->views.faultOnGet = this->views.view.faultOnRelease = false;
+		this->publicApi.faultOnRelease = this->publicApi.faultOnRead = false;
 	}
 	HRESULT acquire(DesktopManager** m, ViewCollection** v, IVirtualDesktopManager** p) {
 		this->manager.AddRef();

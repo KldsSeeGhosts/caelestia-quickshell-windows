@@ -65,7 +65,18 @@ private slots:
 		      "create",
 		      "window-id",
 		      "on-current",
-		      "broken-release"})
+		      "broken-release",
+		      "current",
+		      "get-view",
+		      "can-move",
+		      "move",
+		      "local-array-release",
+		      "local-current-release",
+		      "local-create-release",
+		      "local-view-release",
+		      "snapshot-release",
+		      "local-failed-output-release",
+		      "local-pending-list-release"})
 		{
 			QTest::newRow(operation) << QString::fromLatin1(operation);
 		}
@@ -73,6 +84,7 @@ private slots:
 	void structuredExceptionInvalidates() {
 		QFETCH(QString, operation);
 		Fixture old, fresh;
+		FakeDesktop active(1);
 		fresh.one.id.Data1 = 101;
 		int acquisitions = 0, recovered = 0;
 		bool online = false;
@@ -84,24 +96,61 @@ private slots:
 		    }
 		);
 		struct Reset {
-			~Reset() { setNativeDesktopFactoryForTest({}); }
-		} reset;
+			Fixture& old;
+			Fixture& fresh;
+			FakeDesktop& active;
+			~Reset() {
+				old.clearFaults();
+				fresh.clearFaults();
+				active.faultOnRelease = false;
+				setNativeDesktopFactoryForTest({});
+			}
+		} reset {old, fresh, active};
 		QObject context;
 		VirtualDesktops::Accessor accessor;
 		QVERIFY(loadNativeDesktopAccessor(accessor, &context, [&] { ++recovered; }));
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0x625));
+		setNativeDesktopWindowValidatorForTest([window](HWND candidate) {
+			return candidate == window;
+		});
 		if (operation == "enumerate") old.manager.faultOnEnumeration = true;
 		if (operation == "desktop-id") old.one.faultOnId = true;
 		if (operation == "switch" || operation == "broken-release") old.manager.faultOnSwitch = true;
 		if (operation == "broken-release") old.manager.faultOnRelease = true;
 		if (operation == "create") old.manager.faultOnCreate = true;
 		if (operation == "window-id" || operation == "on-current") old.publicApi.faultOnRead = true;
+		if (operation == "current") old.manager.faultOnCurrent = true;
+		if (operation == "get-view") old.views.faultOnGet = true;
+		if (operation == "can-move") old.manager.faultOnCanMove = true;
+		if (operation == "move") old.manager.faultOnMove = true;
+		if (operation == "local-array-release") old.manager.array.faultOnRelease = true;
+		if (operation == "local-current-release") {
+			old.manager.current = &active;
+			active.faultOnRelease = true;
+		}
+		if (operation == "local-create-release") old.three.faultOnRelease = true;
+		if (operation == "local-view-release") old.views.view.faultOnRelease = true;
+		if (operation == "snapshot-release") old.one.faultOnRelease = true;
+		if (operation == "local-failed-output-release") {
+			old.one.faultOnId = old.one.faultOnRelease = true;
+		}
+		if (operation == "local-pending-list-release") {
+			old.two.faultOnId = old.one.faultOnRelease = true;
+		}
 
 		int result = 0;
-		if (operation == "enumerate" || operation == "desktop-id") result = accessor.getDesktopCount();
-		else if (operation == "create") result = accessor.createDesktop();
+		if (operation == "get-view" || operation == "can-move" || operation == "move"
+		    || operation == "local-view-release")
+			result = accessor.moveWindowToDesktopNumber(window, 1);
+		else if (operation == "create" || operation == "local-create-release")
+			result = accessor.createDesktop();
 		else if (operation == "window-id") result = accessor.getWindowDesktopNumber(nullptr);
 		else if (operation == "on-current") result = accessor.isWindowOnCurrentVirtualDesktop(nullptr);
-		else result = accessor.goToDesktopNumber(1);
+		else if (operation == "switch" || operation == "broken-release")
+			result = accessor.goToDesktopNumber(1);
+		else result = accessor.getDesktopCount();
+		old.clearFaults();
+		active.faultOnRelease = false;
 		QCOMPARE(result, -1);
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Disconnected);
 		QCOMPARE(nativeDesktopLastError(), E_UNEXPECTED);
@@ -116,6 +165,14 @@ private slots:
 		QCOMPARE(old.one.refs, 1UL);
 		QCOMPARE(old.two.refs, 1UL);
 		QCOMPARE(old.three.refs, 1UL); // Partial CreateDesktop output was also released.
+		QCOMPARE(active.refs, 1UL);
+		QCOMPARE(old.views.view.refs, 1UL);
+		if (operation == "get-view") {
+			QCOMPARE(old.views.view.releases, 0);
+			QCOMPARE(old.manager.canMoves, 0);
+			QCOMPARE(old.manager.moves, 0);
+		}
+		if (operation == "can-move") QCOMPARE(old.manager.moves, 0);
 		const auto enumerations = old.manager.enumerations;
 		const auto switches = old.manager.switches;
 		QVERIFY(!retryNativeDesktopAccessor());
@@ -138,6 +195,74 @@ private slots:
 		setNativeDesktopFactoryForTest({});
 		QCOMPARE(fresh.manager.refs, 1UL);
 		QCOMPARE(fresh.one.refs, 1UL);
+	}
+	void failedViewAcquisitionDoesNotTransferOwnership_data() {
+		QTest::addColumn<qint32>("failure");
+		for (const auto failure: {E_FAIL, E_UNEXPECTED, E_ACCESSDENIED, RPC_E_DISCONNECTED}) {
+			QTest::newRow(qPrintable(QString::number(failure, 16))) << qint32(failure);
+		}
+	}
+	void failedViewAcquisitionDoesNotTransferOwnership() {
+		QFETCH(qint32, failure);
+		Fixture fixture;
+		setNativeDesktopFactoryForTest(
+		    [&](DesktopManager** m, ViewCollection** v, IVirtualDesktopManager** p) {
+			    return fixture.acquire(m, v, p);
+		    }
+		);
+		struct Reset {
+			Fixture& fixture;
+			~Reset() {
+				fixture.clearFaults();
+				setNativeDesktopFactoryForTest({});
+			}
+		} reset {fixture};
+		VirtualDesktops::Accessor accessor;
+		QObject context;
+		QVERIFY(loadNativeDesktopAccessor(accessor, &context, [] {}));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		fixture.views.result = failure;
+		QCOMPARE(accessor.moveWindowToDesktopNumber(reinterpret_cast<HWND>(ULONG_PTR(0x625)), 1), -1);
+		QCOMPARE(fixture.views.view.refs, 1UL);
+		QCOMPARE(fixture.views.view.releases, 0);
+		QCOMPARE(fixture.manager.canMoves, 0);
+		QCOMPARE(nativeDesktopLastError(), HRESULT(failure));
+		QCOMPARE(
+		    nativeDesktopAvailability(),
+		    failure == RPC_E_DISCONNECTED ? DesktopAvailability::Disconnected
+		                                  : DesktopAvailability::Available
+		);
+	}
+	void acquisitionLocalReleaseFaultRecovers() {
+		Fixture old, fresh;
+		old.manager.array.faultOnRelease = true;
+		int acquisitions = 0, recovered = 0;
+		setNativeDesktopFactoryForTest(
+		    [&](DesktopManager** m, ViewCollection** v, IVirtualDesktopManager** p) {
+			    return (++acquisitions == 1 ? old : fresh).acquire(m, v, p);
+		    }
+		);
+		struct Reset {
+			Fixture& old;
+			Fixture& fresh;
+			~Reset() {
+				old.clearFaults();
+				fresh.clearFaults();
+				setNativeDesktopFactoryForTest({});
+			}
+		} reset {old, fresh};
+		QObject context;
+		VirtualDesktops::Accessor accessor;
+		const auto loaded = loadNativeDesktopAccessor(accessor, &context, [&] { ++recovered; });
+		old.clearFaults();
+		QVERIFY(!loaded);
+		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Disconnected);
+		QCOMPARE(nativeDesktopLastError(), E_UNEXPECTED);
+		QCOMPARE(old.manager.array.refs, 1UL);
+		QCOMPARE(old.one.refs, 1UL);
+		QTRY_COMPARE_WITH_TIMEOUT(recovered, 1, 1500);
+		QCOMPARE(acquisitions, 2);
+		QVERIFY(retryNativeDesktopAccessor());
 	}
 	void structuredExceptionDuringAcquisitionRecovers() {
 		Fixture partial, fresh;

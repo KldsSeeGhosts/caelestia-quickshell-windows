@@ -16,7 +16,16 @@ drops all provider-owned interfaces. Detach each owned interface before
 attempting `Release`, so a broken release cannot leave a reusable stale pointer.
 A failed release is best-effort cleanup, not proof the remote object freed itself.
 
-The facade's existing post-call availability check unloads it. Its existing
+Local COM outputs and temporary lists are explicitly released through the same
+SEH guard on success and failure, before an operation or acquisition can report
+success. `GetViewForHwnd` transfers ownership only on success; a failure or SEH
+must not cause adoption or release of its potentially half-written output.
+
+The facade's post-call availability check unloads it. As defense in depth,
+the native `accessorFailed` branch also invalidates the provider after any
+escaping SEH, including local cleanup, even if the facade was already unloaded.
+That branch records `E_UNEXPECTED` and enters bounded recovery instead of
+claiming immediate dispatch retry. Its existing
 queued state notification emits the capability change and terminates pending
 switch/creation requests as denied. Recovery never replays those commands.
 Ordinary HRESULT handling, including an ordinary `E_UNEXPECTED`, is unchanged.
@@ -31,7 +40,12 @@ interfaces. A real COM server can return the same identity after reacquisition,
 so this is not an assertion that every successful acquisition has a new server.
 An ABI fault is not evidence that probing another private layout is safe.
 
-## Windows component receipt
+## Original working-tree component receipt
+
+The following is the preserved original receipt. Those tests ran before commit
+`c0286d14817f12e9c3b95f04a552da11bcc02d17`, without capturing HEAD or dirty state.
+They are working-tree evidence, not exact-SHA proof. The review-repair validation
+must be run after a clean commit and retain source/artifact hashes separately.
 
 Validated with Windows 11 x64 build 26300, Qt 6.11.2, clang-cl 20.1.8,
 MSVC tools 14.44.35207 (compiler file version 19.44.35229.0),
@@ -68,6 +82,30 @@ real COM activation, Explorer mutation, keyboard input or desktop mutation.
 The facade fixture uses the public test constructor and a test-only white-box
 native-selection flag; it keeps refresh on the injected model. It separately
 checks the real native capability projection without registry refresh.
+
+## Review repair and exact-commit receipt protocol
+
+The follow-up replaces the private/public macro with a bounded `QS_TEST` friend
+hook. It restores both environment variables and clears injected faults before
+cleanup assertions can abort. Synthetic view objects implement the IUnknown
+prefix, and a test-only window validator permits generated handles without
+creating a native window.
+
+Additional cases exercise `GetCurrentDesktop`, `GetViewForHwnd`,
+`CanViewMoveDesktops`, `MoveViewToDesktop`, local array/active-desktop/create/view
+releases, snapshot replacement and temporary-list cleanup. Failed HRESULT view
+acquisition leaves the borrowed output untouched. Outer-release SEH is injected
+through production facade calls, including terminal pending switch/create
+failure and recovery; the outer failure path also covers an unloaded facade.
+
+Commit the repaired source first. From that clean commit, configure, clean-build
+the three fixtures plus the production provider/facade objects without
+`QS_TEST`, and run the affected CTest expression below. The exact-commit receipt
+must capture full HEAD/tree, empty dirty state before and after, per-file source
+SHA-256 manifests, a `git archive HEAD` source artifact hash, executable/log
+hashes, commands, counts and skips. The source manifests must match before and
+after validation. Preserve the original and preliminary logs with distinct
+names; they must not be presented as the exact committed result.
 
 ## Registration handoff
 

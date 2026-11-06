@@ -15,8 +15,14 @@ bool loadNativeDesktopAccessor(
     std::function<void()> recovered
 );
 bool retryNativeDesktopAccessor();
-void invalidateNativeDesktopAccessor();
+void invalidateNativeDesktopAccessor(HRESULT error = S_OK);
 [[nodiscard]] DesktopAvailability nativeDesktopAvailability();
 [[nodiscard]] HRESULT nativeDesktopLastError();
+
+#ifdef QS_TEST
+// Allows generated handles to exercise the production move path without
+// creating a real window. Reset together with the injected provider factory.
+void setNativeDesktopWindowValidatorForTest(std::function<bool(HWND)> validator);
+#endif
 
 } // namespace qs::windows

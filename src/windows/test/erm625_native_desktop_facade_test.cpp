@@ -1,28 +1,6 @@
-// Preload dependencies before the narrow white-box access below. The existing
-// public test constructor deliberately skips native selection; select that
-// branch without extending the production facade or touching the live desktop.
-#include <functional>
-#include <optional>
-
-#include <qlist.h>
-#include <qobject.h>
-#include <qset.h>
-#include <qstring.h>
-#include <qt_windows.h>
-#include <qtclasshelpermacros.h>
-#include <qthread.h>
-#include <qtimer.h>
-#include <qtmetamacros.h>
-#include <qtypes.h>
-
-#include "accessor_state.hpp"
-#include "desktop_contract.hpp"
-#define private public
-#include "virtual_desktops.hpp"
-#undef private
-
 #include <qsignalspy.h>
 #include <qtest.h>
+#include <wrl/client.h>
 
 #include "erm625_desktop_fakes.hpp"
 #include "native_desktop_accessor.hpp"
@@ -33,10 +11,49 @@ using namespace erm625;
 
 namespace qs::windows {
 DWORD windowsBuild() { return 26100; }
+
+// QS_TEST-only friend. Select the native branch while the public test
+// constructor keeps registry, real COM activation and window creation absent.
+struct NativeDesktopFacadeTestHook {
+	static void selectNative(VirtualDesktops& desktops) {
+		desktops.nativeAccessor = true;
+		desktops.testAvailability = DesktopAvailability::Disconnected;
+	}
+	static QVariantMap nativeCapability(VirtualDesktops& desktops) {
+		const auto testMode = desktops.testMode;
+		desktops.testMode = false;
+		const auto capability = desktops.capability();
+		desktops.testMode = testMode;
+		return capability;
+	}
+	static bool pendingIsEmpty(const VirtualDesktops& desktops) {
+		return !desktops.pendingSwitch && desktops.creationWaiters.isEmpty()
+		    && !desktops.switchDeadline.isActive() && !desktops.creationTimer.isActive();
+	}
+	static int call(VirtualDesktops& desktops, int (*operation)()) {
+		return desktops.call(-1, operation);
+	}
+};
 } // namespace qs::windows
 namespace qs::windows::startup {
 void afterFirstFrame(QObject*, std::function<void()>) {}
 } // namespace qs::windows::startup
+
+namespace {
+FakeView* outerFaultView = nullptr;
+
+int localReleaseOutsideNativeGuard() {
+	Microsoft::WRL::ComPtr<IUnknown> local;
+	outerFaultView->AddRef();
+	local.Attach(outerFaultView);
+	return 0; // The injected Release SEH must reach VirtualDesktops::call.
+}
+
+void restoreEnvironment(const char* name, const QByteArray& previous) {
+	if (previous.isNull()) qunsetenv(name);
+	else qputenv(name, previous);
+}
+} // namespace
 
 class Erm625NativeDesktopFacadeTest: public QObject {
 	Q_OBJECT;
@@ -44,12 +61,13 @@ class Erm625NativeDesktopFacadeTest: public QObject {
 	VirtualDesktops* desktops = nullptr;
 	VirtualDesktops::Accessor accessor;
 	int acquisitions = 0;
+	QByteArray previousHypr, previousDispatch;
 
 	void install() {
 		this->desktops->installAccessorForTest(this->accessor);
 		// Match the native provider's disconnected reason when unloaded. During
 		// operations testMode keeps refresh on the injected model, not registry.
-		this->desktops->testAvailability = DesktopAvailability::Disconnected;
+		NativeDesktopFacadeTestHook::selectNative(*this->desktops);
 	}
 
 	void verifyUnavailable() {
@@ -57,9 +75,7 @@ class Erm625NativeDesktopFacadeTest: public QObject {
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Disconnected);
 		// Exercise the real native capability projection too, without calling
 		// refresh (which would read the live registry outside testMode).
-		this->desktops->testMode = false;
-		const auto capability = this->desktops->capability();
-		this->desktops->testMode = true;
+		const auto capability = NativeDesktopFacadeTestHook::nativeCapability(*this->desktops);
 		QCOMPARE(capability.value("availability").toString(), QStringLiteral("unavailable"));
 		QCOMPARE(capability.value("reason").toString(), QStringLiteral("provider-disconnected"));
 		QVERIFY(!capability.value("operations").toMap().value("switch").toBool());
@@ -67,13 +83,15 @@ class Erm625NativeDesktopFacadeTest: public QObject {
 
 private slots:
 	void init() {
+		this->previousHypr = qgetenv("CAELESTIA_WINDOWS_HYPR");
+		this->previousDispatch = qgetenv("CAELESTIA_WINDOWS_HYPR_DISPATCH");
 		qputenv("CAELESTIA_WINDOWS_HYPR", "1");
 		qputenv("CAELESTIA_WINDOWS_HYPR_DISPATCH", "1");
 		this->acquisitions = 0;
 		VirtualDesktops::TestHooks hooks;
 		hooks.desktops = {{.id = this->old.one.id}, {.id = this->old.two.id}};
 		this->desktops = VirtualDesktops::createForTest(std::move(hooks));
-		this->desktops->nativeAccessor = true;
+		NativeDesktopFacadeTestHook::selectNative(*this->desktops);
 		setNativeDesktopFactoryForTest(
 		    [this](DesktopManager** m, ViewCollection** v, IVirtualDesktopManager** p) {
 			    return (++this->acquisitions == 1 ? this->old : this->fresh).acquire(m, v, p);
@@ -84,16 +102,26 @@ private slots:
 		QCoreApplication::processEvents();
 	}
 	void cleanup() {
+		// Restore all process-global state and disarm every fault before any
+		// assertion can return early and contaminate the following data row.
+		restoreEnvironment("CAELESTIA_WINDOWS_HYPR", this->previousHypr);
+		restoreEnvironment("CAELESTIA_WINDOWS_HYPR_DISPATCH", this->previousDispatch);
+		outerFaultView = nullptr;
+		this->old.clearFaults();
+		this->fresh.clearFaults();
 		setNativeDesktopFactoryForTest({});
-		this->desktops->destroyForTest();
+		if (this->desktops) this->desktops->destroyForTest();
 		this->desktops = nullptr;
+		this->old.manager.switches = this->fresh.manager.switches = 0;
+		this->old.manager.current = &this->old.one;
+		this->fresh.manager.current = &this->fresh.one;
 		QCOMPARE(this->old.manager.refs, 1UL);
 		QCOMPARE(this->old.one.refs, 1UL);
+		QCOMPARE(this->old.views.view.refs, 1UL);
 		QCOMPARE(this->fresh.manager.refs, 1UL);
 		QCOMPARE(this->fresh.one.refs, 1UL);
-		this->old.manager.faultOnSwitch = false;
-		this->old.manager.faultOnEnumeration = false;
-		this->old.manager.switches = this->fresh.manager.switches = 0;
+		QCOMPARE(qgetenv("CAELESTIA_WINDOWS_HYPR"), this->previousHypr);
+		QCOMPARE(qgetenv("CAELESTIA_WINDOWS_HYPR_DISPATCH"), this->previousDispatch);
 	}
 	void switchFaultCannotReuseProviderAndRecovers() {
 		QSignalSpy capabilities(this->desktops, &VirtualDesktops::capabilityChanged);
@@ -120,13 +148,41 @@ private slots:
 		QCOMPARE(this->old.manager.switches, 1);
 		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("observed"));
 	}
+	void outerReleaseFaultInvalidates_data() {
+		QTest::addColumn<bool>("unloaded");
+		QTest::newRow("loaded-facade") << false;
+		QTest::newRow("already-unloaded-facade") << true;
+	}
+	void outerReleaseFaultInvalidates() {
+		QFETCH(bool, unloaded);
+		if (unloaded) this->desktops->loseAccessorForTest();
+		outerFaultView = &this->old.views.view;
+		this->old.views.view.faultOnRelease = true;
+		const auto result =
+		    NativeDesktopFacadeTestHook::call(*this->desktops, &localReleaseOutsideNativeGuard);
+		this->old.clearFaults();
+		outerFaultView = nullptr;
+		QCOMPARE(result, -1);
+		this->verifyUnavailable();
+		QCOMPARE(nativeDesktopLastError(), E_UNEXPECTED);
+		QCOMPARE(this->old.views.view.refs, 1UL);
+		QCOMPARE(this->old.manager.refs, 1UL);
+		QVERIFY(!retryNativeDesktopAccessor());
+		QCOMPARE(this->acquisitions, 1);
+		QTRY_VERIFY_WITH_TIMEOUT(this->desktops->accessorLoaded(), 1500);
+		QCOMPARE(this->acquisitions, 2);
+	}
 	void pendingOperationsFailOnReadFault_data() {
 		QTest::addColumn<bool>("creation");
-		QTest::newRow("pending-switch") << false;
-		QTest::newRow("pending-create") << true;
+		QTest::addColumn<bool>("outerRelease");
+		QTest::newRow("pending-switch") << false << false;
+		QTest::newRow("pending-create") << true << false;
+		QTest::newRow("pending-switch-outer-release") << false << true;
+		QTest::newRow("pending-create-outer-release") << true << true;
 	}
 	void pendingOperationsFailOnReadFault() {
 		QFETCH(bool, creation);
+		QFETCH(bool, outerRelease);
 		QSignalSpy results(this->desktops, &VirtualDesktops::commandResult);
 		int completions = 0;
 		if (creation) {
@@ -139,8 +195,19 @@ private slots:
 		}
 		const auto accepted = this->desktops->lastCommand();
 		QCOMPARE(accepted.value("outcome").toString(), QStringLiteral("accepted"));
-		this->old.manager.faultOnEnumeration = true;
+		if (outerRelease) {
+			outerFaultView = &this->old.views.view;
+			this->old.views.view.faultOnRelease = true;
+			auto accessor = this->accessor;
+			accessor.getDesktopCount = &localReleaseOutsideNativeGuard;
+			this->desktops->installAccessorForTest(accessor);
+			NativeDesktopFacadeTestHook::selectNative(*this->desktops);
+		} else {
+			this->old.manager.faultOnEnumeration = true;
+		}
 		this->desktops->refresh();
+		this->old.clearFaults();
+		outerFaultView = nullptr;
 		this->verifyUnavailable();
 		QCoreApplication::processEvents();
 		QCOMPARE(results.count(), 2);
@@ -149,10 +216,7 @@ private slots:
 		QCOMPARE(terminal.value("outcome").toString(), QStringLiteral("denied"));
 		QCOMPARE(terminal.value("reason").toString(), QStringLiteral("provider-disconnected"));
 		QCOMPARE(completions, creation ? 1 : 0);
-		QVERIFY(!this->desktops->pendingSwitch);
-		QVERIFY(this->desktops->creationWaiters.isEmpty());
-		QVERIFY(!this->desktops->switchDeadline.isActive());
-		QVERIFY(!this->desktops->creationTimer.isActive());
+		QVERIFY(NativeDesktopFacadeTestHook::pendingIsEmpty(*this->desktops));
 		QTRY_VERIFY_WITH_TIMEOUT(this->desktops->accessorLoaded(), 1500);
 		QCOMPARE(results.count(), 2); // Recovery never resurrects/replays the request.
 	}
