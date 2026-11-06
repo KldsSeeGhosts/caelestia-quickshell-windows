@@ -360,7 +360,7 @@ def run_command(args, receipt):
         if getattr(args, "echo", False):
             # Opt-in job diagnostics are not copied into retained artifacts.
             # Never enable this for commands that can read personal data/secrets.
-            sys.stdout.write(output.decode("utf-8", errors="replace"))
+            sys.stdout.buffer.write(output)
             sys.stdout.flush()
         if args.unittest:
             match = re.search(rb"(?m)^Ran (\d+) tests? in ", output)
