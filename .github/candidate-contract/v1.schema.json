@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/KldsSeeGhosts/caelestia-quickshell-windows/candidate-result/v1",
+  "title": "Candidate/result v1 wire shape (use Python validator for PASS semantics)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "evidenceClass", "createdAt", "finishedAt", "sources", "toolchain", "producer", "flags", "stages", "tests", "omittedTiers", "workflowOutcome", "result"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "kind": {"enum": ["standalone", "downstream"]},
+    "evidenceClass": {"const": "component-offscreen"},
+    "createdAt": {"type": "string", "format": "date-time"},
+    "finishedAt": {"type": ["string", "null"], "format": "date-time"},
+    "sources": {
+      "type": "object", "additionalProperties": false,
+      "required": ["backend", "shell"],
+      "properties": {
+        "backend": {
+          "allOf": [
+            {"$ref": "#/$defs/source"},
+            {"properties": {"repository": {"const": "KldsSeeGhosts/caelestia-quickshell-windows"}}}
+          ]
+        },
+        "shell": {
+          "allOf": [
+            {"$ref": "#/$defs/source"},
+            {"properties": {"repository": {"const": "KldsSeeGhosts/caelestia-windows"}}}
+          ]
+        }
+      }
+    },
+    "toolchain": {
+      "type": "object", "additionalProperties": false,
+      "required": ["specSha256", "contractSha256", "expected", "actual"],
+      "properties": {
+        "specSha256": {"$ref": "#/$defs/digest"},
+        "contractSha256": {"$ref": "#/$defs/digest"},
+        "expected": {"$ref": "#/$defs/identities"},
+        "actual": {"$ref": "#/$defs/identities"}
+      }
+    },
+    "producer": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"pythonVersion": {"type": "string", "pattern": "^3\\.12\\.[0-9]+$"}}
+    },
+    "flags": {
+      "const": {
+        "generator": "Ninja", "configuration": "Release", "compiler": "clang-cl",
+        "testSelection": "^portable$", "qpa": "offscreen", "quickBackend": "software"
+      }
+    },
+    "stages": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sources", "producer", "prepare", "configure", "build", "portable"],
+      "properties": {
+        "sources": {"$ref": "#/$defs/stage"},
+        "producer": {"$ref": "#/$defs/stage"},
+        "prepare": {"$ref": "#/$defs/stage"},
+        "configure": {"$ref": "#/$defs/stage"},
+        "build": {"$ref": "#/$defs/stage"},
+        "portable": {"$ref": "#/$defs/stage"},
+        "integration": {"$ref": "#/$defs/stage"}
+      }
+    },
+    "tests": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "producer": {"$ref": "#/$defs/counts"},
+        "portable": {"$ref": "#/$defs/counts"},
+        "integration": {"$ref": "#/$defs/counts"}
+      }
+    },
+    "omittedTiers": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "native": {"$ref": "#/$defs/omission"},
+        "desktop": {"$ref": "#/$defs/omission"},
+        "gpu": {"$ref": "#/$defs/omission"},
+        "machine": {"$ref": "#/$defs/omission"}
+      }
+    },
+    "workflowOutcome": {"enum": [null, "success", "failure", "cancelled", "skipped"]},
+    "result": {"enum": ["incomplete", "pass", "non-pass", "cancelled"]}
+  },
+  "$defs": {
+    "digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "identities": {
+      "type": "object",
+      "additionalProperties": {"type": ["string", "integer"]}
+    },
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository", "requested", "resolved", "dirty", "override"],
+      "properties": {
+        "repository": {"type": "string"},
+        "requested": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "resolved": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
+        "dirty": {"type": ["boolean", "null"]},
+        "override": {"type": "boolean"}
+      }
+    },
+    "stage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["outcome", "exitCode", "startedAt", "finishedAt", "durationSeconds", "diagnostics"],
+      "properties": {
+        "outcome": {"enum": ["not_run", "running", "success", "failure"]},
+        "exitCode": {"type": ["integer", "null"]},
+        "startedAt": {"type": ["string", "null"], "format": "date-time"},
+        "finishedAt": {"type": ["string", "null"], "format": "date-time"},
+        "durationSeconds": {"type": ["number", "null"], "minimum": 0},
+        "diagnostics": {"type": "object"}
+      }
+    },
+    "counts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["total", "executed", "failed", "skipped", "skips"],
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "executed": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "skipped": {"type": "integer", "minimum": 0},
+        "skips": {
+          "type": "array", "items": {
+            "type": "object", "additionalProperties": false, "required": ["test", "reason"],
+            "properties": {"test": {"type": "string", "minLength": 1}, "reason": {"type": "string", "minLength": 1}}
+          }
+        }
+      }
+    },
+    "omission": {
+      "type": "object", "additionalProperties": false, "required": ["count", "reason"],
+      "properties": {"count": {"type": "integer", "minimum": 0}, "reason": {"type": "string", "minLength": 1}}
+    }
+  }
+}
