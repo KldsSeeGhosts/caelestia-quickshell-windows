@@ -11,28 +11,54 @@ owns a generation lease, not the rollback state. Its first confirming request
 captures the original topology before accepting a native write. Snapshot
 failure still returns `false` immediately. Accepted work is not completed work:
 `busy`, `pendingConfirmation`, `lastError` and the existing signals report
-subsequent state.
+subsequent state. The initial in-flight apply is busy but not yet pending
+confirmation. Pending starts after successful apply; failed recovery also
+publishes pending to expose the retained unconfirmed state.
 
 The worker retains the original snapshot through apply, subsequent jobs,
 confirmation, save and restore. The confirmation deadline uses a monotonic clock.
-It begins after the first successful apply and is neither suspended nor reset
-by a second job or failed save. Native completion never requires a QML object or
-a functioning GUI event loop.
+It begins after the first successful apply and is not reset by a second job.
+The facade polls while busy or while a deadline exists, including the gap where
+the deadline expired but the worker has not yet published rollback. Native
+completion never requires a QML object or a functioning GUI event loop.
 
-Replacing or destroying the owning facade requests rollback. A retiring
-generation cannot keep, mutate or release its replacement's transaction.
-Cancellation during a native operation is a completion decision, not unsafe
-thread termination: when that call returns, the worker restores the original
-snapshot once. Successful keep clears state only after persistence succeeds
-and only if its lease and deadline are still valid. Repeated keep, timeout,
-cancel, teardown and shutdown requests do not duplicate a successful recovery.
+Replacing or destroying the owning facade requests rollback of a preview not
+already accepted by Keep. A retiring generation cannot keep, mutate or release
+its replacement's transaction. Cancelling an unconfirmed native apply is a
+completion decision, not unsafe thread termination: when that call returns,
+the worker restores the original snapshot once. Cancellation before dispatch
+of the first confirming job
+discards the unused snapshot without a restoration write. If an earlier
+unconfirmed preview already changed the layout, cancelling before a second
+native call still restores that original baseline.
 
-An apply error may follow a partial native write, so it also requests recovery.
-A failed save retains the baseline and original deadline. A failed or
-unconfirmed restore retains the baseline, `pendingConfirmation = true`, zero
-seconds left and a truthful error. Automatic rollback does not retry in a loop.
+Explicit Keep is ordered under the same transaction lock as lease changes and
+deadline decisions:
+
+1. Keep must be accepted before expiry, cancellation or lease loss. Acceptance
+   suspends the active deadline but retains its original absolute value.
+2. Once accepted, persistence runs even if the facade is then replaced/destroyed
+   or shutdown begins. A successful save commits the confirmed layout, clears
+   recovery state and is not silently undone by later expiry or lease loss.
+3. A failed save reinstates the original deadline, not a new countdown. An
+   expired deadline or ended lease immediately restores the original baseline.
+   Otherwise the preview remains pending with the failure exposed and the
+   remaining original confirmation window available for retry or revert.
+
+Lease loss before Keep acceptance still rolls back the preview. Repeated keep,
+timeout, cancel, teardown and shutdown requests do not duplicate a successful
+save or recovery.
+
+An error in a confirming layout apply may follow a partial native write, so it
+also requests recovery. A failed non-confirming HDR/scale job reports its error
+without cancelling a pending topology preview or changing its deadline. Lease
+loss and timeout still restore that preview even during a non-confirming job.
+A failed or unconfirmed restore retains the baseline, `pendingConfirmation = true`,
+zero seconds left and a truthful error. Automatic rollback does not retry in a loop.
 An extant or replacement facade may explicitly call `revertChanges()` to retry.
-New mutations and keep are refused while failed recovery is unresolved.
+New mutations and keep are refused while failed recovery is unresolved, with
+an actionable error directing the caller to `revertChanges()`. The underlying
+native recovery failure and original snapshot are retained.
 
 ## Disappeared monitors
 
@@ -51,7 +77,10 @@ promise physical output verification or crash recovery.
 250 ms for the worker and logs an incomplete-recovery warning on timeout or
 failure. Facade destruction itself does not wait or perform native writes on
 the GUI thread. The worker owns any in-flight call after this budget and, if
-the process remains alive, restores when that call returns.
+the process remains alive, resolves its retained decision when that call
+returns: successful accepted Keep commits; failed save or an unconfirmed
+preview restores. Shutdown cannot turn a confirmed successful save back into
+an unconfirmed preview.
 
 There is no durable recovery journal, subprocess guardian or unsafe cancellation
 of a Windows API call. A process that exits before late recovery completes,
@@ -65,7 +94,12 @@ gated worker threads and synthetic two-display layouts. It creates no GUI or
 native service window and queries or changes no real display. It covers initial
 and second apply teardown, both replacement orders, original deadline/baseline,
 successful and failed keep, timeout, cancellation, partial apply failure,
-failed/mismatched recovery, explicit retry and bounded shutdown.
+failed/mismatched recovery, explicit retry and bounded shutdown. Scheduling
+barriers compiled only under `QS_DISPLAYS_TEST` exercise the deadline/worker gap
+through the real facade timer and cancellation before dispatch. A save barrier
+crosses success/failure, original expiry and both facade replacement orders,
+including bounded shutdown during an accepted Keep. No additional test target
+or registration dependency is needed for these cases.
 
 The shared test-registration owner should add:
 
