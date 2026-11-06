@@ -114,6 +114,11 @@ public:
 		std::function<QString(DisplayTopology)> apply;
 		std::function<QString(DisplayTopology)> restore;
 		Job save;
+#ifdef QS_DISPLAYS_TEST
+		// Scheduling barriers only. Absent from production operations and code.
+		std::function<void()> beforeApply;
+		std::function<void()> beforeDeadline;
+#endif
 	};
 	struct State {
 		bool busy = false;
@@ -152,6 +157,10 @@ public:
 	bool submit(Lease token, Job job, bool confirm, QString& rejection) {
 		std::unique_lock lock(this->mutex);
 		rejection = QStringLiteral("Another display change is still running");
+		if (this->recoveryUnconfirmed(token)) {
+			rejection = recoveryRejection();
+			return false;
+		}
 		if (!this->writable(token) || this->expired() || this->cancelled) return false;
 		if (confirm && !this->previous) {
 			// Preserve the public bool contract: snapshot refusal is immediate.
@@ -180,19 +189,27 @@ public:
 			this->previous = std::move(baseline);
 		}
 		this->error.clear();
-		this->task = Task {Kind::Apply, std::move(job)};
+		this->task = Task {Kind::Apply, std::move(job), confirm};
 		this->running = true;
 		++this->revision;
 		this->wake.notify_all();
 		return true;
 	}
 
-	bool keep(Lease token) {
+	bool keep(Lease token, QString& rejection) {
 		std::lock_guard lock(this->mutex);
-		if (!this->writable(token) || !this->previous || this->cancelled || this->expired())
+		if (this->recoveryUnconfirmed(token)) {
+			rejection = recoveryRejection();
 			return false;
+		}
+		if (!this->writable(token) || !this->confirmation || this->cancelled || this->expired())
+			return false;
+		// Explicit Keep wins over a later lease loss or deadline. Retain the
+		// original deadline for failed persistence, never start a new window.
+		this->saveDeadline = this->deadline;
+		this->deadline.reset();
 		this->error.clear();
-		this->task = Task {Kind::Save, {}};
+		this->task = Task {Kind::Save, {}, false};
 		this->running = true;
 		++this->revision;
 		this->wake.notify_all();
@@ -223,7 +240,7 @@ public:
 		}
 		return {
 		    this->running,
-		    this->previous.has_value(),
+		    this->confirmation,
 		    seconds,
 		    this->error,
 		    this->revision,
@@ -237,7 +254,8 @@ public:
 
 	// At most budget on the caller (including aboutToQuit), never an unbounded join.
 	// A native call cannot be safely cancelled. If it outlives the budget it still
-	// owns recovery and will restore when it returns, provided the process survives.
+	// owns the decision when it returns, provided the process survives. An accepted
+	// Keep commits on save success; a failed save or unconfirmed preview rolls back.
 	bool shutdown(Clock::duration budget = std::chrono::milliseconds(250)) {
 		std::unique_lock lock(this->mutex);
 		this->stopping = true;
@@ -252,6 +270,7 @@ private:
 	struct Task {
 		Kind kind;
 		Job job;
+		bool confirm;
 	};
 	DisplayTransaction(Operations operations, Clock::duration timeout)
 	    : operations(std::move(operations))
@@ -261,6 +280,15 @@ private:
 		return token != 0 && token == this->lease && !this->stopping && !this->running;
 	}
 	bool expired() const { return this->deadline && Clock::now() >= *this->deadline; }
+	bool recoveryUnconfirmed(Lease token) const {
+		return token != 0 && token == this->lease && !this->running && this->previous
+		    && this->cancelled;
+	}
+	static QString recoveryRejection() {
+		return QStringLiteral(
+		    "Display recovery is unconfirmed; use revertChanges() to retry the original layout"
+		);
+	}
 	void cancel() {
 		if (this->cancelled) return;
 		this->cancelled = true;
@@ -275,6 +303,9 @@ private:
 	void clear() {
 		this->previous.reset();
 		this->deadline.reset();
+		this->saveDeadline.reset();
+		this->confirmation = false;
+		this->mayHaveWritten = false;
 		this->cancelled = false;
 		this->restoreRequested = false;
 	}
@@ -287,7 +318,16 @@ private:
 				this->wake.wait(lock);
 				continue;
 			}
-			if (this->expired()) this->cancel();
+			if (this->expired()) {
+#ifdef QS_DISPLAYS_TEST
+				if (this->operations.beforeDeadline) {
+					lock.unlock();
+					this->operations.beforeDeadline();
+					lock.lock();
+				}
+#endif
+				if (this->expired()) this->cancel();
+			}
 			if (!this->task && !this->restoreRequested) {
 				this->running = false;
 				if (this->stopping) {
@@ -300,19 +340,30 @@ private:
 				continue;
 			}
 
-			auto next = this->task ? std::move(*this->task) : Task {Kind::Restore, {}};
+			auto next = this->task ? std::move(*this->task) : Task {Kind::Restore, {}, false};
 			this->task.reset();
 			if (next.kind == Kind::Restore) {
 				this->restoreRequested = false;
 				this->deadline.reset();
-				if (!this->previous) {
-					this->cancelled = false;
+				if (!this->previous || !this->mayHaveWritten) {
+					// No confirming job was dispatched. Cancelling a queued
+					// first apply must not write an unchanged baseline back.
+					this->clear();
+					++this->revision;
 					continue;
 				}
 			}
 			this->running = true;
 			auto baseline = this->previous;
+#ifdef QS_DISPLAYS_TEST
+			if (next.kind == Kind::Apply && this->operations.beforeApply) {
+				lock.unlock();
+				this->operations.beforeApply();
+				lock.lock();
+			}
+#endif
 			const bool skipApply = next.kind == Kind::Apply && (this->cancelled || this->stopping);
+			if (next.kind == Kind::Apply && next.confirm && !skipApply) this->mayHaveWritten = true;
 			lock.unlock();
 
 			QString result;
@@ -324,13 +375,23 @@ private:
 			if (!result.isEmpty()) this->error = result;
 			if (next.kind == Kind::Restore) {
 				if (result.isEmpty()) this->clear();
+				else this->confirmation = true;
 				// Failure retains the exact baseline, unconfirmed, for explicit retry.
 			} else if (next.kind == Kind::Save) {
-				if (result.isEmpty() && !this->cancelled && !this->stopping && !this->expired())
+				// Acceptance preceded lease loss/shutdown. A successful explicit
+				// Keep is terminal, including when its original deadline passed.
+				if (result.isEmpty()) {
 					this->clear();
+				} else {
+					this->deadline = this->saveDeadline;
+					this->saveDeadline.reset();
+				}
 			} else if (this->previous) {
-				if (!result.isEmpty() || skipApply) this->cancel();
-				if (!this->deadline && !this->cancelled) this->deadline = Clock::now() + this->timeout;
+				if ((next.confirm && !result.isEmpty()) || skipApply) this->cancel();
+				if (next.confirm && result.isEmpty() && !skipApply) {
+					this->confirmation = true;
+					if (!this->deadline && !this->cancelled) this->deadline = Clock::now() + this->timeout;
+				}
 			}
 			if (this->expired()) this->cancel();
 			++this->revision;
@@ -345,12 +406,15 @@ private:
 	std::condition_variable wake;
 	std::optional<DisplayTopology> previous;
 	std::optional<Clock::time_point> deadline;
+	std::optional<Clock::time_point> saveDeadline;
 	std::optional<Task> task;
 	Lease generation = 0;
 	Lease lease = 0;
 	std::uint64_t revision = 0;
 	QString error;
 	bool running = false;
+	bool confirmation = false;
+	bool mayHaveWritten = false;
 	bool preparing = false;
 	bool cancelled = false;
 	bool restoreRequested = false;

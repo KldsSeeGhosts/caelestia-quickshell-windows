@@ -5,6 +5,7 @@
 #include <mutex>
 
 #include <qbytearray.h>
+#include <qsignalspy.h>
 #include <qtest.h>
 
 #include "../system/displays.hpp"
@@ -24,6 +25,7 @@ struct DisplaysTestAccess {
 		return facade.runJob(std::move(job), false);
 	}
 	static void sync(Displays& facade) { facade.syncTransaction(); }
+	static QTimer& timer(Displays& facade) { return facade.countdownTimer; }
 };
 } // namespace qs::windows::sys
 
@@ -112,6 +114,8 @@ struct Native {
 	Gate applyGate;
 	Gate saveGate;
 	Gate restoreGate;
+	Gate beforeApplyGate;
+	Gate deadlineGate;
 	std::mutex mutex;
 	DisplayTopology current = layout(0);
 	DisplayTopology saved = current;
@@ -173,6 +177,8 @@ struct Native {
 			    self->saved = self->current;
 			    return {};
 		    },
+		    [self] { self->beforeApplyGate.enter(); },
+		    [self] { self->deadlineGate.enter(); },
 		};
 	}
 	QByteArray currentBytes() {
@@ -182,6 +188,10 @@ struct Native {
 	QByteArray restoreBytes() {
 		std::lock_guard lock(this->mutex);
 		return bytes(this->lastRestore);
+	}
+	QByteArray savedBytes() {
+		std::lock_guard lock(this->mutex);
+		return bytes(this->saved);
 	}
 };
 
@@ -195,6 +205,8 @@ struct Fixture {
 		this->native->applyGate.open();
 		this->native->saveGate.open();
 		this->native->restoreGate.open();
+		this->native->beforeApplyGate.open();
+		this->native->deadlineGate.open();
 		if (this->owner) this->owner->shutdown(1s);
 	}
 };
@@ -426,7 +438,209 @@ private slots:
 		QTRY_VERIFY(!f.owner->state().busy);
 		QVERIFY(!f.owner->state().pending);
 		QCOMPARE(f.native->saves.load(), 1);
+		QCOMPARE(f.native->restores.load(), 0);
+		QCOMPARE(f.native->currentBytes(), bytes(layout(100)));
+		QCOMPARE(f.native->savedBytes(), bytes(layout(100)));
+	}
+
+	void slowSuccessfulKeepDoesNotWriteRollback() {
+		Fixture f(300ms);
+		auto facade = DisplaysTestAccess::facade(f.owner);
+		QVERIFY(DisplaysTestAccess::apply(*facade, layout(100)));
+		QTRY_VERIFY(!f.owner->state().busy);
+		const auto originalDeadline = f.owner->state().deadline;
+		QVERIFY(originalDeadline.has_value());
+		f.native->saveGate.arm();
+		facade->keepChanges();
+		QVERIFY(f.native->saveGate.reached(1));
+		QTRY_VERIFY_WITH_TIMEOUT(DisplayTransaction::Clock::now() >= *originalDeadline, 1000);
+		f.native->saveGate.open();
+		QTRY_VERIFY(!f.owner->state().busy);
+		QVERIFY(!f.owner->state().pending);
+		QCOMPARE(f.native->saves.load(), 1);
+		QCOMPARE(f.native->restores.load(), 0);
+		QCOMPARE(f.native->currentBytes(), bytes(layout(100)));
+	}
+
+	void keepOrderingAcrossReloadAndExpiry_data() {
+		QTest::addColumn<bool>("saveSucceeds");
+		QTest::addColumn<bool>("originalExpires");
+		QTest::addColumn<int>("reloadOrder");
+		for (const bool success: {false, true}) {
+			for (const bool expires: {false, true}) {
+				for (const int reload: {0, 1, 2}) {
+					const auto name = QStringLiteral("%1-%2-%3")
+					                      .arg(success ? "save-ok" : "save-failed")
+					                      .arg(expires ? "expired" : "before-deadline")
+					                      .arg(
+					                          reload == 0   ? "same-facade"
+					                          : reload == 1 ? "replace-then-retire"
+					                                        : "destroy-then-recreate"
+					                      );
+					QTest::newRow(qPrintable(name)) << success << expires << reload;
+				}
+			}
+		}
+	}
+	void keepOrderingAcrossReloadAndExpiry() {
+		QFETCH(bool, saveSucceeds);
+		QFETCH(bool, originalExpires);
+		QFETCH(int, reloadOrder);
+		Fixture f(originalExpires ? 300ms : 15s);
+		auto facade = DisplaysTestAccess::facade(f.owner);
+		QVERIFY(DisplaysTestAccess::apply(*facade, layout(100)));
+		QTRY_VERIFY(!f.owner->state().busy);
+		const auto originalDeadline = f.owner->state().deadline;
+		QVERIFY(originalDeadline.has_value());
+		f.native->saveFails = !saveSucceeds;
+		f.native->saveGate.arm();
+		facade->keepChanges();
+		QVERIFY(f.native->saveGate.reached(1));
+		QVERIFY(!f.owner->state().deadline.has_value());
+		QVERIFY(f.owner->state().pending);
+
+		if (reloadOrder == 1) {
+			auto replacement = DisplaysTestAccess::facade(f.owner);
+			facade.reset();
+			facade = std::move(replacement);
+		} else if (reloadOrder == 2) {
+			facade.reset();
+			facade = DisplaysTestAccess::facade(f.owner);
+		}
+		if (originalExpires)
+			QTRY_VERIFY_WITH_TIMEOUT(DisplayTransaction::Clock::now() >= *originalDeadline, 1000);
+		QCOMPARE(f.native->restores.load(), 0);
+		facade->keepChanges(); // Busy repeat cannot start another save.
+		QCOMPARE(f.native->saves.load(), 1);
+		f.native->saveGate.open();
+		QTRY_VERIFY(!f.owner->state().busy);
+		const bool resumePreview = !saveSucceeds && !originalExpires && reloadOrder == 0;
+		QCOMPARE(f.owner->state().pending, resumePreview);
+		// Observe the actual replacement/same facade timer, not a manual sync.
+		QTRY_COMPARE(facade->pendingConfirmation(), resumePreview);
+		QTRY_VERIFY(!facade->busy());
+		QCOMPARE(f.native->saves.load(), 1);
+		QCOMPARE(f.native->snapshots.load(), 1);
+		if (saveSucceeds) {
+			QCOMPARE(f.native->restores.load(), 0);
+			QCOMPARE(f.native->currentBytes(), bytes(layout(100)));
+			QCOMPARE(f.native->savedBytes(), bytes(layout(100)));
+		} else {
+			if (resumePreview) {
+				QCOMPARE(f.native->restores.load(), 0);
+				QVERIFY(f.owner->state().deadline == originalDeadline);
+				QCOMPARE(f.owner->state().error, QStringLiteral("save denied"));
+				facade->revertChanges();
+				QTRY_VERIFY(!f.owner->state().busy);
+			}
+			QCOMPARE(f.native->restores.load(), 1);
+			QCOMPARE(f.native->restoreBytes(), bytes(layout(0)));
+			QCOMPARE(f.native->currentBytes(), bytes(layout(0)));
+		}
+		facade.reset();
+		QVERIFY(f.owner->shutdown());
+		QCOMPARE(f.native->restores.load(), saveSucceeds ? 0 : 1);
+	}
+
+	void acceptedKeepDuringBoundedShutdown_data() {
+		QTest::addColumn<bool>("saveSucceeds");
+		QTest::newRow("save-success") << true;
+		QTest::newRow("save-failure") << false;
+	}
+	void acceptedKeepDuringBoundedShutdown() {
+		QFETCH(bool, saveSucceeds);
+		Fixture f;
+		auto facade = DisplaysTestAccess::facade(f.owner);
+		QVERIFY(DisplaysTestAccess::apply(*facade, layout(100)));
+		QTRY_VERIFY(!f.owner->state().busy);
+		f.native->saveFails = !saveSucceeds;
+		f.native->saveGate.arm();
+		facade->keepChanges();
+		QVERIFY(f.native->saveGate.reached(1));
+		const auto start = DisplayTransaction::Clock::now();
+		QVERIFY(!f.owner->shutdown(20ms));
+		QVERIFY(DisplayTransaction::Clock::now() - start < 500ms);
+		facade.reset();
+		f.native->saveGate.open();
+		QTRY_VERIFY(!f.owner->state().busy);
+		QVERIFY(f.owner->shutdown());
+		QVERIFY(!f.owner->state().pending);
+		QCOMPARE(f.native->saves.load(), 1);
+		QCOMPARE(f.native->restores.load(), saveSucceeds ? 0 : 1);
+		QCOMPARE(f.native->currentBytes(), bytes(layout(saveSucceeds ? 100 : 0)));
+	}
+
+	void facadeTimerObservesTimeoutAcrossWorkerGap() {
+		Fixture f(500ms);
+		auto facade = DisplaysTestAccess::facade(f.owner);
+		auto& timer = DisplaysTestAccess::timer(*facade);
+		timer.setInterval(10);
+		QSignalSpy confirmation(facade.get(), &Displays::pendingConfirmationChanged);
+		f.native->deadlineGate.arm();
+		QVERIFY(DisplaysTestAccess::apply(*facade, layout(100)));
+		QTRY_VERIFY(facade->pendingConfirmation());
+		QVERIFY(f.native->deadlineGate.reached(1));
+		QVERIFY(!f.owner->state().busy);
+		QCOMPARE(f.owner->state().secondsLeft, 0);
+		QVERIFY(f.owner->state().deadline.has_value());
+		QSignalSpy ticks(&timer, &QTimer::timeout);
+		QTRY_VERIFY_WITH_TIMEOUT(ticks.count() > 0, 500);
+		QVERIFY(timer.isActive());
+		QVERIFY(facade->pendingConfirmation());
+		facade->keepChanges(); // An already-expired Keep cannot be accepted.
+		QCOMPARE(f.native->saves.load(), 0);
+		f.native->deadlineGate.open();
+		// No DisplaysTestAccess::sync: the real facade timer must publish completion.
+		QTRY_VERIFY_WITH_TIMEOUT(!facade->pendingConfirmation(), 1000);
+		QTRY_VERIFY(!facade->busy());
+		QVERIFY(!timer.isActive());
+		QCOMPARE(confirmation.count(), 2);
 		QCOMPARE(f.native->restores.load(), 1);
+		QCOMPARE(f.native->currentBytes(), bytes(layout(0)));
+	}
+
+	void firstApplyDoesNotPublishPrematureConfirmation() {
+		Fixture f;
+		auto facade = DisplaysTestAccess::facade(f.owner);
+		auto& timer = DisplaysTestAccess::timer(*facade);
+		timer.setInterval(10);
+		QSignalSpy ticks(&timer, &QTimer::timeout);
+		QSignalSpy confirmation(facade.get(), &Displays::pendingConfirmationChanged);
+		f.native->applyGate.arm();
+		QVERIFY(DisplaysTestAccess::apply(*facade, layout(100)));
+		QVERIFY(f.native->applyGate.reached(1));
+		QVERIFY(facade->busy());
+		QVERIFY(!facade->pendingConfirmation());
+		QTRY_VERIFY(ticks.count() > 0);
+		QVERIFY(!facade->pendingConfirmation());
+		QCOMPARE(confirmation.count(), 0);
+		f.native->applyGate.open();
+		QTRY_VERIFY(facade->pendingConfirmation());
+		QCOMPARE(confirmation.count(), 1);
+	}
+
+	void cancellationBeforeDispatchAvoidsUnneededWrites_data() {
+		QTest::addColumn<bool>("alreadyPending");
+		QTest::newRow("before-first-native-call") << false;
+		QTest::newRow("before-second-native-call") << true;
+	}
+	void cancellationBeforeDispatchAvoidsUnneededWrites() {
+		QFETCH(bool, alreadyPending);
+		Fixture f;
+		auto facade = DisplaysTestAccess::facade(f.owner);
+		if (alreadyPending) {
+			QVERIFY(DisplaysTestAccess::apply(*facade, layout(100)));
+			QTRY_VERIFY(!f.owner->state().busy);
+		}
+		f.native->beforeApplyGate.arm();
+		QVERIFY(DisplaysTestAccess::apply(*facade, layout(200)));
+		QVERIFY(f.native->beforeApplyGate.reached(alreadyPending ? 2 : 1));
+		facade.reset();
+		f.native->beforeApplyGate.open();
+		QTRY_VERIFY(!f.owner->state().busy);
+		QVERIFY(!f.owner->state().pending);
+		QCOMPARE(f.native->applies.load(), alreadyPending ? 1 : 0);
+		QCOMPARE(f.native->restores.load(), alreadyPending ? 1 : 0);
 		QCOMPARE(f.native->currentBytes(), bytes(layout(0)));
 	}
 
@@ -451,7 +665,11 @@ private slots:
 		QCOMPARE(f.native->restores.load(), 1);
 		QCOMPARE(f.native->currentBytes(), bytes(layout(100)));
 		QVERIFY(!DisplaysTestAccess::apply(*replacement, layout(200)));
+		QVERIFY(replacement->lastError().contains(QStringLiteral("revertChanges()")));
+		QVERIFY(replacement->lastError().contains(QStringLiteral("unconfirmed")));
 		replacement->keepChanges();
+		QVERIFY(replacement->lastError().contains(QStringLiteral("revertChanges()")));
+		QCOMPARE(f.owner->state().error, QStringLiteral("original monitor unavailable"));
 		QCOMPARE(f.native->saves.load(), 0);
 		// A monitor returning permits explicit retry using the original snapshot.
 		f.native->restoreFails = false;
@@ -501,6 +719,7 @@ private slots:
 	void snapshotFailureDoesNotWrite() {
 		Fixture f;
 		auto facade = DisplaysTestAccess::facade(f.owner);
+		QSignalSpy failures(facade.get(), &Displays::changeFailed);
 		f.native->snapshotFails = true;
 		QVERIFY(!DisplaysTestAccess::apply(*facade, layout(100)));
 		QTRY_VERIFY(!f.owner->state().busy);
@@ -508,6 +727,7 @@ private slots:
 		QVERIFY(!f.owner->state().error.isEmpty());
 		QCOMPARE(f.native->applies.load(), 0);
 		QCOMPARE(f.native->restores.load(), 0);
+		QCOMPARE(failures.count(), 1);
 	}
 
 	void unobservedRestorationRetainsRecovery_data() {
@@ -598,6 +818,44 @@ private slots:
 		QCOMPARE(f.native->snapshots.load(), 1);
 		QCOMPARE(f.native->restores.load(), 1);
 		QCOMPARE(f.native->restoreBytes(), bytes(layout(0)));
+	}
+
+	void failedNonConfirmingJobDoesNotCancelPreview_data() {
+		QTest::addColumn<bool>("leaseEnds");
+		QTest::newRow("live-lease-preserves-preview") << false;
+		QTest::newRow("ended-lease-still-restores") << true;
+	}
+	void failedNonConfirmingJobDoesNotCancelPreview() {
+		QFETCH(bool, leaseEnds);
+		Fixture f;
+		auto facade = DisplaysTestAccess::facade(f.owner);
+		QVERIFY(DisplaysTestAccess::apply(*facade, layout(100)));
+		QTRY_VERIFY(!f.owner->state().busy);
+		const auto deadline = f.owner->state().deadline;
+		auto gate = std::make_shared<Gate>();
+		gate->arm();
+		QVERIFY(DisplaysTestAccess::unconfirmedJob(*facade, [gate] {
+			return gate->enter() ? QStringLiteral("non-confirming setting failed")
+			                     : QStringLiteral("setting gate timed out");
+		}));
+		QVERIFY(gate->reached(1));
+		if (leaseEnds) facade.reset();
+		gate->open();
+		QTRY_VERIFY(!f.owner->state().busy);
+		QCOMPARE(f.owner->state().error, QStringLiteral("non-confirming setting failed"));
+		QCOMPARE(f.native->restores.load(), leaseEnds ? 1 : 0);
+		QCOMPARE(f.owner->state().pending, !leaseEnds);
+		if (!leaseEnds) {
+			QVERIFY(f.owner->state().deadline == deadline);
+			QCOMPARE(f.native->currentBytes(), bytes(layout(100)));
+			facade->keepChanges();
+			QTRY_VERIFY(!f.owner->state().busy);
+			QVERIFY(!f.owner->state().pending);
+			QCOMPARE(f.native->saves.load(), 1);
+			QCOMPARE(f.native->restores.load(), 0);
+		} else {
+			QCOMPARE(f.native->restoreBytes(), bytes(layout(0)));
+		}
 	}
 
 	void shutdownIsBoundedAndLateApplyRestores() {

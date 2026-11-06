@@ -954,7 +954,10 @@ void Displays::fail(const QString& message) {
 bool Displays::runJob(Job job, bool confirm) {
 	QString rejection;
 	if (!this->mTransaction->submit(this->mLease, std::move(job), confirm, rejection)) {
-		this->fail(rejection);
+		const auto previousError = this->mLastError;
+		this->syncTransaction();
+		// Snapshot refusal may already have been published by syncTransaction.
+		if (this->mLastError != rejection || previousError == rejection) this->fail(rejection);
 		return false;
 	}
 	this->syncTransaction();
@@ -986,7 +989,7 @@ void Displays::syncTransaction() {
 			QTimer::singleShot(1500, this, [this] { this->load(true); });
 		}
 	}
-	if (state.busy || (state.pending && state.secondsLeft > 0)) {
+	if (state.busy || state.deadline.has_value()) {
 		if (!this->countdownTimer.isActive()) this->countdownTimer.start();
 	} else {
 		this->countdownTimer.stop();
@@ -994,8 +997,10 @@ void Displays::syncTransaction() {
 }
 
 void Displays::keepChanges() {
-	this->mTransaction->keep(this->mLease);
+	QString rejection;
+	const bool accepted = this->mTransaction->keep(this->mLease, rejection);
 	this->syncTransaction();
+	if (!accepted && !rejection.isEmpty()) this->fail(rejection);
 }
 
 void Displays::revertChanges() {
