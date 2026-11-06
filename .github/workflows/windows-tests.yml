@@ -10,13 +10,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-fixtures-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: windows-fixtures-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   fixtures:
     name: Build all fixtures, run portable tier
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 60
     defaults:
       run:
@@ -26,12 +26,35 @@ jobs:
       TOOL_ROOT: C:\t-fixtures
       PIP_CACHE_DIR: C:\t-fixtures\pip
       RESULTS: C:\ci-fixtures
+      PYTHONDONTWRITEBYTECODE: '1'
+      CANDIDATE_BACKEND_SHA: ${{ github.sha }}
+      CANDIDATE_SHELL_SHA: a9d0a144914104eb7190a2897d25c3a9e9bca139
 
     steps:
       - name: Checkout sources
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+
+      - name: Start candidate receipt before setup
+        run: |
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" init `
+            --backend-sha $env:CANDIDATE_BACKEND_SHA --shell-sha $env:CANDIDATE_SHELL_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Checkout canonical public toolchain contract
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: KldsSeeGhosts/caelestia-windows
+          ref: a9d0a144914104eb7190a2897d25c3a9e9bca139
+          path: toolchain-contract
+          persist-credentials: false
+
+      - name: Verify exact clean sources
+        run: |
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" sources `
+            --backend . --shell toolchain-contract
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Python 3.12
         id: python
@@ -40,60 +63,34 @@ jobs:
           python-version: '3.12'
           architecture: x64
 
+      - name: Validate producer contract fixtures
+        run: |
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" run `
+            --stage producer --unittest --echo -- python -B -m unittest discover -s .github/candidate-contract -p "test_*.py"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Restore versioned tooling
         id: tools
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
-          key: windows-x64-fixture-tools-v1-py${{ steps.python.outputs.python-version }}-cmake4.4.4-ninja1.13.2-aqt076e1659807d0b362a3ed684d54c2e9c775eb9c7-qt6.11.2-msvc2022-llvm20.1.8
+          key: windows-x64-fixture-contract-v1-py${{ steps.python.outputs.python-version }}-${{ hashFiles('toolchain-contract/windows/toolchain.json', 'toolchain-contract/windows/toolchain/*.lock.txt') }}
           path: |
             C:\t-fixtures\Qt
             C:\t-fixtures\downloads
             C:\t-fixtures\pip
             C:\t-fixtures\clang+llvm-20.1.8-x86_64-pc-windows-msvc
+            C:\t-fixtures\deps\CLI11-2.5.0
 
-      - name: Prepare pinned tooling
+      - name: Prepare and assert canonical tooling
         run: |
           $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path $env:TOOL_ROOT, "$env:TOOL_ROOT\downloads", $env:RESULTS | Out-Null
-          python -m venv "$env:TOOL_ROOT\tools"
-          if ($LASTEXITCODE -ne 0) { throw 'Python environment creation failed.' }
-          $python = "$env:TOOL_ROOT\tools\Scripts\python.exe"
-          & $python -m pip install cmake==4.4.4 ninja==1.13.2 `
-            'https://github.com/miurahr/aqtinstall/archive/076e1659807d0b362a3ed684d54c2e9c775eb9c7.zip'
-          if ($LASTEXITCODE -ne 0) { throw 'Pinned Python tooling installation failed.' }
-
-          $qt = "$env:TOOL_ROOT\Qt\6.11.2\msvc2022_64"
-          if ('${{ steps.tools.outputs.cache-hit }}' -ne 'true') {
-            & $python -m aqt install-qt windows desktop 6.11.2 win64_msvc2022_64 `
-              -O "$env:TOOL_ROOT\Qt" --archives qtbase qtdeclarative
-            if ($LASTEXITCODE -ne 0) { throw 'Qt installation failed.' }
-          }
-          $qtVersion = & "$qt\bin\qtpaths.exe" --qt-version
-          if ($LASTEXITCODE -ne 0 -or "$qtVersion".Trim() -ne '6.11.2') { throw 'Qt version mismatch.' }
-
-          $llvmArchive = "$env:TOOL_ROOT\downloads\llvm-20.1.8.tar.xz"
-          if (-not (Test-Path -LiteralPath $llvmArchive)) {
-            curl.exe -L --fail --silent --show-error `
-              'https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/clang+llvm-20.1.8-x86_64-pc-windows-msvc.tar.xz' `
-              -o $llvmArchive
-            if ($LASTEXITCODE -ne 0) { throw 'LLVM download failed.' }
-          }
-          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $llvmArchive).Hash -ne
-              'f229769f11d6a6edc8ada599c0cda964b7dee6ab1a08c6cf9dd7f513e85b107f') {
-            throw 'LLVM checksum mismatch.'
-          }
-          $clang = "$env:TOOL_ROOT\clang+llvm-20.1.8-x86_64-pc-windows-msvc\bin\clang-cl.exe"
-          if (-not (Test-Path -LiteralPath $clang -PathType Leaf)) {
-            & "$env:SystemRoot\System32\tar.exe" -xf $llvmArchive -C $env:TOOL_ROOT
-            if ($LASTEXITCODE -ne 0) { throw 'LLVM extraction failed.' }
-          }
-          $clangVersion = & $clang --version
-          if ($LASTEXITCODE -ne 0 -or "$clangVersion" -notmatch 'clang version 20\.1\.8\b') {
-            throw 'LLVM version mismatch.'
-          }
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" run `
+            --stage prepare --echo -- powershell.exe -NoProfile -NonInteractive -File toolchain-contract/windows/scripts/Prepare-Toolchain.ps1 `
+            -ToolRoot $env:TOOL_ROOT -InstallRust
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Save tooling from trusted main only
-        if: steps.tools.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: steps.tools.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           key: ${{ steps.tools.outputs.cache-primary-key }}
@@ -102,44 +99,49 @@ jobs:
             C:\t-fixtures\downloads
             C:\t-fixtures\pip
             C:\t-fixtures\clang+llvm-20.1.8-x86_64-pc-windows-msvc
+            C:\t-fixtures\deps\CLI11-2.5.0
 
       - name: Build every fixture
         run: |
           $ErrorActionPreference = 'Stop'
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $vsRoot) { throw 'No MSVC toolchain found.' }
-          $env:PATH = "$(Split-Path -Parent $vswhere);$env:PATH"
-          & (Join-Path $vsRoot 'Common7\Tools\Launch-VsDevShell.ps1') -Arch amd64 -HostArch amd64 -SkipAutomaticLocation | Out-Null
-          $qt = "$env:TOOL_ROOT\Qt\6.11.2\msvc2022_64"
-          $env:PATH = "$env:TOOL_ROOT\tools\Scripts;$env:TOOL_ROOT\clang+llvm-20.1.8-x86_64-pc-windows-msvc\bin;$qt\bin;$env:PATH"
-          cmake -S src/windows/test -B $env:BUILD_ROOT -G Ninja "-DCMAKE_PREFIX_PATH=$qt" `
-            -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release
-          if ($LASTEXITCODE -ne 0) { throw 'Fixture configuration failed.' }
-          cmake --build $env:BUILD_ROOT --parallel 4
-          if ($LASTEXITCODE -ne 0) { throw 'Fixture build failed.' }
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" run `
+            --stage configure --echo -- powershell.exe -NoProfile -NonInteractive -File .github/scripts/Invoke-WindowsFixtureGate.ps1 `
+            -Phase Configure -ContractRoot toolchain-contract -ToolRoot $env:TOOL_ROOT -BuildRoot $env:BUILD_ROOT -Results $env:RESULTS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" run `
+            --stage build --echo -- powershell.exe -NoProfile -NonInteractive -File .github/scripts/Invoke-WindowsFixtureGate.ps1 `
+            -Phase Build -ContractRoot toolchain-contract -ToolRoot $env:TOOL_ROOT -BuildRoot $env:BUILD_ROOT -Results $env:RESULTS -Jobs 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" inventory `
+            --ctest "$env:TOOL_ROOT/tools/Scripts/ctest.exe" --build $env:BUILD_ROOT
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run portable fixtures
         run: |
           $ErrorActionPreference = 'Stop'
-          $qt = "$env:TOOL_ROOT\Qt\6.11.2\msvc2022_64"
-          $env:PATH = "$env:TOOL_ROOT\tools\Scripts;$qt\bin;$env:PATH"
-          $env:QT_QPA_PLATFORM = 'offscreen'
-          $env:QT_QPA_PLATFORM_PLUGIN_PATH = "$qt\plugins\platforms"
-          $env:QT_QUICK_BACKEND = 'software'
-          $temp = "$env:RESULTS\temp"
-          New-Item -ItemType Directory -Force -Path $temp | Out-Null
-          $env:TEMP = $temp
-          $env:TMP = $temp
-          ctest --test-dir $env:BUILD_ROOT -L '^portable$' --no-tests=error --output-on-failure `
-            --output-junit "$env:RESULTS\portable.xml"
-          if ($LASTEXITCODE -ne 0) { throw 'Portable fixtures failed.' }
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" run `
+            --stage portable --junit "$env:RESULTS/portable.raw.xml" --echo -- `
+            powershell.exe -NoProfile -NonInteractive -File .github/scripts/Invoke-WindowsFixtureGate.ps1 `
+            -Phase Portable -ContractRoot toolchain-contract -ToolRoot $env:TOOL_ROOT -BuildRoot $env:BUILD_ROOT -Results $env:RESULTS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Test results
+      - name: Finalize sanitized candidate result
+        if: always()
+        env:
+          WORKFLOW_OUTCOME: ${{ job.status }}
+        run: |
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" finalize `
+            --workflow-outcome $env:WORKFLOW_OUTCOME --toolchain "$env:RESULTS/actual-toolchain.json" `
+            --backend . --shell toolchain-contract
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test results and public toolchain receipt
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: fixture-results-${{ github.run_id }}
-          path: C:\ci-fixtures\portable.xml
-          if-no-files-found: ignore
+          path: |
+            C:\ci-fixtures\portable.xml
+            C:\ci-fixtures\candidate-result.json
+          if-no-files-found: warn
           retention-days: 7
