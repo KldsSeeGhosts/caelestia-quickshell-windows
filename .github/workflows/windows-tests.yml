@@ -16,7 +16,7 @@ concurrency:
 jobs:
   fixtures:
     name: Build all fixtures, run portable tier
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 60
     defaults:
       run:
@@ -33,6 +33,14 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Checkout canonical public toolchain contract
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: KldsSeeGhosts/caelestia-windows
+          ref: 55a236ee72fc36bdf0ba8a499a1039fe997fe2c9
+          path: toolchain-contract
+          persist-credentials: false
+
       - name: Python 3.12
         id: python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -44,53 +52,21 @@ jobs:
         id: tools
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
-          key: windows-x64-fixture-tools-v1-py${{ steps.python.outputs.python-version }}-cmake4.4.4-ninja1.13.2-aqt076e1659807d0b362a3ed684d54c2e9c775eb9c7-qt6.11.2-msvc2022-llvm20.1.8
+          key: windows-x64-fixture-contract-v1-py${{ steps.python.outputs.python-version }}-${{ hashFiles('toolchain-contract/windows/toolchain.json', 'toolchain-contract/windows/toolchain/*.lock.txt') }}
           path: |
             C:\t-fixtures\Qt
             C:\t-fixtures\downloads
             C:\t-fixtures\pip
             C:\t-fixtures\clang+llvm-20.1.8-x86_64-pc-windows-msvc
+            C:\t-fixtures\deps\CLI11-2.5.0
 
-      - name: Prepare pinned tooling
+      - name: Prepare and assert canonical tooling
         run: |
           $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path $env:TOOL_ROOT, "$env:TOOL_ROOT\downloads", $env:RESULTS | Out-Null
-          python -m venv "$env:TOOL_ROOT\tools"
-          if ($LASTEXITCODE -ne 0) { throw 'Python environment creation failed.' }
-          $python = "$env:TOOL_ROOT\tools\Scripts\python.exe"
-          & $python -m pip install cmake==4.4.4 ninja==1.13.2 `
-            'https://github.com/miurahr/aqtinstall/archive/076e1659807d0b362a3ed684d54c2e9c775eb9c7.zip'
-          if ($LASTEXITCODE -ne 0) { throw 'Pinned Python tooling installation failed.' }
-
-          $qt = "$env:TOOL_ROOT\Qt\6.11.2\msvc2022_64"
-          if ('${{ steps.tools.outputs.cache-hit }}' -ne 'true') {
-            & $python -m aqt install-qt windows desktop 6.11.2 win64_msvc2022_64 `
-              -O "$env:TOOL_ROOT\Qt" --archives qtbase qtdeclarative
-            if ($LASTEXITCODE -ne 0) { throw 'Qt installation failed.' }
-          }
-          $qtVersion = & "$qt\bin\qtpaths.exe" --qt-version
-          if ($LASTEXITCODE -ne 0 -or "$qtVersion".Trim() -ne '6.11.2') { throw 'Qt version mismatch.' }
-
-          $llvmArchive = "$env:TOOL_ROOT\downloads\llvm-20.1.8.tar.xz"
-          if (-not (Test-Path -LiteralPath $llvmArchive)) {
-            curl.exe -L --fail --silent --show-error `
-              'https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/clang+llvm-20.1.8-x86_64-pc-windows-msvc.tar.xz' `
-              -o $llvmArchive
-            if ($LASTEXITCODE -ne 0) { throw 'LLVM download failed.' }
-          }
-          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $llvmArchive).Hash -ne
-              'f229769f11d6a6edc8ada599c0cda964b7dee6ab1a08c6cf9dd7f513e85b107f') {
-            throw 'LLVM checksum mismatch.'
-          }
-          $clang = "$env:TOOL_ROOT\clang+llvm-20.1.8-x86_64-pc-windows-msvc\bin\clang-cl.exe"
-          if (-not (Test-Path -LiteralPath $clang -PathType Leaf)) {
-            & "$env:SystemRoot\System32\tar.exe" -xf $llvmArchive -C $env:TOOL_ROOT
-            if ($LASTEXITCODE -ne 0) { throw 'LLVM extraction failed.' }
-          }
-          $clangVersion = & $clang --version
-          if ($LASTEXITCODE -ne 0 -or "$clangVersion" -notmatch 'clang version 20\.1\.8\b') {
-            throw 'LLVM version mismatch.'
-          }
+          New-Item -ItemType Directory -Force -Path $env:RESULTS | Out-Null
+          & powershell.exe -NoProfile -NonInteractive -File toolchain-contract/windows/scripts/Prepare-Toolchain.ps1 `
+            -ToolRoot $env:TOOL_ROOT -InstallRust
+          if ($LASTEXITCODE -ne 0) { throw 'Canonical public toolchain preparation failed.' }
 
       - name: Save tooling from trusted main only
         if: steps.tools.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
@@ -102,19 +78,29 @@ jobs:
             C:\t-fixtures\downloads
             C:\t-fixtures\pip
             C:\t-fixtures\clang+llvm-20.1.8-x86_64-pc-windows-msvc
+            C:\t-fixtures\deps\CLI11-2.5.0
 
       - name: Build every fixture
         run: |
           $ErrorActionPreference = 'Stop'
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $vsRoot) { throw 'No MSVC toolchain found.' }
-          $env:PATH = "$(Split-Path -Parent $vswhere);$env:PATH"
-          & (Join-Path $vsRoot 'Common7\Tools\Launch-VsDevShell.ps1') -Arch amd64 -HostArch amd64 -SkipAutomaticLocation | Out-Null
-          $qt = "$env:TOOL_ROOT\Qt\6.11.2\msvc2022_64"
-          $env:PATH = "$env:TOOL_ROOT\tools\Scripts;$env:TOOL_ROOT\clang+llvm-20.1.8-x86_64-pc-windows-msvc\bin;$qt\bin;$env:PATH"
+          . ./toolchain-contract/windows/scripts/Caelestia-Toolchain.ps1
+          $spec = Get-CaelestiaToolchain
+          $qt = Join-Path $env:TOOL_ROOT $spec.qtDirectory
+          $llvm = Join-Path $env:TOOL_ROOT "$($spec.llvmDirectory)\bin"
+          $instance = Enter-CaelestiaToolchain -QtPrefix $qt -LlvmBin $llvm -ToolsBin "$env:TOOL_ROOT\tools\Scripts"
+          Select-CaelestiaRust
+          $receipt = Get-CaelestiaActualToolchain -QtPrefix $qt -Cli11Include (Join-Path $env:TOOL_ROOT $spec.cli11Directory)
+          [ordered]@{
+            schemaVersion = 1
+            toolchain = $receipt
+            backendRevision = (& git rev-parse HEAD).Trim()
+            toolchainSourceRevision = (& git -C toolchain-contract rev-parse HEAD).Trim()
+            vsInstallationVersion = $instance.installationVersion
+          } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$env:RESULTS\toolchain.json" -Encoding UTF8
+          $mt = Join-Path $env:WindowsSdkDir "bin\$($spec.windowsSdkVersion)\x64\mt.exe"
           cmake -S src/windows/test -B $env:BUILD_ROOT -G Ninja "-DCMAKE_PREFIX_PATH=$qt" `
-            -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release
+            "-DCMAKE_CXX_COMPILER:FILEPATH=$llvm\clang-cl.exe" "-DCMAKE_MT:FILEPATH=$mt" `
+            "-DCMAKE_LINKER:FILEPATH=$env:VCToolsInstallDir\bin\Hostx64\x64\link.exe" -DCMAKE_BUILD_TYPE=Release
           if ($LASTEXITCODE -ne 0) { throw 'Fixture configuration failed.' }
           cmake --build $env:BUILD_ROOT --parallel 4
           if ($LASTEXITCODE -ne 0) { throw 'Fixture build failed.' }
@@ -135,11 +121,14 @@ jobs:
             --output-junit "$env:RESULTS\portable.xml"
           if ($LASTEXITCODE -ne 0) { throw 'Portable fixtures failed.' }
 
-      - name: Test results
+      - name: Test results and public toolchain receipt
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: fixture-results-${{ github.run_id }}
-          path: C:\ci-fixtures\portable.xml
+          path: |
+            C:\ci-fixtures\portable.xml
+            C:\ci-fixtures\toolchain.json
+            C:\t-fixtures\toolchain.json
           if-no-files-found: ignore
           retention-days: 7
