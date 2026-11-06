@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <vector>
 
 #include <qobject.h>
@@ -11,7 +12,10 @@
 #include <qtmetamacros.h>
 #include <qtypes.h>
 
+#include "clipboard_capture.hpp"
+
 class QImage;
+class QThreadPool;
 
 namespace qs::windows::sys {
 
@@ -29,6 +33,7 @@ struct ClipboardEntry {
 };
 
 struct ClipboardCapture {
+	std::shared_ptr<ClipboardCaptureGeneration> generation;
 	quint32 sequence = 0;
 	bool captured = false;
 	ClipboardEntry entry;
@@ -61,6 +66,15 @@ signals:
 	void entriesChanged();
 
 private:
+	friend class ClipboardTestAccess;
+	// Non-QML construction seam. Does not register a listener, prune caches or
+	// resolve a personal path. Only focused fixtures supply this boundary.
+	Clipboard(
+	    std::shared_ptr<ClipboardReadProvider> provider,
+	    const QString& directory,
+	    QThreadPool* pool
+	);
+
 	void onClipboardUpdate();
 	void startCapture();
 	void finishCapture(const ClipboardCapture& capture);
@@ -82,6 +96,12 @@ private:
 	quint32 capturedSequence = 0;
 	quint32 writtenSequence = 0;
 	quint32 suppressedSequence = 0;
+	bool cleared = false;
+	quint32 clearSequence = 0;
+	std::shared_ptr<ClipboardReadProvider> readProvider;
+	std::shared_ptr<ClipboardCaptureGeneration> captureGeneration =
+	    std::make_shared<ClipboardCaptureGeneration>();
+	QThreadPool* readPool = nullptr;
 
 	Q_OBJECT_BINDABLE_PROPERTY(Clipboard, QStringList, bEntries, &Clipboard::entriesChanged);
 };
