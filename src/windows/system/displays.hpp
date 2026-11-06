@@ -14,12 +14,9 @@
 #include <qtmetamacros.h>
 #include <qvariant.h>
 
-namespace qs::windows::sys {
+#include "display_transaction.hpp"
 
-struct DisplayTopology {
-	std::vector<DISPLAYCONFIG_PATH_INFO> paths;
-	std::vector<DISPLAYCONFIG_MODE_INFO> modes;
-};
+namespace qs::windows::sys {
 
 class Displays: public QObject {
 	Q_OBJECT;
@@ -73,6 +70,12 @@ signals:
 	void changeFailed(const QString& message);
 
 private:
+#ifdef QS_DISPLAYS_TEST
+	friend struct DisplaysTestAccess;
+	explicit Displays(std::shared_ptr<DisplayTransaction> transaction);
+#endif
+	void initializeTransaction();
+	void syncTransaction();
 	struct Entry {
 		QString id;
 		QString sourceKey;
@@ -112,9 +115,6 @@ private:
 	void scheduleRefresh(int delay);
 	[[nodiscard]] const Entry* find(const QString& id) const;
 	bool runJob(Job job, bool confirm);
-	void onJobFinished(const QString& error, bool confirm, bool tookSnapshot);
-	void armConfirmation();
-	void clearConfirmation();
 	void setBusy(bool busy);
 	void fail(const QString& message);
 	bool applyLayoutChange(DisplayTopology topology);
@@ -128,7 +128,12 @@ private:
 	QString mPrimaryName;
 	std::vector<Entry> mEntries;
 	QVariantList mDisplays;
-	DisplayTopology mPrevious;
+	std::shared_ptr<DisplayTransaction> mTransaction;
+	DisplayTransaction::Lease mLease = 0;
+	std::uint64_t mRevision = 0;
+#ifdef QS_DISPLAYS_TEST
+	bool mSynthetic = false;
+#endif
 	QTimer refreshTimer;
 	QTimer countdownTimer;
 };
