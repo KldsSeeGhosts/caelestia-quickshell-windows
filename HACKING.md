@@ -172,10 +172,12 @@ If the linter is complaining about something that you think it should not,
 please disable the lint in your MR and explain your reasoning if it isn't obvious.
 
 ### Validation
-This production tree does not include private tests or manual fixtures.
-`BUILD_TESTING` defaults to `OFF`; `ON` is rejected because those sources are not
-shipped. Use the separately maintained private harness against the exact
-production revision for automated validation.
+`BUILD_TESTING` defaults to `OFF`. On Windows, enable it to build the public
+tiered native fixtures and register them with CTest. Follow the commands in
+[BUILD.md](BUILD.md#public-windows-regression-tests), explicitly selecting the
+`portable` label for noninteractive validation. The upstream core, io and
+window suites are not part of this public suite, and other runtime tiers
+require the prerequisites described in the fixture guide.
 
 Build the affected production targets and check the changed behavior on the
 supported platform. Report what was and was not verified; an earlier revision's

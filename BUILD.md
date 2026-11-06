@@ -88,6 +88,42 @@ Set `$QtPrefix` and `$Cli11Include` to your Qt prefix and the directory containi
 `brightness-probe` remains a required tool for the parent shell build; that
 packaging workflow stages it separately from CMake's runtime install.
 
+### Public Windows regression tests
+
+The production build defaults to `BUILD_TESTING=OFF`. To build the public
+Windows fixtures alongside the backend, use a separate build directory and
+the same prerequisites as above, plus the Qt Test module and Qt 6.11:
+
+```powershell
+cmake -S . -B C:\b-quickshell-tests -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl `
+  -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_LINKER_TYPE=MSVC `
+  "-DCMAKE_PREFIX_PATH=$QtPrefix" "-DCLI11_INCLUDE_DIR=$Cli11Include" `
+  -DCRASH_HANDLER=OFF -DBUILD_TESTING=ON -DINSTALL_QMLDIR=qml
+cmake --build C:\b-quickshell-tests --parallel 4
+$env:PATH = "$QtPrefix\bin;$env:PATH"
+$env:QT_QPA_PLATFORM = 'offscreen'
+$env:QT_QUICK_BACKEND = 'software'
+ctest --test-dir C:\b-quickshell-tests -L '^portable$' --show-only
+ctest --test-dir C:\b-quickshell-tests -L '^portable$' `
+  --no-tests=error --output-on-failure --output-junit C:\b-quickshell-tests\portable.xml
+if ($LASTEXITCODE -ne 0) { throw 'Portable regression tests failed.' }
+```
+
+All fixture targets are compiled, but only the explicitly selected `portable`
+tier runs in these commands. Do not run unfiltered CTest on a personal desktop:
+other tiers require native windows, GPU, installed-app metadata or a stopped
+shell. See [the fixture guide](src/windows/test/README.md) for the tier boundaries,
+standalone fixture-only build, optional case prerequisites and skipped reasons.
+CTest reports fixture counts; read the captured Qt Test output for individual
+case skips as well. `--no-tests=error` prevents a missing or empty suite from
+being treated as a pass.
+
+No fixture is installed, and production targets do not acquire test-only
+definitions. The upstream core, io and window suites are not included in this
+public Windows suite. `BUILD_TESTING=ON` is not currently supported on other
+platforms; their production build remains available with it disabled.
+
 ### Crash Handler
 The crash reporter catches crashes, restarts Quickshell when it crashes,
 and collects useful crash information in one place. Leaving this enabled will

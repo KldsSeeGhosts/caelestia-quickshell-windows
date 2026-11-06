@@ -45,12 +45,10 @@ message(STATUS "Quickshell configuration")
 message(STATUS "  Distributor: ${DISTRIBUTOR}")
 boption(NO_PCH "Disable precompild headers (dev)" OFF)
 boption(BUILD_TESTING "Build tests (dev)" OFF)
-if (BUILD_TESTING)
+if (BUILD_TESTING AND NOT WIN32)
 	message(FATAL_ERROR
-		"The in-tree core, io and window test suites are not shipped. "
-		"Configure with -DBUILD_TESTING=OFF to build Quickshell; "
-		"the Windows backend fixtures are a standalone project: "
-		"cmake -S src/windows/test (see src/windows/test/README.md).")
+		"The public test suite currently requires Windows. "
+		"Configure with -DBUILD_TESTING=OFF to build on other platforms.")
 endif()
 boption(ASAN "ASAN (dev)" OFF) # note: better output with gcc than clang
 boption(FRAME_POINTERS "Keep Frame Pointers (dev)" ${ASAN})
@@ -189,6 +187,14 @@ qt_standard_project_setup(REQUIRES 6.6)
 set(QT_QML_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/qml_modules)
 
 add_subdirectory(src)
+
+if (BUILD_TESTING)
+	# Register the public Windows fixtures at the root so the documented
+	# ctest --test-dir <build> command discovers them. Test-only definitions
+	# remain private to fixture targets; production targets are unchanged.
+	enable_testing()
+	add_subdirectory(src/windows/test windows-tests)
+endif()
 
 if (USE_JEMALLOC)
 	find_package(PkgConfig REQUIRED)
