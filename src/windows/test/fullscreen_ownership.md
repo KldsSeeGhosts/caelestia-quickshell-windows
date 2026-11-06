@@ -34,12 +34,17 @@ relinquish ownership without restoring an obsolete snapshot. An application
 transition with exactly identical placement and style is not distinguishable
 from the owned episode; this is not an application-fullscreen protocol.
 
-No `ShowWindow`, focus request, foreground request, z-order promotion, synthetic
-input or queued asynchronous placement is added. Placement calls use the saved
-show command; actual Windows show/activation behavior, especially maximized and
-hidden restoration, still requires the separate desktop acceptance below.
+Normal/restore placement uses `SW_SHOWNOACTIVATE`, and minimized placement uses
+`SW_SHOWMINNOACTIVE`. No `ShowWindow`, explicit focus/foreground request,
+z-order promotion, synthetic input or queued asynchronous placement is added.
+Windows has no non-activating maximize show command: restoration of a saved
+maximized window retains `SW_SHOWMAXIMIZED` and may activate it. This remains an
+explicit desktop acceptance gate, not a no-focus claim.
 `WPF_ASYNCWINDOWPLACEMENT` is retained in the original snapshot but cleared on
 native delivery so no queued write outlives the window marker.
+These cross-process writes are synchronous. A target that hangs after the
+initial responsiveness check can block the shell thread, including shutdown;
+there is no bounded-shutdown guarantee for this optional path.
 
 ## Deterministic fixture and registration
 

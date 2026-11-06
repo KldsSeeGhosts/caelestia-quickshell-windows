@@ -197,8 +197,10 @@ public:
 		if (!current.visible) {
 			placement.showCmd = SW_HIDE;
 		} else if (current.minimized) {
-			placement.showCmd = current.placement.showCmd;
+			placement.showCmd = SW_SHOWMINNOACTIVE;
 			if (this->original.maximized) placement.flags |= WPF_RESTORETOMAXIMIZED;
+		} else if (placement.showCmd == SW_SHOWNORMAL || placement.showCmd == SW_RESTORE) {
+			placement.showCmd = SW_SHOWNOACTIVATE;
 		}
 		if (!this->ops.placement(this->hwnd, this->original.identity, this, placement))
 			return Release::Failed;

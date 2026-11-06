@@ -20,6 +20,14 @@ unclassified, classified twice, or a tier names a fixture that does not exist.
 
 All fixtures are built in CI, so every tier is at least compile-checked.
 
+The portable tier includes `fullscreen_ownership`, `display_transaction`,
+`clipboard_capture`, `capture_dimensions`, `erm625_native_desktop_facade`
+and `network_wifi_identity`. These use synthetic operations and content, not
+the user's windows, display configuration, clipboard, capture or WLAN.
+The clipboard fixture receives an absolute disposable directory in the build
+tree and refuses any personal-profile fallback. Test-only definitions are
+scoped to each fixture target.
+
 ## Building
 
 From a Visual Studio x64 developer shell with Qt 6.11, clang-cl, CMake and

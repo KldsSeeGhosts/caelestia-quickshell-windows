@@ -87,7 +87,7 @@ struct FakeOps final: Ops {
 		}
 		if (this->minimizeAfterStyle) {
 			this->state.minimized = true;
-			this->state.placement.showCmd = SW_SHOWMINNOACTIVE;
+			this->state.placement.showCmd = SW_SHOWMINIMIZED;
 			this->state.rect = {-32000, -32000, -31840, -31960};
 		}
 		return true;
@@ -125,7 +125,10 @@ struct FakeOps final: Ops {
 void comparePlacement(const WINDOWPLACEMENT& actual, const WINDOWPLACEMENT& expected) {
 	QCOMPARE(actual.length, expected.length);
 	QCOMPARE(actual.flags, expected.flags);
-	QCOMPARE(actual.showCmd, expected.showCmd);
+	// Restore the saved geometry without activating an ordinary window.
+	const auto expectedShow = expected.showCmd == SW_SHOWNORMAL || expected.showCmd == SW_RESTORE
+	    ? UINT(SW_SHOWNOACTIVATE) : expected.showCmd;
+	QCOMPARE(actual.showCmd, expectedShow);
 	QCOMPARE(actual.ptMinPosition.x, expected.ptMinPosition.x);
 	QCOMPARE(actual.ptMinPosition.y, expected.ptMinPosition.y);
 	QCOMPARE(actual.ptMaxPosition.x, expected.ptMaxPosition.x);
@@ -232,7 +235,8 @@ private slots:
 		QVERIFY(owner.enter(FULL, false));
 		ops.state.visible = !hidden;
 		ops.state.minimized = !hidden;
-		ops.state.placement.showCmd = hidden ? SW_HIDE : SW_SHOWMINNOACTIVE;
+		// GetWindowPlacement reports SW_SHOWMINIMIZED for an iconic window.
+		ops.state.placement.showCmd = hidden ? SW_HIDE : SW_SHOWMINIMIZED;
 		if (!hidden) ops.state.rect = {-32000, -32000, -31840, -31960};
 		QCOMPARE(owner.release(), Release::Restored);
 		QCOMPARE(ops.state.visible, !hidden);
