@@ -28,10 +28,13 @@ To ensure nobody's time is wasted, please follow the rules below.
 ## Build and validation
 
 Use [BUILD.md](BUILD.md) for production configure, build and install commands,
-including Windows dependencies and targets. Keep `BUILD_TESTING=OFF`: private
-tests and validation archives are maintained outside this production tree.
-Report the exact revision and platform checked, what you verified, and anything
-not verified. Private harness results must correspond to that production revision.
+including Windows dependencies, production targets and the public Windows
+regression suite. `BUILD_TESTING` defaults to `OFF`; enable it on Windows to
+build the tiered fixtures, then explicitly select the `portable` CTest label
+for noninteractive validation. Other tiers must be selected deliberately.
+Report the exact revision and platform checked, test counts and skipped cases,
+what you verified, and anything not verified. Any separately maintained harness
+results must correspond to that production revision.
 
 ## Acceptable Non-code Contributions
 
