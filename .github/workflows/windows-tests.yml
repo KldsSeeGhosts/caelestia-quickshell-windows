@@ -116,7 +116,6 @@ jobs:
           # Schema + accelerator + canonical toolchain + all fixture flag inputs.
           key: windows-fixture-objects-v1-sccache015-${{ hashFiles('toolchain-contract/windows/toolchain.json', 'toolchain-contract/windows/toolchain/*.lock.txt', 'src/windows/test/CMakeLists.txt', '.github/scripts/Invoke-WindowsFixtureGate.ps1', '.github/scripts/Prepare-FixtureSccache.ps1') }}-main-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            windows-fixture-objects-v1-sccache015-${{ hashFiles('toolchain-contract/windows/toolchain.json', 'toolchain-contract/windows/toolchain/*.lock.txt', 'src/windows/test/CMakeLists.txt', '.github/scripts/Invoke-WindowsFixtureGate.ps1', '.github/scripts/Prepare-FixtureSccache.ps1') }}-trial-${{ github.event.pull_request.number }}-
             windows-fixture-objects-v1-sccache015-${{ hashFiles('toolchain-contract/windows/toolchain.json', 'toolchain-contract/windows/toolchain/*.lock.txt', 'src/windows/test/CMakeLists.txt', '.github/scripts/Invoke-WindowsFixtureGate.ps1', '.github/scripts/Prepare-FixtureSccache.ps1') }}-main-
           path: C:\o-fixtures
 
@@ -151,15 +150,6 @@ jobs:
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           key: ${{ steps.objects.outputs.cache-primary-key }}
-          path: C:\o-fixtures
-
-      # TRIAL ONLY: PR-ref-scoped caches cannot be restored by main or other PRs.
-      # Remove this step and its restore prefix after cold/warm measurement.
-      - name: TRIAL ONLY save this PR ref's fixture objects
-        if: success() && github.event_name == 'pull_request'
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
-        with:
-          key: windows-fixture-objects-v1-sccache015-${{ hashFiles('toolchain-contract/windows/toolchain.json', 'toolchain-contract/windows/toolchain/*.lock.txt', 'src/windows/test/CMakeLists.txt', '.github/scripts/Invoke-WindowsFixtureGate.ps1', '.github/scripts/Prepare-FixtureSccache.ps1') }}-trial-${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: C:\o-fixtures
 
       - name: Run portable fixtures

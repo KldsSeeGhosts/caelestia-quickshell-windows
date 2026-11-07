@@ -73,9 +73,9 @@ pin bump and explicit opt-in. `candidate_contract.py` is unchanged.
 Object-cache keys include a schema version, sccache version, canonical toolchain
 and Python locks, fixture CMake flags and gate/preparation scripts. Only a `push`
 to trusted `refs/heads/main` may save the shared cache. PRs and manual dispatches
-only restore it. During measurement only, the clearly marked trial step saves to
-the PR's own GitHub cache ref and restore prefix; main and other PRs cannot read
-that ref. Remove that writer and prefix before finalizing the trial.
+only restore it. During measurement, a temporary writer saved to the PR's own
+GitHub cache ref and restore prefix; main and other PRs cannot read that ref.
+That writer and prefix are removed from the final workflow.
 Statistics are printed after each build and uploaded as `sccache-stats.json`.
 Build failures remain failures; caching does not replace any fixture or receipt.
 

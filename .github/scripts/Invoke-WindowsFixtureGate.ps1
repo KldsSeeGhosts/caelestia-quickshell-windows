@@ -27,7 +27,9 @@ if ($Phase -in @('Configure', 'Build')) {
     $actual | Add-Member -NotePropertyName vsInstallationVersion -NotePropertyValue $instance.installationVersion
     $actual | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$Results/actual-toolchain.json" -Encoding UTF8
     $mt = Join-Path $env:WindowsSdkDir "bin/$($spec.windowsSdkVersion)/x64/mt.exe"
-    $launcherArgs = @()
+    # Clear a previously cached launcher too when opting out in a reused build.
+    $launcherArgs = @('-DCMAKE_C_COMPILER_LAUNCHER:FILEPATH=',
+        '-DCMAKE_CXX_COMPILER_LAUNCHER:FILEPATH=')
     if ($CompilerLauncher) {
         if (-not [IO.Path]::IsPathRooted($CompilerLauncher) -or
             -not (Test-Path -LiteralPath $CompilerLauncher -PathType Leaf)) {

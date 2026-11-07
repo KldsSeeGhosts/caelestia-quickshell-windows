@@ -75,8 +75,8 @@ Tests are not parallelized; packaging is not performed.
 The standalone workflow optionally uses a checksum-pinned, local-disk sccache
 compiler launcher. It does not change these flags, test selection or receipt
 semantics. Statistics are a separate artifact, not a new v1 receipt field.
-Only trusted main push runs save shared objects; PRs and dispatches restore only
-(apart from the explicitly temporary PR-ref-isolated measurement writer).
+Only trusted main push runs save shared objects; PRs and dispatches restore only.
+The temporary PR-ref-isolated measurement writer is not in the final workflow.
 See [the toolchain cache policy](../WINDOWS-TOOLCHAIN.md#optional-fixture-object-cache).
 Docs-only PRs still run this job; there is no path-based skip.
 
