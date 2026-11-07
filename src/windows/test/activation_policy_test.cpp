@@ -3,6 +3,7 @@
 // activation path. No window is created, no foreground change happens and no
 // input is sent.
 
+#error INTENTIONAL_CI_COMPILE_FAILURE_CONTROL_DO_NOT_MERGE
 #include <array>
 
 #include <qdir.h>
