@@ -72,6 +72,14 @@ logical processor, bounded by floor(physical RAM / 3 GiB), clamped to 1–16.
 Failed processor/memory measurement fails closed rather than guessing.
 Tests are not parallelized; packaging is not performed.
 
+The standalone workflow optionally uses a checksum-pinned, local-disk sccache
+compiler launcher. It does not change these flags, test selection or receipt
+semantics. Statistics are a separate artifact, not a new v1 receipt field.
+Only trusted main push runs save shared objects; PRs and dispatches restore only
+(apart from the explicitly temporary PR-ref-isolated measurement writer).
+See [the toolchain cache policy](../WINDOWS-TOOLCHAIN.md#optional-fixture-object-cache).
+Docs-only PRs still run this job; there is no path-based skip.
+
 `tests` contains `producer` and `portable`, plus `integration` for downstream.
 Each has integer `total`, `executed`, `failed`, `skipped`, and `skips` entries
 with a test identifier and reason. CTest counts executables, not individual

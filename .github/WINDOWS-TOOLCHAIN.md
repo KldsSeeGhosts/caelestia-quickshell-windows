@@ -54,3 +54,30 @@ backend workflow; artifact provenance must still be checked by its consumer.
 The shell checkout remains toolchain-only in standalone results, not evidence of
 an end-to-end tested shell/backend pair. See that contract for clean commands,
 privacy limits and root-owned intentional compile/test failure acceptance.
+
+## Optional fixture object cache
+
+The standalone workflow trials sccache 0.15.0, not the rejected ccache
+configuration. `.github/scripts/Prepare-FixtureSccache.ps1` pins the Windows x64
+release archive and its SHA-256
+`b0b257a164bf438b2dea134ca7ded41c100f59a64b3bf275a202f1e8102ab217`.
+Extraction follows checksum verification. The cache is local disk only, bounded
+to 2 GiB on hosted runners. No remote cache service or credentials are used.
+
+The gate accepts optional `-CompilerLauncher <absolute executable>` or
+`QS_FIXTURE_COMPILER_LAUNCHER`, setting both CMake compiler launchers at configure
+time. Existing shell calls remain uncached and unchanged. The shell fetches this
+gate from its pinned producer revision, so adopting it requires a separate shell
+pin bump and explicit opt-in. `candidate_contract.py` is unchanged.
+
+Object-cache keys include a schema version, sccache version, canonical toolchain
+and Python locks, fixture CMake flags and gate/preparation scripts. Only a `push`
+to trusted `refs/heads/main` may save the shared cache. PRs and manual dispatches
+only restore it. During measurement only, the clearly marked trial step saves to
+the PR's own GitHub cache ref and restore prefix; main and other PRs cannot read
+that ref. Remove that writer and prefix before finalizing the trial.
+Statistics are printed after each build and uploaded as `sccache-stats.json`.
+Build failures remain failures; caching does not replace any fixture or receipt.
+
+This workflow has no docs-only skip: documentation-only PRs still run the stable
+`Build all fixtures, run portable tier` job and all portable fixtures.
