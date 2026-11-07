@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-fixtures-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: windows-fixtures-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   fixtures:
@@ -26,12 +26,21 @@ jobs:
       TOOL_ROOT: C:\t-fixtures
       PIP_CACHE_DIR: C:\t-fixtures\pip
       RESULTS: C:\ci-fixtures
+      PYTHONDONTWRITEBYTECODE: '1'
+      CANDIDATE_BACKEND_SHA: ${{ github.sha }}
+      CANDIDATE_SHELL_SHA: fcacc6ea53683cdbb8c1bd65c8b4fe90e9ac6664
 
     steps:
       - name: Checkout sources
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+
+      - name: Start candidate receipt before setup
+        run: |
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" init `
+            --backend-sha $env:CANDIDATE_BACKEND_SHA --shell-sha $env:CANDIDATE_SHELL_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Checkout canonical public toolchain contract
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -41,12 +50,24 @@ jobs:
           path: toolchain-contract
           persist-credentials: false
 
+      - name: Verify exact clean sources
+        run: |
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" sources `
+            --backend . --shell toolchain-contract
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Python 3.12
         id: python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.12'
           architecture: x64
+
+      - name: Validate producer contract fixtures
+        run: |
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" run `
+            --stage producer --unittest --echo -- python -B -m unittest discover -s .github/candidate-contract -p "test_*.py"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Restore versioned tooling
         id: tools
@@ -63,13 +84,13 @@ jobs:
       - name: Prepare and assert canonical tooling
         run: |
           $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path $env:RESULTS | Out-Null
-          & powershell.exe -NoProfile -NonInteractive -File toolchain-contract/windows/scripts/Prepare-Toolchain.ps1 `
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" run `
+            --stage prepare --echo -- powershell.exe -NoProfile -NonInteractive -File toolchain-contract/windows/scripts/Prepare-Toolchain.ps1 `
             -ToolRoot $env:TOOL_ROOT -InstallRust
-          if ($LASTEXITCODE -ne 0) { throw 'Canonical public toolchain preparation failed.' }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Save tooling from trusted main only
-        if: steps.tools.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: steps.tools.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           key: ${{ steps.tools.outputs.cache-primary-key }}
@@ -83,43 +104,36 @@ jobs:
       - name: Build every fixture
         run: |
           $ErrorActionPreference = 'Stop'
-          . ./toolchain-contract/windows/scripts/Caelestia-Toolchain.ps1
-          $spec = Get-CaelestiaToolchain
-          $qt = Join-Path $env:TOOL_ROOT $spec.qtDirectory
-          $llvm = Join-Path $env:TOOL_ROOT "$($spec.llvmDirectory)\bin"
-          $instance = Enter-CaelestiaToolchain -QtPrefix $qt -LlvmBin $llvm -ToolsBin "$env:TOOL_ROOT\tools\Scripts"
-          Select-CaelestiaRust
-          $receipt = Get-CaelestiaActualToolchain -QtPrefix $qt -Cli11Include (Join-Path $env:TOOL_ROOT $spec.cli11Directory)
-          [ordered]@{
-            schemaVersion = 1
-            toolchain = $receipt
-            backendRevision = (& git rev-parse HEAD).Trim()
-            toolchainSourceRevision = (& git -C toolchain-contract rev-parse HEAD).Trim()
-            vsInstallationVersion = $instance.installationVersion
-          } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$env:RESULTS\toolchain.json" -Encoding UTF8
-          $mt = Join-Path $env:WindowsSdkDir "bin\$($spec.windowsSdkVersion)\x64\mt.exe"
-          cmake -S src/windows/test -B $env:BUILD_ROOT -G Ninja "-DCMAKE_PREFIX_PATH=$qt" `
-            "-DCMAKE_CXX_COMPILER:FILEPATH=$llvm\clang-cl.exe" "-DCMAKE_MT:FILEPATH=$mt" `
-            "-DCMAKE_LINKER:FILEPATH=$env:VCToolsInstallDir\bin\Hostx64\x64\link.exe" -DCMAKE_BUILD_TYPE=Release
-          if ($LASTEXITCODE -ne 0) { throw 'Fixture configuration failed.' }
-          cmake --build $env:BUILD_ROOT --parallel 4
-          if ($LASTEXITCODE -ne 0) { throw 'Fixture build failed.' }
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" run `
+            --stage configure --echo -- powershell.exe -NoProfile -NonInteractive -File .github/scripts/Invoke-WindowsFixtureGate.ps1 `
+            -Phase Configure -ContractRoot toolchain-contract -ToolRoot $env:TOOL_ROOT -BuildRoot $env:BUILD_ROOT -Results $env:RESULTS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" run `
+            --stage build --echo -- powershell.exe -NoProfile -NonInteractive -File .github/scripts/Invoke-WindowsFixtureGate.ps1 `
+            -Phase Build -ContractRoot toolchain-contract -ToolRoot $env:TOOL_ROOT -BuildRoot $env:BUILD_ROOT -Results $env:RESULTS -Jobs 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" inventory `
+            --ctest "$env:TOOL_ROOT/tools/Scripts/ctest.exe" --build $env:BUILD_ROOT
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run portable fixtures
         run: |
           $ErrorActionPreference = 'Stop'
-          $qt = "$env:TOOL_ROOT\Qt\6.11.2\msvc2022_64"
-          $env:PATH = "$env:TOOL_ROOT\tools\Scripts;$qt\bin;$env:PATH"
-          $env:QT_QPA_PLATFORM = 'offscreen'
-          $env:QT_QPA_PLATFORM_PLUGIN_PATH = "$qt\plugins\platforms"
-          $env:QT_QUICK_BACKEND = 'software'
-          $temp = "$env:RESULTS\temp"
-          New-Item -ItemType Directory -Force -Path $temp | Out-Null
-          $env:TEMP = $temp
-          $env:TMP = $temp
-          ctest --test-dir $env:BUILD_ROOT -L '^portable$' --no-tests=error --output-on-failure `
-            --output-junit "$env:RESULTS\portable.xml"
-          if ($LASTEXITCODE -ne 0) { throw 'Portable fixtures failed.' }
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" run `
+            --stage portable --junit "$env:RESULTS/portable.raw.xml" --echo -- `
+            powershell.exe -NoProfile -NonInteractive -File .github/scripts/Invoke-WindowsFixtureGate.ps1 `
+            -Phase Portable -ContractRoot toolchain-contract -ToolRoot $env:TOOL_ROOT -BuildRoot $env:BUILD_ROOT -Results $env:RESULTS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Finalize sanitized candidate result
+        if: always()
+        env:
+          WORKFLOW_OUTCOME: ${{ job.status }}
+        run: |
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" finalize `
+            --workflow-outcome $env:WORKFLOW_OUTCOME --toolchain "$env:RESULTS/actual-toolchain.json" `
+            --backend . --shell toolchain-contract
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Test results and public toolchain receipt
         if: always()
@@ -128,7 +142,6 @@ jobs:
           name: fixture-results-${{ github.run_id }}
           path: |
             C:\ci-fixtures\portable.xml
-            C:\ci-fixtures\toolchain.json
-            C:\t-fixtures\toolchain.json
-          if-no-files-found: ignore
+            C:\ci-fixtures\candidate-result.json
+          if-no-files-found: warn
           retention-days: 7

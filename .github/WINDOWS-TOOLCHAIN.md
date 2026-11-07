@@ -33,3 +33,13 @@ interactive Windows desktop or hardware qualification.
 
 Capture source can move within the shell repository without introducing another
 toolchain policy: the specification and helpers do not select its source path.
+
+The [candidate/result v1 contract](candidate-contract/README.md) records requested
+and resolved source identities, source dirt, canonical specification/lock digests,
+actual tools, stage outcomes/timings and nonempty test counts. Its producer-only
+fixtures run before preparing native tools. The existing stable fixture job
+always attempts a small sanitized receipt/JUnit upload, including on failure.
+Hard runner cancellation may prevent finalization or upload and is not a pass.
+The shell checkout remains toolchain-only in standalone results, not evidence of
+an end-to-end tested shell/backend pair. See that contract for clean commands,
+privacy limits and root-owned intentional compile/test failure acceptance.
