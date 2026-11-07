@@ -61,6 +61,7 @@ public:
 	// exercise the publish path without touching the live service.
 	static Network* createForTesting();
 	NetworkWifiBackend* wifiBackendForTesting() { return this->mWifi.get(); }
+	QTimer* wifiCompletionTimerForTesting() { return &this->mWifiCompletionTimer; }
 #endif
 
 	[[nodiscard]] UntypedObjectModel* networks() { return &this->mNetworks; }
@@ -171,6 +172,7 @@ private:
 
 	bool mWifiListVisible = false;
 	QTimer mScanTimer;
+	QTimer mWifiCompletionTimer;
 	quint64 mNextWifiRequest = 0;
 	quint64 mPendingWifiRequest = 0;
 	bool mPendingWifiAccepted = false;

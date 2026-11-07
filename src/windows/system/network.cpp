@@ -25,6 +25,17 @@ Network::Network(QObject* parent, bool observe): QObject(parent) {
 
 	this->mScanTimer.setInterval(8000);
 	QObject::connect(&this->mScanTimer, &QTimer::timeout, this, &Network::scanWifiNetworks);
+	// A missing completion is not success and must not block future requests
+	// forever. End attribution only, never disconnect an unrelated connection.
+	this->mWifiCompletionTimer.setSingleShot(true);
+	this->mWifiCompletionTimer.setTimerType(Qt::PreciseTimer);
+	this->mWifiCompletionTimer.setInterval(60000);
+	QObject::connect(&this->mWifiCompletionTimer, &QTimer::timeout, this, [this] {
+		const auto requestId = this->mPendingWifiRequest;
+		if (requestId == 0) return;
+		this->mWifi->cancelConnection();
+		this->backendWifiConnectResult(requestId, false, QStringLiteral("completion-unobserved"));
+	});
 
 	// A fixture constructs the state without touching the live WLAN service or
 	// the connectivity observer.
@@ -107,6 +118,7 @@ void Network::cancelWifiConnection() {
 	const auto accepted = this->mPendingWifiAccepted;
 	this->mPendingWifiRequest = 0;
 	this->mPendingWifiAccepted = false;
+	this->mWifiCompletionTimer.stop();
 	// Stop attributing results to this request. WlanDisconnect targets the
 	// interface's current connection, which may now be a different network.
 	// Only the separate explicit Disconnect command may request that action.
@@ -295,6 +307,7 @@ void Network::publishWifiCommand(
 void Network::backendWifiConnectAccepted(quint64 requestId) {
 	if (requestId == 0 || requestId != this->mPendingWifiRequest) return;
 	this->mPendingWifiAccepted = true;
+	this->mWifiCompletionTimer.start();
 	this->publishWifiCommand(
 	    QString::number(requestId),
 	    wifi_identity::selectionId(this->mPendingWifiNetwork),
@@ -309,6 +322,7 @@ void Network::backendWifiConnectResult(quint64 requestId, bool success, const QS
 	const auto accepted = this->mPendingWifiAccepted;
 	this->mPendingWifiRequest = 0;
 	this->mPendingWifiAccepted = false;
+	this->mWifiCompletionTimer.stop();
 	this->bWifiConnecting = false;
 	if (this->mPendingWifiRequest == 0) this->bWifiConnectingSsid = QString();
 	this->updateWifiStatus();

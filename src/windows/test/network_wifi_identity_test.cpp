@@ -44,6 +44,8 @@ private slots:
 	void savedProfiles();
 	void duplicateDisplayAndLegacyRefusal();
 	void profileIdentityAndDedup();
+	void profilelessTwin_data();
+	void profilelessTwin();
 	void staleSelectionAndAdapterReplacement();
 	void pendingNotificationsAreIdentityBound();
 	void queuedCompletionCannotFinishNewRequest();
@@ -51,6 +53,7 @@ private slots:
 	void refusedCommandsAreNotAccepted();
 	void invalidSavedProfileCannotFallBackToDisplay();
 	void observationIsNotCompletion();
+	void missingCompletionReleasesRequestWithoutDisconnect();
 	void propertyConsumerSeesStructuredIdentity();
 	void unsupportedBssAndInvalidKey();
 	void bssMetadataUsesRawIdentity();
@@ -296,6 +299,79 @@ void NetworkWifiIdentityTest::profileIdentityAndDedup() {
 	QVERIFY(network->networks()->values().contains(stable));
 	network->connectToNetworkById(wifi_identity::selectionId(second), {});
 	QCOMPARE(wifi_fixture::state.connectedProfile, second.profileName);
+}
+
+void NetworkWifiIdentityTest::profilelessTwin_data() {
+	QTest::addColumn<int>("difference");
+	QTest::newRow("same-network") << 0;
+	QTest::newRow("different-raw-ssid") << 1;
+	QTest::newRow("different-authentication") << 2;
+	QTest::newRow("different-cipher") << 3;
+	QTest::newRow("different-bss") << 4;
+	QTest::newRow("different-security-flag") << 5;
+}
+
+void NetworkWifiIdentityTest::profilelessTwin() {
+	QFETCH(int, difference);
+	auto saved = row();
+	saved.hasProfile = true;
+	saved.profileName = QStringLiteral("Exact saved profile");
+	auto unsaved = row();
+	switch (difference) {
+	case 1: unsaved.ssidBytes = QByteArrayLiteral("other"); break;
+	case 2: unsaved.authentication = DOT11_AUTH_ALGO_RSNA_PSK; break;
+	case 3: unsaved.cipher = DOT11_CIPHER_ALGO_CCMP; break;
+	case 4: unsaved.bssType = dot11_BSS_type_independent; break;
+	case 5: unsaved.securityEnabled = true; break;
+	}
+	// Reverse enumeration must not affect whether the redundant twin survives.
+	for (const auto savedFirst: {false, true}) {
+		wifi_fixture::state.rows =
+		    savedFirst ? std::vector {saved, unsaved} : std::vector {unsaved, saved};
+		std::unique_ptr<Network> network(Network::createForTesting());
+		network->wifiBackendForTesting()->finishOpenForTesting(
+		    ERROR_SUCCESS,
+		    reinterpret_cast<HANDLE>(1)
+		);
+		QCOMPARE(network->networks()->values().size(), difference == 0 ? 1 : 2);
+		if (difference == 0) {
+			QCOMPARE(item(network.get())->selectionId(), wifi_identity::selectionId(saved));
+			network->connectToNetwork(saved.ssid, {});
+			QCOMPARE(status(network.get()), QStringLiteral("accepted"));
+			QCOMPARE(wifi_fixture::state.connectedProfile, saved.profileName);
+			QCOMPARE(wifi_fixture::state.profileWrites, 0);
+			network->cancelWifiConnection();
+		}
+	}
+}
+
+void NetworkWifiIdentityTest::missingCompletionReleasesRequestWithoutDisconnect() {
+	const auto target = row();
+	wifi_fixture::state.rows = {target};
+	std::unique_ptr<Network> network(Network::createForTesting());
+	auto* backend = network->wifiBackendForTesting();
+	backend->finishOpenForTesting(ERROR_SUCCESS, reinterpret_cast<HANDLE>(1));
+	network->connectToNetworkById(item(network.get())->selectionId(), {});
+	QCOMPARE(status(network.get()), QStringLiteral("accepted"));
+	const auto firstId = network->lastWifiCommand().value("requestId");
+	auto* timer = network->wifiCompletionTimerForTesting();
+	QVERIFY(timer->isActive());
+	QCOMPARE(timer->interval(), 60000);
+	QVERIFY(timer->isSingleShot());
+	// Exercise the real timer connection without a minute-long wall-clock wait.
+	QVERIFY(QMetaObject::invokeMethod(timer, "timeout", Qt::DirectConnection));
+	QVERIFY(!timer->isActive());
+	QVERIFY(!network->bindableWifiConnecting().value());
+	QCOMPARE(status(network.get()), QStringLiteral("failed"));
+	QCOMPARE(reason(network.get()), QStringLiteral("completion-unobserved"));
+	QCOMPARE(network->lastWifiCommand().value("requestId"), firstId);
+	network->connectToNetworkById(item(network.get())->selectionId(), {});
+	QCOMPARE(status(network.get()), QStringLiteral("accepted"));
+	QVERIFY(network->lastWifiCommand().value("requestId") != firstId);
+	QVERIFY(timer->isActive());
+	network->cancelWifiConnection();
+	QVERIFY(!timer->isActive());
+	// The fake aborts on an unexpected disconnect, including timeout/cancel.
 }
 
 void NetworkWifiIdentityTest::staleSelectionAndAdapterReplacement() {

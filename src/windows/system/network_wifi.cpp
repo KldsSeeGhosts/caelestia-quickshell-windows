@@ -8,6 +8,7 @@
 #include <qmetaobject.h>
 #include <qpointer.h>
 #include <qrunnable.h>
+#include <qset.h>
 #include <qstringbuilder.h>
 #include <qstringview.h>
 #include <qthreadpool.h>
@@ -330,6 +331,22 @@ void NetworkWifiBackend::refreshAvailableNetworks() {
 		}
 	}
 	WlanFreeMemory(list);
+
+	// Windows can enumerate a saved profile and a profileless representation
+	// of the same available network. Keep distinct saved profiles and security
+	// variants, but do not offer the redundant representation as a new network.
+	QSet<QString> savedNetworks;
+	for (const auto& entry: byIdentity) {
+		if (!entry.hasProfile) continue;
+		auto network = entry;
+		network.hasProfile = false;
+		network.profileName.clear();
+		savedNetworks.insert(wifi_identity::selectionId(network));
+	}
+	for (auto entry = byIdentity.begin(); entry != byIdentity.end();) {
+		if (!entry->hasProfile && savedNetworks.contains(entry.key())) entry = byIdentity.erase(entry);
+		else ++entry;
+	}
 
 	PWLAN_BSS_LIST bssList = nullptr;
 	result = WlanGetNetworkBssList(

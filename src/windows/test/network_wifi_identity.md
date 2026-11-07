@@ -50,7 +50,15 @@ Disconnect action requests that operation, without a completion claim. Removing
 the adapter ends a pending request as a failure. Queued notifications from an
 earlier request cannot complete a later request; unrelated notifications and
 display-string connection observations cannot end the pending request.
-There is no new timeout promise.
+An accepted request has a 60-second completion-observation deadline. On expiry,
+tracking ends as `failed/completion-unobserved`, leaving Windows' connection
+untouched and allowing another explicit request. This is not a claim that the
+OS connection failed. Matching completion, cancellation and adapter removal
+stop the timer. Display-only observations still cannot claim completion.
+
+Available-network enumeration drops a profileless twin only when a saved row
+matches its adapter, raw SSID bytes, authentication, cipher, BSS type and security
+flag. Distinct saved profiles and security variants remain separate choices.
 
 Windows supplies no application request ID in these notifications. A matching
 observation is evidence of the reported connection, not proof of causality or
