@@ -426,6 +426,9 @@ HRESULT nativeDesktopLastError() { return provider().lastError; }
 #ifdef QS_TEST
 void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	auto& p = provider();
+	// Clear an injected test clock first: it may capture a caller's local that
+	// is already out of scope when a RAII reset guard runs this.
+	p.recovery.setAgeForTest({});
 	p.drop();
 	p.recovery.reset();
 	p.context = nullptr;
@@ -439,6 +442,14 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 
 void setNativeDesktopWindowValidatorForTest(std::function<bool(HWND)> validator) {
 	provider().windowValidator = std::move(validator);
+}
+
+void setNativeDesktopRecoveryAgeForTest(std::function<qint64()> age) {
+	provider().recovery.setAgeForTest(std::move(age));
+}
+
+int nativeDesktopRecoveryPendingDelayForTest() {
+	return provider().recovery.pendingDelay();
 }
 #endif
 

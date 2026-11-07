@@ -63,6 +63,10 @@ public:
 
 	[[nodiscard]] bool active() const { return this->recovering; }
 
+#ifdef QS_TEST
+	void setAgeForTest(std::function<qint64()> age) { this->age = std::move(age); }
+#endif
+
 private:
 	void schedule() {
 		const auto remaining = 30000 - (this->age ? this->age() : this->elapsed.elapsed());

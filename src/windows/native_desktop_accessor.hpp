@@ -23,6 +23,10 @@ void invalidateNativeDesktopAccessor(HRESULT error = S_OK);
 // Allows generated handles to exercise the production move path without
 // creating a real window. Reset together with the injected provider factory.
 void setNativeDesktopWindowValidatorForTest(std::function<bool(HWND)> validator);
+// Uses the existing elapsed-time seam; an empty callback restores the real clock.
+// Reset together with the injected provider factory.
+void setNativeDesktopRecoveryAgeForTest(std::function<qint64()> age);
+[[nodiscard]] int nativeDesktopRecoveryPendingDelayForTest();
 #endif
 
 } // namespace qs::windows

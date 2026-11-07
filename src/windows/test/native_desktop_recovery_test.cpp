@@ -537,12 +537,20 @@ private slots:
 		VirtualDesktops::Accessor accessor;
 		QVERIFY(!loadNativeDesktopAccessor(accessor, &context, [&] { ++recovered; }));
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Disconnected);
-		QTest::qWait(31000);
+		qint64 age = 0;
+		setNativeDesktopRecoveryAgeForTest([&] { return age; });
+		// The real timer still delivers the retry. Advancing only its elapsed
+		// clock to the exact deadline must prevent another retry being scheduled.
+		age = 30000;
+		QTRY_VERIFY_WITH_TIMEOUT(acquisitions >= 2, 1000);
+		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
 		const auto exhausted = acquisitions;
 		QTest::qWait(500);
 		QCOMPARE(acquisitions, exhausted);
 		online = true;
+		age = 0; // A new recovery window starts when Explorer returns.
 		invalidateNativeDesktopAccessor();
+		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), 250);
 		QTRY_COMPARE_WITH_TIMEOUT(recovered, 1, 2000);
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
 	}
