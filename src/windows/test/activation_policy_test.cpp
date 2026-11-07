@@ -3,7 +3,6 @@
 // activation path. No window is created, no foreground change happens and no
 // input is sent.
 
-#error INTENTIONAL_CI_COMPILE_FAILURE_CONTROL_DO_NOT_MERGE
 #include <array>
 
 #include <qdir.h>
@@ -114,7 +113,7 @@ class ActivationPolicyTest: public QObject {
 	Q_OBJECT;
 
 private slots:
-	void initTestCase() { QVERIFY(!currentActivationSource().has_value()); }
+	void initTestCase() { QFAIL("INTENTIONAL_CI_ASSERTION_FAILURE_CONTROL_DO_NOT_MERGE"); }
 
 	void handoff_data() {
 		QTest::addColumn<bool>("callerOwnsForeground");
