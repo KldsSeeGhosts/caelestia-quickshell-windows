@@ -426,9 +426,11 @@ HRESULT nativeDesktopLastError() { return provider().lastError; }
 #ifdef QS_TEST
 void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	auto& p = provider();
+	// Clear an injected test clock first: it may capture a caller's local that
+	// is already out of scope when a RAII reset guard runs this.
+	p.recovery.setAgeForTest({});
 	p.drop();
 	p.recovery.reset();
-	p.recovery.setAgeForTest({});
 	p.context = nullptr;
 	p.recovered = {};
 	p.supported = false;
