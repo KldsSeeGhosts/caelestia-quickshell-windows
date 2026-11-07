@@ -29,6 +29,8 @@ jobs:
       PYTHONDONTWRITEBYTECODE: '1'
       CANDIDATE_BACKEND_SHA: ${{ github.sha }}
       CANDIDATE_SHELL_SHA: fcacc6ea53683cdbb8c1bd65c8b4fe90e9ac6664
+      SCCACHE_DIR: C:\o-fixtures
+      SCCACHE_CACHE_SIZE: 2G
 
     steps:
       - name: Checkout sources
@@ -104,6 +106,21 @@ jobs:
       - name: Select hardware-aware build parallelism
         run: .github/scripts/Get-BuildJobs.ps1
 
+      - name: Prepare verified optional sccache
+        run: .github/scripts/Prepare-FixtureSccache.ps1 -ToolRoot $env:TOOL_ROOT
+
+      - name: Restore fixture objects
+        id: objects
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          # Schema + sccache release + canonical toolchain. sccache keys each
+          # object by compiler, arguments and preprocessed input, so build-graph
+          # edits (CMakeLists, gate) need not discard the whole warm cache.
+          key: windows-fixture-objects-v1-sccache015-${{ hashFiles('toolchain-contract/windows/toolchain.json', 'toolchain-contract/windows/toolchain/*.lock.txt', '.github/scripts/Prepare-FixtureSccache.ps1') }}-main-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            windows-fixture-objects-v1-sccache015-${{ hashFiles('toolchain-contract/windows/toolchain.json', 'toolchain-contract/windows/toolchain/*.lock.txt', '.github/scripts/Prepare-FixtureSccache.ps1') }}-main-
+          path: C:\o-fixtures
+
       - name: Build every fixture
         run: |
           $ErrorActionPreference = 'Stop'
@@ -118,6 +135,24 @@ jobs:
           python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" inventory `
             --ctest "$env:TOOL_ROOT/tools/Scripts/ctest.exe" --build $env:BUILD_ROOT
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Record sccache statistics and flush disk cache
+        if: always() && env.QS_FIXTURE_COMPILER_LAUNCHER != ''
+        run: |
+          & $env:QS_FIXTURE_COMPILER_LAUNCHER --show-stats
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:QS_FIXTURE_COMPILER_LAUNCHER --show-stats --stats-format json |
+            Set-Content -LiteralPath "$env:RESULTS/sccache-stats.json" -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:QS_FIXTURE_COMPILER_LAUNCHER --stop-server
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Save fixture objects from trusted main push only
+        if: success() && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          key: ${{ steps.objects.outputs.cache-primary-key }}
+          path: C:\o-fixtures
 
       - name: Run portable fixtures
         run: |
@@ -146,5 +181,6 @@ jobs:
           path: |
             C:\ci-fixtures\portable.xml
             C:\ci-fixtures\candidate-result.json
+            C:\ci-fixtures\sccache-stats.json
           if-no-files-found: warn
           retention-days: 7

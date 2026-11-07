@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory)][string]$ToolRoot,
     [Parameter(Mandatory)][string]$BuildRoot,
     [Parameter(Mandatory)][string]$Results,
-    [ValidateRange(1, 16)][int]$Jobs = 2
+    [ValidateRange(1, 16)][int]$Jobs = 2,
+    [string]$CompilerLauncher = $env:QS_FIXTURE_COMPILER_LAUNCHER
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $ContractRoot 'windows/scripts/Caelestia-Toolchain.ps1')
@@ -26,10 +27,21 @@ if ($Phase -in @('Configure', 'Build')) {
     $actual | Add-Member -NotePropertyName vsInstallationVersion -NotePropertyValue $instance.installationVersion
     $actual | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$Results/actual-toolchain.json" -Encoding UTF8
     $mt = Join-Path $env:WindowsSdkDir "bin/$($spec.windowsSdkVersion)/x64/mt.exe"
+    # Clear a previously cached launcher too when opting out in a reused build.
+    $launcherArgs = @('-DCMAKE_C_COMPILER_LAUNCHER:FILEPATH=',
+        '-DCMAKE_CXX_COMPILER_LAUNCHER:FILEPATH=')
+    if ($CompilerLauncher) {
+        if (-not [IO.Path]::IsPathRooted($CompilerLauncher) -or
+            -not (Test-Path -LiteralPath $CompilerLauncher -PathType Leaf)) {
+            throw 'CompilerLauncher must name an existing absolute executable path.'
+        }
+        $launcherArgs = @("-DCMAKE_C_COMPILER_LAUNCHER:FILEPATH=$CompilerLauncher",
+            "-DCMAKE_CXX_COMPILER_LAUNCHER:FILEPATH=$CompilerLauncher")
+    }
     # Configuration is separate so compiler failures have a distinct stage.
     cmake -S src/windows/test -B $BuildRoot -G Ninja "-DCMAKE_PREFIX_PATH=$qt" `
         "-DCMAKE_CXX_COMPILER:FILEPATH=$llvm/clang-cl.exe" "-DCMAKE_MT:FILEPATH=$mt" `
-        "-DCMAKE_LINKER:FILEPATH=$env:VCToolsInstallDir/bin/Hostx64/x64/link.exe" -DCMAKE_BUILD_TYPE=Release
+        "-DCMAKE_LINKER:FILEPATH=$env:VCToolsInstallDir/bin/Hostx64/x64/link.exe" -DCMAKE_BUILD_TYPE=Release @launcherArgs
     exit $LASTEXITCODE
 }
 
