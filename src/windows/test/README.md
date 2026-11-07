@@ -20,6 +20,14 @@ unclassified, classified twice, or a tier names a fixture that does not exist.
 
 All fixtures are built in CI, so every tier is at least compile-checked.
 
+The portable tier includes `fullscreen_ownership`, `display_transaction`,
+`clipboard_capture`, `capture_dimensions`, `erm625_native_desktop_facade`
+and `network_wifi_identity`. These use synthetic operations and content, not
+the user's windows, display configuration, clipboard, capture or WLAN.
+The clipboard fixture receives an absolute disposable directory in the build
+tree and refuses any personal-profile fallback. Test-only definitions are
+scoped to each fixture target.
+
 `runtime_paths_test` compiles the production `src/core/paths.cpp` and runs
 base-, instance-, shell-only failure cases plus a valid runtime in isolated
 child processes. It uses regular-file and directory blockers rather than changing

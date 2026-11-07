@@ -5,11 +5,9 @@
 #include <qstring.h>
 #include <qt_windows.h>
 #include <qtimer.h>
-
 #include <shellapi.h>
 
 #include "network_connectivity.hpp"
-#include "network_wifi_route.hpp"
 
 namespace qs::windows::sys {
 
@@ -27,6 +25,17 @@ Network::Network(QObject* parent, bool observe): QObject(parent) {
 
 	this->mScanTimer.setInterval(8000);
 	QObject::connect(&this->mScanTimer, &QTimer::timeout, this, &Network::scanWifiNetworks);
+	// A missing completion is not success and must not block future requests
+	// forever. End attribution only, never disconnect an unrelated connection.
+	this->mWifiCompletionTimer.setSingleShot(true);
+	this->mWifiCompletionTimer.setTimerType(Qt::PreciseTimer);
+	this->mWifiCompletionTimer.setInterval(60000);
+	QObject::connect(&this->mWifiCompletionTimer, &QTimer::timeout, this, [this] {
+		const auto requestId = this->mPendingWifiRequest;
+		if (requestId == 0) return;
+		this->mWifi->cancelConnection();
+		this->backendWifiConnectResult(requestId, false, QStringLiteral("completion-unobserved"));
+	});
 
 	// A fixture constructs the state without touching the live WLAN service or
 	// the connectivity observer.
@@ -43,32 +52,109 @@ void Network::setWifiRadioEnabled(bool enabled) { this->mWifi->setRadioEnabled(e
 void Network::scanWifiNetworks() { this->mWifi->scan(); }
 
 NetworkWifiNetwork* Network::findNetwork(const QString& ssid) const {
+	NetworkWifiNetwork* match = nullptr;
 	for (auto* net: this->mNetworks.valueList()) {
-		if (net->bindableSsid().value() == ssid) return net;
+		if (net->bindableSsid().value() != ssid) continue;
+		if (match != nullptr) return nullptr; // Ambiguous display label, fail closed.
+		match = net;
+	}
+	return match;
+}
+
+NetworkWifiNetwork* Network::findNetworkById(const QString& selectionId) const {
+	if (selectionId.isEmpty()) return nullptr;
+	for (auto* net: this->mNetworks.valueList()) {
+		if (net->selectionId() == selectionId) return net;
 	}
 	return nullptr;
 }
 
 void Network::connectToNetwork(const QString& ssid, const QString& password) {
-	auto* net = this->findNetwork(ssid);
-	auto hasProfile = net != nullptr && net->bindableHasProfile().value();
-	auto profileName = net != nullptr ? net->profileName() : QString();
-	auto security = net != nullptr ? net->bindableSecurity().value() : QString();
-	auto secure = net != nullptr ? !security.isEmpty() : !password.isEmpty();
-	auto wpa3 = security.contains(QStringLiteral("WPA3"));
-
-	this->bWifiConnectingSsid = ssid;
-	this->bWifiConnecting = true;
-	this->updateWifiStatus();
-
-	this->mWifi->connectToNetwork(ssid, profileName, password, hasProfile, secure, wpa3);
+	this->connectNetwork(this->findNetwork(ssid), ssid, password);
 }
 
-void Network::disconnectActive() { this->mWifi->disconnectActive(); }
+void Network::connectToNetworkById(const QString& selectionId, const QString& password) {
+	this->connectNetwork(this->findNetworkById(selectionId), selectionId, password);
+}
+
+void Network::connectNetwork(
+    NetworkWifiNetwork* network,
+    const QString& selection,
+    const QString& password
+) {
+	if (this->mPendingWifiRequest != 0) {
+		this->publishWifiCommand({}, selection, QStringLiteral("denied"), QStringLiteral("busy"));
+		return;
+	}
+	if (network == nullptr) {
+		this->publishWifiCommand(
+		    {},
+		    selection,
+		    QStringLiteral("denied"),
+		    QStringLiteral("stale-or-ambiguous")
+		);
+		emit this->wifiConnectResult(selection, false, QStringLiteral("stale-or-ambiguous"));
+		return;
+	}
+	this->mPendingWifiNetwork = network->network();
+	this->mPendingWifiRequest = ++this->mNextWifiRequest;
+	const auto requestId = this->mPendingWifiRequest;
+	const auto target = this->mPendingWifiNetwork;
+	this->mPendingWifiAccepted = false;
+	this->bWifiConnectingSsid = target.ssid;
+	if (this->mPendingWifiRequest != requestId) return;
+	this->bWifiConnecting = true;
+	if (this->mPendingWifiRequest != requestId) return;
+	this->updateWifiStatus();
+
+	if (this->mPendingWifiRequest == requestId)
+		this->mWifi->connectToNetwork(target, password, requestId);
+}
+
+void Network::cancelWifiConnection() {
+	if (this->mPendingWifiRequest == 0) return;
+	const auto id = this->mPendingWifiRequest;
+	const auto network = this->mPendingWifiNetwork;
+	const auto accepted = this->mPendingWifiAccepted;
+	this->mPendingWifiRequest = 0;
+	this->mPendingWifiAccepted = false;
+	this->mWifiCompletionTimer.stop();
+	// Stop attributing results to this request. WlanDisconnect targets the
+	// interface's current connection, which may now be a different network.
+	// Only the separate explicit Disconnect command may request that action.
+	this->mWifi->cancelConnection();
+	this->bWifiConnecting = false;
+	if (this->mPendingWifiRequest == 0) this->bWifiConnectingSsid = QString();
+	this->updateWifiStatus();
+	this->publishWifiCommand(
+	    accepted ? QString::number(id) : QString(),
+	    wifi_identity::selectionId(network),
+	    QStringLiteral("cancelled"),
+	    QStringLiteral("completion-unobserved")
+	);
+	if (this->mPendingWifiRequest == 0)
+		emit this->wifiConnectResult(network.ssid, false, QStringLiteral("cancelled"));
+}
+
+void Network::disconnectActive() {
+	const auto generation = this->mNextWifiRequest;
+	if (this->mPendingWifiRequest != 0) this->cancelWifiConnection();
+	if (this->mNextWifiRequest == generation) this->mWifi->disconnectActive();
+}
 
 void Network::forgetNetwork(const QString& ssid) {
 	auto* net = this->findNetwork(ssid);
-	this->mWifi->forgetNetwork(ssid, net != nullptr ? net->profileName() : QString());
+	if (net != nullptr) this->forgetNetworkById(net->selectionId());
+}
+
+void Network::forgetNetworkById(const QString& selectionId) {
+	auto* net = this->findNetworkById(selectionId);
+	if (net == nullptr) return;
+	const auto network = net->network();
+	if (this->mPendingWifiRequest != 0
+	    && wifi_identity::selectionId(this->mPendingWifiNetwork) == selectionId)
+		this->cancelWifiConnection();
+	this->mWifi->forgetNetwork(network);
 }
 
 void Network::openWifiSettings() {
@@ -132,29 +218,25 @@ void Network::backendSetNeedsLocationPermission(bool needs) {
 }
 
 void Network::backendSetCurrentConnection(
-    const QString& ssid,
-    const QString& bssid,
-    int signalQuality,
-    const QString& security,
+    const RawWifiNetwork& network,
     bool connected,
     bool connecting
 ) {
-	this->bActiveSsid = connected ? ssid : QString();
-	this->bActiveBssid = connected ? bssid : QString();
-	this->bActiveSignalQuality = connected ? signalQuality : 0;
-	this->bActiveSecurity = connected ? security : QString();
+	this->bActiveSsid = connected ? network.ssid : QString();
+	this->bActiveBssid = connected ? network.bssid : QString();
+	this->bActiveSignalQuality = connected ? network.strength : 0;
+	this->bActiveSecurity = connected ? wifi_identity::securityLabel(network) : QString();
 
 	if (connected && !this->mWifiListVisible) {
-		auto* net = this->findNetwork(ssid);
-		if (net != nullptr && net->bindableActive().value()) net->setStrength(signalQuality);
+		auto* net = this->findNetworkById(wifi_identity::selectionId(network));
+		if (net != nullptr && net->bindableActive().value()) net->setStrength(network.strength);
 	}
 
-	if (connected && ssid == this->bWifiConnectingSsid.value()) {
-		this->bWifiConnecting = false;
-		this->bWifiConnectingSsid = QString();
-	} else if (connecting && !this->bWifiConnecting.value()) {
-		this->bWifiConnecting = true;
-		this->bWifiConnectingSsid = ssid;
+	// A display-string observation is not command completion. Only the WLAN
+	// request's matching GUID/raw SSID/profile notification ends our request.
+	if (this->mPendingWifiRequest == 0) {
+		this->bWifiConnecting = connecting;
+		this->bWifiConnectingSsid = connecting ? network.ssid : QString();
 	}
 
 	this->updateWifiStatus();
@@ -162,11 +244,14 @@ void Network::backendSetCurrentConnection(
 
 void Network::backendUpdateAvailableNetworks(const std::vector<RawWifiNetwork>& networks) {
 	QSet<QString> seen;
-	for (const auto& r: networks) seen.insert(r.ssid);
+	for (const auto& r: networks) {
+		const auto id = wifi_identity::selectionId(r);
+		if (!id.isEmpty()) seen.insert(id);
+	}
 
 	auto& list = this->mNetworks.valueList();
 	for (auto i = list.size() - 1; i >= 0; i--) {
-		if (!seen.contains(list.at(i)->bindableSsid().value())) {
+		if (!seen.contains(list.at(i)->selectionId())) {
 			auto* obj = list.at(i);
 			this->mNetworks.removeAt(i);
 			obj->deleteLater();
@@ -174,20 +259,15 @@ void Network::backendUpdateAvailableNetworks(const std::vector<RawWifiNetwork>& 
 	}
 
 	for (const auto& r: networks) {
-		auto* item = this->findNetwork(r.ssid);
+		const auto id = wifi_identity::selectionId(r);
+		if (id.isEmpty()) continue;
+		auto* item = this->findNetworkById(id);
 		if (item == nullptr) {
 			item = new NetworkWifiNetwork(&this->mNetworks);
 			this->mNetworks.insertObject(item);
 		}
 
-		item->setSsid(r.ssid);
-		item->setBssid(r.bssid);
-		item->setStrength(r.strength);
-		item->setFrequency(r.frequency);
-		item->setActive(r.active);
-		item->setSecurity(r.security);
-		item->setHasProfile(r.hasProfile);
-		item->setProfileName(r.profileName);
+		item->setNetwork(r);
 	}
 }
 
@@ -197,20 +277,65 @@ void Network::backendPublishAvailableNetworks(const std::vector<RawWifiNetwork>&
 }
 
 void Network::backendEndPendingConnection() {
-	auto end = wifi_route::endPendingOnRemoval(
-	    this->bWifiConnecting.value(),
-	    this->bWifiConnectingSsid.value()
-	);
-	if (end.failed) {
-		this->backendWifiConnectResult(end.ssid, false, QStringLiteral("other"));
-	}
+	this->mWifi->cancelConnection();
+	if (this->mPendingWifiRequest != 0)
+		this->backendWifiConnectResult(
+		    this->mPendingWifiRequest,
+		    false,
+		    QStringLiteral("adapter-removed")
+		);
 }
 
-void Network::backendWifiConnectResult(const QString& ssid, bool success, const QString& reason) {
+void Network::publishWifiCommand(
+    const QString& id,
+    const QString& selectionId,
+    const QString& status,
+    const QString& reason
+) {
+	this->mLastWifiCommand = {
+	    {QStringLiteral("requestId"), id},
+	    {QStringLiteral("selectionId"), selectionId},
+	    {QStringLiteral("status"), status},
+	    {QStringLiteral("reason"), reason},
+	};
+	// Preserve this event even if a signal handler starts another command.
+	const auto result = this->mLastWifiCommand;
+	emit this->wifiCommandResult(result);
+	emit this->wifiCommandChanged();
+}
+
+void Network::backendWifiConnectAccepted(quint64 requestId) {
+	if (requestId == 0 || requestId != this->mPendingWifiRequest) return;
+	this->mPendingWifiAccepted = true;
+	this->mWifiCompletionTimer.start();
+	this->publishWifiCommand(
+	    QString::number(requestId),
+	    wifi_identity::selectionId(this->mPendingWifiNetwork),
+	    QStringLiteral("accepted"),
+	    {}
+	);
+}
+
+void Network::backendWifiConnectResult(quint64 requestId, bool success, const QString& reason) {
+	if (requestId == 0 || requestId != this->mPendingWifiRequest) return;
+	const auto network = this->mPendingWifiNetwork;
+	const auto accepted = this->mPendingWifiAccepted;
+	this->mPendingWifiRequest = 0;
+	this->mPendingWifiAccepted = false;
+	this->mWifiCompletionTimer.stop();
 	this->bWifiConnecting = false;
-	this->bWifiConnectingSsid = QString();
+	if (this->mPendingWifiRequest == 0) this->bWifiConnectingSsid = QString();
 	this->updateWifiStatus();
-	emit this->wifiConnectResult(ssid, success, reason);
+	this->publishWifiCommand(
+	    accepted ? QString::number(requestId) : QString(),
+	    wifi_identity::selectionId(network),
+	    success && accepted ? QStringLiteral("observed")
+	    : accepted          ? QStringLiteral("failed")
+	                        : QStringLiteral("denied"),
+	    success && accepted ? QString() : reason
+	);
+	if (this->mPendingWifiRequest == 0)
+		emit this->wifiConnectResult(network.ssid, success && accepted, reason);
 }
 
 } // namespace qs::windows::sys

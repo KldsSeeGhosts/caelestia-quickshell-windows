@@ -856,6 +856,82 @@ target_include_directories(network_wifi_route_test PRIVATE ${QS_WINDOWS_SRC})
 target_link_libraries(network_wifi_route_test PRIVATE Qt6::Core Qt6::Qml Qt6::Test)
 add_test(NAME network_wifi_route COMMAND network_wifi_route_test)
 
+qs_add_test_executable(fullscreen_ownership_test fullscreen_ownership_test.cpp)
+target_compile_definitions(fullscreen_ownership_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(fullscreen_ownership_test PRIVATE Qt6::Core Qt6::Test user32)
+add_test(NAME fullscreen_ownership COMMAND fullscreen_ownership_test)
+
+qs_add_test_executable(display_transaction_test
+	display_transaction_test.cpp
+	display_transaction_stubs.cpp
+	${QS_WINDOWS_SRC}/system/displays.cpp
+	${QS_WINDOWS_SRC}/system/displays.hpp
+)
+target_compile_definitions(display_transaction_test PRIVATE
+	QS_DISPLAYS_TEST NOMINMAX WIN32_LEAN_AND_MEAN
+)
+target_link_libraries(display_transaction_test PRIVATE Qt6::Gui Qt6::Qml Qt6::Test user32)
+add_test(NAME display_transaction COMMAND display_transaction_test)
+
+qs_add_test_executable(clipboard_capture_test
+	clipboard_capture_test.cpp
+	clipboard_capture_test_stubs.cpp
+	${QS_WINDOWS_SRC}/system/clipboard.cpp
+	${QS_WINDOWS_SRC}/system/clipboard.hpp
+	${QS_WINDOWS_SRC}/../core/redact.cpp
+)
+target_compile_definitions(clipboard_capture_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(clipboard_capture_test PRIVATE Qt6::Gui Qt6::Qml Qt6::Test user32 gdi32)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/clipboard-fixture-data")
+add_test(NAME clipboard_capture COMMAND clipboard_capture_test
+	-o "${CMAKE_CURRENT_BINARY_DIR}/clipboard-qt.xml,xml" -o -,txt
+)
+set_tests_properties(clipboard_capture PROPERTIES ENVIRONMENT
+	"QS_CLIPBOARD_FIXTURE_ROOT=${CMAKE_CURRENT_BINARY_DIR}/clipboard-fixture-data;QT_QPA_PLATFORM=offscreen"
+)
+
+qs_add_test_executable(capture_dimensions_test capture_dimensions_test.cpp)
+target_compile_definitions(capture_dimensions_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(capture_dimensions_test PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(capture_dimensions_test PRIVATE Qt6::Gui Qt6::Test windowsapp ole32)
+add_test(NAME capture_dimensions COMMAND capture_dimensions_test)
+set_tests_properties(capture_dimensions PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+qs_add_test_executable(erm625_native_desktop_facade_test
+	erm625_native_desktop_facade_test.cpp
+	${QS_WINDOWS_SRC}/virtual_desktops.cpp
+	${QS_WINDOWS_SRC}/virtual_desktops.hpp
+	${QS_WINDOWS_SRC}/native_desktop_accessor.cpp
+	${QS_WINDOWS_SRC}/accessor_state.hpp
+	${QS_WINDOWS_SRC}/services/message_window.cpp
+	${QS_WINDOWS_SRC}/../core/redact.cpp
+)
+target_compile_definitions(erm625_native_desktop_facade_test PRIVATE QS_TEST NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(erm625_native_desktop_facade_test PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(erm625_native_desktop_facade_test PRIVATE Qt6::Gui Qt6::Qml Qt6::Test ole32)
+add_test(NAME erm625_native_desktop_facade COMMAND erm625_native_desktop_facade_test)
+set_tests_properties(erm625_native_desktop_facade PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+qs_add_test_executable(network_wifi_identity_test
+	network_wifi_identity_test.cpp
+	network_wifi_native_stubs.cpp
+	network_wifi_stubs.cpp
+	${QS_WINDOWS_SRC}/system/network.cpp
+	${QS_WINDOWS_SRC}/system/network.hpp
+	${QS_WINDOWS_SRC}/system/network_wifi.cpp
+	${QS_WINDOWS_SRC}/system/network_wifi.hpp
+	${QS_WINDOWS_SRC}/system/network_connectivity.hpp
+	${QS_WINDOWS_SRC}/system/network_wifi_item.cpp
+	${QS_WINDOWS_SRC}/system/network_wifi_item.hpp
+	${QS_WINDOWS_SRC}/../core/model.cpp
+)
+target_compile_definitions(network_wifi_identity_test PRIVATE
+	QS_TEST QS_WIFI_NATIVE_FIXTURE NOMINMAX WIN32_LEAN_AND_MEAN
+)
+target_include_directories(network_wifi_identity_test PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(network_wifi_identity_test PRIVATE Qt6::Core Qt6::Qml Qt6::Test shell32)
+add_test(NAME network_wifi_identity COMMAND network_wifi_identity_test)
+
 # Runtime tiers. Every registered fixture belongs to exactly one tier, and
 # configuration fails on an unclassified or doubly classified fixture.
 #   portable: fakes and offscreen Qt only; required in hosted CI.
@@ -875,6 +951,8 @@ set(QS_TESTS_PORTABLE
 	panel_topmost power_profiles brightness_route display_identity
 	native_desktop_recovery pw_session_worker idle_request input_settle
 	super_drag_wait network_wifi_route runtime_paths
+	fullscreen_ownership display_transaction clipboard_capture capture_dimensions
+	erm625_native_desktop_facade network_wifi_identity
 )
 set(QS_TESTS_NATIVE
 	tray_hook tray_host keyboard_layout native_lifetime

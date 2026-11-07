@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <utility>
 
 #include <qt_windows.h>
@@ -19,6 +20,7 @@
 #include <qnamespace.h>
 #include <qpointer.h>
 #include <qrunnable.h>
+#include <qscopeguard.h>
 #include <qstandardpaths.h>
 #include <qstring.h>
 #include <qthreadpool.h>
@@ -160,52 +162,44 @@ bool sameText(const ClipboardEntry& a, const ClipboardEntry& b) {
 	return true;
 }
 
-bool openClipboard(HWND owner, int attempts) {
-	for (auto attempt = 1;; attempt++) {
-		if (OpenClipboard(owner)) return true;
-		if (attempt >= attempts) return false;
-		Sleep(OPEN_RETRY_MS);
+class NativeClipboardReadProvider final: public ClipboardReadProvider {
+public:
+	std::array<quint32, 3> privacyFormats() override {
+		static const std::array<quint32, 3> formats {
+		    RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing"),
+		    RegisterClipboardFormatW(L"Clipboard Viewer Ignore"),
+		    RegisterClipboardFormatW(L"CanIncludeInClipboardHistory"),
+		};
+		return formats;
 	}
-}
 
-bool optedOutOfHistory(UINT format) {
-	if (!IsClipboardFormatAvailable(format)) return false;
+	bool open() override { return OpenClipboard(nullptr) != FALSE; }
+	void close() override { CloseClipboard(); }
+	void retryPause() override { Sleep(OPEN_RETRY_MS); }
+	quint32 sequence() override { return GetClipboardSequenceNumber(); }
+	bool available(quint32 format) override { return IsClipboardFormatAvailable(format) != FALSE; }
 
-	auto* data = GetClipboardData(format);
-	if (data == nullptr) return false;
+	std::optional<QByteArray> data(quint32 format) override {
+		auto* handle = GetClipboardData(format);
+		if (handle == nullptr) return std::nullopt;
+		auto size = GlobalSize(handle);
+		if (size == 0 || size > static_cast<SIZE_T>(std::numeric_limits<qsizetype>::max())) {
+			return std::nullopt;
+		}
+		auto* locked = GlobalLock(handle);
+		if (locked == nullptr) return std::nullopt;
+		const auto unlock = qScopeGuard([handle]() { GlobalUnlock(handle); });
+		return QByteArray(static_cast<const char*>(locked), static_cast<qsizetype>(size));
+	}
+};
 
-	auto* locked = GlobalLock(data);
-	if (locked == nullptr) return false;
-
-	auto optOut = *static_cast<const unsigned char*>(locked) == 0;
-	GlobalUnlock(data);
-	return optOut;
-}
-
-QString readText() {
-	auto* data = GetClipboardData(CF_UNICODETEXT);
-	if (data == nullptr) return {};
-
-	auto* locked = static_cast<const wchar_t*>(GlobalLock(data));
-	if (locked == nullptr) return {};
-
-	auto capacity = static_cast<qsizetype>(GlobalSize(data) / sizeof(wchar_t));
-	auto length = capacity > 0 ? std::find(locked, locked + capacity, L'\0') - locked : -1;
-	auto text = QString::fromWCharArray(locked, length);
-	GlobalUnlock(data);
+QString textFromBytes(const QByteArray& bytes) {
+	auto capacity = bytes.size() / static_cast<qsizetype>(sizeof(char16_t));
+	if (capacity == 0) return {};
+	auto text = QString::fromUtf16(reinterpret_cast<const char16_t*>(bytes.constData()), capacity);
+	auto terminator = text.indexOf(QChar(u'\0'));
+	if (terminator >= 0) text.truncate(terminator);
 	return text;
-}
-
-QByteArray readDib() {
-	auto* data = GetClipboardData(CF_DIB);
-	if (data == nullptr) return {};
-
-	auto* locked = GlobalLock(data);
-	if (locked == nullptr) return {};
-
-	auto dib = QByteArray(static_cast<const char*>(locked), static_cast<qsizetype>(GlobalSize(data)));
-	GlobalUnlock(data);
-	return dib;
 }
 
 QImage imageFromDib(const QByteArray& dib) {
@@ -292,30 +286,58 @@ QImage imageFromDib(const QByteArray& dib) {
 	return image;
 }
 
-ClipboardCapture readClipboard(qint64 id, const QString& dir) {
-	static const auto excludeFormat =
-	    RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing");
-	static const auto ignoreFormat = RegisterClipboardFormatW(L"Clipboard Viewer Ignore");
-	static const auto historyFormat = RegisterClipboardFormatW(L"CanIncludeInClipboardHistory");
-
+ClipboardCapture readClipboard(
+    ClipboardReadProvider& provider,
+    const std::shared_ptr<ClipboardCaptureGeneration>& generation,
+    qint64 id,
+    const QString& dir
+) {
 	ClipboardCapture capture;
+	capture.generation = generation;
 	capture.entry.id = id;
 
-	if (IsClipboardFormatAvailable(excludeFormat) || IsClipboardFormatAvailable(ignoreFormat)) {
-		return capture;
+	auto formats = provider.privacyFormats();
+	// A missing privacy format registration must not silently disable a check.
+	if (std::ranges::find(formats, 0) != formats.end()) return capture;
+
+	bool opened = false;
+	for (int attempt = 1; attempt <= READ_ATTEMPTS; ++attempt) {
+		if (generation->cancelled) return capture;
+		if (provider.open()) {
+			opened = true;
+			break;
+		}
+		if (attempt < READ_ATTEMPTS) provider.retryPause();
+	}
+	if (!opened) return capture;
+
+	QByteArray bytes;
+	bool isText = false;
+	{
+		const auto close = qScopeGuard([&provider]() { provider.close(); });
+		capture.sequence = provider.sequence();
+		if (generation->cancelled) return capture;
+
+		// These decisions and content reads belong to this same open snapshot.
+		if (provider.available(formats[0]) || provider.available(formats[1])) return capture;
+		if (provider.available(formats[2])) {
+			auto marker = provider.data(formats[2]);
+			// Preserve the supported first-byte semantics, but fail closed when
+			// an advertised marker cannot be read, locked or has no bytes.
+			if (!marker || marker->isEmpty() || marker->front() == 0) return capture;
+		}
+
+		isText = provider.available(CF_UNICODETEXT);
+		if (!isText && !provider.available(CF_DIB)) return capture;
+		auto content = provider.data(isText ? CF_UNICODETEXT : CF_DIB);
+		if (!content) return capture;
+		bytes = std::move(*content);
 	}
 
-	if (!openClipboard(nullptr, READ_ATTEMPTS)) return capture;
-	capture.sequence = GetClipboardSequenceNumber();
+	if (generation->cancelled) return capture;
 
-	if (optedOutOfHistory(historyFormat)) {
-		CloseClipboard();
-		return capture;
-	}
-
-	if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
-		capture.entry.text = readText();
-		CloseClipboard();
+	if (isText) {
+		capture.entry.text = textFromBytes(bytes);
 		capture.captured = !capture.entry.text.isEmpty();
 		capture.entry.textLength = capture.entry.text.size();
 		capture.entry.textHash = qHash(capture.entry.text);
@@ -323,27 +345,27 @@ ClipboardCapture readClipboard(qint64 id, const QString& dir) {
 		if (capture.entry.text.size() > SPILL_CHARS) {
 			auto path = QStringLiteral("%1/%2.txt").arg(dir).arg(id);
 			QFile file(path);
-			if (file.open(QIODevice::WriteOnly) && file.write(capture.entry.text.toUtf8()) >= 0) {
+			auto utf8 = capture.entry.text.toUtf8();
+			if (file.open(QIODevice::WriteOnly) && file.write(utf8) == utf8.size() && file.flush()) {
 				file.close();
 				capture.entry.preview = previewOf(capture.entry.text);
 				capture.entry.textPath = path;
 				capture.entry.text.clear();
+			} else {
+				file.close();
+				QFile::remove(path);
 			}
 		}
-
+		if (generation->cancelled) {
+			removeEntryFiles(capture.entry);
+			capture.captured = false;
+		}
 		return capture;
 	}
 
-	if (!IsClipboardFormatAvailable(CF_DIB)) {
-		CloseClipboard();
-		return capture;
-	}
+	if (bytes.isEmpty()) return capture;
 
-	auto dib = readDib();
-	CloseClipboard();
-	if (dib.isEmpty()) return capture;
-
-	auto image = imageFromDib(dib);
+	auto image = imageFromDib(bytes);
 	if (image.isNull()) {
 		qCWarning(logClipboard) << "Failed to convert clipboard DIB to an image";
 		return capture;
@@ -365,12 +387,19 @@ ClipboardCapture readClipboard(qint64 id, const QString& dir) {
 	capture.entry.width = image.width();
 	capture.entry.height = image.height();
 	capture.captured = true;
+	if (generation->cancelled) {
+		removeEntryFiles(capture.entry);
+		capture.captured = false;
+	}
 	return capture;
 }
 
 } // namespace
 
-Clipboard::Clipboard(QObject* parent): QObject(parent) {
+Clipboard::Clipboard(QObject* parent)
+    : QObject(parent)
+    , readProvider(std::make_shared<NativeClipboardReadProvider>())
+    , readPool(capturePool()) {
 	static int instances = 0; // NOLINT
 	auto isFirstInstance = instances == 0;
 	this->mCacheDir = cacheRoot() + QStringLiteral("/%1-%2").arg(GetCurrentProcessId()).arg(instances++);
@@ -400,7 +429,19 @@ Clipboard::Clipboard(QObject* parent): QObject(parent) {
 	});
 }
 
-Clipboard::~Clipboard() { QDir(this->mCacheDir).removeRecursively(); }
+Clipboard::Clipboard(
+    std::shared_ptr<ClipboardReadProvider> provider,
+    const QString& directory,
+    QThreadPool* pool
+)
+    : mCacheDir(directory)
+    , readProvider(std::move(provider))
+    , readPool(pool) {}
+
+Clipboard::~Clipboard() {
+	this->captureGeneration->cancelled = true;
+	QDir(this->mCacheDir).removeRecursively();
+}
 
 QString Clipboard::cacheDir() {
 	QDir().mkpath(this->mCacheDir);
@@ -419,7 +460,17 @@ void Clipboard::onClipboardUpdate() {
 void Clipboard::startCapture() {
 	this->captureAgain = false;
 
-	auto sequence = GetClipboardSequenceNumber();
+	auto sequence = this->readProvider->sequence();
+	// An update already queued at clear is not a new copy. If Windows cannot
+	// identify the current sequence, fail closed until an identifiable change.
+	if (this->cleared && (sequence == 0 || sequence == this->clearSequence)) return;
+	if (this->cleared && this->clearSequence == 0) {
+		// Clear itself had no trustworthy identity. Establish a baseline first;
+		// learning an identity is not evidence of a new post-clear copy.
+		this->clearSequence = sequence;
+		this->capturedSequence = sequence;
+		return;
+	}
 	if (sequence != 0 && sequence == this->capturedSequence) return;
 	if (sequence != 0 && sequence == this->suppressedSequence) {
 		this->capturedSequence = sequence;
@@ -429,8 +480,12 @@ void Clipboard::startCapture() {
 	this->capturing = true;
 	auto id = this->nextId++;
 
-	auto* task = QRunnable::create([self = QPointer(this), id, dir = this->cacheDir()]() {
-		auto capture = readClipboard(id, dir);
+	auto* task = QRunnable::create([self = QPointer(this),
+	                               provider = this->readProvider,
+	                               generation = this->captureGeneration,
+	                               id,
+	                               dir = this->cacheDir()]() {
+		auto capture = readClipboard(*provider, generation, id, dir);
 
 		QMetaObject::invokeMethod(
 		    QCoreApplication::instance(),
@@ -442,23 +497,27 @@ void Clipboard::startCapture() {
 		);
 	});
 
-	capturePool()->start(task);
+	this->readPool->start(task);
 }
 
 void Clipboard::finishCapture(const ClipboardCapture& capture) {
 	this->capturing = false;
-	if (capture.sequence != 0) this->capturedSequence = capture.sequence;
 
-	auto stale = capture.sequence < this->writtenSequence
+	auto stale = capture.generation != this->captureGeneration
+	          || capture.generation->cancelled
+	          || (this->cleared && (capture.sequence == 0 || capture.sequence == this->clearSequence))
+	          || capture.sequence < this->writtenSequence
 	          || (capture.sequence != 0 && capture.sequence == this->suppressedSequence);
+	// In particular, a pre-clear completion must not overwrite the clear
+	// sequence fence and make an old queued notification eligible again.
+	if (!stale && capture.sequence != 0) this->capturedSequence = capture.sequence;
 
-	if (capture.captured && capture.entry.isImage) {
-		if (stale) QFile::remove(capture.entry.imagePath);
-		else this->captureImage(capture.entry);
-	} else if (capture.captured && !stale) {
-		this->captureText(capture.entry);
-	} else {
+	if (stale || !capture.captured) {
 		removeEntryFiles(capture.entry);
+	} else if (capture.entry.isImage) {
+		this->captureImage(capture.entry);
+	} else {
+		this->captureText(capture.entry);
 	}
 
 	if (this->captureAgain) this->startCapture();
@@ -646,6 +705,13 @@ void Clipboard::deleteEntry(qint64 id) {
 }
 
 void Clipboard::wipe() {
+	this->captureGeneration->cancelled = true;
+	this->captureGeneration = std::make_shared<ClipboardCaptureGeneration>();
+	this->captureAgain = false;
+	this->cleared = true;
+	this->clearSequence = this->readProvider->sequence();
+	this->capturedSequence = this->clearSequence;
+	this->suppressNextCaptureFor = -1;
 	for (const auto& entry: this->storage) removeEntryFiles(entry);
 	this->storage.clear();
 	this->rebuildEntriesProperty();

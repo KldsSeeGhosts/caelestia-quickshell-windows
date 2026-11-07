@@ -10,7 +10,6 @@
 #include <optional>
 #include <set>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -198,18 +197,15 @@ QString errorText(const char* what, LONG code) {
 }
 
 QString revertTopology(DisplayTopology& previous) {
-	LONG result = ERROR_INVALID_PARAMETER;
-	if (!previous.paths.empty()) {
-		result = applyTopology(previous, false, true);
-		if (result == ERROR_SUCCESS) return {};
-		result = applyTopology(previous, true, true);
-		if (result == ERROR_SUCCESS) return {};
-		qCWarning(logDisplays) << "Restoring the previous layout failed:" << result
-		                       << "- going back to the saved one";
-	}
-
-	result = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_USE_DATABASE_CURRENT);
-	return result == ERROR_SUCCESS ? QString() : errorText("SetDisplayConfig", result);
+	return restoreDisplayTopology(
+	    previous,
+	    [](DisplayTopology& supplied) {
+		    const auto result = applyTopology(supplied, false, true);
+		    return result == ERROR_SUCCESS ? QString()
+		                                   : errorText("Restoring the previous display layout", result);
+	    },
+	    [](DisplayTopology& observed) { return queryTopology(QDC_ONLY_ACTIVE_PATHS, observed); }
+	);
 }
 
 QString saveCurrent() {
@@ -655,21 +651,36 @@ ScaleInfo readScale(const LUID& adapter, UINT32 source) {
 
 } // namespace
 
-Displays::Displays(QObject* parent): QObject(parent) {
-	this->refreshTimer.setSingleShot(true);
-	QObject::connect(&this->refreshTimer, &QTimer::timeout, this, [this] { this->load(true); });
+namespace {
+std::shared_ptr<DisplayTransaction> displayTransaction() {
+	static auto transaction = [] {
+		auto owner = DisplayTransaction::create(
+		    {
+		        [](DisplayTopology& topology) {
+			        return queryTopology(QDC_ONLY_ACTIVE_PATHS, topology);
+		        },
+		        [](DisplayTopology topology) {
+			        const auto result = applyBest(topology, false);
+			        return result == ERROR_SUCCESS ? QString() : errorText("SetDisplayConfig", result);
+		        },
+		        [](DisplayTopology topology) { return revertTopology(topology); },
+		        [] { return saveCurrent(); },
+		    },
+		    std::chrono::seconds(CONFIRM_SECONDS)
+		);
+		QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, [owner] {
+			if (!owner->shutdown()) {
+				qCWarning(logDisplays) << "Display recovery incomplete at shutdown; no restoration is claimed";
+			}
+		});
+		return owner;
+	}();
+	return transaction;
+}
+} // namespace
 
-	this->countdownTimer.setInterval(1000);
-	QObject::connect(&this->countdownTimer, &QTimer::timeout, this, [this] {
-		if (!this->mPending) {
-			this->countdownTimer.stop();
-			return;
-		}
-
-		this->mSecondsLeft = std::max(0, this->mSecondsLeft - 1);
-		emit this->confirmSecondsLeftChanged();
-		if (this->mSecondsLeft == 0) this->revertChanges();
-	});
+Displays::Displays(QObject* parent): QObject(parent), mTransaction(displayTransaction()) {
+	this->initializeTransaction();
 
 	auto* window = qs::windows::services::ServiceMessageWindow::instance();
 	window->addHandler(WM_DISPLAYCHANGE, this, [self = QPointer(this)](WPARAM /*w*/, LPARAM /*l*/) {
@@ -677,12 +688,28 @@ Displays::Displays(QObject* parent): QObject(parent) {
 	});
 }
 
-Displays::~Displays() {
-	if (this->mPending && !this->mBusy && !this->mPrevious.paths.empty()) {
-		auto error = revertTopology(this->mPrevious);
-		if (!error.isEmpty()) qCWarning(logDisplays) << "Reverting on exit failed:" << error;
-	}
+#ifdef QS_DISPLAYS_TEST
+Displays::Displays(std::shared_ptr<DisplayTransaction> transaction)
+    : mTransaction(std::move(transaction))
+    , mSynthetic(true) {
+	this->initializeTransaction();
 }
+#endif
+
+void Displays::initializeTransaction() {
+	this->mLease = this->mTransaction->acquire();
+	this->refreshTimer.setSingleShot(true);
+	QObject::connect(&this->refreshTimer, &QTimer::timeout, this, [this] { this->load(true); });
+	// Poll only while work/recovery is outstanding. Native completion and the
+	// monotonic deadline do not depend on this timer or on any QML event loop.
+	this->countdownTimer.setInterval(100);
+	QObject::connect(&this->countdownTimer, &QTimer::timeout, this, [this] {
+		this->syncTransaction();
+	});
+	this->syncTransaction();
+}
+
+Displays::~Displays() { this->mTransaction->release(this->mLease); }
 
 int Displays::confirmTimeout() { return CONFIRM_SECONDS; }
 
@@ -706,6 +733,9 @@ const Displays::Entry* Displays::find(const QString& id) const {
 }
 
 void Displays::load(bool notify) {
+#ifdef QS_DISPLAYS_TEST
+	if (this->mSynthetic) return;
+#endif
 	DisplayTopology active;
 	if (!queryTopology(QDC_ONLY_ACTIVE_PATHS, active)) {
 		qCWarning(logDisplays) << "QueryDisplayConfig failed:" << GetLastError();
@@ -922,110 +952,66 @@ void Displays::fail(const QString& message) {
 }
 
 bool Displays::runJob(Job job, bool confirm) {
-	if (this->mBusy) {
-		this->fail(QStringLiteral("Another display change is still running"));
+	QString rejection;
+	if (!this->mTransaction->submit(this->mLease, std::move(job), confirm, rejection)) {
+		const auto previousError = this->mLastError;
+		this->syncTransaction();
+		// Snapshot refusal may already have been published by syncTransaction.
+		if (this->mLastError != rejection || previousError == rejection) this->fail(rejection);
 		return false;
 	}
-
-	bool tookSnapshot = false;
-	if (confirm && !this->mPending) {
-		if (!queryTopology(QDC_ONLY_ACTIVE_PATHS, this->mPrevious) || this->mPrevious.paths.empty()) {
-			this->mPrevious = {};
-			this->fail(QStringLiteral("Couldn't read the current display layout"));
-			return false;
-		}
-		tookSnapshot = true;
-	}
-
-	if (!this->mLastError.isEmpty()) {
-		this->mLastError.clear();
-		emit this->lastErrorChanged();
-	}
-
-	this->countdownTimer.stop();
-	this->setBusy(true);
-
-	std::thread([self = QPointer(this), job = std::move(job), confirm, tookSnapshot]() {
-		SetThreadDescription(GetCurrentThread(), L"qs display config");
-		auto error = job();
-
-		QMetaObject::invokeMethod(
-		    QCoreApplication::instance(),
-		    [self, error = std::move(error), confirm, tookSnapshot]() {
-			    if (self) self->onJobFinished(error, confirm, tookSnapshot);
-		    },
-		    Qt::QueuedConnection
-		);
-	}).detach();
-
+	this->syncTransaction();
 	return true;
 }
 
-void Displays::onJobFinished(const QString& error, bool confirm, bool tookSnapshot) {
-	this->setBusy(false);
-
-	if (!error.isEmpty()) {
-		if (tookSnapshot) this->mPrevious = {};
-		this->fail(error);
-		if (this->mPending) this->countdownTimer.start();
-	} else if (confirm) {
-		this->armConfirmation();
-	} else if (this->mPending) {
-		this->countdownTimer.start();
-	}
-
-	this->scheduleRefresh(300);
-	QTimer::singleShot(1500, this, [this] { this->load(true); });
-}
-
-void Displays::armConfirmation() {
-	this->mSecondsLeft = CONFIRM_SECONDS;
-	emit this->confirmSecondsLeftChanged();
-
-	if (!this->mPending) {
-		this->mPending = true;
+void Displays::syncTransaction() {
+	const auto state = this->mTransaction->state();
+	this->setBusy(state.busy);
+	if (state.pending != this->mPending) {
+		this->mPending = state.pending;
 		emit this->pendingConfirmationChanged();
 	}
-
-	this->countdownTimer.start();
-}
-
-void Displays::clearConfirmation() {
-	this->countdownTimer.stop();
-
-	if (this->mSecondsLeft != 0) {
-		this->mSecondsLeft = 0;
+	if (state.secondsLeft != this->mSecondsLeft) {
+		this->mSecondsLeft = state.secondsLeft;
 		emit this->confirmSecondsLeftChanged();
 	}
-
-	if (this->mPending) {
-		this->mPending = false;
-		emit this->pendingConfirmationChanged();
+	if (state.revision != this->mRevision) {
+		this->mRevision = state.revision;
+		if (state.error != this->mLastError) {
+			if (!state.error.isEmpty()) this->fail(state.error);
+			else {
+				this->mLastError.clear();
+				emit this->lastErrorChanged();
+			}
+		}
+		if (!state.busy) {
+			this->scheduleRefresh(300);
+			QTimer::singleShot(1500, this, [this] { this->load(true); });
+		}
+	}
+	if (state.busy || state.deadline.has_value()) {
+		if (!this->countdownTimer.isActive()) this->countdownTimer.start();
+	} else {
+		this->countdownTimer.stop();
 	}
 }
 
 void Displays::keepChanges() {
-	if (!this->mPending || this->mBusy) return;
-
-	this->mPrevious = {};
-	this->clearConfirmation();
-	this->runJob([] { return saveCurrent(); }, false);
+	QString rejection;
+	const bool accepted = this->mTransaction->keep(this->mLease, rejection);
+	this->syncTransaction();
+	if (!accepted && !rejection.isEmpty()) this->fail(rejection);
 }
 
 void Displays::revertChanges() {
-	if (!this->mPending || this->mBusy) return;
-
-	auto previous = std::move(this->mPrevious);
-	this->mPrevious = {};
-	this->clearConfirmation();
-	this->runJob([previous = std::move(previous)]() mutable { return revertTopology(previous); }, false);
+	this->mTransaction->revert(this->mLease);
+	this->syncTransaction();
 }
 
 bool Displays::applyLayoutChange(DisplayTopology topology) {
 	return this->runJob(
-	    [topology = std::move(topology)]() mutable -> QString {
-		    auto result = applyBest(topology, false);
-		    return result == ERROR_SUCCESS ? QString() : errorText("SetDisplayConfig", result);
+	    [owner = this->mTransaction, topology = std::move(topology)]() mutable -> QString {
+		    return owner->apply(std::move(topology));
 	    },
 	    true
 	);

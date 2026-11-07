@@ -229,7 +229,18 @@ bool isShown(HWND hwnd) {
 TrackedWindow::TrackedWindow(WindowTracker* tracker, HWND hwnd)
     : QObject(tracker)
     , tracker(tracker)
-    , mHwnd(hwnd) {}
+    , mHwnd(hwnd)
+    , fullscreenOwner(this->fullscreenOps, hwnd) {}
+
+TrackedWindow::~TrackedWindow() { this->releaseFullscreenOwnership(); }
+
+void TrackedWindow::releaseFullscreenOwnership() {
+	this->endingTracking = true;
+	if (this->fullscreenOwner.release() == fullscreen_ownership::Release::Failed) {
+		qCWarning(logTracker) << "Could not restore optional fullscreen ownership for"
+		                     << this->addressHex();
+	}
+}
 
 quint64 TrackedWindow::address() const {
 	return static_cast<quint64>(reinterpret_cast<quintptr>(this->mHwnd));
@@ -435,54 +446,18 @@ void TrackedWindow::setFullscreen(bool fullscreen) {
 }
 
 void TrackedWindow::fullscreenOn(QScreen* screen) {
-	auto& backup = this->fullscreenBackup;
-	if (IsHungAppWindow(this->mHwnd)) return;
-
 	if (screen == nullptr) {
-		if (!backup.active) {
-			if (this->bFullscreen.value()) {
-				qCInfo(logTracker) << "Window" << this->addressHex()
-				                   << "made itself fullscreen; cannot undo that for it.";
-			}
-			return;
+		if (this->fullscreenOwner.release() == fullscreen_ownership::Release::Failed) {
+			qCWarning(logTracker) << "Could not restore optional fullscreen for" << this->addressHex();
 		}
-
-		SetWindowLongPtrW(this->mHwnd, GWL_STYLE, backup.style);
-		SetWindowPos(
-		    this->mHwnd,
-		    nullptr,
-		    backup.rect.left,
-		    backup.rect.top,
-		    backup.rect.right - backup.rect.left,
-		    backup.rect.bottom - backup.rect.top,
-		    SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
-		);
-
-		backup.active = false;
 		return;
 	}
 
+	if (this->endingTracking) return;
 	auto rects = monitorRects(monitorForScreen(screen));
 	if (!rects.valid) return;
-
-	if (!backup.active) {
-		backup.style = GetWindowLongPtrW(this->mHwnd, GWL_STYLE);
-		GetWindowRect(this->mHwnd, &backup.rect);
-		backup.active = true;
-	}
-
-	if (IsZoomed(this->mHwnd)) ShowWindowAsync(this->mHwnd, SW_RESTORE);
-
-	SetWindowLongPtrW(this->mHwnd, GWL_STYLE, backup.style & ~(WS_CAPTION | WS_THICKFRAME));
-	SetWindowPos(
-	    this->mHwnd,
-	    HWND_TOP,
-	    rects.monitor.left(),
-	    rects.monitor.top(),
-	    rects.monitor.width(),
-	    rects.monitor.height(),
-	    SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS
-	);
+	auto rect = toRECT(rects.monitor);
+	(void)this->fullscreenOwner.enter(rect, this->bFullscreen.value());
 }
 
 bool TrackedWindow::moveToDesktop(qsizetype index) {
@@ -556,6 +531,13 @@ WindowTracker::WindowTracker() {
 	                 this, &WindowTracker::onScreensChanged);
 
 	if (auto* app = qobject_cast<QGuiApplication*>(QGuiApplication::instance())) {
+		// instance() is process-lifetime, so its destructor is not the normal
+		// exit path. Release before the application event loop stops.
+		QObject::connect(app, &QCoreApplication::aboutToQuit, this, [this]() {
+			for (auto* window: this->findChildren<TrackedWindow*>(Qt::FindDirectChildrenOnly)) {
+				window->releaseFullscreenOwnership();
+			}
+		});
 		QObject::connect(app, &QGuiApplication::screenAdded, this, &WindowTracker::onScreensChanged);
 		QObject::connect(app, &QGuiApplication::screenRemoved, this, [this](QScreen* screen) {
 			for (auto* window: this->mWindows) window->forgetScreen(screen);
@@ -585,6 +567,9 @@ WindowTracker::WindowTracker() {
 }
 
 WindowTracker::~WindowTracker() {
+	for (auto* window: this->findChildren<TrackedWindow*>(Qt::FindDirectChildrenOnly)) {
+		window->releaseFullscreenOwnership();
+	}
 	if (trackerInstance == this) trackerInstance = nullptr;
 }
 
@@ -878,6 +863,9 @@ void WindowTracker::addWindow(HWND hwnd) {
 
 void WindowTracker::removeWindow(TrackedWindow* window) {
 	qCDebug(logTracker) << "Dropping" << window->addressHex();
+	// Do this before callbacks and deleteLater(), including hide/eligibility
+	// removal while the native window is still alive.
+	window->releaseFullscreenOwnership();
 
 	this->mWindows.removeOne(window);
 	this->byHwnd.remove(window->hwnd());

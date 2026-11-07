@@ -7,6 +7,8 @@
 #include <qtmetamacros.h>
 #include <qtypes.h>
 
+#include "network_wifi_identity.hpp"
+
 namespace qs::windows::sys {
 
 class NetworkWifiNetwork: public QObject {
@@ -19,6 +21,12 @@ class NetworkWifiNetwork: public QObject {
 	Q_PROPERTY(bool active READ default NOTIFY activeChanged BINDABLE bindableActive);
 	Q_PROPERTY(QString security READ default NOTIFY securityChanged BINDABLE bindableSecurity);
 	Q_PROPERTY(bool hasProfile READ default NOTIFY hasProfileChanged BINDABLE bindableHasProfile);
+	Q_PROPERTY(QString selectionId READ selectionId NOTIFY identityChanged);
+	Q_PROPERTY(QString rawSsidHex READ rawSsidHex NOTIFY identityChanged);
+	Q_PROPERTY(quint32 authentication READ authentication NOTIFY identityChanged);
+	Q_PROPERTY(quint32 cipher READ cipher NOTIFY identityChanged);
+	Q_PROPERTY(bool newProfileSupported READ newProfileSupported NOTIFY identityChanged);
+	Q_PROPERTY(QString newProfileReason READ newProfileReason NOTIFY identityChanged);
 	// clang-format on
 	QML_ELEMENT;
 	QML_UNCREATABLE("NetworkWifiNetworks can only be acquired from Network.networks");
@@ -37,6 +45,20 @@ public:
 
 	[[nodiscard]] const QString& profileName() const { return this->mProfileName; }
 	void setProfileName(const QString& v) { this->mProfileName = v; }
+	[[nodiscard]] QString selectionId() const { return wifi_identity::selectionId(this->mNetwork); }
+	[[nodiscard]] QString rawSsidHex() const {
+		return QString::fromLatin1(this->mNetwork.ssidBytes.toHex());
+	}
+	[[nodiscard]] quint32 authentication() const { return this->mNetwork.authentication; }
+	[[nodiscard]] quint32 cipher() const { return this->mNetwork.cipher; }
+	[[nodiscard]] bool newProfileSupported() const {
+		return wifi_identity::supportsNewProfile(this->mNetwork);
+	}
+	[[nodiscard]] QString newProfileReason() const {
+		return this->newProfileSupported() ? QString() : QStringLiteral("unsupported-security");
+	}
+	[[nodiscard]] const RawWifiNetwork& network() const { return this->mNetwork; }
+	void setNetwork(const RawWifiNetwork& network);
 
 	void setSsid(const QString& v) { this->bSsid = v; }
 	void setBssid(const QString& v) { this->bBssid = v; }
@@ -54,6 +76,7 @@ signals:
 	void activeChanged();
 	void securityChanged();
 	void hasProfileChanged();
+	void identityChanged();
 
 private:
 	// clang-format off
@@ -67,6 +90,7 @@ private:
 	// clang-format on
 
 	QString mProfileName;
+	RawWifiNetwork mNetwork;
 };
 
 } // namespace qs::windows::sys

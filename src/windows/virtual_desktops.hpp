@@ -139,6 +139,9 @@ signals:
 	void commandResult(QVariantMap result);
 
 private:
+#ifdef QS_TEST
+	friend struct NativeDesktopFacadeTestHook;
+#endif
 	explicit VirtualDesktops();
 #ifdef QS_TEST
 	explicit VirtualDesktops(TestHooks hooks);

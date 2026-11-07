@@ -1,29 +1,20 @@
 #pragma once
 
-#include <vector>
+#include <atomic>
+#include <optional>
 
 #include <qobject.h>
 #include <qstring.h>
 #include <qt_windows.h>
 #include <qtclasshelpermacros.h>
 #include <qtmetamacros.h>
-
 #include <wlanapi.h>
+
+#include "network_wifi_identity.hpp"
 
 namespace qs::windows::sys {
 
 class Network;
-
-struct RawWifiNetwork {
-	QString ssid;
-	QString bssid;
-	int strength = 0;
-	int frequency = 0;
-	bool active = false;
-	QString security;
-	bool hasProfile = false;
-	QString profileName;
-};
 
 class NetworkWifiBackend: public QObject {
 	Q_OBJECT;
@@ -40,16 +31,15 @@ public:
 	void scan();
 	void refreshAvailableNetworks();
 	void refreshCurrentConnection();
-	void connectToNetwork(
-	    const QString& ssid,
-	    const QString& profileName,
-	    const QString& password,
-	    bool hasProfile,
-	    bool secure,
-	    bool wpa3
-	);
+	void connectToNetwork(const RawWifiNetwork& network, const QString& password, quint64 requestId);
+	void cancelConnection();
 	void disconnectActive();
-	void forgetNetwork(const QString& ssid, const QString& profileName);
+	void forgetNetwork(const RawWifiNetwork& network);
+
+#ifdef QS_TEST
+	void finishOpenForTesting(DWORD result, HANDLE handle) { this->finishOpen(result, handle); }
+	void notifyForTesting(PWLAN_NOTIFICATION_DATA data) { notificationCallback(data, this); }
+#endif
 
 private:
 	void open();
@@ -69,6 +59,14 @@ private:
 	bool mHasAdapter = false;
 	bool mScanRequested = false;
 	GUID mInterfaceGuid {};
+	struct PendingConnection {
+		RawWifiNetwork network;
+		QString profileName;
+		quint64 requestId = 0;
+	};
+	std::optional<PendingConnection> mPendingConnection;
+	// Read on the WLAN callback thread, checked again on the QObject thread.
+	std::atomic<quint64> mCallbackRequestId {0};
 };
 
 } // namespace qs::windows::sys

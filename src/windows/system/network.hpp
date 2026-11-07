@@ -11,6 +11,7 @@
 #include <qtimer.h>
 #include <qtmetamacros.h>
 #include <qtypes.h>
+#include <qvariant.h>
 
 #include "../../core/doc.hpp"
 #include "../../core/model.hpp"
@@ -43,6 +44,7 @@ class Network: public QObject {
 	// property's change handler therefore sees the rows that refresh published.
 	Q_PROPERTY(int wifiSnapshot READ default NOTIFY wifiSnapshotChanged BINDABLE bindableWifiSnapshot);
 	Q_PROPERTY(bool needsLocationPermission READ default NOTIFY needsLocationPermissionChanged BINDABLE bindableNeedsLocationPermission);
+	Q_PROPERTY(QVariantMap lastWifiCommand READ lastWifiCommand NOTIFY wifiCommandChanged);
 	QSDOC_TYPE_OVERRIDE(ObjectModel<qs::windows::sys::NetworkWifiNetwork>*);
 	Q_PROPERTY(UntypedObjectModel* networks READ networks CONSTANT);
 	// clang-format on
@@ -58,6 +60,8 @@ public:
 	// State only: no WLAN or connectivity observation starts, so a fixture can
 	// exercise the publish path without touching the live service.
 	static Network* createForTesting();
+	NetworkWifiBackend* wifiBackendForTesting() { return this->mWifi.get(); }
+	QTimer* wifiCompletionTimerForTesting() { return &this->mWifiCompletionTimer; }
 #endif
 
 	[[nodiscard]] UntypedObjectModel* networks() { return &this->mNetworks; }
@@ -84,9 +88,7 @@ public:
 	[[nodiscard]] QBindable<int> bindableActiveSignalQuality() const {
 		return &this->bActiveSignalQuality;
 	}
-	[[nodiscard]] QBindable<QString> bindableActiveSecurity() const {
-		return &this->bActiveSecurity;
-	}
+	[[nodiscard]] QBindable<QString> bindableActiveSecurity() const { return &this->bActiveSecurity; }
 	[[nodiscard]] QBindable<QString> bindableWifiStatus() const { return &this->bWifiStatus; }
 	[[nodiscard]] QBindable<int> bindableWifiSnapshot() const { return &this->bWifiSnapshot; }
 	[[nodiscard]] QBindable<bool> bindableNeedsLocationPermission() const {
@@ -96,13 +98,17 @@ public:
 	Q_INVOKABLE void setWifiRadioEnabled(bool enabled);
 	Q_INVOKABLE void scanWifiNetworks();
 	Q_INVOKABLE void connectToNetwork(const QString& ssid, const QString& password);
+	Q_INVOKABLE void connectToNetworkById(const QString& selectionId, const QString& password);
+	Q_INVOKABLE void cancelWifiConnection();
 	Q_INVOKABLE void disconnectActive();
 	Q_INVOKABLE void forgetNetwork(const QString& ssid);
+	Q_INVOKABLE void forgetNetworkById(const QString& selectionId);
 	Q_INVOKABLE static void openWifiSettings();
 	Q_INVOKABLE static void openLocationSettings();
 	Q_INVOKABLE void setWifiListVisible(bool visible);
 
 	[[nodiscard]] bool wifiListVisible() const { return this->mWifiListVisible; }
+	[[nodiscard]] QVariantMap lastWifiCommand() const { return this->mLastWifiCommand; }
 
 	void backendSetHasInternet(bool hasInternet);
 	void backendSetEthernetConnected(bool connected);
@@ -112,14 +118,7 @@ public:
 	void backendSetWifiRadioOn(bool on);
 	void backendSetWifiScanning(bool scanning);
 	void backendSetNeedsLocationPermission(bool needs);
-	void backendSetCurrentConnection(
-	    const QString& ssid,
-	    const QString& bssid,
-	    int signalQuality,
-	    const QString& security,
-	    bool connected,
-	    bool connecting
-	);
+	void backendSetCurrentConnection(const RawWifiNetwork& network, bool connected, bool connecting);
 	void backendUpdateAvailableNetworks(const std::vector<RawWifiNetwork>& networks);
 	// One completed available-network refresh. The networks model is reconciled
 	// with these rows first, then wifiSnapshot advances once, even when the rows
@@ -127,7 +126,8 @@ public:
 	// snapshot a consumer may use to confirm an absence.
 	void backendPublishAvailableNetworks(const std::vector<RawWifiNetwork>& networks);
 	void backendEndPendingConnection();
-	void backendWifiConnectResult(const QString& ssid, bool success, const QString& reason);
+	void backendWifiConnectAccepted(quint64 requestId);
+	void backendWifiConnectResult(quint64 requestId, bool success, const QString& reason);
 
 signals:
 	void hasInternetChanged();
@@ -147,11 +147,24 @@ signals:
 	void wifiSnapshotChanged();
 	void needsLocationPermissionChanged();
 	void wifiConnectResult(const QString& ssid, bool success, const QString& reason);
+	// Accepted is not completion. Only a matching Windows completion produces
+	// observed; legacy wifiConnectResult remains terminal-only.
+	void wifiCommandChanged();
+	void wifiCommandResult(const QVariantMap& result);
 
 private:
 	explicit Network(QObject* parent, bool observe);
 	void updateWifiStatus();
 	[[nodiscard]] NetworkWifiNetwork* findNetwork(const QString& ssid) const;
+	[[nodiscard]] NetworkWifiNetwork* findNetworkById(const QString& selectionId) const;
+	void
+	connectNetwork(NetworkWifiNetwork* network, const QString& selection, const QString& password);
+	void publishWifiCommand(
+	    const QString& id,
+	    const QString& selectionId,
+	    const QString& status,
+	    const QString& reason
+	);
 
 	std::unique_ptr<NetworkWifiBackend> mWifi;
 	std::unique_ptr<NetworkConnectivityBackend> mConnectivity;
@@ -159,6 +172,12 @@ private:
 
 	bool mWifiListVisible = false;
 	QTimer mScanTimer;
+	QTimer mWifiCompletionTimer;
+	quint64 mNextWifiRequest = 0;
+	quint64 mPendingWifiRequest = 0;
+	bool mPendingWifiAccepted = false;
+	RawWifiNetwork mPendingWifiNetwork;
+	QVariantMap mLastWifiCommand;
 
 	// clang-format off
 	Q_OBJECT_BINDABLE_PROPERTY(Network, bool, bHasInternet, &Network::hasInternetChanged);
