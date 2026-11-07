@@ -449,8 +449,7 @@ def run_command(args, receipt):
             info["reason"] = reason
         finish(receipt, args.stage, code, time.monotonic() - began, info)
         write(args.receipt, receipt)
-    if getattr(args, "echo", False):
-        print(f"{args.stage}: {'success' if code == 0 else 'failure'}; exit={code}; raw output excluded")
+    print(f"{args.stage}: {'success' if code == 0 else 'failure'}; exit={code}; raw output excluded")
     return code if 0 <= code <= 255 else 1
 
 

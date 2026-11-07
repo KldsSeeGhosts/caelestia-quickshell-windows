@@ -466,7 +466,10 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(b"synthetic-private-output" in output.buffer.getvalue(), echo)
             self.assertNotIn("synthetic-private-output", json.dumps(receipt))
             if not echo:
-                self.assertEqual(output.buffer.getvalue(), b"")
+                # Only the sanitized stage summary is printed without --echo.
+                output.flush()
+                self.assertEqual(output.buffer.getvalue().strip(),
+                                 b"portable: success; exit=0; raw output excluded")
 
     def test_echo_streams_before_child_exit_and_preserves_diagnostics(self):
         marker = self.root / "echo-observed"
@@ -540,7 +543,9 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(stage["outcome"], "failure")
             self.assertEqual(stage["diagnostics"]["reason"], "command-launch-or-test-report-invalid")
             if not echo:
-                self.assertEqual(output.buffer.getvalue(), b"")
+                output.flush()
+                self.assertEqual(output.buffer.getvalue().strip(),
+                                 b"build: failure; exit=1; raw output excluded")
 
     def test_missing_junit_is_failure_even_after_exit_zero(self):
         code, receipt = self.run_fixture("pass", str(self.root / "absent.xml"))
