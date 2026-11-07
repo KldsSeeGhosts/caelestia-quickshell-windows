@@ -62,8 +62,6 @@ class TilingManager: public QObject {
 public:
 	using Edge = tiling::Edge;
 
-	// A title-bar drag (the native move loop) or a Super drag.
-	enum class DragGesture : quint8 { Caption, Super };
 	enum class DropMode : quint8 { Home, Swap, Insert, Move };
 
 	static TilingManager* instance();
@@ -291,6 +289,9 @@ private:
 		Layout* layout = nullptr;
 		TrackedWindow* target = nullptr;
 		std::optional<Edge> side;
+		// The cursor sample the plan was made from. Re-planning a shown plan
+		// uses it, not wherever the cursor has drifted since.
+		QPoint cursor;
 		// Physical frames after the drop: where the dragged window lands, and
 		// where the other window goes when exactly one other tile moves and it
 		// stays on this screen. Null when nothing is drawn.
@@ -301,6 +302,12 @@ private:
 		QRect zone;
 		// dropGeneration when the frames were computed.
 		quint64 generation = 0;
+
+		// The same drop: what the release would do, whatever the frames.
+		[[nodiscard]] bool sameDrop(const DropPlan& other) const {
+			return this->mode == other.mode && this->target == other.target && this->side == other.side
+			    && this->screen == other.screen;
+		}
 	};
 
 	// A move-size loop is classified at its first location change: a resize
@@ -308,7 +315,6 @@ private:
 	enum class DragKind : quint8 { Unknown, Move, Resize };
 
 	struct Drag {
-		DragGesture gesture = DragGesture::Caption;
 		DragKind kind = DragKind::Unknown;
 		bool zoomed = false;
 		QRect frame;
@@ -316,6 +322,9 @@ private:
 		QSize threshold;
 		// The cursor moved past the system drag threshold; the plan is shown.
 		bool active = false;
+		// A plan was shown at some point. Only a drag that never showed one
+		// (window contents hidden while dragging) plans at the release.
+		bool shown = false;
 		// The planned target stopped being a valid drop while the cursor was
 		// still: the drop is home until the cursor moves past the drag
 		// threshold from where it was when the plan was invalidated.
@@ -404,8 +413,7 @@ private:
 	void onDeadline();
 	void startSnap(Managed& m, const QRect& frame);
 	void stepSnaps();
-	[[nodiscard]] DropPlan
-	planDrop(const Managed& m, const QPoint& cursor, DragGesture gesture, const DropPlan* previous) const;
+	[[nodiscard]] DropPlan planDrop(const Managed& m, const QPoint& cursor, const DropPlan* previous) const;
 	void simulateDrop(const Managed& m, DropPlan& plan) const;
 	void commitDrop(Managed& m, const DropPlan& plan);
 	void showDrag(const DropPlan& plan);

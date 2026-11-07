@@ -2396,7 +2396,9 @@ QRectF TilingManager::dragDisplaced() const {
 	return this->drag.active ? screenLocal(this->drag.plan.displaced, this->drag.plan.screen) : QRectF();
 }
 
-void TilingManager::onMoveSizeStarted(TrackedWindow* window, bool super) {
+// A title-bar drag and a Super drag drop by the same cursor rule, so the
+// tracker's `super` flag no longer changes the plan.
+void TilingManager::onMoveSizeStarted(TrackedWindow* window, [[maybe_unused]] bool super) {
 	auto iter = this->managed.find(window);
 	if (iter == this->managed.end() || iter->second.layout == nullptr) return;
 
@@ -2405,7 +2407,6 @@ void TilingManager::onMoveSizeStarted(TrackedWindow* window, bool super) {
 
 	this->dragging = window;
 	this->clearDrag();
-	this->drag.gesture = super ? DragGesture::Super : DragGesture::Caption;
 	this->drag.zoomed = IsZoomed(window->hwnd()) != FALSE;
 	this->drag.frame = currentFrame(window->hwnd());
 	this->drag.cursor = cursorPos();
@@ -2459,7 +2460,7 @@ void TilingManager::onDragMoved(TrackedWindow* window) {
 	if (iter == this->managed.end()) return;
 
 	auto previous = this->drag.active ? &this->drag.plan : nullptr;
-	this->showDrag(this->planDrop(iter->second, cursor, this->drag.gesture, previous));
+	this->showDrag(this->planDrop(iter->second, cursor, previous));
 }
 
 void TilingManager::invalidateDragTarget() {
@@ -2470,18 +2471,19 @@ void TilingManager::invalidateDragTarget() {
 // Publishes a plan, emitting only when what it shows changed.
 void TilingManager::showDrag(const DropPlan& plan) {
 	const auto& old = this->drag.plan;
-	auto same = this->drag.active && plan.mode == old.mode && plan.target == old.target
-	         && plan.side == old.side && plan.screen == old.screen && plan.landing == old.landing
+	auto same = this->drag.active && plan.sameDrop(old) && plan.landing == old.landing
 	         && plan.displaced == old.displaced;
 	this->drag.plan = plan;
+	this->drag.shown = true;
 	if (same) return;
 	this->drag.active = true;
 	emit this->dragChanged();
 }
 
-// Re-plans after a layout change at the same cursor. The target may change
-// only by the user's own movement: a plan whose target was invalidated, or
-// would now be another window, is home.
+// Re-plans after a layout change at the cursor sample the shown plan came
+// from. The drop may change only by the user's own movement: a plan whose
+// target was invalidated, or that would now be another drop (another target,
+// a swap turned insert or the other way round), is home.
 void TilingManager::replanDrag() {
 	auto iter = this->managed.find(this->dragging);
 	if (iter == this->managed.end()) return;
@@ -2490,8 +2492,8 @@ void TilingManager::replanDrag() {
 	auto plan = this->homePlan(m);
 	auto keep = !this->drag.invalidated && this->dropTargetValid(this->drag.plan);
 	if (keep) {
-		auto fresh = this->planDrop(m, cursorPos(), this->drag.gesture, &this->drag.plan);
-		keep = fresh.target == this->drag.plan.target;
+		auto fresh = this->planDrop(m, this->drag.plan.cursor, &this->drag.plan);
+		keep = fresh.sameDrop(this->drag.plan);
 		if (keep) plan = fresh;
 	}
 	if (!keep) this->invalidateDragTarget();
@@ -2572,12 +2574,19 @@ void TilingManager::onMoveSizeEnded(TrackedWindow* window) {
 	auto move = drag.kind == DragKind::Move
 	         || (drag.kind == DragKind::Unknown && (!resized || moved == 4));
 	if (move) {
-		// Planned afresh from the current tree. A target that was invalidated
-		// since the last plan makes the drop home; it is never replaced here.
+		// The release commits the drop the preview shows, re-planned from the
+		// current tree at the cursor sample it was planned from: the end event
+		// arrives late, and the cursor may have moved on with no new plan shown.
+		// If that is no longer the same drop, or its target was invalidated, the
+		// drop is home; it is never replaced here. A drag that never showed a
+		// plan (no location events) plans once, at the release cursor.
 		auto plan = this->homePlan(m);
 		this->dropGeneration++;
-		if (!drag.invalidated && (!drag.active || this->dropTargetValid(drag.plan))) {
-			plan = this->planDrop(m, cursorPos(), drag.gesture, drag.active ? &drag.plan : nullptr);
+		if (drag.active && !drag.invalidated && this->dropTargetValid(drag.plan)) {
+			auto fresh = this->planDrop(m, drag.plan.cursor, &drag.plan);
+			if (fresh.sameDrop(drag.plan)) plan = fresh;
+		} else if (!drag.shown && !drag.invalidated) {
+			plan = this->planDrop(m, cursorPos(), nullptr);
 		}
 		this->commitDrop(m, plan);
 		return;
@@ -2595,18 +2604,16 @@ void TilingManager::onMoveSizeEnded(TrackedWindow* window) {
 	this->markLayout(layout);
 }
 
-// A title-bar drop over another tile swaps the two. A Super drop swaps in the
-// tile's centre and, in dwindle, inserts on the side of an edge band. Master
-// and scrolling ignore the side, so they always swap. Another monitor's empty
-// area moves the window there; anywhere else on its own monitor is home.
-TilingManager::DropPlan TilingManager::planDrop(
-    const Managed& m,
-    const QPoint& cursor,
-    DragGesture gesture,
-    const DropPlan* previous
-) const {
+// The cursor decides, for a title-bar and a Super drag alike. Over another
+// tile, its centre swaps the two and, in dwindle, an edge band inserts on that
+// side. Master and scrolling ignore the side, so they always swap. Another
+// monitor's empty area moves the window there; anywhere else on its own
+// monitor (its own slot, a gap, the bar) is home.
+TilingManager::DropPlan
+TilingManager::planDrop(const Managed& m, const QPoint& cursor, const DropPlan* previous) const {
 	auto plan = this->homePlan(m);
 	auto* from = m.layout;
+	plan.cursor = cursor;
 	if (plan.screen == nullptr) return plan;
 
 	auto self = idOf(m.window);
@@ -2671,7 +2678,7 @@ TilingManager::DropPlan TilingManager::planDrop(
 		plan.screen = screen;
 		plan.zone = inflate(box, h).intersected(physicalMonitor(screen));
 
-		if (gesture == DragGesture::Super && layout->tree->kind() == tiling::Kind::Dwindle) {
+		if (layout->tree->kind() == tiling::Kind::Dwindle) {
 			auto cap = toPhysical(DROP_BAND_DP, dpr);
 			const auto* kept = previous != nullptr && previous->target == target ? &previous->side : nullptr;
 			plan.side = tiling::insertSide(box, cursor, cap, h, kept);
@@ -2715,9 +2722,7 @@ TilingManager::DropPlan TilingManager::planDrop(
 	// trees; any layout change since bumped the generation.
 	plan.generation = this->dropGeneration;
 	auto unchanged = previous != nullptr && previous->generation == plan.generation
-	              && previous->mode == plan.mode && previous->target == plan.target
-	              && previous->side == plan.side && previous->screen == plan.screen
-	              && previous->layout == plan.layout;
+	              && previous->sameDrop(plan) && previous->layout == plan.layout;
 	if (unchanged) {
 		plan.landing = previous->landing;
 		plan.displaced = previous->displaced;
