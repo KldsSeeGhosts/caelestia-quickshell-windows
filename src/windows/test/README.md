@@ -20,6 +20,57 @@ unclassified, classified twice, or a tier names a fixture that does not exist.
 
 All fixtures are built in CI, so every tier is at least compile-checked.
 
+`runtime_paths_test` compiles the production `src/core/paths.cpp` and runs
+base-, instance-, shell-only failure cases plus a valid runtime in isolated
+child processes. It uses regular-file and directory blockers rather than changing
+ACLs. It also covers required PID/path link and lock failures, including rollback
+of a shell link when PID publication fails. The fixture checks independent
+directory states, explicit failure results, controlled diagnostics, no access
+violation and no relative lock/log fallback. It is deterministic coverage of the
+path failure contract, not a Windows permission-denial or full-launch test.
+
+`runtime_paths_launch_test.ps1` separately exercises a built **real** `qs.exe`
+with a synthetic windowless QML config on offscreen/software Qt. It disables
+native control providers, never installs or starts the live shell, and checks:
+
+- An existing regular-file `QS_RUNTIME_DIR` blocker.
+- A real ACL denial of child-directory creation inside a newly owned temporary
+  runtime directory. A .NET creation probe must independently confirm denial.
+- Independent instance-only and shell-only blockers, plus PID/path bookkeeping
+  blockers.
+- Controlled nonzero startup refusal before QML readiness or IPC, and no relative
+  artifacts or runtime lock/logs on failure.
+- A valid control that loads QML, accepts a real IPC connection and exits zero.
+
+The script restores the fixture's original ACL in `finally` and removes synthetic
+profiles. Only per-case logs and `receipt.json` remain. Its evidence is actual
+isolated launch behavior, not installed-shell or physical-desktop qualification.
+Regular-file blockers are not permission-denial evidence.
+
+```powershell
+./src/windows/test/runtime_paths_launch_test.ps1 `
+  -BackendExe <backend-build>/qs.exe -QtPrefix <Qt>/6.11.2/msvc2022_64 `
+  -EvidenceRoot <new-absolute-evidence-directory>
+```
+
+Required runtime bookkeeping failure aborts launch before filesystem logging,
+QML/plugin initialization or IPC startup. This does not alter data/state/cache
+path policy. File-backed runtime links alone are not live-instance readiness:
+discovery also requires a held instance lock.
+
+The lock indicates process liveness, not IPC readiness: it is held during Qt
+and plugin startup, so a client may briefly see a live instance whose IPC
+endpoint is not listening yet. A later bookkeeping refusal can leave unheld
+runtime links or an empty lock file; those are not a live/ready instance.
+Existing early-log temporary files are outside this fixture's runtime-log
+assertion and are not claimed to be eliminated by this repair.
+
+The launch harness records only a named-pipe connection, not a command
+round trip. Its receipt and per-case logs scrub fixture/profile/tool paths
+and omit security descriptors. On failure, process output is retained even
+after a timeout; the failed synthetic profile is kept locally with restored
+ACLs. Do not upload that profile directory or older unsanitized receipts.
+
 ## Building
 
 From a Visual Studio x64 developer shell with Qt 6.11, clang-cl, CMake and

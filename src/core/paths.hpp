@@ -41,9 +41,10 @@ public:
 	QDir* shellRunDir();
 	QDir* shellVfsDir();
 	QDir* instanceRunDir();
-	void linkRunDir();
-	void linkPathDir();
-	void createLock();
+	// Required startup bookkeeping. Failure must stop launch before logging/IPC.
+	bool linkRunDir();
+	bool linkPathDir();
+	bool createLock();
 
 	QDir shellDataDir();
 	QDir shellStateDir();

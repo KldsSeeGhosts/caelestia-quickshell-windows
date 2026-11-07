@@ -188,8 +188,11 @@ int launch(const LaunchArgs& args, char** argv) {
 #endif
 
 	QsPaths::init(shellId, pathId, pragmas.dataDir, pragmas.stateDir, pragmas.cacheDir);
-	QsPaths::instance()->linkRunDir();
-	QsPaths::instance()->linkPathDir();
+	auto* paths = QsPaths::instance();
+	if (!paths->linkRunDir() || !paths->linkPathDir() || !paths->createLock()) {
+		qCritical() << "Cannot launch: required runtime bookkeeping could not be created.";
+		return -1;
+	}
 
 	Common::INITIAL_ENVIRONMENT = QProcessEnvironment::systemEnvironment();
 
@@ -359,8 +362,7 @@ int launch(const LaunchArgs& args, char** argv) {
 	}
 
 	qs::ipc::IpcServer::start();
-	QsPaths::instance()->createLock();
-	qCDebug(logStartup) << "Started IPC and took the lock in" << timer.restart() << "ms";
+	qCDebug(logStartup) << "Started IPC in" << timer.restart() << "ms";
 
 	auto root = RootWrapper(args.configPath, shellId);
 	QGuiApplication::setQuitOnLastWindowClosed(false);
