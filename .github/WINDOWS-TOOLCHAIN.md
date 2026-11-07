@@ -40,6 +40,17 @@ actual tools, stage outcomes/timings and nonempty test counts. Its producer-only
 fixtures run before preparing native tools. The existing stable fixture job
 always attempts a small sanitized receipt/JUnit upload, including on failure.
 Hard runner cancellation may prevent finalization or upload and is not a pass.
+Build parallelism is measured by `.github/scripts/Get-BuildJobs.ps1`: one job
+per logical processor, bounded by floor(total physical RAM / 3 GiB), clamped to
+1–16 (the fixture gate's accepted range). Measurement failure stops the job.
+Only compilation is parallelized, not test execution. Main push and manual
+runs have unique concurrency groups; only PR runs share a per-PR group and
+cancel earlier runs. The job label remains `Build all fixtures, run portable tier`.
+Opt-in command echo streams live without adding raw output to receipts.
+The producer's `merge` command supports two unfinalized same-run downstream
+receipts from parallel fixture/integration jobs, then normal finalization and
+validation using the unchanged v1 schema. This does not split the standalone
+backend workflow; artifact provenance must still be checked by its consumer.
 The shell checkout remains toolchain-only in standalone results, not evidence of
 an end-to-end tested shell/backend pair. See that contract for clean commands,
 privacy limits and root-owned intentional compile/test failure acceptance.

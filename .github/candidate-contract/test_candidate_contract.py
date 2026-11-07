@@ -62,6 +62,114 @@ class ContractTests(unittest.TestCase):
     def test_downstream_success(self):
         c.validate(passing("downstream"))
 
+    def partials(self):
+        fixture = passing("downstream")
+        integration = copy.deepcopy(fixture)
+        empty = c.new_receipt("downstream", "a" * 40, "b" * 40)
+        for receipt, absent in ((fixture, ("integration",)),
+                                (integration, ("configure", "build", "portable"))):
+            receipt.update(finishedAt=None, workflowOutcome=None, result="incomplete")
+            for name in absent:
+                receipt["stages"][name] = copy.deepcopy(empty["stages"][name])
+        del fixture["tests"]["integration"]
+        del integration["tests"]["portable"]
+        integration["omittedTiers"] = {}
+        return fixture, integration
+
+    def test_merge_then_finalize_and_validate_with_overlapping_stages(self):
+        fixture, integration = self.partials()
+        integration["createdAt"] = "2000-01-01T00:00:00+00:00"
+        integration["stages"]["prepare"]["diagnostics"] = {"outputBytesExcluded": 99}
+        original = copy.deepcopy((fixture, integration))
+        merged = c.merge(fixture, integration)
+        self.assertEqual((fixture, integration), original)
+        self.assertEqual(merged["createdAt"], integration["createdAt"])
+        self.assertEqual(merged["stages"]["prepare"], fixture["stages"]["prepare"])
+        self.assertEqual(merged["omittedTiers"], fixture["omittedTiers"])
+        self.assertEqual(merged["tests"]["portable"], fixture["tests"]["portable"])
+        self.assertEqual(merged["tests"]["integration"], integration["tests"]["integration"])
+        self.assertEqual(merged["result"], "incomplete")
+        self.assertTrue(c.finalize(merged, "success"))
+        c.validate(merged, kind="downstream")
+
+    def test_merge_refuses_mismatched_identity(self):
+        for path, value in (
+                (("kind",), "standalone"), (("schemaVersion",), 2),
+                (("sources", "backend", "requested"), "d" * 40),
+                (("sources", "shell", "resolved"), "d" * 40),
+                (("toolchain", "specSha256"), "d" * 64),
+                (("toolchain", "contractSha256"), "d" * 64),
+                (("toolchain", "expected", "clangVersion"), "drift"),
+                (("toolchain", "actual", "clangVersion"), "drift"),
+                (("flags", "qpa"), "windows"),
+                (("producer", "pythonVersion"), "3.12.11")):
+            fixture, integration = self.partials()
+            target = integration
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                c.merge(fixture, integration)
+
+    def test_merge_refuses_failed_owned_or_attempted_nonowned_stages(self):
+        for index, owned, absent in (
+                (0, ("sources", "producer", "prepare", "configure", "build", "portable"),
+                 ("integration",)),
+                (1, ("sources", "producer", "prepare", "integration"),
+                 ("configure", "build", "portable"))):
+            for name in owned + absent:
+                for field, value in (("outcome", "failure"), ("exitCode", 1),
+                                     ("exitCode", True)):
+                    pair = self.partials()
+                    pair[index]["stages"][name][field] = value
+                    with self.subTest(index=index, name=name, field=field), self.assertRaises(ValueError):
+                        c.merge(*pair)
+
+    def test_merge_refuses_finalized_inputs(self):
+        for index in (0, 1):
+            for field, value in (("finishedAt", c.now()), ("result", "non-pass"),
+                                 ("workflowOutcome", "success")):
+                pair = self.partials()
+                pair[index][field] = value
+                with self.subTest(index=index, field=field), self.assertRaises(ValueError):
+                    c.merge(*pair)
+
+    def test_merge_does_not_rescue_invalid_evidence_at_finalization(self):
+        fixture, integration = self.partials()
+        fixture["omittedTiers"] = {}
+        self.assertFalse(c.finalize(c.merge(fixture, integration), "success"))
+        for suite, index in (("portable", 0), ("integration", 1), ("producer", 0)):
+            pair = self.partials()
+            pair[index]["tests"][suite]["executed"] = 0
+            self.assertFalse(c.finalize(c.merge(*pair), "success"))
+
+    def test_merge_cli_fresh_output_and_finalize(self):
+        fixture, integration = self.partials()
+        actual = copy.deepcopy(fixture["toolchain"]["actual"])
+        # These fields are only populated by normal finalization, not run.
+        for receipt in (fixture, integration):
+            receipt["toolchain"]["actual"] = {}
+            receipt["producer"] = {}
+        left, right, output = (self.root / name for name in ("fixture.json", "integration.json", "merged.json"))
+        c.write(left, fixture)
+        c.write(right, integration)
+        command = [sys.executable, "-B", str(HELPER), "--receipt", str(output),
+                   "merge", "--fixture", str(left), "--integration", str(right)]
+        self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)
+        original = output.read_bytes()
+        self.assertEqual(subprocess.run(command, capture_output=True).returncode, 1)
+        self.assertEqual(output.read_bytes(), original)
+        merged = c.read(output)
+        toolchain = self.root / "actual.json"
+        c.write(toolchain, actual)
+        argv = ["candidate-contract", "--receipt", str(output), "finalize",
+                "--workflow-outcome", "success", "--toolchain", str(toolchain),
+                "--backend", "synthetic-backend", "--shell", "synthetic-shell"]
+        with patch.object(sys, "argv", argv), patch.object(c, "resolve_sources"), patch.object(
+                c.sys, "version_info", (3, 12, 10)):
+            self.assertEqual(c.main(), 0)
+        c.validate(c.read(output))
+
     def test_consumer_expected_pair_kind_and_digests(self):
         c.validate(passing("downstream"), kind="downstream", backend_sha="a" * 40,
                    shell_sha="b" * 40, contract_sha256="c" * 64, spec_sha256="e" * 64)
@@ -357,6 +465,54 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(b"synthetic-private-output" in output.buffer.getvalue(), echo)
             self.assertNotIn("synthetic-private-output", json.dumps(receipt))
+            if not echo:
+                # Only the sanitized stage summary is printed without --echo.
+                output.flush()
+                self.assertEqual(output.buffer.getvalue().strip(),
+                                 b"portable: success; exit=0; raw output excluded")
+
+    def test_echo_streams_before_child_exit_and_preserves_diagnostics(self):
+        marker = self.root / "echo-observed"
+
+        class ObservedOutput(io.BytesIO):
+            def write(stream, data):
+                result = super().write(data)
+                if b"first-line" in data:
+                    marker.touch()
+                return result
+
+        output = io.TextIOWrapper(ObservedOutput(), encoding="utf-8")
+        # The child cannot emit its second line or succeed until the parent
+        # echoes its first. Buffered-at-exit implementations fail after 5s.
+        code = (
+            "import pathlib,time,sys;print('first-line',flush=True);"
+            f"marker=pathlib.Path({str(marker)!r});"
+            "deadline=time.monotonic()+5\n"
+            "while not marker.exists() and time.monotonic()<deadline: time.sleep(.01)\n"
+            "sys.stdout.buffer.write(b'error: C1234\\xff');sys.stdout.flush();"
+            "sys.exit(0 if marker.exists() else 8)"
+        )
+        with contextlib.redirect_stdout(output):
+            result, receipt = self.run_fixture(code, echo=True)
+        self.assertEqual(result, 0)
+        info = receipt["stages"]["portable"]["diagnostics"]
+        self.assertEqual(info["outputBytesExcluded"],
+                         len(b"first-line\nerror: C1234\xff") +
+                         (1 if sys.platform == "win32" else 0))
+        self.assertEqual(info["compilerCodes"], ["C1234"])
+        self.assertIn("compile-error", info["categories"])
+
+    def test_echo_and_silent_capture_retain_identical_diagnostics_on_failure(self):
+        results = []
+        for echo in (False, True):
+            output = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+            with contextlib.redirect_stdout(output):
+                result, receipt = self.run_fixture(
+                    "import sys;sys.stdout.buffer.write(b'error: C1234\\xff');sys.exit(7)",
+                    echo=echo)
+            self.assertEqual(result, 7)
+            results.append(receipt["stages"]["portable"]["diagnostics"])
+        self.assertEqual(*results)
 
     def test_echo_preserves_non_utf8_output_on_legacy_stdout(self):
         output = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
@@ -373,6 +529,23 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(receipt["stages"]["portable"]["exitCode"], 7)
         self.assertNotIn("private-title", json.dumps(receipt))
         self.assertFalse(c.finalize(receipt, "success"))
+
+    def test_command_launch_failure_remains_durable_with_or_without_echo(self):
+        for echo in (False, True):
+            receipt = c.new_receipt("standalone", "a" * 40, "b" * 40)
+            args = argparse.Namespace(
+                receipt=str(self.root / "launch.json"), stage="build", junit=None,
+                unittest=False, echo=echo, command=[str(self.root / "absent-command")])
+            output = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(c.run_command(args, receipt), 1)
+            stage = c.read(args.receipt)["stages"]["build"]
+            self.assertEqual(stage["outcome"], "failure")
+            self.assertEqual(stage["diagnostics"]["reason"], "command-launch-or-test-report-invalid")
+            if not echo:
+                output.flush()
+                self.assertEqual(output.buffer.getvalue().strip(),
+                                 b"build: failure; exit=1; raw output excluded")
 
     def test_missing_junit_is_failure_even_after_exit_zero(self):
         code, receipt = self.run_fixture("pass", str(self.root / "absent.xml"))

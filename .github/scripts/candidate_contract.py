@@ -7,6 +7,7 @@ The JSON format and trust boundary are documented in ../candidate-contract/READM
 """
 
 import argparse
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -343,6 +344,48 @@ def finalize(receipt, workflow_outcome):
     return True
 
 
+def merge(fixture, integration):
+    """Join unfinalized same-run downstream evidence, never a partial PASS."""
+    shared = {"sources", "producer", "prepare"}
+    fixture_only = {"configure", "build", "portable"}
+    identity = ("schemaVersion", "kind", "evidenceClass", "sources",
+                "toolchain", "flags", "producer")
+    require(all(fixture[key] == integration[key] for key in identity),
+            "partial receipt identity mismatch")
+    require(fixture["kind"] == "downstream", "merge requires downstream receipts")
+    template = new_receipt("downstream", "a" * 40, "b" * 40)
+    empty = template["stages"]
+    require(type(fixture["schemaVersion"]) is int and fixture["schemaVersion"] == 1,
+            "unsupported version")
+    for receipt, owned, suites in (
+            (fixture, shared | fixture_only, {"producer", "portable"}),
+            (integration, shared | {"integration"}, {"producer", "integration"})):
+        require(set(receipt) == set(template), "partial receipt fields mismatch")
+        check_sources(receipt)
+        require(receipt["finishedAt"] is None and receipt["workflowOutcome"] is None
+                and receipt["result"] == "incomplete", "input already finalized")
+        require(set(receipt["stages"]) == set(empty), "partial stage set mismatch")
+        require(set(receipt["tests"]) == suites, "partial test set mismatch")
+        for name, stage in receipt["stages"].items():
+            require(set(stage) == set(empty[name]), "partial stage fields mismatch")
+            if name in owned:
+                require(stage["outcome"] == "success" and type(stage["exitCode"]) is int
+                        and stage["exitCode"] == 0, "owned stage did not succeed")
+                require(dt.datetime.fromisoformat(stage["startedAt"])
+                        >= dt.datetime.fromisoformat(receipt["createdAt"]),
+                        "stage predates its receipt")
+            else:
+                require(stage == empty[name], "non-owned stage attempted")
+    merged = copy.deepcopy(fixture)
+    merged["createdAt"] = min(
+        (fixture["createdAt"], integration["createdAt"]), key=dt.datetime.fromisoformat)
+    merged["stages"]["integration"] = copy.deepcopy(integration["stages"]["integration"])
+    merged["tests"]["integration"] = copy.deepcopy(integration["tests"]["integration"])
+    # Actual tool identities and producer Python may still be empty: the normal
+    # finalizer records them after its source recheck. Merge is not a PASS claim.
+    return merged
+
+
 def run_command(args, receipt):
     start(receipt, args.stage)
     write(args.receipt, receipt)  # Durable running marker before launching work.
@@ -355,13 +398,19 @@ def run_command(args, receipt):
             # Never reuse an old successful JUnit if this execution fails early.
             Path(args.junit).unlink(missing_ok=True)
             (Path(args.receipt).parent / f"{args.stage}.xml").unlink(missing_ok=True)
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        code, output = result.returncode, result.stdout
         if getattr(args, "echo", False):
             # Opt-in job diagnostics are not copied into retained artifacts.
             # Never enable this for commands that can read personal data/secrets.
-            sys.stdout.buffer.write(output)
-            sys.stdout.flush()
+            output = bytearray()
+            with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as child:
+                for line in iter(child.stdout.readline, b""):
+                    output.extend(line)
+                    sys.stdout.buffer.write(line)
+                    sys.stdout.flush()
+                code = child.wait()
+        else:
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            code, output = result.returncode, result.stdout
         if args.unittest:
             match = re.search(rb"(?m)^Ran (\d+) tests? in ", output)
             require(match is not None, "unittest count missing")
@@ -412,6 +461,9 @@ def main():
     init.add_argument("--kind", choices=("standalone", "downstream"), default="standalone")
     init.add_argument("--backend-sha", required=True)
     init.add_argument("--shell-sha", required=True)
+    join = sub.add_parser("merge")
+    join.add_argument("--fixture", required=True)
+    join.add_argument("--integration", required=True)
     sources = sub.add_parser("sources")
     sources.add_argument("--backend", required=True)
     sources.add_argument("--shell", required=True)
@@ -438,6 +490,15 @@ def main():
     expected.add_argument("--spec-sha256")
     args = parser.parse_args()
     try:
+        if args.action == "merge":
+            require(not Path(args.receipt).exists(), "receipt already exists")
+            receipt = merge(read(args.fixture), read(args.integration))
+            path = Path(args.receipt)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Exclusive creation also refuses races, aliases and input overwrites.
+            with path.open("x", encoding="utf-8") as output:
+                output.write(json.dumps(receipt, indent=2) + "\n")
+            return 0
         if args.action == "init":
             require(not Path(args.receipt).exists(), "receipt already exists")
             write(args.receipt, new_receipt(args.kind, args.backend_sha, args.shell_sha))
