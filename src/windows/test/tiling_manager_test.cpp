@@ -3175,9 +3175,9 @@ private slots:
 		QCOMPARE(fakeDesktop.threadAwareness, quint32(DPI_AWARENESS_PER_MONITOR_AWARE));
 	}
 
-	// P2-1. A title-bar drag drops with the cursor near the top of the target.
-	// There are no zones on a title-bar drop: it swaps the two windows, here
-	// across monitors.
+	// P2-1. A title-bar drag drops with the cursor in the upper half of a
+	// landscape target, short of its top band. The tile's shape decides
+	// nothing: the centre swaps the two windows, here across monitors.
 	void titleBarDropOnLandscapeTileSwaps() {
 		auto* platform = addLeftMonitor();
 		const auto cleanupScreen = qScopeGuard([&]() { removeMonitor(platform); });
@@ -3193,7 +3193,7 @@ private slots:
 		const auto from = source->tree->box(manager->idOf(dragged));
 		const auto box = destination->tree->box(manager->idOf(target));
 		QVERIFY(box.width() > box.height());
-		const auto cursor = QPoint(box.left() + box.width() / 4, box.top() + 30);
+		const auto cursor = QPoint(box.left() + box.width() / 4, box.top() + box.height() / 3);
 		manager->onMoveSizeStarted(dragged);
 		fakeDesktop.cursor = cursor;
 		fakeWindow(dragged->hwnd()).frame.moveTopLeft(cursor - QPoint(100, 15));

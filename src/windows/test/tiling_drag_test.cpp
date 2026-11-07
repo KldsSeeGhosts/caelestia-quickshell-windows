@@ -51,6 +51,7 @@ class TilingDragTest: public QObject {
 	Q_OBJECT;
 
 	using Mode = TilingManager::DropMode;
+	using Edge = TilingManager::Edge;
 
 	TilingManager* manager = nullptr;
 	QList<TrackedWindow*> windows;
@@ -132,6 +133,13 @@ class TilingDragTest: public QObject {
 		return point;
 	}
 
+	// A title-bar drag and a Super drag follow the same cursor rule.
+	static void gestures() {
+		QTest::addColumn<bool>("super");
+		QTest::newRow("caption") << false;
+		QTest::newRow("super") << true;
+	}
+
 private slots:
 	void init() {
 		fakeDesktop = {};
@@ -151,57 +159,98 @@ private slots:
 	}
 
 	// The reported case: two side-by-side tiles are each portrait, so the old
-	// drop always stacked them. A title-bar drop anywhere over B swaps.
-	void captionDropSwapsSideBySide_data() {
+	// drop always stacked them. The tile's shape decides nothing now: the
+	// centre swaps, and only an explicit edge band inserts on that side.
+	void captionDropSideBySide_data() {
 		QTest::addColumn<int>("spot");
 		QTest::newRow("centre") << 0;
-		QTest::newRow("top-12") << 1;
-		QTest::newRow("corner") << 2;
+		QTest::newRow("upper-centre") << 1;
+		QTest::newRow("top-band") << 2;
+		QTest::newRow("corner") << 3;
 	}
 
-	void captionDropSwapsSideBySide() {
+	void captionDropSideBySide() {
 		QFETCH(int, spot);
 		auto* a = add(1);
 		auto* b = add(2);
 		enable();
 		const auto boxA = box(a);
 		const auto boxB = box(b);
+		const auto tileB = frame(b);
 		QVERIFY(boxA.right() < boxB.left());
-		QVERIFY(boxB.height() > boxB.width());
-		auto cursor = boxB.center();
-		if (spot == 1) cursor.setY(boxB.top() + 12);
-		if (spot == 2) cursor = boxB.bottomRight() - QPoint(12, 12);
-		dragTo(a, cursor, false);
-		QCOMPARE(box(a), boxB);
-		QCOMPARE(box(b), boxA);
+		QVERIFY(tileB.height() > tileB.width());
+		const auto band = qMin(tileB.width() / 5, 120);
+		auto cursor = tileB.center();
+		// The upper half of a portrait tile, short of its top band.
+		if (spot == 1) cursor.setY(tileB.top() + band + 20);
+		if (spot == 2) cursor.setY(tileB.top() + 12);
+		// Equally deep in the right and bottom bands: the tie goes across.
+		if (spot == 3) cursor = tileB.bottomRight() - QPoint(11, 11);
+		begin(a, false);
+		moveTo(a, cursor);
+		const auto plan = manager->drag.plan;
+		QCOMPARE(plan.target, b);
+		finish(a);
+		const auto ra = box(a);
+		const auto rb = box(b);
 		QCOMPARE(manager->managed.at(a).layout->tree->ids().size(), 2);
-		QVERIFY(frame(a).left() > frame(b).right());
+		QCOMPARE(frame(a), plan.landing);
+		switch (spot) {
+		case 0:
+		case 1:
+			QCOMPARE(plan.mode, Mode::Swap);
+			QCOMPARE(ra, boxB);
+			QCOMPARE(rb, boxA);
+			QVERIFY(frame(a).left() > frame(b).right());
+			break;
+		case 2:
+			QCOMPARE(plan.mode, Mode::Insert);
+			QVERIFY(plan.side == Edge::Top);
+			QCOMPARE(ra.bottom() + 1, rb.top());
+			QCOMPARE(ra.left(), rb.left());
+			break;
+		case 3:
+			QCOMPARE(plan.mode, Mode::Insert);
+			QVERIFY(plan.side == Edge::Right);
+			QCOMPARE(rb.right() + 1, ra.left());
+			QCOMPARE(ra.top(), rb.top());
+			break;
+		default: break;
+		}
 	}
 
-	void superCentreSwaps() {
+	void centreSwaps_data() { gestures(); }
+
+	void centreSwaps() {
+		QFETCH(bool, super);
 		auto* a = add(1);
 		auto* b = add(2);
 		enable();
 		const auto boxA = box(a);
 		const auto boxB = box(b);
-		dragTo(a, boxB.center(), true);
+		dragTo(a, boxB.center(), super);
 		QCOMPARE(box(a), boxB);
 		QCOMPARE(box(b), boxA);
 	}
 
-	void superEdgeInserts_data() {
+	void edgeInserts_data() {
+		QTest::addColumn<bool>("super");
 		QTest::addColumn<bool>("landscape");
 		QTest::addColumn<int>("side");
 		const char* sides[] = {"left", "right", "top", "bottom"};
-		for (auto landscape: {false, true}) {
-			for (int side = 0; side < 4; side++) {
-				auto name = QByteArray(landscape ? "landscape-" : "portrait-") + sides[side];
-				QTest::newRow(name.constData()) << landscape << side;
+		for (auto super: {false, true}) {
+			for (auto landscape: {false, true}) {
+				for (int side = 0; side < 4; side++) {
+					auto name = QByteArray(super ? "super-" : "caption-") + (landscape ? "landscape-" : "portrait-")
+					          + sides[side];
+					QTest::newRow(name.constData()) << super << landscape << side;
+				}
 			}
 		}
 	}
 
-	void superEdgeInserts() {
+	void edgeInserts() {
+		QFETCH(bool, super);
 		QFETCH(bool, landscape);
 		QFETCH(int, side);
 		// A portrait monitor stacks two tiles, so each is landscape.
@@ -212,7 +261,11 @@ private slots:
 		const auto work = fakeDesktop.monitors[0].work;
 		const auto boxB = box(b);
 		QCOMPARE(boxB.width() > boxB.height(), landscape);
-		dragTo(a, inBand(boxB, side), true);
+		begin(a, super);
+		moveTo(a, inBand(boxB, side));
+		QCOMPARE(manager->drag.plan.mode, Mode::Insert);
+		QCOMPARE(manager->dragMode(), QStringLiteral("insert"));
+		finish(a);
 		const auto ra = box(a);
 		const auto rb = box(b);
 		switch (side) {
@@ -227,7 +280,10 @@ private slots:
 
 	// Jitter across a zone boundary and across a tile boundary: the 8 dp
 	// hysteresis keeps the previous result, so the preview does not flicker.
-	void superHysteresisNoFlicker() {
+	void hysteresisNoFlicker_data() { gestures(); }
+
+	void hysteresisNoFlicker() {
+		QFETCH(bool, super);
 		auto* a = add(1);
 		auto* b = add(2);
 		auto* c = add(3);
@@ -238,8 +294,25 @@ private slots:
 		// A | (B over C); the band is 20% of B's width, capped at 120 dp.
 		QCOMPARE(box(b).bottom() + 1, box(c).top());
 		const auto band = qMin(boxB.width() / 5, 120);
+		const auto y = boxB.center().y();
 
-		begin(a, true);
+		// A band is entered 8 dp past its boundary and left 8 dp past it.
+		begin(a, super);
+		moveTo(a, QPoint(boxB.left() + band + 20, y));
+		QCOMPARE(manager->drag.plan.mode, Mode::Swap);
+		moveTo(a, QPoint(boxB.left() + band - 3, y));
+		QCOMPARE(manager->drag.plan.mode, Mode::Swap);
+		moveTo(a, QPoint(boxB.left() + band - 10, y));
+		QCOMPARE(manager->drag.plan.mode, Mode::Insert);
+		QVERIFY(manager->drag.plan.side == Edge::Left);
+		moveTo(a, QPoint(boxB.left() + band + 3, y));
+		QCOMPARE(manager->drag.plan.mode, Mode::Insert);
+		moveTo(a, QPoint(boxB.left() + band + 10, y));
+		QCOMPARE(manager->drag.plan.mode, Mode::Swap);
+		manager->cancelDrag(a);
+		finish(a);
+
+		begin(a, super);
 		moveTo(a, QPoint(boxB.left() + band + 20, boxB.center().y()));
 		QVERIFY(manager->dragActive());
 		QCOMPARE(manager->drag.plan.mode, Mode::Swap);
@@ -300,14 +373,22 @@ private slots:
 	void planEqualsCommit_data() {
 		QTest::addColumn<QString>("layout");
 		QTest::addColumn<QString>("op");
+		QTest::addColumn<bool>("super");
+		QTest::addColumn<qreal>("dpr");
 		const char* ops[] = {
 		    "swap", "insert-left", "insert-right", "insert-top", "insert-bottom",
 		    "home", "move", "cross", "cross-insert",
 		};
 		for (const auto* layout: {"dwindle", "master", "scrolling"}) {
 			for (const auto* op: ops) {
-				auto name = QByteArray(layout) + '-' + op;
-				QTest::newRow(name.constData()) << QString::fromLatin1(layout) << QString::fromLatin1(op);
+				for (auto super: {false, true}) {
+					for (auto dpr: {2.0, 1.5, 1.75}) {
+						auto name = QByteArray(layout) + '-' + op + (super ? "-super-" : "-caption-")
+						          + QByteArray::number(dpr);
+						QTest::newRow(name.constData())
+						    << QString::fromLatin1(layout) << QString::fromLatin1(op) << super << qreal(dpr);
+					}
+				}
 			}
 		}
 	}
@@ -315,10 +396,13 @@ private slots:
 	void planEqualsCommit() {
 		QFETCH(QString, layout);
 		QFETCH(QString, op);
+		QFETCH(bool, super);
+		QFETCH(qreal, dpr);
 		manager->setLayout(layout);
-		// A second monitor left of and above the primary one at DPR 2.
-		auto* hidpi = addMonitor(QRect(-3840, -400, 3840, 2160), 2.0, QStringLiteral("fixture-hidpi"));
-		QCOMPARE(hidpi->devicePixelRatio(), 2.0);
+		// A second monitor left of and above the primary one, at an odd
+		// negative origin and a whole or fractional DPR.
+		auto* hidpi = addMonitor(QRect(-3840, -403, 3840, 2160), dpr, QStringLiteral("fixture-hidpi"));
+		QCOMPARE(hidpi->devicePixelRatio(), dpr);
 		auto* a = add(1, 0);
 		auto* b = add(2, 0);
 		TrackedWindow* c = nullptr;
@@ -328,7 +412,6 @@ private slots:
 		const auto boxB = box(b);
 		const auto dwindle = layout == QStringLiteral("dwindle");
 
-		auto super = op.contains(QStringLiteral("insert"));
 		auto cursor = boxB.center();
 		auto expected = Mode::Swap;
 		TrackedWindow* target = b;
@@ -377,13 +460,15 @@ private slots:
 		QCOMPARE(destination->screen->name(), screen);
 		const auto index = fakeDesktop.screens.indexOf(destination->screen);
 		const auto monitor = fakeDesktop.monitors.at(index < 0 ? 0 : index).monitor;
-		const auto dpr = destination->screen->devicePixelRatio();
+		const auto scale = destination->screen->devicePixelRatio();
 		QCOMPARE(frame(a), plan.landing);
-		QCOMPARE(landing, logical(plan.landing, monitor, dpr));
+		QCOMPARE(landing, logical(plan.landing, monitor, scale));
+		// A move to the empty monitor draws its landing too.
+		QVERIFY(!landing.isEmpty());
 		if (!plan.displaced.isNull()) {
 			QVERIFY(target != nullptr);
 			QCOMPARE(frame(target), plan.displaced);
-			QCOMPARE(displaced, logical(plan.displaced, monitor, dpr));
+			QCOMPARE(displaced, logical(plan.displaced, monitor, scale));
 		} else {
 			QVERIFY(displaced.isNull());
 		}
@@ -391,6 +476,238 @@ private slots:
 		// master and scrolling never draw a ghost.
 		if (op == QStringLiteral("swap") && dwindle) QVERIFY(!plan.displaced.isNull());
 		if (!dwindle) QVERIFY(plan.displaced.isNull());
+	}
+
+	// The edge band is 120 dp at the target's DPR: one physical pixel inside it
+	// inserts, its boundary swaps.
+	void bandScalesWithTargetDpi_data() {
+		QTest::addColumn<qreal>("dpr");
+		QTest::addColumn<bool>("inside");
+		for (auto dpr: {1.0, 1.5, 1.75, 2.0}) {
+			for (auto inside: {true, false}) {
+				auto name = QByteArray::number(dpr) + (inside ? "-inside" : "-boundary");
+				QTest::newRow(name.constData()) << qreal(dpr) << inside;
+			}
+		}
+	}
+
+	void bandScalesWithTargetDpi() {
+		QFETCH(qreal, dpr);
+		QFETCH(bool, inside);
+		addMonitor(QRect(-3840, -403, 3840, 2160), dpr, QStringLiteral("fixture-scaled"));
+		auto* a = add(1, 0);
+		add(2, 0);
+		auto* c = add(3, 1);
+		enable();
+		const auto tile = frame(c);
+		const auto cap = static_cast<int>(std::lround(120 * dpr));
+		QVERIFY(tile.width() / 5 > cap && tile.height() / 5 > cap);
+		begin(a, false);
+		moveTo(a, QPoint(tile.left() + cap - (inside ? 1 : 0), tile.center().y()));
+		QCOMPARE(manager->drag.plan.target, c);
+		QCOMPARE(manager->drag.plan.mode, inside ? Mode::Insert : Mode::Swap);
+		if (inside) QVERIFY(manager->drag.plan.side == Edge::Left);
+		const auto landing = manager->drag.plan.landing;
+		finish(a);
+		QCOMPARE(frame(a), landing);
+	}
+
+	// Equally deep in two bands of a square-capped tile: the horizontal band
+	// wins, the same way every time.
+	void cornerTieIsDeterministic_data() {
+		QTest::addColumn<int>("corner");
+		QTest::newRow("top-left") << 0;
+		QTest::newRow("top-right") << 1;
+		QTest::newRow("bottom-left") << 2;
+		QTest::newRow("bottom-right") << 3;
+	}
+
+	void cornerTieIsDeterministic() {
+		QFETCH(int, corner);
+		auto* a = add(1);
+		auto* b = add(2);
+		enable();
+		const auto tile = frame(b);
+		QVERIFY(tile.width() / 5 >= 120 && tile.height() / 5 >= 120);
+		const auto right = corner % 2 == 1;
+		const auto bottom = corner >= 2;
+		const QPoint cursor(
+		    right ? tile.right() - 5 : tile.left() + 5,
+		    bottom ? tile.bottom() - 5 : tile.top() + 5
+		);
+		for (int attempt = 0; attempt < 2; attempt++) {
+			begin(a, attempt == 1);
+			moveTo(a, cursor);
+			QCOMPARE(manager->drag.plan.mode, Mode::Insert);
+			QVERIFY(manager->drag.plan.side == (right ? Edge::Right : Edge::Left));
+			manager->cancelDrag(a);
+			finish(a);
+		}
+	}
+
+	// The release commits the plan the preview showed. The cursor moving on
+	// without a location event, so with no new plan shown, changes nothing.
+	void releaseCommitsShownPlan_data() {
+		QTest::addColumn<bool>("super");
+		QTest::addColumn<int>("drift");
+		const char* drifts[] = {"swap-then-edge", "insert-then-centre", "swap-then-own-tile"};
+		for (auto super: {false, true}) {
+			for (int drift = 0; drift < 3; drift++) {
+				auto name = QByteArray(super ? "super-" : "caption-") + drifts[drift];
+				QTest::newRow(name.constData()) << super << drift;
+			}
+		}
+	}
+
+	void releaseCommitsShownPlan() {
+		QFETCH(bool, super);
+		QFETCH(int, drift);
+		auto* a = add(1);
+		auto* b = add(2);
+		enable();
+		const auto boxA = box(a);
+		const auto boxB = box(b);
+		const auto shown = drift == 1 ? Mode::Insert : Mode::Swap;
+		begin(a, super);
+		moveTo(a, drift == 1 ? inBand(boxB, 2) : boxB.center());
+		QCOMPARE(manager->drag.plan.mode, shown);
+		QCOMPARE(manager->drag.plan.target, b);
+		const auto landing = manager->drag.plan.landing;
+		QSignalSpy changed(manager, &TilingManager::dragChanged);
+		switch (drift) {
+		case 0: fakeDesktop.cursor = inBand(boxB, 2); break;
+		case 1: fakeDesktop.cursor = boxB.center(); break;
+		case 2: fakeDesktop.cursor = boxA.center(); break;
+		default: break;
+		}
+		finish(a);
+		QCOMPARE(changed.count(), 1);
+		QCOMPARE(frame(a), landing);
+		const auto ra = box(a);
+		const auto rb = box(b);
+		if (shown == Mode::Swap) {
+			QCOMPARE(ra, boxB);
+			QCOMPARE(rb, boxA);
+		} else {
+			QCOMPARE(ra.bottom() + 1, rb.top());
+			QCOMPARE(ra.left(), rb.left());
+		}
+	}
+
+	// The target reflows under the still cursor so that the same cursor would
+	// now insert instead of swap. The shown intent is gone: the drop is home,
+	// and the release does not substitute the new one.
+	void reflowedIntentIsHome_data() { gestures(); }
+
+	void reflowedIntentIsHome() {
+		QFETCH(bool, super);
+		auto* a = add(1);
+		auto* b = add(2);
+		enable();
+		begin(a, super);
+		// Just short of B's top band.
+		moveTo(a, QPoint(frame(b).center().x(), frame(b).top() + 125));
+		QCOMPARE(manager->drag.plan.mode, Mode::Swap);
+		QCOMPARE(manager->drag.plan.target, b);
+		const auto top = frame(b).top();
+		// A larger outer gap moves B's top edge 30 px towards the cursor.
+		manager->setGapsOut(40);
+		manager->sync();
+		QCOMPARE(frame(b).top(), top + 30);
+		QCOMPARE(manager->drag.plan.mode, Mode::Home);
+		QVERIFY(manager->dragLanding().isNull());
+		const auto boxA = box(a);
+		const auto boxB = box(b);
+		finish(a);
+		QCOMPARE(box(a), boxA);
+		QCOMPARE(box(b), boxB);
+		QVERIFY(box(a).right() < box(b).left());
+	}
+
+	// With window contents hidden while dragging there are no location events
+	// and no preview; the release plans once, by the same cursor rule.
+	void noPreviewPlansAtRelease_data() {
+		QTest::addColumn<bool>("super");
+		QTest::addColumn<bool>("edge");
+		for (auto super: {false, true}) {
+			for (auto edge: {false, true}) {
+				auto name = QByteArray(super ? "super-" : "caption-") + (edge ? "edge" : "centre");
+				QTest::newRow(name.constData()) << super << edge;
+			}
+		}
+	}
+
+	void noPreviewPlansAtRelease() {
+		QFETCH(bool, super);
+		QFETCH(bool, edge);
+		auto* a = add(1);
+		auto* b = add(2);
+		enable();
+		const auto boxA = box(a);
+		const auto boxB = box(b);
+		QSignalSpy changed(manager, &TilingManager::dragChanged);
+		begin(a, super);
+		const auto cursor = edge ? inBand(boxB, 2) : boxB.center();
+		frame(a).translate(cursor - fakeDesktop.cursor);
+		fakeDesktop.cursor = cursor;
+		finish(a);
+		QCOMPARE(changed.count(), 0);
+		const auto ra = box(a);
+		const auto rb = box(b);
+		if (edge) {
+			QCOMPARE(ra.bottom() + 1, rb.top());
+			QCOMPARE(ra.left(), rb.left());
+		} else {
+			QCOMPARE(ra, boxB);
+			QCOMPARE(rb, boxA);
+		}
+	}
+
+	// A shown plan withdrawn when its target closed is not planned again by
+	// the release fallback, even after the cursor moved over another tile.
+	void withdrawnPlanStaysHome_data() { gestures(); }
+
+	void withdrawnPlanStaysHome() {
+		QFETCH(bool, super);
+		auto* a = add(1);
+		auto* b = add(2);
+		auto* c = add(3);
+		enable();
+		const auto boxA = box(a);
+		begin(a, super);
+		moveTo(a, box(b).center());
+		QCOMPARE(manager->drag.plan.target, b);
+		manager->unmanage(b);
+		QVERIFY(!manager->dragActive());
+		const auto cursor = box(c).center();
+		frame(a).translate(cursor - fakeDesktop.cursor);
+		fakeDesktop.cursor = cursor;
+		finish(a);
+		QCOMPARE(box(a), boxA);
+		QCOMPARE(manager->managed.at(c).layout, manager->managed.at(a).layout);
+		QVERIFY(box(c).left() > boxA.right());
+	}
+
+	// A window still maximized when its drag ends is left to Windows.
+	void maximizedDragEndCommitsNothing_data() { gestures(); }
+
+	void maximizedDragEndCommitsNothing() {
+		QFETCH(bool, super);
+		auto* a = add(1);
+		auto* b = add(2);
+		enable();
+		const auto boxA = box(a);
+		const auto boxB = box(b);
+		fakeWindow(a->hwnd()).maximized = true;
+		emit a->maximizedChanged();
+		manager->sync();
+		QCOMPARE(manager->stateOf(manager->managed.at(a)), TilingManager::State::Suspended);
+		begin(a, super);
+		QCOMPARE(manager->dragging, a);
+		moveTo(a, boxB.center());
+		finish(a);
+		QCOMPARE(box(a), boxA);
+		QCOMPARE(box(b), boxB);
 	}
 
 	// Aero Snap can resize the frame during a title-bar move. A drag that
@@ -567,7 +884,10 @@ private slots:
 	}
 
 	// The gap between two frames is home: no tile is drawn there.
+	void gapIsHome_data() { gestures(); }
+
 	void gapIsHome() {
+		QFETCH(bool, super);
 		manager->setGapsIn(10);
 		manager->setGapsOut(20);
 		auto* a = add(1);
@@ -577,7 +897,7 @@ private slots:
 		const auto boxB = box(b);
 		const auto spot = QPoint(boxB.left() + 1, boxB.center().y());
 		QVERIFY(!frame(b).contains(spot));
-		begin(a, false);
+		begin(a, super);
 		moveTo(a, spot);
 		QCOMPARE(manager->drag.plan.mode, Mode::Home);
 		finish(a);
