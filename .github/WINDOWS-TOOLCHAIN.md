@@ -2,7 +2,7 @@
 
 The producer workflow consumes the shell repository's canonical public
 `windows/toolchain.json`, Python locks and shared PowerShell helpers at
-`ab54ebb6cd3e2d8ab6f459bb683faa0e71038b5b`. There is no second compiler,
+`fcacc6ea53683cdbb8c1bd65c8b4fe90e9ac6664`. There is no second compiler,
 Rust or runtime policy in this repository. Updating that contract source is
 a deliberate reviewed toolchain upgrade, not a floating branch checkout.
 
