@@ -67,7 +67,10 @@ Actual identities must match expected identities and the combined digest.
 `producer.pythonVersion` records the actual Python 3.12 patch version.
 The producer does not substitute a runner banner for selected compiler identity.
 `flags` fixes Ninja, Release, clang-cl, portable selection and offscreen/software
-Qt. Jobs use two build workers; packaging is not performed.
+Qt. Build workers are selected by `.github/scripts/Get-BuildJobs.ps1`: one per
+logical processor, bounded by floor(physical RAM / 3 GiB), clamped to 1–16.
+Failed processor/memory measurement fails closed rather than guessing.
+Tests are not parallelized; packaging is not performed.
 
 `tests` contains `producer` and `portable`, plus `integration` for downstream.
 Each has integer `total`, `executed`, `failed`, `skipped`, and `skips` entries
@@ -113,7 +116,9 @@ python -B .github/scripts/candidate_contract.py --receipt <results>/candidate-re
 The existing workflow prepares tools through the pinned shell
 `Prepare-Toolchain.ps1`. `Invoke-WindowsFixtureGate.ps1` runs phases `Configure`,
 `Build` and `Portable`, taking `-ContractRoot`, `-ToolRoot`, `-BuildRoot`,
-`-Results` and optional `-Jobs 2`. Each phase runs through the helper's `run`
+`-Results` and optional `-Jobs` (1–16, default 2 for direct callers). CI selects
+hardware-aware parallelism and passes `-Jobs $env:BUILD_JOBS`.
+Each phase runs through the helper's `run`
 command with its corresponding stage. `Portable` additionally passes
 `--junit <results>/portable.raw.xml` to the recorder. `inventory --ctest <ctest>
 --build <build-root>` records omitted tiers from configured CTest metadata.
@@ -130,7 +135,8 @@ python -B .github/scripts/candidate_contract.py --receipt <results>/candidate-re
 source arguments are required to detect mid-run dirt. `run` returns the actual
 command exit code (or a nonzero validation/launch failure). Raw command output is
 suppressed by default. The isolated hosted workflow opts into `run --echo` for
-useful job diagnostics; retained JSON/JUnit still contain no raw output. Never
+line-by-line live job diagnostics, preserving original output bytes for sanitized
+diagnostic extraction; retained JSON/JUnit still contain no raw output. Never
 enable echo for commands with access to personal data or secrets. Bootstrap
 receipt/source actions support Python 3.9+ before setup-python; passing final
 receipts require the recorded Python 3.12 identity.
@@ -140,10 +146,44 @@ Every fresh attempt requires a new result directory; `init` refuses overwrite.
 The producer fixtures use synthetic metadata and disposable files only, not a
 shell consumer, native desktop, network, clipboard or installed app.
 
+### Parallel downstream receipts
+
+Two parallel jobs from the same downstream run may record partial receipts.
+The fixture job owns `configure`, `build`, `portable`, `tests.portable` and the
+`inventory` output. The integration job owns `integration` and
+`tests.integration`. Both must successfully execute `sources`, `producer` and
+`prepare`, with integer zero exit codes. Every non-owned stage must remain
+untouched (`not_run` with empty timing/diagnostics), and neither input may be
+finalized. The actual toolchain and producer Python fields may still be empty,
+as in normal unfinalized receipts, but must match between inputs.
+
+```powershell
+python -B .github/scripts/candidate_contract.py --receipt <results>/merged.json merge `
+  --fixture <fixture-results>/candidate-result.json `
+  --integration <integration-results>/candidate-result.json
+```
+
+The output path must be fresh. Kind (downstream only), schema, source identities,
+toolchain digests/expected/actual identities, flags and producer info must match.
+The merge keeps the fixture's shared stage values and inventory, copies the
+integration stage/test counts, and uses the earliest `createdAt`. Stage timing
+may overlap; no inter-stage ordering is
+required. The output is still incomplete: run the normal `finalize` command
+above, with verified source roots, actual toolchain and aggregate workflow
+outcome, then `validate`. Finalization records actual toolchain and Python
+identities and applies all existing PASS checks, including counts and inventory.
+A failed job cannot be rescued by merge.
+There are no schema changes. Historical and sequential validation is unchanged.
+The caller must verify both jobs' same-run artifact provenance and conclusions;
+v1 receipts do not contain a run ID and cannot establish that provenance alone.
+
 ## Retention, security and acceptance
 
 The existing stable check remains **Build all fixtures, run portable tier** in
 **Windows fixtures**. It builds every fixture once and runs only portable tests.
+PR runs share a concurrency group per PR with cancellation enabled. Push and
+manual runs use unique run IDs, so newer main runs do not queue behind older
+runs in the workflow concurrency group; only PR runs cancel earlier runs.
 The job retains `candidate-result.json` and sanitized `portable.xml` on both
 success and failure for seven days, when the runner can execute finalization
 and upload. It uploads no build tree, raw logs, original JUnit, user profile or
@@ -161,7 +201,8 @@ Canonical toolchain preparation and identity assertions remain mandatory.
 
 Local producer controls cover valid standalone/downstream receipts, malformed
 identities, dirt/overrides, failed/cancelled/incomplete stages, drift, empty and
-failed tests, stale/malformed JUnit and privacy filtering. These are contract
+failed tests, stale/malformed JUnit, parallel receipt merging, live opt-in echo
+and privacy filtering. These are contract
 fixtures, not native acceptance.
 
 Root-owned hosted acceptance still requires:

@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-fixtures-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  group: windows-fixtures-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -101,6 +101,9 @@ jobs:
             C:\t-fixtures\clang+llvm-20.1.8-x86_64-pc-windows-msvc
             C:\t-fixtures\deps\CLI11-2.5.0
 
+      - name: Select hardware-aware build parallelism
+        run: .github/scripts/Get-BuildJobs.ps1
+
       - name: Build every fixture
         run: |
           $ErrorActionPreference = 'Stop'
@@ -110,7 +113,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" run `
             --stage build --echo -- powershell.exe -NoProfile -NonInteractive -File .github/scripts/Invoke-WindowsFixtureGate.ps1 `
-            -Phase Build -ContractRoot toolchain-contract -ToolRoot $env:TOOL_ROOT -BuildRoot $env:BUILD_ROOT -Results $env:RESULTS -Jobs 2
+            -Phase Build -ContractRoot toolchain-contract -ToolRoot $env:TOOL_ROOT -BuildRoot $env:BUILD_ROOT -Results $env:RESULTS -Jobs $env:BUILD_JOBS
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" inventory `
             --ctest "$env:TOOL_ROOT/tools/Scripts/ctest.exe" --build $env:BUILD_ROOT
