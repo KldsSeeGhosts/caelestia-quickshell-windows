@@ -70,8 +70,11 @@ time. Existing shell calls remain uncached and unchanged. The shell fetches this
 gate from its pinned producer revision, so adopting it requires a separate shell
 pin bump and explicit opt-in. `candidate_contract.py` is unchanged.
 
-Object-cache keys include a schema version, sccache version, canonical toolchain
-and Python locks, fixture CMake flags and gate/preparation scripts. Only a `push`
+Object-cache keys include a schema version, the sccache release (its preparation
+script) and the canonical toolchain and Python locks. Fixture CMake files and the
+gate are excluded on purpose: sccache keys every object by compiler identity,
+arguments and preprocessed input, so graph edits cannot serve a stale object and
+need not discard the whole warm cache. Only a `push`
 to trusted `refs/heads/main` may save the shared cache. PRs and manual dispatches
 only restore it. During measurement, a temporary writer saved to the PR's own
 GitHub cache ref and restore prefix; main and other PRs cannot read that ref.

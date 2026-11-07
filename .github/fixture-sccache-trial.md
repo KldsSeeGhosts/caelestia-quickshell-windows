@@ -43,14 +43,25 @@ The required stable job passed.
 | Hosted measurement | Build every fixture step | Compile stage | Hits | Misses | Non-cacheable calls |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Cold local disk | 366 s | 353.375 s | 0 | 291 | 0 |
-| Warm local disk | Pending | Pending | Pending | Pending | Pending |
+| Warm local disk | 104 s | 88.859 s | 290 | 1 | 0 |
 
 Cold configure: 11.312 s. Portable: 78.532 s, all 44 passed. Cache size:
 9,785,938 bytes. Unsupported compiler calls, non-cacheable compilations,
 compilation failures, cache errors and write errors: all zero.
 The workflow was rerun with `gh run rerun 42408812180` for warm evidence.
 
-Do not merge until warm hosted job/step timings and statistics are recorded here.
+Warm run: [42408812180, attempt 2](https://github.com/KldsSeeGhosts/caelestia-quickshell-windows/actions/runs/42408812180/attempts/2),
+restoring the object cache (about 8 MB) in under a second. Hit rate 99.66 %.
+Configure: 13.86 s. Portable: 78.89 s, all passed. Cache write errors,
+compilation failures and non-cacheable compilations: all zero. The compile
+stage fell from 353.375 s to 88.859 s; most of the remainder is linking.
+
+The object-cache key prefix covers only the cache schema, the sccache release
+(`Prepare-FixtureSccache.ps1`) and the canonical toolchain. It deliberately
+excludes `CMakeLists.txt` and the gate: sccache keys every object by compiler
+identity, arguments and preprocessed input, so build-graph edits cannot serve
+a stale object. Including them would discard the whole warm cache on each edit.
+
 The temporary PR-ref cache writer and its restore prefix have been removed from
 the final workflow. The shared writer remains restricted to trusted main pushes.
 The full compile-deduplication change is intentionally not included in this PR.
