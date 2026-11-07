@@ -428,6 +428,7 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	auto& p = provider();
 	p.drop();
 	p.recovery.reset();
+	p.recovery.setAgeForTest({});
 	p.context = nullptr;
 	p.recovered = {};
 	p.supported = false;
@@ -439,6 +440,14 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 
 void setNativeDesktopWindowValidatorForTest(std::function<bool(HWND)> validator) {
 	provider().windowValidator = std::move(validator);
+}
+
+void setNativeDesktopRecoveryAgeForTest(std::function<qint64()> age) {
+	provider().recovery.setAgeForTest(std::move(age));
+}
+
+int nativeDesktopRecoveryPendingDelayForTest() {
+	return provider().recovery.pendingDelay();
 }
 #endif
 

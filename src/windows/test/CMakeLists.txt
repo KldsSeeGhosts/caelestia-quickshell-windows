@@ -26,8 +26,68 @@ find_program(QS_SDK_MT NAMES mt.exe
 	HINTS "$ENV{WindowsSdkVerBinPath}x64" ${QS_SDK_BIN_DIRS}
 	NO_DEFAULT_PATH REQUIRED)
 
+# These translation units have compatible definitions across their consumers.
+# Each archive contains one source (and its moc, where needed), so linking
+# it cannot pull unrelated platform implementations across a fake boundary.
+set(QS_SHARED_TEST_SOURCES
+	../core/redact ../core/model ../core/qmlscreen ../core/instanceinfo
+	activation_policy window_selectors transition_trace util screen_identity
+	tiling_scope tiling_layout system_surface fullscreen_occluders
+	layer_rules panel_effects panel_animation startup input_settle
+	capture_device capture_format capture_texture
+	system/brightness system/gamma services/pipewire/pw_node services/pipewire/pw_types
+	services/message_window native_desktop_accessor virtual_desktops desktop_host tiling
+	system/network system/network_wifi_item
+)
+set(QS_SHARED_TEST_MOC_SOURCES
+	../core/model ../core/qmlscreen screen_identity startup fullscreen_occluders
+	tiling_scope panel_effects virtual_desktops desktop_host tiling
+	system/brightness system/gamma system/network system/network_wifi_item
+	services/pipewire/pw_node services/pipewire/pw_types
+)
+foreach(source IN LISTS QS_SHARED_TEST_SOURCES)
+	string(MAKE_C_IDENTIFIER "fixture_${source}" library)
+	get_filename_component(path "${QS_WINDOWS_SRC}/${source}.cpp" ABSOLUTE)
+	add_library(${library} STATIC "${path}")
+	# Avoid an empty moc translation unit for helpers without QObject classes.
+	if(NOT source IN_LIST QS_SHARED_TEST_MOC_SOURCES)
+		set_target_properties(${library} PROPERTIES AUTOMOC OFF)
+	endif()
+	set_target_properties(${library} PROPERTIES AUTOUIC OFF)
+	target_compile_definitions(${library} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+	# All consumers of these sources use precisely this test seam. Stubs remain
+	# executable-local. Never reuse these archives in a production target.
+	if(source MATCHES "^(native_desktop_accessor|virtual_desktops|desktop_host|system/network)$")
+		target_compile_definitions(${library} PRIVATE QS_TEST)
+	elseif(source STREQUAL "tiling")
+		target_compile_definitions(${library} PRIVATE QS_TILING_FAKE_DESKTOP)
+	endif()
+	target_include_directories(${library} PRIVATE "${QS_WINDOWS_SRC}" "${QS_WINDOWS_SRC}/../core")
+	target_link_libraries(${library} PRIVATE Qt6::GuiPrivate Qt6::QuickPrivate Qt6::Qml)
+	set_property(GLOBAL APPEND PROPERTY QS_SHARED_TEST_PATHS "${path}")
+	set_property(GLOBAL APPEND PROPERTY QS_SHARED_TEST_LIBRARIES "${library}")
+endforeach()
+
 function(qs_add_test_executable target)
-	qt_add_executable(${target} ${ARGN})
+	get_property(paths GLOBAL PROPERTY QS_SHARED_TEST_PATHS)
+	get_property(libraries GLOBAL PROPERTY QS_SHARED_TEST_LIBRARIES)
+	set(sources "")
+	set(shared "")
+	foreach(source IN LISTS ARGN)
+		get_filename_component(path "${source}" ABSOLUTE)
+		# Also move explicitly listed matching headers to the archive's automoc.
+		string(REGEX REPLACE "[.]hpp$" ".cpp" path "${path}")
+		list(FIND paths "${path}" index)
+		if(index EQUAL -1)
+			list(APPEND sources "${source}")
+		else()
+			list(GET libraries ${index} library)
+			list(APPEND shared "${library}")
+		endif()
+	endforeach()
+	list(REMOVE_DUPLICATES shared)
+	qt_add_executable(${target} ${sources})
+	target_link_libraries(${target} PRIVATE ${shared})
 	add_custom_command(TARGET ${target} POST_BUILD
 		COMMAND "${QS_SDK_MT}" -nologo -manifest "${QS_TEST_MANIFEST}"
 			"-outputresource:$<TARGET_FILE:${target}>;#1"
