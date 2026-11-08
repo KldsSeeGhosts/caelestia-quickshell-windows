@@ -2,10 +2,12 @@
 
 #include <qobject.h>
 #include <qproperty.h>
+#include <qvariant.h>
 
 #include "../../core/model.hpp"
 #include "../../core/qmlscreen.hpp"
 #include "../virtual_desktops.hpp"
+#include "../window_stack.hpp"
 #include "connection.hpp"
 #include "monitor.hpp"
 #include "pin_support.hpp"
@@ -75,6 +77,11 @@ HyprlandMonitor* HyprlandIpcQml::monitorFor(QuickshellScreenInfo* screen) {
 void HyprlandIpcQml::refreshMonitors() { HyprlandIpc::instance()->refreshMonitors(); }
 void HyprlandIpcQml::refreshWorkspaces() { HyprlandIpc::instance()->refreshWorkspaces(); }
 void HyprlandIpcQml::refreshToplevels() { HyprlandIpc::instance()->refreshToplevels(); }
+
+QVariantList HyprlandIpcQml::windowStack() {
+	return qs::windows::window_stack::toVariantList(qs::windows::window_stack::snapshot());
+}
+
 QString HyprlandIpcQml::requestSocketPath() { return HyprlandIpc::instance()->requestSocketPath(); }
 QString HyprlandIpcQml::eventSocketPath() { return HyprlandIpc::instance()->eventSocketPath(); }
 

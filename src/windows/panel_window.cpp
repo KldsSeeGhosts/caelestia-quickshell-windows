@@ -1020,7 +1020,22 @@ void WinPanelWindow::nativeInit() {
 	this->updateDimensions();
 	this->updateLayer();
 	this->updateFocus();
+	// A new native window starts with no capture exclusion.
+	this->applyCaptureExclusion();
 	this->blur->attach();
+}
+
+void WinPanelWindow::applyCaptureExclusion() {
+	auto* hwnd = this->hwnd();
+	if (hwnd == nullptr) return;
+
+	auto outcome = this->captureExclusion.apply(hwnd, this->bExcludeFromCapture.value());
+	if (!outcome.firstFailure) return;
+
+	// An older Windows build, or a window type the call rejects. The panel keeps
+	// working and is captured normally.
+	qCDebug(logPanel) << "Could not change the capture exclusion of" << this << "(error"
+	                  << outcome.error << "), it stays visible to screen capture";
 }
 
 void WinPanelWindow::applyNativeStyles() {
@@ -1481,6 +1496,8 @@ void WinPanelWindow::unembed() {
 
 	qCDebug(logPanel) << "Took" << this << "out of the desktop";
 
+	// An embedded child window cannot hold the affinity, a top-level one can.
+	this->applyCaptureExclusion();
 	this->blur->attach();
 	if (this->window->isVisible()) this->stickToAllDesktops();
 }
@@ -2514,6 +2531,7 @@ WinPanelInterface::WinPanelInterface(QObject* parent)
 	QObject::connect(this->panel, &WinPanelWindow::exclusionModeChanged, this, &WinPanelInterface::exclusionModeChanged);
 	QObject::connect(this->panel, &WinPanelWindow::layerChanged, this, &WinPanelInterface::aboveWindowsChanged);
 	QObject::connect(this->panel, &WinPanelWindow::keyboardFocusChanged, this, &WinPanelInterface::focusableChanged);
+	QObject::connect(this->panel, &WinPanelWindow::excludeFromCaptureChanged, this, &WinPanelInterface::excludeFromCaptureChanged);
 	// clang-format on
 }
 
@@ -2537,6 +2555,7 @@ proxyPair(qint32, exclusiveZone, setExclusiveZone);
 proxyPair(ExclusionMode::Enum, exclusionMode, setExclusionMode);
 proxyPair(bool, focusable, setFocusable);
 proxyPair(bool, aboveWindows, setAboveWindows);
+proxyPair(bool, excludeFromCapture, setExcludeFromCapture);
 
 #undef proxyPair
 // NOLINTEND

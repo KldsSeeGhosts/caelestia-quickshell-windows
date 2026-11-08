@@ -30,6 +30,7 @@
 #include "../window/panelinterface.hpp"
 #include "../window/proxywindow.hpp"
 #include "appbar.hpp"
+#include "capture_affinity.hpp"
 #include "panel_animation.hpp"
 #include "panel_effects.hpp"
 #include "screen_surface_guard.hpp"
@@ -87,6 +88,7 @@ class WinPanelWindow: public ProxyWindowBase {
 	QSDOC_HIDE Q_PROPERTY(Margins margins READ margins WRITE setMargins NOTIFY marginsChanged);
 	QSDOC_HIDE Q_PROPERTY(bool aboveWindows READ aboveWindows WRITE setAboveWindows NOTIFY layerChanged);
 	QSDOC_HIDE Q_PROPERTY(bool focusable READ focusable WRITE setFocusable NOTIFY keyboardFocusChanged);
+	QSDOC_HIDE Q_PROPERTY(bool excludeFromCapture READ excludeFromCapture WRITE setExcludeFromCapture NOTIFY excludeFromCaptureChanged);
 	// clang-format on
 	QML_ELEMENT;
 
@@ -134,6 +136,9 @@ public:
 	[[nodiscard]] bool focusable() const;
 	void setFocusable(bool focusable);
 
+	[[nodiscard]] bool excludeFromCapture() const { return this->bExcludeFromCapture; }
+	void setExcludeFromCapture(bool exclude) { this->bExcludeFromCapture = exclude; }
+
 	[[nodiscard]] PanelLayer layer() const { return this->bLayer; }
 	void setLayer(PanelLayer layer) { this->bLayer = layer; }
 
@@ -161,6 +166,7 @@ signals:
 	void layerChanged();
 	void namespaceChanged();
 	void keyboardFocusChanged();
+	void excludeFromCaptureChanged();
 	QSDOC_HIDE void anchorsChanged();
 	QSDOC_HIDE void exclusiveZoneChanged();
 	QSDOC_HIDE void exclusionModeChanged();
@@ -192,6 +198,8 @@ private:
 	void updateLayerCb() { this->updateLayer(); }
 	void updateFocus();
 	void updateFocusCb() { this->updateFocus(); }
+	void applyCaptureExclusion();
+	void applyCaptureExclusionCb() { this->applyCaptureExclusion(); }
 	void updateDimensions(const MonitorRects& nativeRects);
 	void onDisplayChange();
 	void updateDimensionsCb() { this->updateDimensions(); }
@@ -248,6 +256,7 @@ private:
 	qreal mTrackedScreenDpr = 1;
 	ScreenSurfaceGuard screenGuard;
 	WinAppBar appBar;
+	capture_affinity::CaptureExclusion captureExclusion;
 	PanelBlur* blur = nullptr;
 	QObject* mLayershellAttached = nullptr;
 	bool dimensionsUpdatePending = false;
@@ -315,6 +324,7 @@ private:
 	Q_OBJECT_BINDABLE_PROPERTY_WITH_ARGS(WinPanelWindow, PanelLayer, bLayer, PanelLayer::Top, &WinPanelWindow::layerChanged);
 	Q_OBJECT_BINDABLE_PROPERTY_WITH_ARGS(WinPanelWindow, QString, bNamespace, "quickshell", &WinPanelWindow::namespaceChanged);
 	Q_OBJECT_BINDABLE_PROPERTY(WinPanelWindow, PanelKeyboardFocus, bKeyboardFocus, &WinPanelWindow::keyboardFocusChanged);
+	Q_OBJECT_BINDABLE_PROPERTY(WinPanelWindow, bool, bExcludeFromCapture, &WinPanelWindow::excludeFromCaptureChanged);
 	Q_OBJECT_BINDABLE_PROPERTY(WinPanelWindow, Anchors, bAnchors, &WinPanelWindow::anchorsChanged);
 	Q_OBJECT_BINDABLE_PROPERTY(WinPanelWindow, Margins, bMargins, &WinPanelWindow::marginsChanged);
 	Q_OBJECT_BINDABLE_PROPERTY(WinPanelWindow, qint32, bExclusiveZone, &WinPanelWindow::exclusiveZoneChanged);
@@ -325,6 +335,7 @@ private:
 	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bLayer, updateLayerCb, onValueChanged);
 	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bNamespace, updateLayerCb, onValueChanged);
 	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bKeyboardFocus, updateFocusCb, onValueChanged);
+	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bExcludeFromCapture, applyCaptureExclusionCb, onValueChanged);
 	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bAnchors, updateDimensionsCb, onValueChanged);
 	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bMargins, updateDimensionsCb, onValueChanged);
 	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bExclusionMode, updateDimensionsCb, onValueChanged);
@@ -338,6 +349,18 @@ private:
 
 class WinPanelInterface: public PanelWindowInterface {
 	Q_OBJECT;
+	/// Keep the window out of screen capture, screenshots and screen recording.
+	/// Defaults to false.
+	///
+	/// When true and the window exists, `SetWindowDisplayAffinity` is called with
+	/// `WDA_EXCLUDEFROMCAPTURE`, which hides the window from capture while it
+	/// stays visible on the monitor. When false the window is captured normally.
+	/// The setting is applied again whenever the native window is recreated.
+	///
+	/// Needs Windows 10 2004 or later. On an older build, or for a window type
+	/// the call rejects (for example a panel embedded in the desktop window),
+	/// the window is captured normally and one debug message is logged.
+	Q_PROPERTY(bool excludeFromCapture READ excludeFromCapture WRITE setExcludeFromCapture NOTIFY excludeFromCaptureChanged);
 
 public:
 	explicit WinPanelInterface(QObject* parent = nullptr);
@@ -364,7 +387,13 @@ public:
 
 	[[nodiscard]] bool focusable() const override;
 	void setFocusable(bool focusable) override;
+
+	[[nodiscard]] bool excludeFromCapture() const;
+	void setExcludeFromCapture(bool exclude);
 	// NOLINTEND
+
+signals:
+	void excludeFromCaptureChanged();
 
 private:
 	WinPanelWindow* panel;

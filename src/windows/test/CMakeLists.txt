@@ -992,6 +992,49 @@ target_include_directories(network_wifi_identity_test PRIVATE ${QS_WINDOWS_SRC})
 target_link_libraries(network_wifi_identity_test PRIVATE Qt6::Core Qt6::Qml Qt6::Test shell32)
 add_test(NAME network_wifi_identity COMMAND network_wifi_identity_test)
 
+# The capture exclusion decision with fake Win32 calls. No window and no desktop.
+qs_add_test_executable(capture_affinity_test capture_affinity_test.cpp)
+target_compile_definitions(capture_affinity_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(capture_affinity_test PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(capture_affinity_test PRIVATE Qt6::Core Qt6::Test user32)
+add_test(NAME capture_affinity COMMAND capture_affinity_test)
+
+# The window stack snapshot's classification, frame mapping and QML conversion.
+# It never enumerates a desktop.
+qs_add_test_executable(window_stack_test
+	window_stack_test.cpp
+	${QS_WINDOWS_SRC}/window_stack.cpp
+	${QS_WINDOWS_SRC}/system_surface.cpp
+	${QS_WINDOWS_SRC}/window_selectors.cpp
+	${QS_WINDOWS_SRC}/activation_policy.cpp
+	${QS_WINDOWS_SRC}/util.cpp
+)
+target_compile_definitions(window_stack_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(window_stack_test PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(window_stack_test PRIVATE
+	Qt6::Gui Qt6::GuiPrivate Qt6::Qml Qt6::Test user32 advapi32 dwmapi ole32
+)
+add_test(NAME window_stack COMMAND window_stack_test)
+set_tests_properties(window_stack PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+# Capture exclusion and the window stack against real windows on a private
+# desktop that is never switched to: affinity round trips for top-level, layered
+# and child windows, and the enumeration order, restacking and exclusions.
+qs_add_test_executable(capture_native_test
+	capture_native_test.cpp
+	${QS_WINDOWS_SRC}/window_stack.cpp
+	${QS_WINDOWS_SRC}/system_surface.cpp
+	${QS_WINDOWS_SRC}/window_selectors.cpp
+	${QS_WINDOWS_SRC}/activation_policy.cpp
+	${QS_WINDOWS_SRC}/util.cpp
+)
+target_compile_definitions(capture_native_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(capture_native_test PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(capture_native_test PRIVATE
+	Qt6::Gui Qt6::GuiPrivate Qt6::Qml Qt6::Test user32 gdi32 advapi32 dwmapi ole32
+)
+add_test(NAME capture_native COMMAND capture_native_test)
+
 # Runtime tiers. Every registered fixture belongs to exactly one tier, and
 # configuration fails on an unclassified or doubly classified fixture.
 #   portable: fakes and offscreen Qt only; required in hosted CI.
@@ -1012,11 +1055,11 @@ set(QS_TESTS_PORTABLE
 	native_desktop_recovery pw_session_worker idle_request input_settle
 	super_drag_wait network_wifi_route runtime_paths
 	fullscreen_ownership display_transaction clipboard_capture capture_dimensions
-	erm625_native_desktop_facade network_wifi_identity
+	erm625_native_desktop_facade network_wifi_identity capture_affinity window_stack
 )
 set(QS_TESTS_NATIVE
 	tray_hook tray_host keyboard_layout native_lifetime
-	notification_mirror_consent desktop_underlay
+	notification_mirror_consent desktop_underlay capture_native
 )
 set(QS_TESTS_DESKTOP system_surface desktop_zorder panel_hidden_reembed)
 set(QS_TESTS_GPU capture_format capture_device video_node)
