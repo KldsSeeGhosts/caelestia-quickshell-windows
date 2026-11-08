@@ -19,6 +19,7 @@ qt_add_library(quickshell-windows STATIC
 	virtual_desktops.cpp
 	native_desktop_accessor.cpp
 	window_tracker.cpp
+	window_stack.cpp
 	foreground_observer.cpp
 	foreground_observer.hpp
 	foreground_policy.hpp

@@ -143,6 +143,9 @@ private:
 	bool refreshPending = false;
 };
 
+// The QML-facing name of an identity: the unique name, or the label while the
+// registry has not reserved one. QuickshellScreenInfo::name() is this value.
+[[nodiscard]] QString displayName(const DisplayIdentity& identity);
 // Unique QML-facing name (label plus a collision suffix when needed). Use it
 // for config selection and display, never for native routing.
 [[nodiscard]] QString screenName(QScreen* screen);

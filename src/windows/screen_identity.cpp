@@ -703,10 +703,13 @@ DisplayIdentity ScreenIdentityRegistry::identity(QScreen* screen) const {
 	return {device, {}, name, id, name, false};
 }
 
+QString displayName(const DisplayIdentity& identity) {
+	return identity.uniqueName.isEmpty() ? identity.friendlyName : identity.uniqueName;
+}
+
 QString screenName(QScreen* screen) {
 	if (screen == nullptr) return {};
-	auto identity = ScreenIdentityRegistry::instance()->identity(screen);
-	return identity.uniqueName.isEmpty() ? identity.friendlyName : identity.uniqueName;
+	return displayName(ScreenIdentityRegistry::instance()->identity(screen));
 }
 
 QScreen* screenByName(const QString& name) {

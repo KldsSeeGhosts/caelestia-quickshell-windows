@@ -8,6 +8,7 @@
 
 #include <qguiapplication.h>
 #include <qscreen.h>
+#include <qsignalspy.h>
 #include <qtest.h>
 #include <qt_windows.h>
 
@@ -62,6 +63,8 @@ private slots:
 	}
 
 	void init() {
+		if (!needsHosts()) return;
+
 		m_hostA = createHost();
 		m_hostB = createHost();
 		QVERIFY(m_hostA != nullptr && m_hostB != nullptr);
@@ -72,6 +75,8 @@ private slots:
 	}
 
 	void cleanup() {
+		if (!needsHosts()) return;
+
 		auto* host = qs::windows::DesktopHost::instance();
 		host->setDiscoveredHostForTesting(nullptr);
 		host->setEnabled(false);
@@ -189,7 +194,91 @@ private slots:
 		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
 	}
 
+	// excludeFromCapture is the QML-facing property on the production panel. The
+	// window is created but never shown, so this touches no visible window and
+	// needs no desktop host.
+	void excludeFromCaptureFollowsTheProperty() {
+		auto* primary = QGuiApplication::primaryScreen();
+		QVERIFY(primary != nullptr);
+		QuickshellScreenInfo screenInfo(nullptr, primary);
+		qs::windows::WinPanelWindow panel;
+		panel.setLayer(qs::windows::PanelLayer::Overlay);
+		panel.setExclusionMode(ExclusionMode::Ignore);
+		panel.setScreen(&screenInfo);
+
+		// Default, and a value set before the window exists.
+		QVERIFY(!panel.excludeFromCapture());
+		QSignalSpy changed(&panel, &qs::windows::WinPanelWindow::excludeFromCaptureChanged);
+		panel.setExcludeFromCapture(true);
+		QVERIFY(panel.excludeFromCapture());
+		QCOMPARE(changed.count(), 1);
+		panel.setExcludeFromCapture(true);
+		QCOMPARE(changed.count(), 1);
+		QCOMPARE(panel.property("excludeFromCapture").toBool(), true);
+
+		panel.createWindow();
+		auto* window = panel.backingWindow();
+		QVERIFY(window != nullptr);
+		auto* hwnd = reinterpret_cast<HWND>(window->winId());
+		QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+		QVERIFY(!IsWindowVisible(hwnd));
+
+		// The creation applied the value that was set before it.
+		QCOMPARE(affinityOf(hwnd), static_cast<DWORD>(WDA_EXCLUDEFROMCAPTURE));
+
+		panel.setExcludeFromCapture(false);
+		QCOMPARE(affinityOf(hwnd), static_cast<DWORD>(WDA_NONE));
+		QCOMPARE(changed.count(), 2);
+
+		panel.setExcludeFromCapture(true);
+		QCOMPARE(affinityOf(hwnd), static_cast<DWORD>(WDA_EXCLUDEFROMCAPTURE));
+		QCOMPARE(changed.count(), 3);
+
+		// Changing other panel state leaves the exclusion alone.
+		panel.setFocusable(true);
+		panel.setAboveWindows(false);
+		panel.setAboveWindows(true);
+		QCOMPARE(affinityOf(hwnd), static_cast<DWORD>(WDA_EXCLUDEFROMCAPTURE));
+		QVERIFY(panel.excludeFromCapture());
+
+		// A recreated native window starts without the affinity and gets it again.
+		panel.deleteWindow();
+		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+		QVERIFY(panel.excludeFromCapture());
+
+		panel.createWindow();
+		window = panel.backingWindow();
+		QVERIFY(window != nullptr);
+		hwnd = reinterpret_cast<HWND>(window->winId());
+		QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+		QCOMPARE(affinityOf(hwnd), static_cast<DWORD>(WDA_EXCLUDEFROMCAPTURE));
+
+		// An unrelated panel is unaffected.
+		qs::windows::WinPanelWindow other;
+		other.setLayer(qs::windows::PanelLayer::Overlay);
+		other.setExclusionMode(ExclusionMode::Ignore);
+		other.setScreen(&screenInfo);
+		other.createWindow();
+		auto* otherHwnd = reinterpret_cast<HWND>(other.backingWindow()->winId());
+		QVERIFY(otherHwnd != nullptr && IsWindow(otherHwnd));
+		QCOMPARE(affinityOf(otherHwnd), static_cast<DWORD>(WDA_NONE));
+
+		other.deleteWindow();
+		panel.deleteWindow();
+		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+	}
+
 private:
+	static bool needsHosts() {
+		return qstrcmp(QTest::currentTestFunction(), "excludeFromCaptureFollowsTheProperty") != 0;
+	}
+
+	static DWORD affinityOf(HWND hwnd) {
+		DWORD affinity = 0xFFFFFFFF;
+		GetWindowDisplayAffinity(hwnd, &affinity);
+		return affinity;
+	}
+
 	HWND m_hostA = nullptr;
 	HWND m_hostB = nullptr;
 };

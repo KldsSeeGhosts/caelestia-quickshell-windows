@@ -3,6 +3,7 @@
 #include <qobject.h>
 #include <qqmlintegration.h>
 #include <qtmetamacros.h>
+#include <qvariant.h>
 
 #include "../../core/doc.hpp"
 #include "../../core/model.hpp"
@@ -48,6 +49,25 @@ public:
 	Q_INVOKABLE static void refreshWorkspaces();
 
 	Q_INVOKABLE static void refreshToplevels();
+
+	/// The visible application windows from the topmost down, as a list of
+	/// `{ id, title, rects }` objects. Windows extension, not part of Hyprland.
+	///
+	/// `rects` is a list of `{ screen, rect }`, one per screen the window
+	/// covers. `screen` is the screen's name (`ShellScreen.name`) and `rect` is
+	/// the part of the visible frame on that screen, in Qt logical global
+	/// coordinates (the space of `QuickshellScreenInfo` geometry). A window that
+	/// spans monitors of different scale is cut at the monitor border and each
+	/// part uses its own monitor's scale, so a picker window on a screen
+	/// hit-tests only that screen's parts. `title` is empty for a window without
+	/// a caption. `id` is the address a `HyprlandToplevel` of the same window
+	/// reports. Cloaked, minimised and hidden windows, the desktop, the taskbars
+	/// and other Windows shell surfaces, and this shell's own windows are not
+	/// listed.
+	///
+	/// This is a one-shot, synchronous read for a picker that opens on demand.
+	/// `toplevels` is the live set and has no stacking order.
+	Q_INVOKABLE static QVariantList windowStack();
 
 	[[nodiscard]] static QString requestSocketPath();
 	[[nodiscard]] static QString eventSocketPath();
