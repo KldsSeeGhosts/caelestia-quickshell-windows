@@ -4,6 +4,7 @@
 
 #include <qlist.h>
 #include <qrect.h>
+#include <qscreen.h>
 #include <qstring.h>
 #include <qt_windows.h>
 #include <qtypes.h>
@@ -29,7 +30,9 @@ namespace qs::windows::window_stack {
 
 // One screen as the mapping needs it.
 struct Monitor {
-	// QScreen::name(), the string ShellScreen.name reports in QML.
+	// The QML-facing name from the screen identity registry, the string
+	// ShellScreen.name reports. Not QScreen::name(): that repeats for identical
+	// monitors and can stay stale when Qt reuses a QScreen for another monitor.
 	QString screen;
 	// The monitor rectangle in physical virtual-desktop pixels.
 	QRect physical;
@@ -61,6 +64,20 @@ struct Entry {
 
 	[[nodiscard]] bool operator==(const Entry&) const = default;
 };
+
+// How a QScreen becomes a Monitor. The defaults are the production behaviour.
+struct ScreenSource {
+	// The QML-facing name. Defaults to qs::windows::screenName.
+	std::function<QString(QScreen*)> name;
+	// The monitor rectangle in physical pixels, empty when unknown. Defaults to
+	// the native monitor of the screen.
+	std::function<QRect(QScreen*)> physical;
+};
+
+// The screens as Monitors, in the order given. A screen without a physical
+// rectangle is skipped.
+[[nodiscard]] QList<Monitor>
+monitorsFor(const QList<QScreen*>& screens, const ScreenSource& source = ScreenSource());
 
 // What a snapshot asks of the process. The defaults are the production
 // behaviour. A fixture replaces them to create its windows in the test

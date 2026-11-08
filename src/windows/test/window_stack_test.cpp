@@ -2,18 +2,40 @@
 // windows are listed, how a physical frame maps to logical global coordinates,
 // and what QML receives. window_stack_native_test creates real windows in a
 // known order and checks the enumeration.
-#include <qcoreapplication.h>
+#include <algorithm>
+
+#include <qguiapplication.h>
+#include <qhash.h>
+#include <qpa/qplatformscreen.h>
+#include <qpa/qwindowsysteminterface.h>
 #include <qrect.h>
 #include <qtest.h>
 #include <qvariant.h>
 
+#include "../screen_identity.hpp"
 #include "../system_surface.hpp"
 #include "../window_stack.hpp"
 
 using namespace qs::windows::window_stack;
+using qs::windows::DisplayIdentity;
+using qs::windows::ScreenIdentityRegistry;
 using qs::windows::system_surface::Identity;
 
 namespace {
+
+// A screen Qt reports under one fixed name, as it does for identical monitors
+// and for a QScreen it reuses for another monitor.
+class FakeScreen: public QPlatformScreen {
+public:
+	QRect rect;
+	explicit FakeScreen(QRect rect): rect(rect) {}
+	QRect geometry() const override { return this->rect; }
+	int depth() const override { return 32; }
+	QImage::Format format() const override { return QImage::Format_RGB32; }
+	QString name() const override { return QStringLiteral("Qt Name"); }
+	qreal devicePixelRatio() const override { return 1.0; }
+	QDpi logicalDpi() const override { return {96, 96}; }
+};
 
 Identity application() {
 	Identity identity;
@@ -225,6 +247,124 @@ private slots:
 		QVERIFY(logicalPieces(QRect(5760, 0, 100, 100), mixedScaleMonitors()).isEmpty());
 	}
 
+	// ShellScreen.name comes from the identity registry. A picker filtering its
+	// own screen's pieces by that name must find them under the same string, also
+	// when two monitors share a label and the registry suffixes one of them.
+	void namesPiecesLikeShellScreenForIdenticalMonitors() {
+		auto* firstPlatform = new FakeScreen(QRect(0, 0, 1920, 1080));
+		auto* secondPlatform = new FakeScreen(QRect(1920, 0, 1920, 1080));
+		QWindowSystemInterface::handleScreenAdded(firstPlatform);
+		QWindowSystemInterface::handleScreenAdded(secondPlatform);
+		auto* first = firstPlatform->screen();
+		auto* second = secondPlatform->screen();
+		QList<DisplayIdentity> displays {
+		    {QStringLiteral("DISPLAY1"), QStringLiteral("generic-path-b"), QStringLiteral("Generic Monitor")},
+		    {QStringLiteral("DISPLAY2"), QStringLiteral("generic-path-a"), QStringLiteral("Generic Monitor")},
+		};
+
+		{
+			ScreenIdentityRegistry registry(
+			    [&] { return displays; },
+			    [first, second](QScreen* target) {
+				    if (target == first) return QStringLiteral("DISPLAY1");
+				    if (target == second) return QStringLiteral("DISPLAY2");
+				    return QString();
+			    }
+		    );
+
+			auto physical = QHash<QScreen*, QRect> {
+			    {first, QRect(0, 0, 1920, 1080)},
+			    {second, QRect(1920, 0, 1920, 1080)},
+			};
+			auto source = ScreenSource {
+			    .name = [&](QScreen* screen) { return qs::windows::displayName(registry.identity(screen)); },
+			    .physical = [&](QScreen* screen) { return physical.value(screen); },
+			};
+
+			auto monitors = monitorsFor({first, second}, source);
+			QCOMPARE(monitors.size(), 2);
+
+			// The registry orders the suffix by target path, not by screen order.
+			QCOMPARE(monitors.at(0).screen, QStringLiteral("Generic Monitor (2)"));
+			QCOMPARE(monitors.at(1).screen, QStringLiteral("Generic Monitor"));
+			// Qt's own name is the same for both and is not what QML sees.
+			QCOMPARE(first->name(), second->name());
+			QVERIFY(monitors.at(0).screen != first->name());
+
+			// A window across both monitors gets one piece under each QML name.
+			auto pieces = logicalPieces(QRect(1800, 100, 400, 300), monitors);
+			QCOMPARE(pieces.size(), 2);
+			QCOMPARE(pieces.at(0).screen, QStringLiteral("Generic Monitor (2)"));
+			QCOMPARE(pieces.at(0).rect, QRect(1800, 100, 120, 300));
+			QCOMPARE(pieces.at(1).screen, QStringLiteral("Generic Monitor"));
+			QCOMPARE(pieces.at(1).rect, QRect(1920, 100, 280, 300));
+
+			// A reordered source list cannot rename either piece.
+			std::reverse(displays.begin(), displays.end());
+			registry.refresh();
+			QCOMPARE(monitorsFor({first, second}, source).at(0).screen, QStringLiteral("Generic Monitor (2)"));
+		}
+
+		QWindowSystemInterface::handleScreenRemoved(secondPlatform);
+		QWindowSystemInterface::handleScreenRemoved(firstPlatform);
+	}
+
+	// Qt can keep a QScreen and its name while the monitor behind it is replaced.
+	// QScreen::name() then names the old monitor, and the registry the new one.
+	void namesPiecesAfterAMonitorReplacementBehindAReusedScreen() {
+		auto* platform = new FakeScreen(QRect(0, 0, 1920, 1080));
+		QWindowSystemInterface::handleScreenAdded(platform);
+		auto* screen = platform->screen();
+		QList<DisplayIdentity> displays {
+		    {QStringLiteral("DISPLAY1"), QStringLiteral("oled-path"), QStringLiteral("Contoso OLED 32")},
+		};
+
+		{
+			ScreenIdentityRegistry registry(
+			    [&] { return displays; },
+			    [screen](QScreen* target) {
+				    return target == screen ? QStringLiteral("DISPLAY1") : QString();
+			    }
+		    );
+			auto source = ScreenSource {
+			    .name = [&](QScreen* target) { return qs::windows::displayName(registry.identity(target)); },
+			    .physical = [](QScreen*) { return QRect(0, 0, 1920, 1080); },
+			};
+
+			QCOMPARE(monitorsFor({screen}, source).first().screen, QStringLiteral("Contoso OLED 32"));
+
+			// Same QScreen and GDI source, another physical monitor.
+			displays[0] =
+			    {QStringLiteral("DISPLAY1"), QStringLiteral("lcd-path"), QStringLiteral("Fabrikam 27Q")};
+			registry.refresh();
+
+			QCOMPARE(screen->name(), QStringLiteral("Qt Name"));
+			auto monitors = monitorsFor({screen}, source);
+			QCOMPARE(monitors.size(), 1);
+			QCOMPARE(monitors.first().screen, QStringLiteral("Fabrikam 27Q"));
+			QCOMPARE(
+			    logicalPieces(QRect(100, 100, 200, 200), monitors).first().screen,
+			    QStringLiteral("Fabrikam 27Q")
+			);
+		}
+
+		QWindowSystemInterface::handleScreenRemoved(platform);
+	}
+
+	// A screen with no known monitor rectangle is left out, not given a zero rect.
+	void skipsAScreenWithoutAMonitorRectangle() {
+		auto* platform = new FakeScreen(QRect(0, 0, 1920, 1080));
+		QWindowSystemInterface::handleScreenAdded(platform);
+
+		auto source = ScreenSource {
+		    .name = [](QScreen*) { return QStringLiteral("X"); },
+		    .physical = [](QScreen*) { return QRect(); },
+		};
+		QVERIFY(monitorsFor({platform->screen()}, source).isEmpty());
+
+		QWindowSystemInterface::handleScreenRemoved(platform);
+	}
+
 	void cutsAWindowAcrossAVerticalStack() {
 		// A monitor above the primary, with a negative logical origin.
 		auto monitors = QList<Monitor> {
@@ -292,7 +432,7 @@ private slots:
 };
 
 int main(int argc, char** argv) {
-	QCoreApplication app(argc, argv);
+	QGuiApplication app(argc, argv);
 	WindowStackTest test;
 	return QTest::qExec(&test, argc, argv);
 }

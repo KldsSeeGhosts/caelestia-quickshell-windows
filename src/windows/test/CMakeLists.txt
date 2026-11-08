@@ -1004,6 +1004,8 @@ add_test(NAME capture_affinity COMMAND capture_affinity_test)
 qs_add_test_executable(window_stack_test
 	window_stack_test.cpp
 	${QS_WINDOWS_SRC}/window_stack.cpp
+	${QS_WINDOWS_SRC}/screen_identity.cpp
+	${QS_WINDOWS_SRC}/../core/redact.cpp
 	${QS_WINDOWS_SRC}/system_surface.cpp
 	${QS_WINDOWS_SRC}/window_selectors.cpp
 	${QS_WINDOWS_SRC}/activation_policy.cpp
@@ -1023,6 +1025,8 @@ set_tests_properties(window_stack PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscr
 qs_add_test_executable(capture_native_test
 	capture_native_test.cpp
 	${QS_WINDOWS_SRC}/window_stack.cpp
+	${QS_WINDOWS_SRC}/screen_identity.cpp
+	${QS_WINDOWS_SRC}/../core/redact.cpp
 	${QS_WINDOWS_SRC}/system_surface.cpp
 	${QS_WINDOWS_SRC}/window_selectors.cpp
 	${QS_WINDOWS_SRC}/activation_policy.cpp

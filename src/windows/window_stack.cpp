@@ -13,6 +13,7 @@
 #include <qtypes.h>
 #include <qvariant.h>
 
+#include "screen_identity.hpp"
 #include "system_surface.hpp"
 #include "util.hpp"
 
@@ -20,23 +21,7 @@ namespace qs::windows::window_stack {
 
 namespace {
 
-QList<Monitor> qtScreens() {
-	auto monitors = QList<Monitor>();
-
-	for (auto* screen: QGuiApplication::screens()) {
-		auto rects = monitorRects(monitorForScreen(screen));
-		if (!rects.valid) continue;
-
-		monitors.append(
-		    {.screen = screen->name(),
-		     .physical = rects.monitor,
-		     .logical = screen->geometry(),
-		     .devicePixelRatio = screen->devicePixelRatio()}
-		);
-	}
-
-	return monitors;
-}
+QList<Monitor> qtScreens() { return monitorsFor(QGuiApplication::screens()); }
 
 struct Walk {
 	const Hooks* hooks = nullptr;
@@ -99,6 +84,33 @@ QRect logicalFrame(
     qreal devicePixelRatio
 ) {
 	return ScreenMapper(logicalScreen, physicalMonitor, devicePixelRatio).toLogical(physicalFrame);
+}
+
+QList<Monitor> monitorsFor(const QList<QScreen*>& screens, const ScreenSource& requested) {
+	auto source = requested;
+	if (!source.name) source.name = &screenName;
+	if (!source.physical) {
+		source.physical = [](QScreen* screen) {
+			auto rects = monitorRects(monitorForScreen(screen));
+			return rects.valid ? rects.monitor : QRect();
+		};
+	}
+
+	auto monitors = QList<Monitor>();
+
+	for (auto* screen: screens) {
+		auto physical = source.physical(screen);
+		if (physical.isEmpty()) continue;
+
+		monitors.append(
+		    {.screen = source.name(screen),
+		     .physical = physical,
+		     .logical = screen->geometry(),
+		     .devicePixelRatio = screen->devicePixelRatio()}
+		);
+	}
+
+	return monitors;
 }
 
 QList<Piece> logicalPieces(const QRect& physicalFrame, const QList<Monitor>& monitors) {
