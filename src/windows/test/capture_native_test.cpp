@@ -78,20 +78,25 @@ DWORD affinityOf(HWND hwnd) {
 }
 
 // Test windows are in this process, so the snapshot's own-process filter would
-// drop them. The fixture says none is ours, and maps with a fixed 2x scale so a
-// mapping that is skipped shows up as a wrong rect.
+// drop them. The fixture says none is ours, and supplies two screens of
+// different scale instead of the machine's: a 200% screen at physical 0,0 and a
+// 100% screen to its right at physical 3840,0, which Qt places at logical
+// 1920,0. A mapping that is skipped shows up as a wrong rect.
 window_stack::Hooks fixtureHooks() {
 	return {
 	    .ownProcess = [](HWND) { return false; },
-	    .toLogical =
-	        [](HWND, const QRect& physical) {
-		        return QRect(
-		            physical.x() / 2,
-		            physical.y() / 2,
-		            physical.width() / 2,
-		            physical.height() / 2
-		        );
-	        },
+	    .monitors = []() {
+		    return QList<window_stack::Monitor> {
+		        {.screen = QStringLiteral("fixture-left"),
+		         .physical = QRect(0, 0, 3840, 2160),
+		         .logical = QRect(0, 0, 1920, 1080),
+		         .devicePixelRatio = 2.0},
+		        {.screen = QStringLiteral("fixture-right"),
+		         .physical = QRect(3840, 0, 1920, 1080),
+		         .logical = QRect(1920, 0, 1920, 1080),
+		         .devicePixelRatio = 1.0},
+		    };
+	    },
 	};
 }
 
@@ -278,16 +283,33 @@ private slots:
 		auto entries = window_stack::snapshot(fixtureHooks());
 		QCOMPARE(entries.size(), 1);
 
-		// The window has no border, so its frame is its rect. The fixture hook maps
-		// physical pixels to logical ones at a 2x scale.
-		QCOMPARE(entries.first().rect, QRect(30, 20, 150, 100));
+		// The window has no border, so its frame is its rect. The left fixture
+		// screen maps physical pixels to logical ones at a 2x scale.
+		QCOMPARE(entries.first().pieces.size(), 1);
+		QCOMPARE(entries.first().pieces.first().screen, QStringLiteral("fixture-left"));
+		QCOMPARE(entries.first().pieces.first().rect, QRect(30, 20, 150, 100));
 
-		// The default mapping needs a Qt screen for the window's monitor. The
-		// private desktop has none, so the window is dropped and not given a wrong
-		// rect.
+		// The default screens come from Qt, and the private desktop has none, so
+		// the window is dropped and not given a wrong rect.
 		auto hooks = fixtureHooks();
-		hooks.toLogical = nullptr;
+		hooks.monitors = nullptr;
 		QVERIFY(window_stack::snapshot(hooks).isEmpty());
+	}
+
+	// A real window across two screens of different scale: one piece per screen,
+	// each mapped through its own screen.
+	void cutsAStraddlingWindowPerScreen() {
+		make({.title = L"straddler", .rect = QRect(3600, 150, 500, 600)});
+
+		auto entries = window_stack::snapshot(fixtureHooks());
+		QCOMPARE(entries.size(), 1);
+
+		auto pieces = entries.first().pieces;
+		QCOMPARE(pieces.size(), 2);
+		QCOMPARE(pieces.at(0).screen, QStringLiteral("fixture-left"));
+		QCOMPARE(pieces.at(0).rect, QRect(1800, 75, 120, 300));
+		QCOMPARE(pieces.at(1).screen, QStringLiteral("fixture-right"));
+		QCOMPARE(pieces.at(1).rect, QRect(1920, 150, 260, 600));
 	}
 
 	void idMatchesTheWindowHandle() {
@@ -304,14 +326,27 @@ private slots:
 		auto* minimized = make({.title = L"minimized", .style = WS_OVERLAPPEDWINDOW | WS_VISIBLE});
 		ShowWindow(minimized, SW_SHOWMINIMIZED);
 		QVERIFY(IsIconic(minimized));
-		make({.title = L"", .rect = QRect(0, 0, 100, 80)});
 		make({.title = L"tooltip", .exStyle = WS_EX_TOOLWINDOW});
 		make({.title = L"overlay", .exStyle = WS_EX_NOACTIVATE});
 		make({.className = L"Shell_TrayWnd", .title = L"Taskbar"});
 		make({.className = L"Progman", .title = L"Program Manager"});
+		// Shell surfaces without a title are still shell surfaces.
+		make({.className = L"Shell_TrayWnd", .title = L""});
 		(void) listed;
 
 		QCOMPARE(titles(window_stack::snapshot(fixtureHooks())), (QStringList {"listed"}));
+	}
+
+	// Not every application window has a caption. It is listed with an empty
+	// title, at its place in the stack.
+	void listsAWindowWithoutATitle() {
+		make({.title = L"below"});
+		make({.title = L"", .rect = QRect(10, 10, 100, 80)});
+		make({.title = L"above"});
+
+		auto entries = window_stack::snapshot(fixtureHooks());
+		QCOMPARE(titles(entries), (QStringList {"above", "", "below"}));
+		QCOMPARE(entries.at(1).pieces.first().rect, QRect(5, 5, 50, 40));
 	}
 
 	void listsWhatAnApplicationForcesIntoTheTaskbar() {

@@ -44,7 +44,7 @@ private slots:
 		QVERIFY(!isStackWindow(cloaked));
 	}
 
-	void dropsChildAndUntitledWindows() {
+	void dropsNonRootAndChildWindows() {
 		auto owned = application();
 		owned.root = false;
 		QVERIFY(!isStackWindow(owned));
@@ -52,11 +52,25 @@ private slots:
 		auto child = application();
 		child.child = true;
 		QVERIFY(!isStackWindow(child));
+	}
 
+	// Not every application window has a native caption. Electron and UWP
+	// windows with a custom frame, and many games, have an empty title.
+	void listsWindowsWithoutATitle() {
 		auto untitled = application();
 		untitled.hasTitle = false;
 		untitled.title.clear();
+		QVERIFY(isStackWindow(untitled));
+
+		// The other rules still apply to it.
+		untitled.toolWindow = true;
 		QVERIFY(!isStackWindow(untitled));
+
+		auto shell = application();
+		shell.hasTitle = false;
+		shell.title.clear();
+		shell.windowClass = QStringLiteral("Shell_TrayWnd");
+		QVERIFY(!isStackWindow(shell));
 	}
 
 	void dropsTheDesktopAndTheTaskbars() {
@@ -154,10 +168,94 @@ private slots:
 		);
 	}
 
+	// A primary monitor at 150% (3840x2160 physical, 2560x1440 logical) and a
+	// 100% monitor to its right (1920x1080 at physical 3840,0). Qt places the
+	// second screen at logical 2560,0, so the two scales meet at one border.
+	static QList<Monitor> mixedScaleMonitors() {
+		return {
+		    {.screen = QStringLiteral("DP-1"),
+		     .physical = QRect(0, 0, 3840, 2160),
+		     .logical = QRect(0, 0, 2560, 1440),
+		     .devicePixelRatio = 1.5},
+		    {.screen = QStringLiteral("DP-2"),
+		     .physical = QRect(3840, 0, 1920, 1080),
+		     .logical = QRect(2560, 0, 1920, 1080),
+		     .devicePixelRatio = 1.0},
+		};
+	}
+
+	void cutsAStraddlingWindowAtTheMonitorBorder() {
+		// 240 physical pixels on the primary, 260 on the second monitor.
+		auto pieces = logicalPieces(QRect(3600, 150, 500, 600), mixedScaleMonitors());
+
+		QCOMPARE(pieces.size(), 2);
+		QCOMPARE(pieces.at(0).screen, QStringLiteral("DP-1"));
+		// x 3600..3840 / 1.5 = 2400..2560, y 150..750 / 1.5 = 100..500
+		QCOMPARE(pieces.at(0).rect, QRect(2400, 100, 160, 400));
+		QCOMPARE(pieces.at(1).screen, QStringLiteral("DP-2"));
+		// The second monitor is 1:1 and starts at logical 2560.
+		QCOMPARE(pieces.at(1).rect, QRect(2560, 150, 260, 600));
+
+		// The picker's window on the primary hit-tests a cursor at physical
+		// 3750,300, which is 2500,200 in Qt coordinates there. Each piece ends
+		// exactly at the border of its screen in logical space, which one rect
+		// mapped through a single monitor cannot do: through the second monitor
+		// the frame would start at 2320 and run to 2820, over the border.
+		QVERIFY(pieces.at(0).rect.contains(QPoint(2500, 200)));
+		QVERIFY(!pieces.at(1).rect.contains(QPoint(2500, 200)));
+		QCOMPARE(pieces.at(0).rect.right() + 1, pieces.at(1).rect.left());
+	}
+
+	void keepsAWindowOnOneMonitorInOnePiece() {
+		auto pieces = logicalPieces(QRect(300, 150, 600, 300), mixedScaleMonitors());
+		QCOMPARE(pieces.size(), 1);
+		QCOMPARE(pieces.at(0).screen, QStringLiteral("DP-1"));
+		QCOMPARE(pieces.at(0).rect, QRect(200, 100, 400, 200));
+
+		pieces = logicalPieces(QRect(4000, 100, 400, 300), mixedScaleMonitors());
+		QCOMPARE(pieces.size(), 1);
+		QCOMPARE(pieces.at(0).screen, QStringLiteral("DP-2"));
+		QCOMPARE(pieces.at(0).rect, QRect(2720, 100, 400, 300));
+	}
+
+	void dropsAWindowOnNoMonitor() {
+		QVERIFY(logicalPieces(QRect(9000, 0, 100, 100), mixedScaleMonitors()).isEmpty());
+		QVERIFY(logicalPieces(QRect(0, 0, 100, 100), {}).isEmpty());
+		// A frame that only touches a border overlaps nothing.
+		QVERIFY(logicalPieces(QRect(5760, 0, 100, 100), mixedScaleMonitors()).isEmpty());
+	}
+
+	void cutsAWindowAcrossAVerticalStack() {
+		// A monitor above the primary, with a negative logical origin.
+		auto monitors = QList<Monitor> {
+		    {.screen = QStringLiteral("A"),
+		     .physical = QRect(0, 0, 1920, 1080),
+		     .logical = QRect(0, 0, 1920, 1080),
+		     .devicePixelRatio = 1.0},
+		    {.screen = QStringLiteral("B"),
+		     .physical = QRect(0, -2160, 3840, 2160),
+		     .logical = QRect(0, -1080, 1920, 1080),
+		     .devicePixelRatio = 2.0},
+		};
+
+		auto pieces = logicalPieces(QRect(200, -400, 600, 800), monitors);
+		QCOMPARE(pieces.size(), 2);
+		QCOMPARE(pieces.at(0).rect, QRect(200, 0, 600, 400));
+		// y -400..0 / 2 on a screen whose logical origin is -1080 and physical -2160
+		QCOMPARE(pieces.at(1).rect, QRect(100, -200, 300, 200));
+	}
+
 	void convertsToQml() {
 		auto entries = QList<Entry> {
-		    {.id = QStringLiteral("1a2b"), .title = QStringLiteral("Top"), .rect = QRect(10, 20, 300, 200)},
-		    {.id = QStringLiteral("ff"), .title = QStringLiteral("Below"), .rect = QRect(-5, 0, 100, 50)},
+		    {.id = QStringLiteral("1a2b"),
+		     .title = QStringLiteral("Top"),
+		     .pieces = {
+		         {.screen = QStringLiteral("DP-1"), .rect = QRect(10, 20, 300, 200)},
+		         {.screen = QStringLiteral("DP-2"), .rect = QRect(310, 20, 50, 200)},
+		     }},
+		    {.id = QStringLiteral("ff"),
+		     .title = QString(),
+		     .pieces = {{.screen = QStringLiteral("DP-2"), .rect = QRect(-5, 0, 100, 50)}}},
 		};
 
 		auto list = toVariantList(entries);
@@ -166,12 +264,23 @@ private slots:
 		auto first = list.at(0).toMap();
 		QCOMPARE(first.value(QStringLiteral("id")).toString(), QStringLiteral("1a2b"));
 		QCOMPARE(first.value(QStringLiteral("title")).toString(), QStringLiteral("Top"));
-		QCOMPARE(first.value(QStringLiteral("rect")).toRectF(), QRectF(10, 20, 300, 200));
 		QCOMPARE(first.size(), 3);
+		QVERIFY(!first.contains(QStringLiteral("rect")));
+
+		auto rects = first.value(QStringLiteral("rects")).toList();
+		QCOMPARE(rects.size(), 2);
+		auto piece = rects.at(0).toMap();
+		QCOMPARE(piece.value(QStringLiteral("screen")).toString(), QStringLiteral("DP-1"));
+		QCOMPARE(piece.value(QStringLiteral("rect")).toRectF(), QRectF(10, 20, 300, 200));
+		QCOMPARE(piece.size(), 2);
+		QCOMPARE(rects.at(1).toMap().value(QStringLiteral("rect")).toRectF(), QRectF(310, 20, 50, 200));
 
 		auto second = list.at(1).toMap();
 		QCOMPARE(second.value(QStringLiteral("id")).toString(), QStringLiteral("ff"));
-		QCOMPARE(second.value(QStringLiteral("rect")).toRectF(), QRectF(-5, 0, 100, 50));
+		QVERIFY(second.value(QStringLiteral("title")).toString().isEmpty());
+		auto secondRects = second.value(QStringLiteral("rects")).toList();
+		QCOMPARE(secondRects.size(), 1);
+		QCOMPARE(secondRects.at(0).toMap().value(QStringLiteral("rect")).toRectF(), QRectF(-5, 0, 100, 50));
 
 		QVERIFY(toVariantList({}).isEmpty());
 	}

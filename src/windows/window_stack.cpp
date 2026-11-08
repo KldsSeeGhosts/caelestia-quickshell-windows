@@ -20,17 +20,27 @@ namespace qs::windows::window_stack {
 
 namespace {
 
-QRect mapThroughNearestScreen(HWND hwnd, const QRect& physical) {
-	auto* monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-	auto* screen = screenForMonitor(monitor);
-	auto rects = monitorRects(monitor);
-	if (screen == nullptr || !rects.valid) return {};
+QList<Monitor> qtScreens() {
+	auto monitors = QList<Monitor>();
 
-	return logicalFrame(physical, rects.monitor, screen->geometry(), screen->devicePixelRatio());
+	for (auto* screen: QGuiApplication::screens()) {
+		auto rects = monitorRects(monitorForScreen(screen));
+		if (!rects.valid) continue;
+
+		monitors.append(
+		    {.screen = screen->name(),
+		     .physical = rects.monitor,
+		     .logical = screen->geometry(),
+		     .devicePixelRatio = screen->devicePixelRatio()}
+		);
+	}
+
+	return monitors;
 }
 
 struct Walk {
 	const Hooks* hooks = nullptr;
+	const QList<Monitor>* monitors = nullptr;
 	QList<Entry>* entries = nullptr;
 };
 
@@ -57,10 +67,12 @@ BOOL CALLBACK collectWindow(HWND hwnd, LPARAM param) {
 	auto physical = toQRect(frame);
 	if (physical.isEmpty()) return TRUE;
 
-	auto logical = walk.hooks->toLogical(hwnd, physical);
-	if (logical.isEmpty()) return TRUE;
+	auto pieces = logicalPieces(physical, *walk.monitors);
+	if (pieces.isEmpty()) return TRUE;
 
-	walk.entries->append({.id = windowId(hwnd), .title = std::move(identity.title), .rect = logical});
+	walk.entries->append(
+	    {.id = windowId(hwnd), .title = std::move(identity.title), .pieces = std::move(pieces)}
+	);
 	return TRUE;
 }
 
@@ -72,7 +84,6 @@ QString windowId(HWND hwnd) {
 
 bool isStackWindow(const system_surface::Identity& identity) {
 	if (!identity.visible || !identity.root || identity.child || identity.cloaked) return false;
-	if (!identity.hasTitle) return false;
 	if (system_surface::isShellSurface(identity)) return false;
 
 	// A tooltip, a menu or an overlay is a tool window or never takes focus. An
@@ -90,15 +101,32 @@ QRect logicalFrame(
 	return ScreenMapper(logicalScreen, physicalMonitor, devicePixelRatio).toLogical(physicalFrame);
 }
 
+QList<Piece> logicalPieces(const QRect& physicalFrame, const QList<Monitor>& monitors) {
+	auto pieces = QList<Piece>();
+
+	for (const auto& monitor: monitors) {
+		auto part = physicalFrame.intersected(monitor.physical);
+		if (part.isEmpty()) continue;
+
+		auto rect = logicalFrame(part, monitor.physical, monitor.logical, monitor.devicePixelRatio);
+		if (rect.isEmpty()) continue;
+
+		pieces.append({.screen = monitor.screen, .rect = rect});
+	}
+
+	return pieces;
+}
+
 QList<Entry> snapshot() { return snapshot(Hooks()); }
 
 QList<Entry> snapshot(const Hooks& requested) {
 	auto hooks = requested;
 	if (!hooks.ownProcess) hooks.ownProcess = &isOwnProcessWindow;
-	if (!hooks.toLogical) hooks.toLogical = &mapThroughNearestScreen;
+	if (!hooks.monitors) hooks.monitors = &qtScreens;
 
+	auto monitors = hooks.monitors();
 	auto entries = QList<Entry>();
-	auto walk = Walk {.hooks = &hooks, .entries = &entries};
+	auto walk = Walk {.hooks = &hooks, .monitors = &monitors, .entries = &entries};
 	EnumWindows(&collectWindow, reinterpret_cast<LPARAM>(&walk));
 	return entries;
 }
@@ -108,10 +136,20 @@ QVariantList toVariantList(const QList<Entry>& entries) {
 	list.reserve(entries.size());
 
 	for (const auto& entry: entries) {
+		auto rects = QVariantList();
+		rects.reserve(entry.pieces.size());
+
+		for (const auto& piece: entry.pieces) {
+			rects.append(QVariantMap {
+			    {QStringLiteral("screen"), piece.screen},
+			    {QStringLiteral("rect"), QRectF(piece.rect)},
+			});
+		}
+
 		list.append(QVariantMap {
 		    {QStringLiteral("id"), entry.id},
 		    {QStringLiteral("title"), entry.title},
-		    {QStringLiteral("rect"), QRectF(entry.rect)},
+		    {QStringLiteral("rects"), rects},
 		});
 	}
 
