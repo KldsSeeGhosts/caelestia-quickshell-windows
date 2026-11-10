@@ -20,6 +20,24 @@ unclassified, classified twice, or a tier names a fixture that does not exist.
 
 All fixtures are built in CI, so every tier is at least compile-checked.
 
+`DesktopLayer.externalWallpaperEnabled` defaults to `true` for compatibility.
+Setting it to `false` places every Background panel above foreign wallpaper
+children inside the desktop host, without changing the foreign windows or
+placing the panels above desktop icons. `underlayActive` is false in this mode.
+The private-desktop `desktop_underlay` fixture covers both monitor backgrounds,
+restacking, toggling the policy and an absent renderer. `desktop_zorder` also
+covers production event reconciliation and renderer replacement.
+
+For shell issue KldsSeeGhosts/caelestia-windows#62, the shell pin update must
+also wire `Native.DesktopLayer.externalWallpaperEnabled` to
+`!Wallpapers.sourceFresh || WallpaperEngine.enabled` in
+`WindowsBackground.reconcileDesktop()`, and reconcile when that expression
+changes. This preserves existing-profile behaviour and enabled integration.
+Do not bind it to process liveness or `externalWallpaperActive`: those describe
+ownership, not the user's integration choice, and depend on `underlayActive`.
+The backend cannot infer the shell profile's setting. No shell pin is updated
+by this backend change.
+
 The portable tier includes `fullscreen_ownership`, `display_transaction`,
 `clipboard_capture`, `capture_dimensions`, `erm625_native_desktop_facade`
 and `network_wifi_identity`. These use synthetic operations and content, not

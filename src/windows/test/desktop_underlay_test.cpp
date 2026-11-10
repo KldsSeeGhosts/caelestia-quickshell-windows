@@ -120,6 +120,39 @@ private slots:
 		qs::windows::placeDesktopBackgrounds(parent);
 		QCOMPARE(qs::windows::desktopBackgroundMovesForTesting(), moves);
 
+		// Disabling integration keeps both monitor backgrounds above the
+		// still-running foreign renderer without reparenting either one.
+		host->setAboveIcons({});
+		QVERIFY(host->underlayActive());
+		qs::windows::DesktopLayer layer;
+		layer.setExternalWallpaperEnabled(false);
+		QVERIFY(!layer.externalWallpaperEnabled());
+		QVERIFY(!host->underlayActive());
+		QVERIFY(host->active());
+		QVERIFY(GetParent(left) == parent && GetParent(right) == parent);
+		QVERIFY(below(parent, external, left));
+		QVERIFY(below(parent, external, right));
+		QVERIFY(!qs::windows::desktopBackgroundsMisordered(parent, false));
+		moves = qs::windows::desktopBackgroundMovesForTesting();
+		qs::windows::placeDesktopBackgrounds(parent, false);
+		QCOMPARE(qs::windows::desktopBackgroundMovesForTesting(), moves);
+		// Simulate a renderer restack and exercise the same policy check the
+		// event reconciliation uses. Only synthetic private-desktop windows.
+		SetWindowPos(external, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+		QVERIFY(qs::windows::desktopBackgroundsMisordered(parent, false));
+		qs::windows::placeDesktopBackgrounds(parent, false);
+		QVERIFY(below(parent, external, left) && below(parent, external, right));
+		auto* topBackground = GetWindow(parent, GW_CHILD);
+		SetWindowPos(external, topBackground, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+		QVERIFY(GetWindow(parent, GW_CHILD) == topBackground);
+		QVERIFY(qs::windows::desktopBackgroundsMisordered(parent, false));
+		qs::windows::placeDesktopBackgrounds(parent, false);
+		QVERIFY(below(parent, external, left) && below(parent, external, right));
+		layer.setExternalWallpaperEnabled(true);
+		QVERIFY(host->underlayActive());
+		QVERIFY(below(parent, left, external) && below(parent, right, external));
+		host->setAboveIcons({QStringLiteral("background")});
+
 		// The external child covers only the left region; host-wide order
 		// does not invent a MonitorN mapping or per-monitor acknowledgement.
 		RECT externalRect {}, rightRect {};
@@ -148,6 +181,10 @@ private slots:
 		QVERIFY(!host->allowsAboveIcons(QStringLiteral("background")));
 		SendMessageW(external, WM_CLOSE, 0, 0);
 		QVERIFY(foreign.waitForFinished());
+		layer.setExternalWallpaperEnabled(false);
+		QVERIFY(!host->underlayActive());
+		QVERIFY(!qs::windows::desktopBackgroundsMisordered(parent, false));
+		layer.setExternalWallpaperEnabled(true);
 		QVERIFY(host->allowsAboveIcons(QStringLiteral("background")));
 		host->setEnabled(false);
 		DestroyWindow(parent);
