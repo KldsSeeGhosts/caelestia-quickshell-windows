@@ -220,6 +220,7 @@ private slots:
 
 	void init() {
 		auto* host = qs::windows::DesktopHost::instance();
+		host->setExternalWallpaperEnabled(true);
 		host->setReconcileSourcesForTesting(true, true);
 
 		// The host window lives in its own process, like Explorer's WorkerW.
@@ -262,7 +263,10 @@ private slots:
 		    this,
 		    [this] {
 			    if (auto* current = qs::windows::DesktopHost::instance()->parentWindow()) {
-				    qs::windows::placeDesktopBackgrounds(current);
+				    qs::windows::placeDesktopBackgrounds(
+				        current,
+				        qs::windows::DesktopHost::instance()->externalWallpaperEnabled()
+				    );
 			    }
 		    },
 		    Qt::QueuedConnection
@@ -292,6 +296,7 @@ private slots:
 		host->setDiscoveredHostForTesting(nullptr);
 		host->setReconcileSourcesForTesting(true, true);
 		host->setEnabled(false);
+		host->setExternalWallpaperEnabled(true);
 
 		for (auto* process: {&m_foreignProcess, &m_replacementProcess, &m_hostProcess}) {
 			if (process->state() != QProcess::NotRunning) {
@@ -321,6 +326,57 @@ private slots:
 		QVERIFY(isBelow(m_host, m_shell, m_foreign));
 		QVERIFY(isBelow(m_host, m_other, m_shell));
 		QVERIFY(host->underlayActive());
+	}
+
+	void disabledIntegrationCoversRunningForeignOwner() {
+		QVERIFY(attachWallpaperBelowShell());
+		auto* host = qs::windows::DesktopHost::instance();
+		qs::windows::DesktopLayer layer;
+		QSignalSpy changed(&layer, &qs::windows::DesktopLayer::externalWallpaperEnabledChanged);
+		QVERIFY(layer.externalWallpaperEnabled());
+
+		layer.setExternalWallpaperEnabled(false);
+		QCOMPARE(changed.count(), 1);
+		QVERIFY(!host->underlayActive());
+		QVERIFY(host->active());
+		QVERIFY(GetParent(m_shell) == m_host);
+		QVERIFY(GetWindow(m_host, GW_CHILD) == m_shell);
+		QVERIFY(isBelow(m_host, m_other, m_shell));
+		QVERIFY(isBelow(m_host, m_foreign, m_other));
+		QVERIFY(!qs::windows::desktopBackgroundsMisordered(m_host, false));
+
+		// The engine can restack or replace its window without restarting.
+		QVERIFY(command("top"));
+		QTRY_VERIFY_WITH_TIMEOUT(GetWindow(m_host, GW_CHILD) == m_shell, 2500);
+		QVERIFY(command("replace"));
+		QVERIFY(command("top"));
+		QTRY_VERIFY_WITH_TIMEOUT(GetWindow(m_host, GW_CHILD) == m_shell, 2500);
+		QVERIFY(isBelow(m_host, m_foreign, m_other));
+		QVERIFY(!host->underlayActive());
+
+		auto moves = qs::windows::desktopBackgroundMovesForTesting();
+		layer.setExternalWallpaperEnabled(false);
+		qs::windows::placeDesktopBackgrounds(m_host, false);
+		QCOMPARE(changed.count(), 1);
+		QCOMPARE(qs::windows::desktopBackgroundMovesForTesting(), moves);
+
+		// Re-enabling restores exactly the existing underlay policy.
+		layer.setExternalWallpaperEnabled(true);
+		QCOMPARE(changed.count(), 2);
+		QVERIFY(host->underlayActive());
+		QVERIFY(orderIsCorrect());
+	}
+
+	void disabledIntegrationBeforeOwnerArrives() {
+		auto* host = qs::windows::DesktopHost::instance();
+		host->setExternalWallpaperEnabled(false);
+		QVERIFY(!host->underlayActive());
+		QVERIFY(GetWindow(m_host, GW_CHILD) == m_shell);
+		QVERIFY(startWallpaper());
+		QVERIFY(command("top"));
+		QTRY_VERIFY_WITH_TIMEOUT(GetWindow(m_host, GW_CHILD) == m_shell, 2500);
+		QVERIFY(isBelow(m_host, m_foreign, m_other));
+		QVERIFY(!host->underlayActive());
 	}
 
 	void correctOrderIsNeverRestacked() {

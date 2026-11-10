@@ -29,18 +29,18 @@ void markDesktopBackground(HWND hwnd, bool marked);
 
 // Re-orders the marked Background windows inside `parent`. Only a visible
 // foreign child covers the desktop: while one exists every background sits
-// below the bottom-most visible foreign sibling. When every foreign child is
+// below the bottom-most visible foreign sibling when externalWallpaperEnabled
+// is true. When integration is disabled, or every foreign child is
 // hidden or gone, the group goes to the top of the host instead, so a hidden
 // wallpaper window cannot leave the user looking at a bare host. Both paths
 // keep the backgrounds' relative order and are idempotent, so a queued reorder
 // cannot start a restack loop.
-void placeDesktopBackgrounds(HWND parent);
+void placeDesktopBackgrounds(HWND parent, bool externalWallpaperEnabled = true);
 
 // True when the marked Backgrounds are not where placeDesktopBackgrounds()
-// would put them: above a visible foreign child, or not on top of the host
-// while no foreign child is visible. Read-only and cheap, so every reconciling
-// event can ask and only call placeDesktopBackgrounds() when it drifted.
-[[nodiscard]] bool desktopBackgroundsMisordered(HWND parent);
+// would put them under the requested integration policy. Read-only and cheap,
+// so every reconciling event can ask and only place the group when it drifted.
+[[nodiscard]] bool desktopBackgroundsMisordered(HWND parent, bool externalWallpaperEnabled = true);
 
 #ifdef QS_TEST
 // Number of SetWindowPos calls placeDesktopBackgrounds() has made, to prove an
@@ -58,6 +58,12 @@ public:
 
 	[[nodiscard]] bool enabled() const { return this->mEnabled; }
 	void setEnabled(bool enabled);
+
+	// Defaults to the released underlay behaviour. Shells that opt out of
+	// external wallpaper integration set false to keep their Backgrounds
+	// above foreign wallpaper children, still inside the desktop host.
+	[[nodiscard]] bool externalWallpaperEnabled() const { return this->mExternalWallpaperEnabled; }
+	void setExternalWallpaperEnabled(bool enabled);
 
 	[[nodiscard]] HWND parentWindow();
 	[[nodiscard]] HWND insertAfter() const { return this->mInsertAfter; }
@@ -96,8 +102,8 @@ public:
 	// acknowledgment and, through the same visibility rule, sends the
 	// Background group to the top of the host (see placeDesktopBackgrounds).
 	[[nodiscard]] bool underlayActive() const {
-		return this->mEnabled && this->mParent != nullptr && !this->mEmbedRefused
-		    && this->mInsertAfter == nullptr && this->mAboveIcons.isEmpty()
+		return this->mEnabled && this->mExternalWallpaperEnabled && this->mParent != nullptr
+		    && !this->mEmbedRefused && this->mInsertAfter == nullptr && this->mAboveIcons.isEmpty()
 		    && desktopHostHasForeignChild(this->mParent, true);
 	}
 
@@ -112,6 +118,7 @@ public:
 
 signals:
 	void enabledChanged();
+	void externalWallpaperEnabledChanged();
 	void activeChanged();
 	void underlayActiveChanged();
 	void embedRefusedChanged();
@@ -180,6 +187,7 @@ private:
 	);
 
 	bool mEnabled = false;
+	bool mExternalWallpaperEnabled = true;
 	bool lookedUp = false;
 	HWND mParent = nullptr;
 	HWND mInsertAfter = nullptr;
@@ -224,6 +232,7 @@ class DesktopLayer: public QObject {
 	QML_SINGLETON;
 	// clang-format off
 	Q_PROPERTY(bool enabled READ enabled WRITE setEnabled NOTIFY enabledChanged);
+	Q_PROPERTY(bool externalWallpaperEnabled READ externalWallpaperEnabled WRITE setExternalWallpaperEnabled NOTIFY externalWallpaperEnabledChanged);
 	Q_PROPERTY(bool active READ active NOTIFY activeChanged);
 	Q_PROPERTY(bool underlayActive READ underlayActive NOTIFY underlayActiveChanged);
 	Q_PROPERTY(bool embedRefused READ embedRefused NOTIFY embedRefusedChanged);
@@ -236,6 +245,9 @@ public:
 	[[nodiscard]] bool enabled() const;
 	void setEnabled(bool enabled);
 
+	[[nodiscard]] bool externalWallpaperEnabled() const;
+	void setExternalWallpaperEnabled(bool enabled);
+
 	[[nodiscard]] bool active() const;
 
 	[[nodiscard]] bool underlayActive() const;
@@ -247,6 +259,7 @@ public:
 
 signals:
 	void enabledChanged();
+	void externalWallpaperEnabledChanged();
 	void activeChanged();
 	void underlayActiveChanged();
 	void embedRefusedChanged();

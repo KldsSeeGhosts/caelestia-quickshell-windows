@@ -187,25 +187,34 @@ bool isAbove(HWND parent, HWND window, HWND other) {
 
 } // namespace
 
-bool desktopBackgroundsMisordered(HWND parent) {
+bool desktopBackgroundsMisordered(HWND parent, bool externalWallpaperEnabled) {
 	if (parent == nullptr || !IsWindow(parent)) return false;
 
-	// Top to bottom. Only a visible foreign child covers the desktop, so only
+	// Top to bottom. With integration enabled, only a visible foreign child covers the desktop, so only
 	// it can make a marked background misplaced: either the background sits
 	// above such a child, or no visible foreign child exists and the group is
 	// not on top of the host where it belongs. A hidden foreign child never
 	// makes the order wrong. Read-only, so every reconciling event can ask.
 	HWND topChild = GetWindow(parent, GW_CHILD);
 	HWND firstBackground = nullptr;
+	HWND previousBackground = nullptr;
 	bool visibleForeign = false;
 
 	for (auto* child = topChild; child != nullptr; child = GetWindow(child, GW_HWNDNEXT)) {
 		if (GetPropW(child, BACKGROUND_PROP) != nullptr) {
 			if (firstBackground == nullptr) firstBackground = child;
+			// The top monitor can still be correct while a foreign child
+			// covers a later monitor. The own group must be contiguous.
+			if (!externalWallpaperEnabled && previousBackground != nullptr
+			    && GetWindow(previousBackground, GW_HWNDNEXT) != child)
+			{
+				return true;
+			}
+			previousBackground = child;
 			continue;
 		}
 
-		if (!IsWindowVisible(child) || isOwnProcessWindow(child)) continue;
+		if (!externalWallpaperEnabled || !IsWindowVisible(child) || isOwnProcessWindow(child)) continue;
 		visibleForeign = true;
 		if (firstBackground != nullptr) return true;
 	}
@@ -214,7 +223,7 @@ bool desktopBackgroundsMisordered(HWND parent) {
 	return firstBackground != topChild;
 }
 
-void placeDesktopBackgrounds(HWND parent) {
+void placeDesktopBackgrounds(HWND parent, bool externalWallpaperEnabled) {
 	if (parent == nullptr || !IsWindow(parent)) return;
 
 	QList<HWND> backgrounds;
@@ -225,7 +234,7 @@ void placeDesktopBackgrounds(HWND parent) {
 	{
 		if (GetPropW(child, BACKGROUND_PROP) != nullptr) {
 			backgrounds.append(child);
-		} else if (!isOwnProcessWindow(child) && IsWindowVisible(child)) {
+		} else if (externalWallpaperEnabled && !isOwnProcessWindow(child) && IsWindowVisible(child)) {
 			// Only a visible foreign wallpaper window may pin the shell below
 			// it. A hidden one contributes no pixels, so keeping the group
 			// under it would leave the user with a black host. The visibility
@@ -253,7 +262,7 @@ void placeDesktopBackgrounds(HWND parent) {
 		return;
 	}
 
-	// No visible foreign child left (none, or all hidden): put the group back
+	// Integration disabled, or no visible foreign child left: put the group back
 	// on top of the host in its existing order, then keep it contiguous. The
 	// first background is the top of the group; each following one sits
 	// directly below its predecessor. This too is idempotent.
@@ -307,6 +316,16 @@ void DesktopHost::setEnabled(bool enabled) {
 	this->mEnabled = enabled;
 	emit this->enabledChanged();
 	this->refresh();
+}
+
+void DesktopHost::setExternalWallpaperEnabled(bool enabled) {
+	if (enabled == this->mExternalWallpaperEnabled) return;
+	this->mExternalWallpaperEnabled = enabled;
+	emit this->externalWallpaperEnabledChanged();
+	// Reconcile immediately, including a live settings change. Do not touch
+	// the foreign window or move the shell out of its desktop host.
+	this->updateReportedState();
+	emit this->backgroundOrderChanged();
 }
 
 HWND DesktopHost::parentWindow() {
@@ -381,9 +400,10 @@ void DesktopHost::updateReportedState() {
 	// created inside Explorer's process, which the hooks scoped to the old
 	// host may not watch. Do not keep embedding into the old parent: re-run
 	// discovery now and let parentChanged re-embed the panels into the host
-	// that is live. A refusal and an above-icons embed are not handbacks.
+	// that is live. A refusal, a policy change and an above-icons embed are
+	// not handbacks.
 	if (wasUnderlayActive && !underlayActive && !this->mEmbedRefused && this->mEnabled
-	    && this->mParent != nullptr && this->mAboveIcons.isEmpty())
+	    && this->mParent != nullptr && this->mAboveIcons.isEmpty() && this->mExternalWallpaperEnabled)
 	{
 		this->scheduleRefresh();
 	}
@@ -403,8 +423,10 @@ void DesktopHost::updateReportedState() {
 	// read-only and the placement is idempotent, so an already correct order
 	// costs no SetWindowPos. Both the desktop-wide hook and every per-process
 	// hook end here.
-	if (this->mParent != nullptr && desktopBackgroundsMisordered(this->mParent)) {
-		placeDesktopBackgrounds(this->mParent);
+	if (this->mParent != nullptr
+	    && desktopBackgroundsMisordered(this->mParent, this->mExternalWallpaperEnabled))
+	{
+		placeDesktopBackgrounds(this->mParent, this->mExternalWallpaperEnabled);
 	}
 
 	this->syncForeignWatch();
@@ -1006,6 +1028,12 @@ int desktopBackgroundMovesForTesting() { return gPlacementMoves; }
 DesktopLayer::DesktopLayer(QObject* parent): QObject(parent) {
 	auto* host = DesktopHost::instance();
 	QObject::connect(host, &DesktopHost::enabledChanged, this, &DesktopLayer::enabledChanged);
+	QObject::connect(
+	    host,
+	    &DesktopHost::externalWallpaperEnabledChanged,
+	    this,
+	    &DesktopLayer::externalWallpaperEnabledChanged
+	);
 	QObject::connect(host, &DesktopHost::activeChanged, this, &DesktopLayer::activeChanged);
 	QObject::connect(host, &DesktopHost::underlayActiveChanged, this, &DesktopLayer::underlayActiveChanged);
 	QObject::connect(host, &DesktopHost::embedRefusedChanged, this, &DesktopLayer::embedRefusedChanged);
@@ -1015,6 +1043,12 @@ DesktopLayer::DesktopLayer(QObject* parent): QObject(parent) {
 
 bool DesktopLayer::enabled() const { return DesktopHost::instance()->enabled(); }
 void DesktopLayer::setEnabled(bool enabled) { DesktopHost::instance()->setEnabled(enabled); }
+bool DesktopLayer::externalWallpaperEnabled() const {
+	return DesktopHost::instance()->externalWallpaperEnabled();
+}
+void DesktopLayer::setExternalWallpaperEnabled(bool enabled) {
+	DesktopHost::instance()->setExternalWallpaperEnabled(enabled);
+}
 bool DesktopLayer::active() const { return DesktopHost::instance()->active(); }
 bool DesktopLayer::underlayActive() const { return DesktopHost::instance()->underlayActive(); }
 

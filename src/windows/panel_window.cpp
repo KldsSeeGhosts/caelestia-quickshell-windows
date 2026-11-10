@@ -1528,7 +1528,12 @@ void WinPanelWindow::placeEmbedded() {
 	SetWindowPos(hwnd, insertAfter, rect.x(), rect.y(), rect.width(), rect.height(), flags);
 	this->placingEmbedded = false;
 
-	if (backgroundGroup) placeDesktopBackgrounds(this->mEmbedParent);
+	if (backgroundGroup) {
+		placeDesktopBackgrounds(
+		    this->mEmbedParent,
+		    DesktopHost::instance()->externalWallpaperEnabled()
+		);
+	}
 	if (this->mEmbedAboveIcons) this->applyInputRegion();
 }
 
