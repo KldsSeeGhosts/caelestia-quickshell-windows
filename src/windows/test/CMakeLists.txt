@@ -512,6 +512,12 @@ set_tests_properties(daemon_handshake PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=of
 
 enable_testing()
 
+qs_add_test_executable(appbar_call_test appbar_call_test.cpp)
+target_compile_definitions(appbar_call_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(appbar_call_test PRIVATE Qt6::Gui Qt6::Test user32)
+add_test(NAME appbar_call COMMAND appbar_call_test)
+set_tests_properties(appbar_call PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 qs_add_test_executable(tray_hook_test
 	tray_hook_test.cpp
 	${QS_WINDOWS_SRC}/services/systray/hook.cpp
@@ -969,7 +975,7 @@ target_compile_definitions(network_wifi_route_test PRIVATE
 	QS_TEST NOMINMAX WIN32_LEAN_AND_MEAN
 )
 target_include_directories(network_wifi_route_test PRIVATE ${QS_WINDOWS_SRC})
-target_link_libraries(network_wifi_route_test PRIVATE Qt6::Core Qt6::Qml Qt6::Test)
+target_link_libraries(network_wifi_route_test PRIVATE Qt6::Gui Qt6::Qml Qt6::Test)
 add_test(NAME network_wifi_route COMMAND network_wifi_route_test)
 
 qs_add_test_executable(fullscreen_ownership_test fullscreen_ownership_test.cpp)
@@ -1045,7 +1051,7 @@ target_compile_definitions(network_wifi_identity_test PRIVATE
 	QS_TEST QS_WIFI_NATIVE_FIXTURE NOMINMAX WIN32_LEAN_AND_MEAN
 )
 target_include_directories(network_wifi_identity_test PRIVATE ${QS_WINDOWS_SRC})
-target_link_libraries(network_wifi_identity_test PRIVATE Qt6::Core Qt6::Qml Qt6::Test shell32)
+target_link_libraries(network_wifi_identity_test PRIVATE Qt6::Gui Qt6::Qml Qt6::Test shell32)
 add_test(NAME network_wifi_identity COMMAND network_wifi_identity_test)
 
 # The capture exclusion decision with fake Win32 calls. No window and no desktop.
@@ -1118,7 +1124,7 @@ set(QS_TESTS_PORTABLE
 	erm625_native_desktop_facade network_wifi_identity capture_affinity window_stack
 )
 set(QS_TESTS_NATIVE
-	tray_hook tray_host keyboard_layout native_lifetime
+	appbar_call tray_hook tray_host keyboard_layout native_lifetime
 	notification_mirror_consent desktop_underlay capture_native daemon_handshake
 )
 set(QS_TESTS_DESKTOP system_surface desktop_zorder panel_hidden_reembed)

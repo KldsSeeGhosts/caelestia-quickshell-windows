@@ -4,10 +4,15 @@
 // WLAN backend with fake Windows entry points and uses only the connectivity
 // stubs below. Neither variant uses the live WLAN service or WinRT.
 #include <qstring.h>
+#include <functional>
 
 #include "../system/network.hpp"
 #include "../system/network_connectivity.hpp"
 #include "../system/network_wifi.hpp"
+
+namespace qs::windows {
+void runLauncher(std::function<void()>) { qFatal("Unexpected settings launch in WLAN fixture"); }
+}
 
 namespace qs::windows::sys {
 

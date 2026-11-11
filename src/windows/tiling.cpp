@@ -387,6 +387,7 @@ void restorePlacement(HWND hwnd, const QRect& rect) {
 	placement.length = sizeof(placement);
 	if (!GetWindowPlacement(hwnd, &placement)) return;
 	placement.rcNormalPosition = screenToPlacement(hwnd, rect);
+	placement.flags |= WPF_ASYNCWINDOWPLACEMENT;
 	SetWindowPlacement(hwnd, &placement);
 }
 
@@ -2424,6 +2425,7 @@ void TilingManager::rescueParked() {
 			auto native = toRECT(normal);
 			if (MonitorFromRect(&native, MONITOR_DEFAULTTONULL) != nullptr) continue;
 			placement.rcNormalPosition = screenToPlacement(hwnd, rect);
+			placement.flags |= WPF_ASYNCWINDOWPLACEMENT;
 			SetWindowPlacement(hwnd, &placement);
 			rescued++;
 			continue;

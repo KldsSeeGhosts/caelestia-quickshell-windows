@@ -213,6 +213,7 @@ private:
 	[[nodiscard]] bool wantsEmbedding() const;
 	[[nodiscard]] bool wantsAboveIcons() const;
 	void updateEmbedding();
+	void retryEmbedding();
 	void embedInto(HWND parent, HWND insertAfter, bool aboveIcons);
 	void unembed();
 	void placeEmbedded();
@@ -260,6 +261,8 @@ private:
 	PanelBlur* blur = nullptr;
 	QObject* mLayershellAttached = nullptr;
 	bool dimensionsUpdatePending = false;
+	bool appBarRetryPending = false;
+	bool embedRetryPending = false;
 	bool scaleRecreatePending = false;
 	bool focusFlagPending = false;
 	bool focusOnExpose = false;

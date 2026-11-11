@@ -248,14 +248,16 @@ bool parseHexColor(const QString& hex, QColor& out) {
 }
 
 void openUri(const wchar_t* uri) {
-	auto result = reinterpret_cast<INT_PTR>( // NOLINT
-	    ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL)
-	);
+	runLauncher([uri = std::wstring(uri)] {
+		auto result = reinterpret_cast<INT_PTR>( // NOLINT
+		    ShellExecuteW(nullptr, L"open", uri.c_str(), nullptr, nullptr, SW_SHOWNORMAL)
+		);
 
-	if (result <= 32) {
-		qCWarning(logWallpaper) << "Could not open"
-		                        << qs::windows::logPath(QString::fromWCharArray(uri)) << ":" << result;
-	}
+		if (result <= 32) {
+			qCWarning(logWallpaper) << "Could not open"
+			                        << qs::windows::logPath(QString::fromStdWString(uri)) << ":" << result;
+		}
+	});
 }
 
 struct LockScreenResult {

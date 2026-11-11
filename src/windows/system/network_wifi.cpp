@@ -17,6 +17,7 @@
 #include "../../core/backgroundpool.hpp"
 #include "../../core/logcat.hpp"
 #include "../startup.hpp"
+#include "../util.hpp"
 #include "network.hpp"
 #include "network_wifi_route.hpp"
 
@@ -247,7 +248,9 @@ void NetworkWifiBackend::refreshRadioState() {
 
 void NetworkWifiBackend::setRadioEnabled(bool enabled) {
 	if (!this->mHasAdapter) {
-		ShellExecuteW(nullptr, L"open", L"ms-settings:network-wifi", nullptr, nullptr, SW_SHOWNORMAL);
+		runLauncher([] {
+			ShellExecuteW(nullptr, L"open", L"ms-settings:network-wifi", nullptr, nullptr, SW_SHOWNORMAL);
+		});
 		return;
 	}
 
@@ -266,7 +269,9 @@ void NetworkWifiBackend::setRadioEnabled(bool enabled) {
 	if (result != ERROR_SUCCESS) {
 		qCWarning(logWifi) << "WlanSetInterface(radio_state) failed (needs admin?):" << result
 		                   << "-- opening Wi-Fi settings instead";
-		ShellExecuteW(nullptr, L"open", L"ms-settings:network-wifi", nullptr, nullptr, SW_SHOWNORMAL);
+		runLauncher([] {
+			ShellExecuteW(nullptr, L"open", L"ms-settings:network-wifi", nullptr, nullptr, SW_SHOWNORMAL);
+		});
 		return;
 	}
 

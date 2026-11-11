@@ -20,6 +20,12 @@ unclassified, classified twice, or a tier names a fixture that does not exist.
 
 All fixtures are built in CI, so every tier is at least compile-checked.
 
+`appbar_call` uses hidden fixture windows in child processes whose message
+pumps can stop and resume through kernel events. It checks the AppBar worker
+deadline, late output isolation, replacement recovery, the outstanding-worker
+cap, synchronous GUI callbacks and bounded responsiveness checks. It never
+registers an AppBar or discovers/messages the real Explorer.
+
 `DesktopLayer.externalWallpaperEnabled` defaults to `true` for compatibility.
 Setting it to `false` places every Background panel above foreign wallpaper
 children inside the desktop host, without changing the foreign windows or

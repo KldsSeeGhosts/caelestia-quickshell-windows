@@ -59,6 +59,7 @@
 #include "util.hpp"
 #include "virtual_desktops.hpp"
 #include "window_tracker.hpp"
+#include "window_responsiveness.hpp"
 
 namespace qs::windows {
 
@@ -1242,6 +1243,13 @@ void WinPanelWindow::updateDimensions(const MonitorRects& nativeRects) {
 		}
 
 		auto reserved = this->appBar.reserve(hwnd, abEdge, rects.monitor, mapper.toPhysical(zone));
+		if (!reserved.isValid() && !this->appBarRetryPending) {
+			this->appBarRetryPending = true;
+			QTimer::singleShot(1000, this, [this]() {
+				this->appBarRetryPending = false;
+				this->scheduleUpdateDimensions();
+			});
+		}
 
 		if (reserved.isValid()) {
 			auto reservedLogical = mapper.toLogical(reserved);
@@ -1275,6 +1283,11 @@ void WinPanelWindow::updateDimensions(const MonitorRects& nativeRects) {
 	);
 
 	if (this->mEmbedParent != nullptr) this->mEmbedRect = mapper.toPhysical(geometry);
+
+	if (this->mEmbedParent != nullptr && !windowResponding(this->mEmbedParent)) {
+		this->retryEmbedding();
+		return;
+	}
 
 	if (this->window->geometry() != geometry) {
 		qCDebug(logPanel) << "Placing" << this << "at" << geometry << "on"
@@ -1428,6 +1441,13 @@ void WinPanelWindow::updateEmbedding() {
 
 void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 	auto* hwnd = this->hwnd();
+	// SetParent has no timeout and joins input queues across processes. Avoid
+	// the known-hung case and retry once the desktop responds. This is only a
+	// preflight, not cancellation if Explorer hangs inside SetParent.
+	if (!windowResponding(parent)) {
+		this->retryEmbedding();
+		return;
+	}
 	auto wasEmbedded = this->mEmbedParent != nullptr;
 
 	if (!wasEmbedded) {
@@ -1476,6 +1496,10 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 void WinPanelWindow::unembed() {
 	auto* hwnd = this->hwnd();
 	auto wasEmbedded = this->mEmbedParent != nullptr;
+	if (wasEmbedded && IsWindow(this->mEmbedParent) && !windowResponding(this->mEmbedParent)) {
+		this->retryEmbedding();
+		return;
+	}
 	this->mEmbedParent = nullptr;
 	this->mEmbedInsertAfter = nullptr;
 	this->mEmbedAboveIcons = false;
@@ -1511,6 +1535,10 @@ QRect WinPanelWindow::embeddedRect() const {
 void WinPanelWindow::placeEmbedded() {
 	auto* hwnd = this->hwnd();
 	if (hwnd == nullptr || this->mEmbedParent == nullptr || !this->mEmbedRect.isValid()) return;
+	if (!windowResponding(this->mEmbedParent)) {
+		this->retryEmbedding();
+		return;
+	}
 
 	auto rect = this->embeddedRect();
 	// The WorkerW host has no insert-after; its z-order is a group property.
@@ -1520,7 +1548,7 @@ void WinPanelWindow::placeEmbedded() {
 	                    && this->mEmbedInsertAfter == nullptr;
 	markDesktopBackground(hwnd, backgroundGroup);
 
-	UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+	UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS;
 	auto* insertAfter = this->mEmbedAboveIcons ? HWND_TOP : this->mEmbedInsertAfter;
 	if (insertAfter == nullptr && !this->mEmbedAboveIcons) flags |= SWP_NOZORDER;
 
@@ -1535,6 +1563,16 @@ void WinPanelWindow::placeEmbedded() {
 		);
 	}
 	if (this->mEmbedAboveIcons) this->applyInputRegion();
+}
+
+void WinPanelWindow::retryEmbedding() {
+	if (this->embedRetryPending) return;
+	this->embedRetryPending = true;
+	QTimer::singleShot(500, this, [this]() {
+		this->embedRetryPending = false;
+		this->updateEmbedding();
+		this->scheduleUpdateDimensions();
+	});
 }
 
 void WinPanelWindow::reconcileEmbedding() {

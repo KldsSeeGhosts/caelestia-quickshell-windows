@@ -8,6 +8,7 @@
 #include <shellapi.h>
 
 #include "network_connectivity.hpp"
+#include "../util.hpp"
 
 namespace qs::windows::sys {
 
@@ -158,11 +159,15 @@ void Network::forgetNetworkById(const QString& selectionId) {
 }
 
 void Network::openWifiSettings() {
-	ShellExecuteW(nullptr, L"open", L"ms-settings:network-wifi", nullptr, nullptr, SW_SHOWNORMAL);
+	runLauncher([] {
+		ShellExecuteW(nullptr, L"open", L"ms-settings:network-wifi", nullptr, nullptr, SW_SHOWNORMAL);
+	});
 }
 
 void Network::openLocationSettings() {
-	ShellExecuteW(nullptr, L"open", L"ms-settings:privacy-location", nullptr, nullptr, SW_SHOWNORMAL);
+	runLauncher([] {
+		ShellExecuteW(nullptr, L"open", L"ms-settings:privacy-location", nullptr, nullptr, SW_SHOWNORMAL);
+	});
 }
 
 void Network::setWifiListVisible(bool visible) {
