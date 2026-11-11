@@ -2,10 +2,13 @@
 #include "listing_pool.hpp"
 
 #include <algorithm>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <system_error>
+#include <utility>
+#include <vector>
 
 #include <qt_windows.h>
 
@@ -87,8 +90,15 @@ QList<FoundEntry> listDirOnDisk(const QString& path) {
 struct FsUtils::Bridge {
 	std::mutex mutex;
 	QObject* receiver = nullptr;
-	int latestRequest = 0;
-	std::shared_ptr<ListingPool::Slot> slot = std::make_shared<ListingPool::Slot>();
+	// One coalescing slot per path. FsUtils is a QML singleton shared by
+	// unrelated callers, so a request for one folder must never cancel a
+	// request for another. Requests for the same path that arrive before its
+	// listing starts share that listing's result.
+	struct PathListing {
+		std::shared_ptr<ListingPool::Slot> slot = std::make_shared<ListingPool::Slot>();
+		std::vector<int> waiting;
+	};
+	std::map<QString, PathListing> paths;
 
 	void close() {
 		std::lock_guard lock(mutex);
@@ -145,20 +155,21 @@ int FsUtils::listDirAsync(const QString& path) {
 	const auto request = m_nextRequest++;
 	auto bridge = m_bridge;
 	auto* owner = this;
+	std::shared_ptr<ListingPool::Slot> slot;
 	{
 		std::lock_guard lock(bridge->mutex);
-		bridge->latestRequest = request;
+		auto& listing = bridge->paths[path];
+		listing.waiting.push_back(request);
+		slot = listing.slot;
 	}
 
 	try {
 		static ListingPool pool;
-		pool.submit(bridge->slot, [weak = std::weak_ptr(bridge), owner, request, path] {
+		pool.submit(slot, [weak = std::weak_ptr(bridge), owner, path] {
 			auto bridge = weak.lock();
 			if (!bridge) return;
-			{
-				std::lock_guard lock(bridge->mutex);
-				if (!bridge->receiver || bridge->latestRequest != request) return;
-			}
+			auto requests = takeWaiting(bridge, path);
+			if (requests.empty()) return;
 			auto entries = QVariantList();
 			for (const auto& entry: listDirOnDisk(path)) {
 				QVariantMap map;
@@ -166,32 +177,39 @@ int FsUtils::listDirAsync(const QString& path) {
 				map.insert(QStringLiteral("onDisk"), entry.onDisk);
 				entries.append(map);
 			}
-			deliver(bridge, owner, request, path, entries);
+			deliver(bridge, owner, requests, path, entries);
 		});
 	} catch (const std::system_error&) {
-		// No worker could start: finish the request with an empty answer so a
-		// caller never treats it as pending.
-		deliver(bridge, owner, request, path, {});
+		// No worker could start: finish the waiting requests with an empty
+		// answer so a caller never treats them as pending.
+		deliver(bridge, owner, takeWaiting(bridge, path), path, {});
 	}
 
 	return request;
 }
 
+std::vector<int> FsUtils::takeWaiting(const std::shared_ptr<Bridge>& bridge, const QString& path) {
+	std::lock_guard lock(bridge->mutex);
+	if (!bridge->receiver) return {};
+	auto it = bridge->paths.find(path);
+	if (it == bridge->paths.end()) return {};
+	return std::exchange(it->second.waiting, {});
+}
+
 void FsUtils::deliver(
     const std::shared_ptr<Bridge>& bridge,
     FsUtils* owner,
-    int request,
+    const std::vector<int>& requests,
     const QString& path,
     const QVariantList& entries
 ) {
+	if (requests.empty()) return;
 	std::lock_guard lock(bridge->mutex);
-	if (!bridge->receiver || bridge->latestRequest != request) return;
+	if (!bridge->receiver) return;
 	QMetaObject::invokeMethod(
 	    bridge->receiver,
-	    [bridge, owner, request, path, entries] {
-		    // Check again after the GUI queue, where a newer request may have arrived.
-		    if (bridge->latestRequest == request)
-			    emit owner->listDirFinished(request, path, entries);
+	    [owner, requests, path, entries] {
+		    for (auto request: requests) emit owner->listDirFinished(request, path, entries);
 	    },
 	    Qt::QueuedConnection
 	);

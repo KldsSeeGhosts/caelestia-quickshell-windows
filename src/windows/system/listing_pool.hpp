@@ -8,6 +8,7 @@
 #include <mutex>
 #include <system_error>
 #include <thread>
+#include <utility>
 
 namespace qs::windows::sys {
 
@@ -33,7 +34,7 @@ public:
 							slot = state->queue.front().lock();
 							state->queue.pop_front();
 							if (!slot) continue;
-							work = std::move(slot->pending);
+							work = std::exchange(slot->pending, nullptr);
 						}
 						work();
 						{

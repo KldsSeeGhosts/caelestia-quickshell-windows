@@ -3,10 +3,10 @@
 These limits protect against accidental same-user resource exhaustion. They are
 not privilege or authentication boundaries.
 
-Directory listings use two shared detached workers for the process. Each
-`FsUtils` requester can have one active listing and one pending listing.
-A newer request replaces the pending listing. Results are discarded when their
-request ID is stale. A stuck share can occupy a worker, but cannot create more
+Directory listings use two shared detached workers for the process. Each path
+requested through `FsUtils` has at most one active and one pending listing.
+Every request is answered: requests for the same path that arrive before its
+pending listing starts share its result. A stuck share can occupy a worker, but cannot create more
 workers, and shutdown does not join them. If both workers stall, listings wait.
 
 The IPC server accepts at most 128 concurrent connections, including long-lived

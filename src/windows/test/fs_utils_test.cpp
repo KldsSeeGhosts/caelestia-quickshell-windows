@@ -12,6 +12,7 @@
 #include <qvariantlist.h>
 #include <qvariantmap.h>
 
+#include <qset.h>
 #include <qt_windows.h>
 
 #include "fs_utils.hpp"
@@ -59,7 +60,8 @@ private slots:
 	void onDiskOnlyStillListsPlaceholders();
 	void missingDirectoryStillDelivers();
 	void workersAreBoundedAndCoalesce();
-	void staleResultsAreDiscarded();
+	void everyRequestIsAnswered();
+	void otherPathsAreNotSuperseded();
 };
 
 void TestFsUtils::asyncListingDeliversFiles() {
@@ -185,15 +187,33 @@ void TestFsUtils::workersAreBoundedAndCoalesce() {
 	QCOMPARE(state->latest.load(), 1000);
 }
 
-void TestFsUtils::staleResultsAreDiscarded() {
+void TestFsUtils::everyRequestIsAnswered() {
 	QTemporaryDir dir;
 	QVERIFY(dir.isValid());
 	FsUtils utils;
 	QSignalSpy spy(&utils, &FsUtils::listDirFinished);
-	int latest = 0;
-	for (int i = 0; i < 1000; ++i) latest = utils.listDirAsync(dir.path());
-	QTRY_COMPARE_WITH_TIMEOUT(spy.count(), 1, 5000);
-	QCOMPARE(spy.first().at(0).toInt(), latest);
+	QSet<int> requested;
+	for (int i = 0; i < 1000; ++i) requested.insert(utils.listDirAsync(dir.path()));
+	QTRY_COMPARE_WITH_TIMEOUT(spy.count(), 1000, 5000);
+	QSet<int> answered;
+	for (const auto& args: spy) answered.insert(args.at(0).toInt());
+	QCOMPARE(answered, requested);
+}
+
+void TestFsUtils::otherPathsAreNotSuperseded() {
+	// FsUtils is a QML singleton: the dashboard and the wallpaper service list
+	// different folders through the same instance at startup.
+	QTemporaryDir first;
+	QTemporaryDir second;
+	QVERIFY(first.isValid() && second.isValid());
+	FsUtils utils;
+	QSignalSpy spy(&utils, &FsUtils::listDirFinished);
+	const auto a = utils.listDirAsync(first.path());
+	const auto b = utils.listDirAsync(second.path());
+	QTRY_COMPARE_WITH_TIMEOUT(spy.count(), 2, 5000);
+	QSet<int> answered;
+	for (const auto& args: spy) answered.insert(args.at(0).toInt());
+	QCOMPARE(answered, (QSet<int> {a, b}));
 }
 
 QTEST_GUILESS_MAIN(TestFsUtils)
