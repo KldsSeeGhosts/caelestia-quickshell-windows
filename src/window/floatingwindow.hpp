@@ -162,8 +162,11 @@ public:
 	/// Start a system resize operation. Must be called during a pointer press/drag.
 	Q_INVOKABLE [[nodiscard]] bool startSystemResize(Qt::Edges edges) const;
 
-	/// On Windows, bring an existing window to the front and request keyboard
-	/// focus. Other platforms leave focus and stacking to the compositor.
+	/// On Windows, bring a window to the front and request keyboard focus.
+	/// After createObject() returns, this also completes a deferred first show
+	/// before returning, so a caller can then close its source panel without
+	/// giving foreground rights back to the previous application first.
+	/// Other platforms leave focus and stacking to the compositor.
 	///
 	/// Use this when an already open window is requested again. Unlike changing
 	/// @@visible, it neither recreates the window nor changes its content.

@@ -8,6 +8,24 @@ if (WIN32)
 	target_compile_definitions(quickshell-gui PRIVATE QS_WINDOWS_GUI_EXE)
 
 	set(QS_PRODUCT_NAME "Quickshell" CACHE STRING "Product name in the Windows version resource")
+	set(QS_ICON_FILE "" CACHE FILEPATH "Optional .ico for Windows executable resources and application windows")
+	if (QS_ICON_FILE)
+		if (NOT EXISTS "${QS_ICON_FILE}")
+			message(FATAL_ERROR "QS_ICON_FILE does not exist: ${QS_ICON_FILE}")
+		endif()
+		file(TO_CMAKE_PATH "${QS_ICON_FILE}" QS_RC_ICON_FILE)
+		get_filename_component(QS_ICON_DIRECTORY "${QS_ICON_FILE}" DIRECTORY)
+		foreach(target quickshell quickshell-gui)
+			qt_add_resources(${target} "window_icon"
+				PREFIX "/quickshell"
+				BASE "${QS_ICON_DIRECTORY}"
+				FILES "${QS_ICON_FILE}")
+		endforeach()
+		get_filename_component(QS_ICON_NAME "${QS_ICON_FILE}" NAME)
+		# launch.cpp is compiled in a shared library, not either executable.
+		add_compile_definitions(QS_WINDOW_ICON_RESOURCE=":/quickshell/${QS_ICON_NAME}")
+		set_property(SOURCE quickshell.rc APPEND PROPERTY OBJECT_DEPENDS "${QS_ICON_FILE}")
+	endif()
 	set(QS_COMPANY_NAME "" CACHE STRING "Company name in the Windows version resource (default: the product name followed by contributors)")
 	if (NOT QS_COMPANY_NAME)
 		set(QS_RC_COMPANY "${QS_PRODUCT_NAME} contributors")

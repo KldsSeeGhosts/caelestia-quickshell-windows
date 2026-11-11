@@ -398,6 +398,20 @@ private slots:
 		}
 	}
 
+	void explicitFloatingOpenCompletesBeforeSourcePanelCloses() {
+		auto floating = codeOnly(readSource(QStringLiteral("../window/floatingwindow.cpp")));
+		auto begin = floating.indexOf(QStringLiteral("void FloatingWindowInterface::requestActivate()"));
+		QVERIFY(begin >= 0);
+		auto request = floating.mid(begin);
+		QVERIFY(request.contains(QStringLiteral("this->engineGeneration->reloadComplete")));
+		auto reload = request.indexOf(QStringLiteral("this->reload()"));
+		auto done = request.indexOf(QStringLiteral("return;"), reload);
+		auto existing = request.indexOf(QStringLiteral("this->window->raiseAndActivate()"));
+		QVERIFY(reload >= 0 && done > reload && existing > done);
+		// Initial show uses activateAs once. No second request after the reload.
+		QVERIFY(!request.contains(QStringLiteral("requestForegroundWindow(")));
+	}
+
 	void activationPathUsesOneRequest() {
 		static const auto callers = QStringList {
 		    QStringLiteral("focus_grab.cpp"),

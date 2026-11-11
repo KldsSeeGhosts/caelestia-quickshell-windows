@@ -9,6 +9,7 @@
 #include <qtypes.h>
 #include <qwindow.h>
 
+#include "../core/generation.hpp"
 #include "proxywindow.hpp"
 #include "windowinterface.hpp"
 #ifdef _WIN32
@@ -342,7 +343,22 @@ bool FloatingWindowInterface::startSystemResize(Qt::Edges edges) const {
 	return qw->startSystemResize(edges);
 }
 
-void FloatingWindowInterface::requestActivate() { this->window->raiseAndActivate(); }
+void FloatingWindowInterface::requestActivate() {
+#ifdef _WIN32
+	// createObject() has completed the QML object, but Reloadable normally waits
+	// for the next event-loop turn to show its backer. Complete that first show
+	// while the opening input dispatch/source panel still owns foreground rights.
+	// Never bypass an in-progress generation reload, which may supply an old window.
+	if (!this->reloadComplete && this->engineGeneration != nullptr
+	    && this->engineGeneration->reloadComplete)
+	{
+		this->reload();
+		// The first show already made its one source-aware activation request.
+		return;
+	}
+#endif
+	this->window->raiseAndActivate();
+}
 
 QObject* FloatingWindowInterface::parentWindow() const { return this->window->parentWindow(); }
 
