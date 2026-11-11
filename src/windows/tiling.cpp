@@ -469,6 +469,10 @@ TilingManager::TilingManager(QString mutexName): mutexName(std::move(mutexName))
 	}
 	this->snapshotPath = QDir(state).filePath(QStringLiteral("tiling-layout.json"));
 #endif
+	// Debounced, not periodic: an idle tiler must not wake up to re-hash an
+	// unchanged layout. Every layout, geometry and state change ends in sync(),
+	// which re-arms this single shot; stop() and aboutToQuit capture directly.
+	this->snapshotTimer.setSingleShot(true);
 	this->snapshotTimer.setInterval(SNAPSHOT_MS);
 	QObject::connect(&this->snapshotTimer, &QTimer::timeout, this, &TilingManager::persistLayout);
 
@@ -1516,6 +1520,7 @@ void TilingManager::sync() {
 
 	this->refreshManagedCount();
 	this->refreshBorderColours();
+	if (this->mEnabled) this->snapshotTimer.start();
 }
 
 void TilingManager::refreshManagedCount() {

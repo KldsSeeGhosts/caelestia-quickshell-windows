@@ -4,9 +4,10 @@ The manager saves `tiling-layout.json` in `CAELESTIA_STATE_DIR`, or in
 `QStandardPaths::GenericStateLocation/caelestia` when no profile override exists.
 It uses compact version 1 JSON and `QSaveFile` atomic replacement, with no
 direct-write fallback. It captures before clean stop restores floating
-rectangles, before `aboutToQuit` unparks windows, and every two seconds while
-enabled. Unchanged snapshots do not rewrite the file. A crash can lose the
-changes since the last periodic snapshot.
+rectangles, before `aboutToQuit` unparks windows, and two seconds after the last
+layout pass while enabled. There is no periodic timer, so an idle tiler never
+wakes up for persistence. Unchanged snapshots do not rewrite the file. A crash
+can lose the changes made in the last two seconds.
 
 The snapshot contains:
 
