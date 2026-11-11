@@ -194,7 +194,10 @@ void LazyLoader::onIncubationFailed() {
 		qWarning() << error;
 	}
 
-	delete this->incubator;
+	// The failure signal also runs inside the incubator's status callback.
+	this->incubator->deleteLater();
+	this->incubator = nullptr;
 	this->targetLoading = false;
+	this->targetActive = false;
 	emit this->loadingChanged();
 }

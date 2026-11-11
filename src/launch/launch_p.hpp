@@ -8,14 +8,9 @@
 #include <qstring.h>
 
 #include "../core/instanceinfo.hpp"
+#include "daemon.hpp"
 
 namespace qs::launch {
-
-#ifdef _WIN32
-extern void* DAEMON_PIPE; // NOLINT
-#else
-extern int DAEMON_PIPE; // NOLINT
-#endif
 
 class QStringOption {
 public:
@@ -109,12 +104,6 @@ struct LaunchArgs {
 	int debugPort = -1;
 	bool waitForDebug = false;
 };
-
-void exitDaemon(int code);
-
-#ifdef _WIN32
-bool spawnDaemon(int argc, char** argv, int* exitCode);
-#endif
 
 int parseCommand(int argc, char** argv, CommandState& state);
 int runCommand(int argc, char** argv);

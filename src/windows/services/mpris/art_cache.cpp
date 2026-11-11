@@ -1,11 +1,13 @@
 #include "art_cache.hpp"
 
 #include <qbytearray.h>
+#include <qbuffer.h>
 #include <qcryptographichash.h>
 #include <qdir.h>
 #include <qfile.h>
 #include <qfileinfo.h>
 #include <qimage.h>
+#include <qimagereader.h>
 #include <qlist.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
@@ -38,9 +40,19 @@ void pruneCache(const QString& dir, const QString& retainedFileName) {
 } // namespace
 
 CachedArt cacheImageBytes(const QByteArray& bytes, const QString& cacheDirectory) {
-	if (bytes.isEmpty() || cacheDirectory.isEmpty()) return {};
-	QImage image;
-	if (!image.loadFromData(bytes)) {
+	if (!artworkSizeAllowed(static_cast<uint64_t>(bytes.size())) || cacheDirectory.isEmpty()) return {};
+	QBuffer buffer;
+	buffer.setData(bytes);
+	buffer.open(QIODevice::ReadOnly);
+	QImageReader reader(&buffer);
+	// Inspect the header before decoding so compressed images cannot request
+	// an unbounded pixel allocation. Reject formats without a known size.
+	if (!artworkDimensionsAllowed(reader.size())) {
+		qCWarning(logMprisArt) << "Could not decode a thumbnail with invalid or oversized dimensions";
+		return {};
+	}
+	auto image = reader.read();
+	if (image.isNull() || !artworkDimensionsAllowed(image.size())) {
 		qCWarning(logMprisArt) << "Could not decode a thumbnail of" << bytes.size() << "bytes";
 		return {};
 	}
@@ -69,11 +81,12 @@ CachedArt cacheThumbnail(
 
 	try {
 		auto stream = thumbnail.OpenReadAsync().get();
-		auto size = static_cast<uint32_t>(stream.Size());
-		if (size == 0) return {};
+		auto streamSize = stream.Size();
+		if (!artworkSizeAllowed(streamSize)) return {};
+		auto size = static_cast<uint32_t>(streamSize);
 
 		DataReader reader(stream);
-		reader.LoadAsync(size).get();
+		if (reader.LoadAsync(size).get() != size) return {};
 
 		QByteArray bytes(static_cast<qsizetype>(size), Qt::Uninitialized);
 		reader.ReadBytes(winrt::array_view<uint8_t>(

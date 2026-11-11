@@ -47,6 +47,7 @@ uint8_t gHoldActive = 0;           // NOLINT
 // A Super chord was swallowed since the Windows key went down. If an earlier
 // native chord exposed Win-down, keep the legacy masked-release fallback.
 bool gSuperChordConsumed = false; // NOLINT
+bool gEscapeClaimed = false; // NOLINT
 // Suppressed Win downs do not update GetAsyncKeyState. Keep the two sides
 // separately, and publish only the physical hold for the mouse hook.
 struct WinKey {
@@ -316,6 +317,7 @@ void resetPhysicalState() {
 	gHoldActive = 0;
 	gSuppressLoneSuperTap.store(false);
 	gSuperChordConsumed = false;
+	gEscapeClaimed = false;
 
 	for (size_t vk = 0; vk < std::size(gReplayed); vk++) {
 		if (!gReplayed[vk]) continue;
@@ -679,14 +681,13 @@ LRESULT CALLBACK hookProc(int code, WPARAM wParam, LPARAM lParam) {
 
 	// Esc that cancels a Super drag is consumed with its release. The filter
 	// claims it only while such a drag is active, so Esc passes otherwise.
-	static bool escapeClaimed = false;
-	if (info->vkCode == VK_ESCAPE && !up && !escapeClaimed) {
+	if (info->vkCode == VK_ESCAPE && !up && !gEscapeClaimed) {
 		auto* filter = gEscapeFilter.load(std::memory_order_acquire);
-		escapeClaimed = filter != nullptr && filter();
-		if (escapeClaimed) swallow = 1;
-	} else if (info->vkCode == VK_ESCAPE && escapeClaimed) {
+		gEscapeClaimed = filter != nullptr && filter();
+		if (gEscapeClaimed) swallow = 1;
+	} else if (info->vkCode == VK_ESCAPE && gEscapeClaimed) {
 		// The claimed press's repeats and release.
-		if (up) escapeClaimed = false;
+		if (up) gEscapeClaimed = false;
 		swallow = 1;
 	}
 

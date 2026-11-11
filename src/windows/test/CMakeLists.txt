@@ -470,6 +470,27 @@ target_compile_definitions(runtime_paths_test PRIVATE NOMINMAX WIN32_LEAN_AND_ME
 target_link_libraries(runtime_paths_test PRIVATE Qt6::Core Qt6::Test)
 add_test(NAME runtime_paths COMMAND runtime_paths_test)
 
+qs_add_test_executable(lazyloader_test
+	lazyloader_test.cpp lazyloader_test_stubs.cpp
+	${QS_WINDOWS_SRC}/../core/lazyloader.cpp
+	${QS_WINDOWS_SRC}/../core/incubator.cpp
+	${QS_WINDOWS_SRC}/../core/reload.hpp
+)
+target_link_libraries(lazyloader_test PRIVATE Qt6::QuickPrivate Qt6::Qml Qt6::Test)
+add_test(NAME lazyloader COMMAND lazyloader_test)
+set_tests_properties(lazyloader PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+# A console-only copy of the fixture is the daemon child. It never starts qs,
+# initializes GUI providers or touches the desktop.
+qs_add_test_executable(daemon_handshake_test
+	daemon_handshake_test.cpp
+	${QS_WINDOWS_SRC}/../launch/daemon_win.cpp
+)
+target_compile_definitions(daemon_handshake_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(daemon_handshake_test PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME daemon_handshake COMMAND daemon_handshake_test)
+set_tests_properties(daemon_handshake PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 enable_testing()
 
 qs_add_test_executable(tray_hook_test
@@ -1057,13 +1078,13 @@ set(QS_TESTS_PORTABLE
 	transition_trace foreground_observer activation_policy fullscreen_app_state
 	panel_topmost power_profiles brightness_route display_identity
 	native_desktop_recovery pw_session_worker idle_request input_settle
-	super_drag_wait network_wifi_route runtime_paths
+	super_drag_wait network_wifi_route runtime_paths lazyloader
 	fullscreen_ownership display_transaction clipboard_capture capture_dimensions
 	erm625_native_desktop_facade network_wifi_identity capture_affinity window_stack
 )
 set(QS_TESTS_NATIVE
 	tray_hook tray_host keyboard_layout native_lifetime
-	notification_mirror_consent desktop_underlay capture_native
+	notification_mirror_consent desktop_underlay capture_native daemon_handshake
 )
 set(QS_TESTS_DESKTOP system_surface desktop_zorder panel_hidden_reembed)
 set(QS_TESTS_GPU capture_format capture_device video_node)

@@ -46,6 +46,18 @@ The clipboard fixture receives an absolute disposable directory in the build
 tree and refuses any personal-profile fallback. Test-only definitions are
 scoped to each fixture target.
 
+`lazyloader` runs real Qt incubation, including a required-property error after
+component compilation succeeds, deferred incubator deletion and loading or
+activation retries. Only shell-generation and render-timing integrations are
+stubbed. `mpris_art_cache` checks encoded and decoded size limits without
+opening a media session. `keyboard_hook` exercises consumed-Esc resets through
+its fake input callbacks without installing hooks or injecting input.
+
+`daemon_handshake` is a native-tier, console-only fixture. It spawns only a copy
+of itself through the production daemon launcher, checks both daemon flags,
+verifies that the consumed pipe is no longer inheritable and acknowledges
+readiness. It never launches the shell or creates GUI windows.
+
 `runtime_paths_test` compiles the production `src/core/paths.cpp` and runs
 base-, instance-, shell-only failure cases plus a valid runtime in isolated
 child processes. It uses regular-file and directory blockers rather than changing

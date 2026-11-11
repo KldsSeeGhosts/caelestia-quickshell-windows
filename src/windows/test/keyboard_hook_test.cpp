@@ -400,6 +400,8 @@ private slots:
 		for (auto& replayed: gReplayed) replayed = false;
 		gTapCandidate = gHoldActive = 0;
 		gSuperChordConsumed = false;
+		gEscapeClaimed = false;
+		gEscapeFilter.store(nullptr);
 		gWin = {};
 		gWinDown.store(false);
 		gSuppressLoneSuperTap.store(false);
@@ -416,6 +418,48 @@ private slots:
 		auto snapshot = std::make_shared<HookSnapshot>();
 		snapshot->triggers.push_back({.kind = HookTrigger::Tap, .combo = {.lone = ModSuper}});
 		KeyboardHook::setSnapshot(snapshot);
+	}
+
+	void claimedEscapeConsumesRepeatsAndRelease() {
+		KeyboardHook::setEscapeFilter(+[] { return true; });
+		physical(VK_ESCAPE, false, 100);
+		KeyboardHook::setEscapeFilter(nullptr);
+		physical(VK_ESCAPE, false, 110);
+		physical(VK_ESCAPE, true, 120);
+		QVERIFY(desktop.delivered.empty());
+		QVERIFY(!gEscapeClaimed);
+		physical(VK_ESCAPE, false, 200);
+		physical(VK_ESCAPE, true, 210);
+		QCOMPARE(desktop.delivered.size(), size_t(2));
+		QCOMPARE(desktop.injections, 0);
+	}
+
+	void inputResetClearsClaimedEscape_data() {
+		QTest::addColumn<bool>("desktopSwitch");
+		QTest::newRow("hook-reset") << false;
+		QTest::newRow("desktop-switch") << true;
+	}
+
+	void inputResetClearsClaimedEscape() {
+		QFETCH(bool, desktopSwitch);
+		KeyboardHook::setEscapeFilter(+[] { return true; });
+		physical(VK_ESCAPE, false, 100);
+		QVERIFY(gEscapeClaimed);
+		QVERIFY(desktop.delivered.empty());
+
+		// The release happens on another desktop or while the hook is stopped.
+		if (desktopSwitch) {
+			inputDesktopChanged(nullptr, EVENT_SYSTEM_DESKTOPSWITCH, nullptr, 0, 0, 0, 0);
+		} else {
+			resetPhysicalState();
+		}
+		KeyboardHook::setEscapeFilter(nullptr);
+		QVERIFY(!gEscapeClaimed);
+		physical(VK_ESCAPE, false, 200);
+		physical(VK_ESCAPE, true, 210);
+		QCOMPARE(desktop.delivered.size(), size_t(2));
+		QVERIFY(!desktop.down[VK_ESCAPE]);
+		QCOMPARE(desktop.injections, 0);
 	}
 
 	void bareWinSurvivesAMaskDiscardingHook_data() {
