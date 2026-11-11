@@ -25,13 +25,19 @@ void initLogCategoryLevel(const char*, QtMsgType) {}
 namespace {
 constexpr auto CLASS_NAME = L"QuickshellUnderlayPolicyTest";
 constexpr UINT SET_VISIBLE = WM_APP + 1;
+constexpr UINT DESTROY_WALLPAPER = WM_APP + 2;
 
 LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 	if (msg == SET_VISIBLE) {
 		ShowWindow(hwnd, wp ? SW_SHOWNA : SW_HIDE);
 		return 0;
 	}
-	if (msg == WM_DESTROY) PostQuitMessage(0);
+	if (msg == DESTROY_WALLPAPER) {
+		SetWindowLongPtrW(hwnd, GWLP_USERDATA, 1);
+		DestroyWindow(hwnd);
+		return 0;
+	}
+	if (msg == WM_DESTROY && GetWindowLongPtrW(hwnd, GWLP_USERDATA) == 0) PostQuitMessage(0);
 	return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
@@ -79,6 +85,98 @@ public:
 	QString desktopName;
 
 private slots:
+	void shellRestackAfterStopPlay_data() {
+		QTest::addColumn<bool>("freshStart");
+		QTest::addColumn<bool>("stopHides");
+		QTest::newRow("live-reenable-hidden") << false << true;
+		QTest::newRow("live-reenable-visible") << false << false;
+		QTest::newRow("fresh-shell-existing-hidden-wallpaper") << true << true;
+		QTest::newRow("fresh-shell-existing-visible-wallpaper") << true << false;
+	}
+
+	void shellRestackAfterStopPlay() {
+		QFETCH(bool, freshStart);
+		QFETCH(bool, stopHides);
+		registerClass();
+		QProcess explorer;
+		auto nativeDesktop = desktopName.toStdWString();
+		explorer.setCreateProcessArgumentsModifier([&](QProcess::CreateProcessArguments* args) {
+			args->startupInfo->lpDesktop = nativeDesktop.data();
+		});
+		explorer.start(QCoreApplication::applicationFilePath(),
+		               {QStringLiteral("--foreign"), QStringLiteral("0")});
+		QVERIFY(explorer.waitForStarted());
+		QTRY_VERIFY_WITH_TIMEOUT(explorer.canReadLine(), 5000);
+		auto* parent = reinterpret_cast<HWND>(explorer.readLine().trimmed().toLongLong());
+		QVERIFY(parent);
+		auto* host = qs::windows::DesktopHost::instance();
+		host->setReconcileSourcesForTesting(false, false);
+		host->setEnabled(false);
+		host->setAboveIcons({});
+		host->setExternalWallpaperEnabled(true);
+
+		QProcess foreign;
+		foreign.setCreateProcessArgumentsModifier([&](QProcess::CreateProcessArguments* args) {
+			args->startupInfo->lpDesktop = nativeDesktop.data();
+		});
+		foreign.start(QCoreApplication::applicationFilePath(), {
+		    QStringLiteral("--foreign"), QString::number(reinterpret_cast<qintptr>(parent))
+		});
+		QVERIFY(foreign.waitForStarted());
+		QTRY_VERIFY_WITH_TIMEOUT(foreign.canReadLine(), 5000);
+		auto* external = reinterpret_cast<HWND>(foreign.readLine().trimmed().toLongLong());
+		QVERIFY(IsWindow(external));
+		if (freshStart && stopHides) {
+			// stop/play happened before this shell had a window or hooks.
+			SendMessageW(external, SET_VISIBLE, FALSE, 0);
+			SendMessageW(external, SET_VISIBLE, TRUE, 0);
+		}
+		auto* shell = create(parent, 0, 200);
+		QVERIFY(shell);
+		qs::windows::markDesktopBackground(shell, true);
+		host->adoptHostForTesting(parent);
+		host->setReconcileSourcesForTesting(true, true);
+		QTRY_VERIFY(host->underlayActive());
+		QTRY_VERIFY(below(parent, shell, external));
+
+		if (!freshStart) {
+			host->setExternalWallpaperEnabled(false);
+			if (stopHides) SendMessageW(external, SET_VISIBLE, FALSE, 0);
+			QTRY_VERIFY(!host->underlayActive());
+			QTRY_VERIFY(GetWindow(parent, GW_CHILD) == shell);
+			host->setExternalWallpaperEnabled(true);
+			if (stopHides) SendMessageW(external, SET_VISIBLE, TRUE, 0);
+			QTRY_VERIFY(host->underlayActive());
+			QTRY_VERIFY(below(parent, shell, external));
+		}
+		QVERIFY(IsWindow(external));
+		// Drain foreign events before a shell-only reorder. Visibility and the
+		// acknowledgement remain true, so neither edge can repair this.
+		QTest::qWait(200);
+		SetWindowPos(shell, HWND_TOP, 0, 0, 0, 0,
+		             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+		QTRY_VERIFY_WITH_TIMEOUT(below(parent, shell, external), 2000);
+		auto moves = qs::windows::desktopBackgroundMovesForTesting();
+		QTest::qWait(200);
+		QCOMPARE(qs::windows::desktopBackgroundMovesForTesting(), moves);
+
+		// Destroy only the wallpaper window. The engine process stays alive,
+		// and repeated host reconciliation must not invent another claim.
+		SendMessageW(external, DESTROY_WALLPAPER, 0, 0);
+		QVERIFY(!IsWindow(external));
+		QVERIFY(foreign.state() == QProcess::Running);
+		QTRY_VERIFY(!host->underlayActive());
+		QTRY_VERIFY(GetWindow(parent, GW_CHILD) == shell);
+		host->refreshForTesting();
+		QVERIFY(!host->underlayActive());
+		foreign.kill();
+		QVERIFY(foreign.waitForFinished());
+		host->setEnabled(false);
+		DestroyWindow(shell);
+		SendMessageW(parent, WM_CLOSE, 0, 0);
+		QVERIFY(explorer.waitForFinished());
+	}
+
 	void nativeOwnerOverridesReplaceWithoutDiscovery() {
 		registerClass();
 		auto* parent = create(nullptr, 0, 200);
