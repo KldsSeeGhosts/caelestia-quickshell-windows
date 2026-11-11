@@ -2,12 +2,13 @@
 #include <cstdio>
 #include <vector>
 
+#include <qdebug.h>
 #include <qlogging.h>
 #include <qstring.h>
 #include <qtenvironmentvariables.h>
 #include <windows.h>
 
-#include "launch_p.hpp"
+#include "daemon.hpp"
 
 namespace qs::launch {
 
@@ -53,7 +54,17 @@ bool spawnDaemon(int argc, char** argv, int* exitCode) {
 		qunsetenv(DAEMON_PIPE_ENV);
 
 		if (ok && handle != 0) {
-			DAEMON_PIPE = reinterpret_cast<void*>(static_cast<uintptr_t>(handle)); // NOLINT
+			auto pipe = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(handle)); // NOLINT
+			// Helpers started before readiness must not keep the parent's
+			// handshake open if this child exits without acknowledging it.
+			if (!SetHandleInformation(pipe, HANDLE_FLAG_INHERIT, 0)) {
+				auto error = GetLastError();
+				qCritical() << "Failed to stop daemon pipe inheritance with error code" << error;
+				CloseHandle(pipe);
+				*exitCode = -1;
+				return true;
+			}
+			DAEMON_PIPE = pipe;
 		}
 
 		return false;
@@ -101,7 +112,8 @@ bool spawnDaemon(int argc, char** argv, int* exitCode) {
 
 	for (auto i = 1; i < argc; ++i) {
 		auto arg = QString::fromLocal8Bit(argv[i]); // NOLINT
-		if (arg == "-d" || arg == "--daemonize") continue;
+		// Keep the daemon flag so runCommand dispatches the child here too.
+		// The inherited environment branch above prevents recursive spawning.
 		commandLine += u' ' + quoteArgument(arg);
 	}
 

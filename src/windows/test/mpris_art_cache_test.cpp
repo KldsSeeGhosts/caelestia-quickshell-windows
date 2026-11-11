@@ -7,10 +7,12 @@
 #include <qtemporarydir.h>
 #include <qtest.h>
 #include <qurl.h>
+#include <limits>
 
 #include "art_cache.hpp"
 
 using qs::windows::services::mpris::cacheImageBytes;
+using namespace qs::windows::services::mpris;
 
 class MprisArtCacheTest: public QObject {
 	Q_OBJECT;
@@ -26,6 +28,43 @@ class MprisArtCacheTest: public QObject {
 	}
 
 private slots:
+	void encodedSizeLimits() {
+		QVERIFY(!artworkSizeAllowed(0));
+		QVERIFY(artworkSizeAllowed(1));
+		QVERIFY(artworkSizeAllowed(MAX_ARTWORK_BYTES));
+		QVERIFY(!artworkSizeAllowed(MAX_ARTWORK_BYTES + 1));
+		// Values that would wrap to a small uint32_t must be rejected first.
+		QVERIFY(!artworkSizeAllowed((uint64_t(1) << 32) + 1));
+		QVERIFY(!artworkSizeAllowed(std::numeric_limits<uint64_t>::max()));
+	}
+
+	void decodedSizeLimits() {
+		QVERIFY(!artworkDimensionsAllowed({}));
+		QVERIFY(!artworkDimensionsAllowed({-1, 2}));
+		QVERIFY(artworkDimensionsAllowed({1, 1}));
+		QVERIFY(artworkDimensionsAllowed({MAX_ARTWORK_DIMENSION, MAX_ARTWORK_DIMENSION}));
+		QVERIFY(!artworkDimensionsAllowed({MAX_ARTWORK_DIMENSION + 1, 1}));
+		QVERIFY(!artworkDimensionsAllowed({1, MAX_ARTWORK_DIMENSION + 1}));
+		QVERIFY(!artworkDimensionsAllowed({INT_MAX, INT_MAX}));
+	}
+
+	void oversizedImageDoesNotCreateCache() {
+		QTemporaryDir temporary;
+		QVERIFY(temporary.isValid());
+		auto profile = temporary.filePath("cache");
+		QByteArray bytes(MAX_ARTWORK_BYTES + 1, 'x');
+		QVERIFY(cacheImageBytes(bytes, profile).url.isEmpty());
+		QImage image(MAX_ARTWORK_DIMENSION + 1, 1, QImage::Format_ARGB32);
+		image.fill(Qt::red);
+		bytes.clear();
+		QBuffer buffer(&bytes);
+		QVERIFY(buffer.open(QIODevice::WriteOnly));
+		QVERIFY(image.save(&buffer, "PNG"));
+		QTest::ignoreMessage(QtWarningMsg, QRegularExpression("Could not decode a thumbnail.*"));
+		QVERIFY(cacheImageBytes(bytes, profile).url.isEmpty());
+		QVERIFY(!QFileInfo::exists(profile));
+	}
+
 	void writesOnlyToProvidedProfileCache() {
 		QTemporaryDir temporary;
 		QVERIFY(temporary.isValid());
