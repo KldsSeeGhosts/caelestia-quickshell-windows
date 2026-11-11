@@ -1,5 +1,9 @@
 #include "version_info.h"
 
+#ifdef QS_RC_ICON_FILE
+1 ICON QS_RC_ICON_FILE
+#endif
+
 #ifndef QS_EXTERNAL_MANIFEST
 1 24 "quickshell.manifest"
 #endif
