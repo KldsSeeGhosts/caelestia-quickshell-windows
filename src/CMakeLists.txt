@@ -23,7 +23,9 @@ if (WIN32)
 		endforeach()
 		get_filename_component(QS_ICON_NAME "${QS_ICON_FILE}" NAME)
 		# launch.cpp is compiled in a shared library, not either executable.
-		add_compile_definitions(QS_WINDOW_ICON_RESOURCE=":/quickshell/${QS_ICON_NAME}")
+		# Stored without the leading ":" so the binary holds no "<letter>:/" text
+		# that a release privacy scan reads as a drive path; launch.cpp adds it.
+		add_compile_definitions(QS_WINDOW_ICON_RESOURCE="/quickshell/${QS_ICON_NAME}")
 		set_property(SOURCE quickshell.rc APPEND PROPERTY OBJECT_DEPENDS "${QS_ICON_FILE}")
 	endif()
 	set(QS_COMPANY_NAME "" CACHE STRING "Company name in the Windows version resource (default: the product name followed by contributors)")

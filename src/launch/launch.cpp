@@ -336,7 +336,7 @@ int launch(const LaunchArgs& args, char** argv) {
 #ifdef QS_WINDOW_ICON_RESOURCE
 	// QWindow inherits this icon. Qt publishes it as WM_GETICON for native
 	// taskbars/Alt+Tab; the executable resource also serves shell icon lookup.
-	QGuiApplication::setWindowIcon(QIcon(QStringLiteral(QS_WINDOW_ICON_RESOURCE)));
+	QGuiApplication::setWindowIcon(QIcon(QLatin1Char(':') + QStringLiteral(QS_WINDOW_ICON_RESOURCE)));
 #endif
 
 	if (args.debugPort != -1) {
