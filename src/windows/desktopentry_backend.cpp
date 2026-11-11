@@ -10,7 +10,6 @@
 #include <qset.h>
 #include <qstring.h>
 #include <qstringlist.h>
-#include <qthreadpool.h>
 
 #include <qt_windows.h>
 
@@ -24,6 +23,7 @@
 #include "../core/desktopentry.hpp"
 #include "known_folders.hpp"
 #include "redact.hpp"
+#include "util.hpp"
 
 using Microsoft::WRL::ComPtr;
 
@@ -387,19 +387,6 @@ void launchToken(const QString& token, const QString& workingDirectory) {
 	}
 }
 
-class LaunchTask: public QRunnable {
-public:
-	LaunchTask(QString token, QString workingDirectory)
-	    : token(std::move(token))
-	    , workingDirectory(std::move(workingDirectory)) {}
-
-	void run() override { launchToken(this->token, this->workingDirectory); }
-
-private:
-	QString token;
-	QString workingDirectory;
-};
-
 } // namespace
 
 void WindowsDesktopEntryBackend::execute(
@@ -417,9 +404,12 @@ void WindowsDesktopEntryBackend::execute(
 void WindowsDesktopEntryBackend::launch(const QString& token, const QString& workingDirectory) {
 	if (token.isEmpty()) return;
 
-	auto* task = new LaunchTask(token, workingDirectory);
-	task->setAutoDelete(true);
-	QThreadPool::globalInstance()->start(task);
+	// Activation and ShellExecuteExW can block for as long as the shell or the
+	// launched app decides. ~QCoreApplication waits for the global thread pool
+	// without a bound, so one stuck launch there kept qs.exe alive after quit
+	// and failed the update that stopped it. runLauncher's pool is never
+	// waited for at exit.
+	runLauncher([token, workingDirectory]() { launchToken(token, workingDirectory); });
 }
 
 } // namespace qs::windows
