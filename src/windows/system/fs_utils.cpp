@@ -1,11 +1,11 @@
 #include "fs_utils.hpp"
+#include "listing_pool.hpp"
 
 #include <algorithm>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <system_error>
-#include <thread>
 
 #include <qt_windows.h>
 
@@ -87,6 +87,8 @@ QList<FoundEntry> listDirOnDisk(const QString& path) {
 struct FsUtils::Bridge {
 	std::mutex mutex;
 	QObject* receiver = nullptr;
+	int latestRequest = 0;
+	std::shared_ptr<ListingPool::Slot> slot = std::make_shared<ListingPool::Slot>();
 
 	void close() {
 		std::lock_guard lock(mutex);
@@ -143,11 +145,20 @@ int FsUtils::listDirAsync(const QString& path) {
 	const auto request = m_nextRequest++;
 	auto bridge = m_bridge;
 	auto* owner = this;
+	{
+		std::lock_guard lock(bridge->mutex);
+		bridge->latestRequest = request;
+	}
 
 	try {
-		// Detached on purpose: joining a stalled network share at shutdown would
-		// hold the shell open for as long as the provider keeps stalling.
-		std::thread([bridge, owner, request, path] {
+		static ListingPool pool;
+		pool.submit(bridge->slot, [weak = std::weak_ptr(bridge), owner, request, path] {
+			auto bridge = weak.lock();
+			if (!bridge) return;
+			{
+				std::lock_guard lock(bridge->mutex);
+				if (!bridge->receiver || bridge->latestRequest != request) return;
+			}
 			auto entries = QVariantList();
 			for (const auto& entry: listDirOnDisk(path)) {
 				QVariantMap map;
@@ -156,7 +167,7 @@ int FsUtils::listDirAsync(const QString& path) {
 				entries.append(map);
 			}
 			deliver(bridge, owner, request, path, entries);
-		}).detach();
+		});
 	} catch (const std::system_error&) {
 		// No worker could start: finish the request with an empty answer so a
 		// caller never treats it as pending.
@@ -174,10 +185,14 @@ void FsUtils::deliver(
     const QVariantList& entries
 ) {
 	std::lock_guard lock(bridge->mutex);
-	if (!bridge->receiver) return;
+	if (!bridge->receiver || bridge->latestRequest != request) return;
 	QMetaObject::invokeMethod(
 	    bridge->receiver,
-	    [owner, request, path, entries] { emit owner->listDirFinished(request, path, entries); },
+	    [bridge, owner, request, path, entries] {
+		    // Check again after the GUI queue, where a newer request may have arrived.
+		    if (bridge->latestRequest == request)
+			    emit owner->listDirFinished(request, path, entries);
+	    },
 	    Qt::QueuedConnection
 	);
 }

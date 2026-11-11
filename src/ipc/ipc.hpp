@@ -16,6 +16,7 @@
 #include <qtypes.h>
 
 #include "../core/logcat.hpp"
+#include "limits.hpp"
 
 template <typename... Types>
 constexpr void assertSerializable() {
@@ -145,6 +146,7 @@ private slots:
 
 private:
 	QLocalServer server;
+	IpcAdmission admission;
 };
 
 class IpcServerConnection: public QObject {
@@ -171,6 +173,9 @@ public:
 private slots:
 	void onDisconnected();
 	void onReadyRead();
+
+private:
+	IpcInputGuard* inputGuard;
 };
 
 class IpcClient: public QObject {

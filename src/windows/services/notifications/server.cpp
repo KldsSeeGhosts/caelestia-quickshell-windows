@@ -39,6 +39,27 @@ constexpr auto BUS_MUTEX = L"Local\\quickshell-notification-bus";
 constexpr ULONG_PTR NOTIFY_SEND_MAGIC = 0x514e5331;
 constexpr qsizetype MAX_PENDING_SENDS = 128;
 
+bool isExpectedOwner(HWND window) {
+	DWORD pid = 0;
+	if (!GetWindowThreadProcessId(window, &pid) || pid == 0) return false;
+	auto process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (!process) return false;
+	// Query both paths through the same API. Fail closed on access/query errors.
+	wchar_t ownerPath[32768];
+	wchar_t currentPath[32768];
+	DWORD ownerSize = 32768;
+	DWORD currentSize = 32768;
+	auto valid = QueryFullProcessImageNameW(process, 0, ownerPath, &ownerSize)
+	          && QueryFullProcessImageNameW(GetCurrentProcess(), 0, currentPath, &currentSize);
+	CloseHandle(process);
+	if (!valid) return false;
+	DWORD confirmedPid = 0;
+	return GetWindowThreadProcessId(window, &confirmedPid) != 0 && confirmedPid == pid
+	    && QString::fromWCharArray(ownerPath, ownerSize).compare(
+	           QString::fromWCharArray(currentPath, currentSize), Qt::CaseInsensitive
+	       ) == 0;
+}
+
 QString systemUriFor(const QString& aumid) {
 	static const QHash<QString, QString> uris {
 	    {QStringLiteral("windows.defender.securitycenter"), QStringLiteral("windowsdefender:")},
@@ -210,6 +231,10 @@ quint32 NotificationServer::forwardToOwner(
 ) {
 	auto* owner = FindWindowExW(HWND_MESSAGE, nullptr, busClass(), nullptr);
 	if (owner == nullptr) return 0;
+	if (!isExpectedOwner(owner)) {
+		qCWarning(logNotifications) << "Refusing notification forwarding to an unverified process.";
+		return 0;
+	}
 
 	QJsonArray array {summary, body};
 	for (const auto& arg: args) array.append(arg);
