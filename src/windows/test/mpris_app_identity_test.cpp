@@ -1,3 +1,5 @@
+#include <functional>
+
 #include <qdir.h>
 #include <qfileinfo.h>
 #include <qhash.h>
@@ -11,6 +13,12 @@
 
 #include "../desktopentry_backend.hpp"
 #include "app_identity.hpp"
+
+// This fixture never launches an app; desktopentry_backend.cpp only needs
+// the symbol.
+namespace qs::windows {
+void runLauncher(std::function<void()>) {}
+} // namespace qs::windows
 
 using qs::windows::DesktopEntryAliasCandidate;
 using qs::windows::WindowsDesktopEntryBackend;

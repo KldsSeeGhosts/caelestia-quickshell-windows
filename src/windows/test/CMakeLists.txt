@@ -660,7 +660,7 @@ qs_add_test_executable(mpris_app_identity_test
 target_compile_definitions(mpris_app_identity_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(mpris_app_identity_test PRIVATE ${QS_WINDOWS_SRC}/services/mpris)
 target_link_libraries(mpris_app_identity_test PRIVATE
-	Qt6::Core Qt6::Qml Qt6::Test shell32 ole32 windowsapp runtimeobject
+	Qt6::Core Qt6::Gui Qt6::Qml Qt6::Test shell32 ole32 windowsapp runtimeobject
 )
 add_test(NAME mpris_app_identity COMMAND mpris_app_identity_test)
 add_test(NAME pw_audio_control COMMAND pw_audio_control_test)
@@ -915,6 +915,22 @@ target_compile_definitions(idle_request_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEA
 target_link_libraries(idle_request_test PRIVATE Qt6::Core Qt6::Test)
 add_test(NAME idle_request COMMAND idle_request_test)
 
+# An app launch blocked forever must not keep the process alive after main
+# returns: launches use runLauncher's pool, which nothing waits for at exit.
+qs_add_test_executable(launcher_exit_test
+	launcher_exit_test.cpp
+	${QS_WINDOWS_SRC}/util.cpp
+	${QS_WINDOWS_SRC}/activation_policy.cpp
+)
+target_compile_definitions(launcher_exit_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+	QS_WINDOWS_SRC="${QS_WINDOWS_SRC}"
+)
+target_include_directories(launcher_exit_test PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(launcher_exit_test PRIVATE
+	Qt6::Gui Qt6::GuiPrivate Qt6::Qml Qt6::Test user32 advapi32 dwmapi ole32
+)
+add_test(NAME launcher_exit COMMAND launcher_exit_test)
+
 # The key-release gate behind `displays off`: settles only on the last release,
 # cancels on new input, and ignores key repeat.
 qs_add_test_executable(input_settle_test
@@ -1096,7 +1112,7 @@ set(QS_TESTS_PORTABLE
 	upower_status tiling_observability tiling_manager tiling_drag tiling_reload
 	transition_trace foreground_observer activation_policy fullscreen_app_state
 	panel_topmost power_profiles brightness_route display_identity
-	native_desktop_recovery pw_session_worker idle_request input_settle
+	native_desktop_recovery pw_session_worker idle_request launcher_exit input_settle
 	super_drag_wait network_wifi_route runtime_paths lazyloader
 	fullscreen_ownership display_transaction clipboard_capture capture_dimensions
 	erm625_native_desktop_facade network_wifi_identity capture_affinity window_stack
