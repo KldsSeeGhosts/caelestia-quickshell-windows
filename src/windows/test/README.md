@@ -37,6 +37,13 @@ wallpaper and shell processes to reproduce it, with both hidden and still-visibl
 stop states. Repairs remain idempotent, and destroying the wallpaper window
 while its process stays alive withdraws the acknowledgement.
 
+Wallpaper Engine's real stop/play destroys its desktop windows on stop and, on
+play, creates new hidden children directly inside the host and then shows them.
+That raises no host reorder and no parent change, and the wallpaper process
+hooks are already gone with the last foreign child. The desktop-wide hook also
+covers show/hide of host children so that return is reclaimed;
+`desktop_zorder`'s `stopPlayRecreatedInsideHostIsReclaimed` reproduces it.
+
 `quickshell.windows.desktop.info` logs an `Underlay decision` line on state
 changes and repairs. It reports policy, host availability, insert-after and
 above-icons blockers, refusal, foreign/visible/background counts,

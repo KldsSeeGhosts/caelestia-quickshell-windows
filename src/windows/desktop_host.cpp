@@ -34,14 +34,17 @@ constexpr int SETTLE_MS = 500;
 
 // A wallpaper owner is another process: it attaches its window to the host and
 // restacks it from its own thread, and its process id is not known in advance.
-// A hook scoped to a process or thread can never see that first owner, so two
+// A hook scoped to a process or thread can never see that first owner, so
 // desktop-wide out-of-context hooks report the only edges that are left:
-// EVENT_OBJECT_REORDER on the host covers any change to its child list
-// (attached, restacked, removed, however it happened), and
+// EVENT_OBJECT_REORDER on the host covers a restack of its child list,
 // EVENT_OBJECT_PARENTCHANGE covers a window gaining or losing a parent without
-// the host's list necessarily moving. Everything else - a known owner's
-// visibility and destruction edges - stays on the per-process hooks that only
-// exist while it has a child in the host.
+// the host's list necessarily moving, and EVENT_OBJECT_SHOW/HIDE of a host
+// child covers a window created directly inside the host. Wallpaper Engine's
+// stop/play does exactly that: stop destroys its windows (so the per-process
+// hooks go away with the last foreign child), and play creates new hidden
+// children of the host and shows them, which raises neither a reorder nor a
+// parent change. A known owner's destruction edges stay on the per-process
+// hooks that only exist while it has a child in the host.
 // The host belongs to Explorer, but a shell window can reorder itself after
 // embedding/presentation too. Neither Explorer's scoped hook nor the foreign
 // wallpaper process hooks see that edge. Include our process and let the
@@ -822,8 +825,9 @@ void DesktopHost::installReconcileHook() {
 	// failed keeps the one that succeeded, and the next refresh retries only the
 	// other instead of overwriting (and leaking) a live handle.
 	if (this->reorderHook == nullptr) {
+		// SHOW, HIDE and REORDER are contiguous.
 		this->reorderHook = SetWinEventHook(
-		    EVENT_OBJECT_REORDER,
+		    EVENT_OBJECT_SHOW,
 		    EVENT_OBJECT_REORDER,
 		    nullptr,
 		    &DesktopHost::reconcileEventProc,
@@ -879,6 +883,17 @@ void CALLBACK DesktopHost::reconcileEventProc(
 	// changed them. Only the host's own list can move the desktop layer.
 	if (event == EVENT_OBJECT_REORDER) {
 		if (hwnd == host->mParent) host->queueReconcile();
+		return;
+	}
+
+	// A window shown or hidden directly inside the host, from any process. The
+	// parent check is cheap and discards the system-wide show/hide traffic.
+	if (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_HIDE) {
+		if (idObject == OBJID_WINDOW && idChild == CHILDID_SELF
+		    && GetAncestor(hwnd, GA_PARENT) == host->mParent)
+		{
+			host->queueReconcile();
+		}
 		return;
 	}
 
