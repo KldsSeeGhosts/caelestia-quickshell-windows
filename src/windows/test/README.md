@@ -28,6 +28,21 @@ The private-desktop `desktop_underlay` fixture covers both monitor backgrounds,
 restacking, toggling the policy and an absent renderer. `desktop_zorder` also
 covers production event reconciliation and renderer replacement.
 
+Desktop-wide reorder hooks include the shell process. A shell window's own
+show/restack can move it above an unchanged visible wallpaper, including after
+stop/play or a fresh start with an existing wallpaper window. Explorer's scoped
+hooks and the wallpaper process hooks do not report that shell-originated
+edge. The private-desktop `desktop_underlay` fixture uses separate host,
+wallpaper and shell processes to reproduce it, with both hidden and still-visible
+stop states. Repairs remain idempotent, and destroying the wallpaper window
+while its process stays alive withdraws the acknowledgement.
+
+`quickshell.windows.desktop.info` logs an `Underlay decision` line on state
+changes and repairs. It reports policy, host availability, insert-after and
+above-icons blockers, refusal, foreign/visible/background counts,
+acknowledgement, actual remaining misorder and whether a repair ran. It includes
+no titles, handles, paths or process/device identifiers.
+
 For shell issue KldsSeeGhosts/caelestia-windows#62, the shell pin update must
 also wire `Native.DesktopLayer.externalWallpaperEnabled` to
 `!Wallpapers.sourceFresh || WallpaperEngine.enabled` in

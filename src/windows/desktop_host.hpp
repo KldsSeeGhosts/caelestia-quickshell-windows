@@ -198,6 +198,7 @@ private:
 	bool mLastActive = false;
 	bool mLastUnderlayActive = false;
 	bool mLastVisibleForeign = false;
+	QString mLastUnderlayDecision;
 	HWND listener = nullptr;
 	HKEY desktopKey = nullptr;
 	HANDLE desktopKeyEvent = nullptr;

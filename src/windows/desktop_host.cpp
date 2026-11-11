@@ -42,7 +42,11 @@ constexpr int SETTLE_MS = 500;
 // the host's list necessarily moving. Everything else - a known owner's
 // visibility and destruction edges - stays on the per-process hooks that only
 // exist while it has a child in the host.
-constexpr DWORD RECONCILE_HOOK_FLAGS = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+// The host belongs to Explorer, but a shell window can reorder itself after
+// embedding/presentation too. Neither Explorer's scoped hook nor the foreign
+// wallpaper process hooks see that edge. Include our process and let the
+// idempotent order check discard feedback from our own repairs.
+constexpr DWORD RECONCILE_HOOK_FLAGS = WINEVENT_OUTOFCONTEXT;
 
 constexpr DWORD BUILD_24H2 = 26100;
 
@@ -423,10 +427,37 @@ void DesktopHost::updateReportedState() {
 	// read-only and the placement is idempotent, so an already correct order
 	// costs no SetWindowPos. Both the desktop-wide hook and every per-process
 	// hook end here.
-	if (this->mParent != nullptr
-	    && desktopBackgroundsMisordered(this->mParent, this->mExternalWallpaperEnabled))
-	{
+	auto misordered = desktopBackgroundsMisordered(this->mParent, this->mExternalWallpaperEnabled);
+	if (misordered) {
 		placeDesktopBackgrounds(this->mParent, this->mExternalWallpaperEnabled);
+	}
+
+	// A complete decision without any titles, classes, paths, handles or
+	// process/device identifiers. Report actual order, not just the claim:
+	// underlayActive is presence/policy and can stay true through a restack.
+	int foreign = 0;
+	int visible = 0;
+	int backgrounds = 0;
+	for (auto* child = this->mParent == nullptr ? nullptr : GetWindow(this->mParent, GW_CHILD);
+	     child != nullptr;
+	     child = GetWindow(child, GW_HWNDNEXT))
+	{
+		if (GetPropW(child, BACKGROUND_PROP) != nullptr) backgrounds++;
+		if (isOwnProcessWindow(child)) continue;
+		foreign++;
+		if (IsWindowVisible(child)) visible++;
+	}
+	auto stillMisordered =
+	    desktopBackgroundsMisordered(this->mParent, this->mExternalWallpaperEnabled);
+	const auto decision = QStringLiteral(
+	    "enabled=%1 policy=%2 host=%3 insertAfter=%4 aboveIcons=%5 refused=%6 "
+	    "foreign=%7 visibleForeign=%8 backgrounds=%9 underlay=%10 misordered=%11"
+	).arg(this->mEnabled).arg(this->mExternalWallpaperEnabled).arg(this->active())
+	     .arg(this->mInsertAfter != nullptr).arg(!this->mAboveIcons.isEmpty()).arg(this->mEmbedRefused)
+	     .arg(foreign).arg(visible).arg(backgrounds).arg(this->underlayActive()).arg(stillMisordered);
+	if (misordered || decision != this->mLastUnderlayDecision) {
+		this->mLastUnderlayDecision = decision;
+		qCInfo(logDesktop).noquote() << "Underlay decision" << decision << "repair=" << misordered;
 	}
 
 	this->syncForeignWatch();
@@ -783,8 +814,9 @@ void DesktopHost::installReconcileHook() {
 	// Both hooks are desktop-wide: the owner is another process whose id is
 	// not known until it has already attached, so no narrower scope can
 	// report its arrival. They are out-of-context, which sends every event
-	// here through this thread's message queue, and skip this process's own
-	// windows, whose changes the shell already makes itself.
+	// here through this thread's message queue. Include this process: a panel
+	// can be shown/restacked after its initial group placement, while the
+	// foreign wallpaper's HWND, visibility and acknowledgement stay unchanged.
 	//
 	// Each hook is installed only while missing: a pair where one registration
 	// failed keeps the one that succeeded, and the next refresh retries only the
