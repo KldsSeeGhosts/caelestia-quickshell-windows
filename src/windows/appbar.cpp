@@ -14,6 +14,7 @@
 #include <qtypes.h>
 
 #include "system_surface.hpp"
+#include "appbar_call.hpp"
 #include "util.hpp"
 #include "transition_trace.hpp"
 
@@ -98,9 +99,8 @@ void WinAppBar::removeStale() {
 			GetWindowThreadProcessId(hwnd, &owner);
 			if (owner == pid) continue;
 		} else if (hwnd != nullptr) {
-			auto yield = TrayHookYield();
 			auto data = appBarData(hwnd);
-			SHAppBarMessage(ABM_REMOVE, &data);
+			if (!boundedAppBarMessage(ABM_REMOVE, data)) continue;
 			removed++;
 		}
 
@@ -151,7 +151,6 @@ bool WinAppBar::windowCoversMonitor(HWND hwnd) {
 }
 
 bool WinAppBar::ensureRegistered(HWND hwnd) {
-	auto yield = TrayHookYield();
 	if (this->mRegistered && this->mHwnd == hwnd) return true;
 	if (this->mRegistered) this->remove();
 
@@ -163,10 +162,15 @@ bool WinAppBar::ensureRegistered(HWND hwnd) {
 
 	auto data = appBarData(hwnd);
 	traceWorkArea(hwnd, "before_register");
-	if (!SHAppBarMessage(ABM_NEW, &data)) {
-		SHAppBarMessage(ABM_REMOVE, &data);
+	// A timed-out NEW can still complete later. Keep the cleanup record even
+	// if this caller never observes success.
+	rememberRegistration(hwnd);
+	auto registered = boundedAppBarMessage(ABM_NEW, data);
+	if (!registered) return false;
+	if (!*registered) {
+		boundedAppBarMessage(ABM_REMOVE, data);
 		data = appBarData(hwnd);
-		if (!SHAppBarMessage(ABM_NEW, &data)) {
+		if (!boundedAppBarMessage(ABM_NEW, data).value_or(0)) {
 			QS_TRANSITION_TRACE("appbar_register", {{"window", transition_trace::handle(reinterpret_cast<quintptr>(hwnd))}, {"success", false}});
 			qCWarning(logAppBar) << "Failed to register AppBar for window" << hwnd;
 			return false;
@@ -176,7 +180,6 @@ bool WinAppBar::ensureRegistered(HWND hwnd) {
 	QS_TRANSITION_TRACE("appbar_register", {{"window", transition_trace::handle(reinterpret_cast<quintptr>(hwnd))}, {"success", true}});
 	traceWorkArea(hwnd, "after_register");
 
-	rememberRegistration(hwnd);
 	this->mHwnd = hwnd;
 	this->mRegistered = true;
 	this->mReserved = QRect();
@@ -193,7 +196,7 @@ QRect WinAppBar::reserve(HWND hwnd, UINT edge, const QRect& monitor, qint32 size
 		return this->mReserved;
 	}
 
-	auto yield = TrayHookYield();
+	this->mPositionValid = false;
 	if (!this->ensureRegistered(hwnd)) return {};
 
 	auto data = appBarData(hwnd);
@@ -211,16 +214,17 @@ QRect WinAppBar::reserve(HWND hwnd, UINT edge, const QRect& monitor, qint32 size
 	};
 
 	applySize();
-	SHAppBarMessage(ABM_QUERYPOS, &data);
+	if (!boundedAppBarMessage(ABM_QUERYPOS, data)) return {};
 	applySize();
 
 	auto granted = toQRect(data.rc);
 
 	if (this->mEdge != edge || this->mReserved != granted) {
 		traceWorkArea(hwnd, "before_position");
-		auto result = SHAppBarMessage(ABM_SETPOS, &data);
+		auto result = boundedAppBarMessage(ABM_SETPOS, data);
+		if (!result) return {};
 		QS_TRANSITION_TRACE("appbar_position", {{"window", transition_trace::handle(reinterpret_cast<quintptr>(hwnd))},
-		    {"edge", static_cast<int>(edge)}, {"rect", transition_trace::rect(toQRect(data.rc))}, {"success", result != 0}});
+		    {"edge", static_cast<int>(edge)}, {"rect", transition_trace::rect(toQRect(data.rc))}, {"success", *result != 0}});
 		traceWorkArea(hwnd, "after_position");
 		this->mEdge = edge;
 		this->mReserved = toQRect(data.rc);
@@ -240,14 +244,13 @@ void WinAppBar::invalidatePosition() {
 
 void WinAppBar::remove() {
 	if (!this->mRegistered) return;
-	auto yield = TrayHookYield();
 
 	auto data = appBarData(this->mHwnd);
 	traceWorkArea(this->mHwnd, "before_remove");
-	auto result = SHAppBarMessage(ABM_REMOVE, &data);
-	QS_TRANSITION_TRACE("appbar_remove", {{"window", transition_trace::handle(reinterpret_cast<quintptr>(this->mHwnd))}, {"success", result != 0}});
+	auto result = boundedAppBarMessage(ABM_REMOVE, data);
+	QS_TRANSITION_TRACE("appbar_remove", {{"window", transition_trace::handle(reinterpret_cast<quintptr>(this->mHwnd))}, {"success", result.value_or(0) != 0}});
 	traceWorkArea(this->mHwnd, "after_remove");
-	forgetRegistration(this->mHwnd);
+	if (result) forgetRegistration(this->mHwnd);
 	this->invalidate();
 }
 
@@ -277,16 +280,14 @@ void WinAppBar::adopt(WinAppBar& other) {
 
 void WinAppBar::notifyActivate() {
 	if (!this->mRegistered) return;
-	auto yield = TrayHookYield();
 	auto data = appBarData(this->mHwnd);
-	SHAppBarMessage(ABM_ACTIVATE, &data);
+	boundedAppBarMessage(ABM_ACTIVATE, data);
 }
 
 void WinAppBar::notifyWindowPosChanged() {
 	if (!this->mRegistered) return;
-	auto yield = TrayHookYield();
 	auto data = appBarData(this->mHwnd);
-	SHAppBarMessage(ABM_WINDOWPOSCHANGED, &data);
+	boundedAppBarMessage(ABM_WINDOWPOSCHANGED, data);
 }
 
 } // namespace qs::windows

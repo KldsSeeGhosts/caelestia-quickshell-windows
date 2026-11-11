@@ -19,6 +19,7 @@
 
 #include "../core/logcat.hpp"
 #include "input_mask.hpp"
+#include "appbar_call.hpp"
 #include "startup.hpp"
 #include "util.hpp"
 
@@ -94,18 +95,20 @@ void showAllTaskbars() {
 	);
 }
 
-UINT appBarState() {
+std::optional<UINT_PTR> appBarState() {
 	APPBARDATA data {};
 	data.cbSize = sizeof(data);
-	return static_cast<UINT>(SHAppBarMessage(ABM_GETSTATE, &data));
+	return boundedAppBarMessage(ABM_GETSTATE, data);
 }
 
-void setAutoHide(bool autoHide) {
+bool setAutoHide(bool autoHide) {
+	auto state = appBarState();
+	if (!state) return false;
 	APPBARDATA data {};
 	data.cbSize = sizeof(data);
 	data.hWnd = explorerTaskbarWindow();
-	data.lParam = (appBarState() & ABS_ALWAYSONTOP) | (autoHide ? ABS_AUTOHIDE : 0);
-	SHAppBarMessage(ABM_SETSTATE, &data);
+	data.lParam = (*state & ABS_ALWAYSONTOP) | (autoHide ? ABS_AUTOHIDE : 0);
+	return boundedAppBarMessage(ABM_SETSTATE, data).has_value();
 }
 
 QRect physicalRect(const RECT& rect) {
@@ -120,7 +123,7 @@ bool primaryBarEdge(HWND hwnd, TaskbarEdge& edge, int& thickness) {
 	APPBARDATA data {};
 	data.cbSize = sizeof(data);
 	data.hWnd = hwnd;
-	if (SHAppBarMessage(ABM_GETTASKBARPOS, &data) == 0) return false;
+	if (boundedAppBarMessage(ABM_GETTASKBARPOS, data).value_or(0) == 0) return false;
 
 	switch (data.uEdge) {
 	case ABE_LEFT: edge = TaskbarEdge::Left; break;
@@ -218,13 +221,16 @@ void TaskbarManager::setHoverOnly(bool hoverOnly) {
 void TaskbarManager::turnOffAutoHide() {
 	if (this->mHoverOnly) return;
 
-	gTurnedOnAutoHide.store(false);
-	setAutoHideOwned(false);
-
-	if ((appBarState() & ABS_AUTOHIDE) != 0) {
-		setAutoHide(false);
+	auto state = appBarState();
+	if (!state || ((*state & ABS_AUTOHIDE) != 0 && !setAutoHide(false))) {
+		QTimer::singleShot(1000, this, &TaskbarManager::turnOffAutoHide);
+		return;
+	}
+	if ((*state & ABS_AUTOHIDE) != 0) {
 		qCInfo(logTaskbar) << "Turned taskbar auto-hide off for the Windows taskbar mode.";
 	}
+	gTurnedOnAutoHide.store(false);
+	setAutoHideOwned(false);
 
 	showAllTaskbars();
 }
@@ -236,8 +242,12 @@ void TaskbarManager::restoreForCrash() {
 void TaskbarManager::releaseStaleAutoHide() {
 	if (this->mHoverOnly || gTurnedOnAutoHide.load() || !autoHideOwned()) return;
 
-	if ((appBarState() & ABS_AUTOHIDE) != 0) {
-		setAutoHide(false);
+	auto state = appBarState();
+	if (!state || ((*state & ABS_AUTOHIDE) != 0 && !setAutoHide(false))) {
+		QTimer::singleShot(1000, this, &TaskbarManager::releaseStaleAutoHide);
+		return;
+	}
+	if ((*state & ABS_AUTOHIDE) != 0) {
 		qCInfo(logTaskbar) << "Hover only mode is off; turned taskbar auto-hide back off.";
 	}
 
@@ -248,17 +258,7 @@ void TaskbarManager::enable() {
 	if (this->enabled) return;
 	this->enabled = true;
 
-	auto owned = autoHideOwned();
-
-	if ((appBarState() & ABS_AUTOHIDE) == 0) {
-		setAutoHide(true);
-		gTurnedOnAutoHide.store(true);
-		if (!owned) setAutoHideOwned(true);
-		qCInfo(logTaskbar) << "Turned on taskbar auto-hide for hover only mode"
-		                   << "(undone when hover only mode is turned off).";
-	} else if (owned) {
-		gTurnedOnAutoHide.store(true);
-	}
+	this->ensureAutoHide();
 
 	this->findBars();
 
@@ -292,12 +292,36 @@ void TaskbarManager::disable(bool restoreAutoHide) {
 
 	if (!restoreAutoHide) return;
 
-	if (gTurnedOnAutoHide.exchange(false)) {
-		setAutoHide(false);
-		qCInfo(logTaskbar) << "Hover only mode turned off; turned taskbar auto-hide back off.";
+	if (gTurnedOnAutoHide.load()) {
+		this->turnOffAutoHide();
+		return;
 	}
 
 	setAutoHideOwned(false);
+}
+
+void TaskbarManager::ensureAutoHide() {
+	if (!this->mHoverOnly) return;
+	auto state = appBarState();
+	if (!state) {
+		QTimer::singleShot(1000, this, &TaskbarManager::ensureAutoHide);
+		return;
+	}
+	auto owned = autoHideOwned();
+	if ((*state & ABS_AUTOHIDE) == 0) {
+		// A timed-out SETSTATE can still take effect later. Record ownership
+		// before sending, so disabling the mode or a later process can undo it.
+		gTurnedOnAutoHide.store(true);
+		if (!owned) setAutoHideOwned(true);
+		if (!setAutoHide(true)) {
+			QTimer::singleShot(1000, this, &TaskbarManager::ensureAutoHide);
+			return;
+		}
+		qCInfo(logTaskbar) << "Turned on taskbar auto-hide for hover only mode"
+		                   << "(undone when hover only mode is turned off).";
+	} else if (owned) {
+		gTurnedOnAutoHide.store(true);
+	}
 }
 
 void TaskbarManager::findBars() {

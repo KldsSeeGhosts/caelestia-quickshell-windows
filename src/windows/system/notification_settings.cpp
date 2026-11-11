@@ -9,6 +9,7 @@
 
 #include "../../core/logcat.hpp"
 #include "../redact.hpp"
+#include "../util.hpp"
 
 namespace qs::windows::sys {
 
@@ -16,15 +17,17 @@ namespace {
 QS_LOGGING_CATEGORY(logNotificationSettings, "quickshell.windows.notificationsettings", QtWarningMsg);
 
 void openUri(const wchar_t* uri) {
-	auto result = reinterpret_cast<INT_PTR>( // NOLINT
-	    ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL)
-	);
+	runLauncher([uri = QString::fromWCharArray(uri)] {
+		auto native = uri.toStdWString();
+		auto result = reinterpret_cast<INT_PTR>( // NOLINT
+		    ShellExecuteW(nullptr, L"open", native.c_str(), nullptr, nullptr, SW_SHOWNORMAL)
+		);
 
-	if (result <= 32) {
-		qCWarning(logNotificationSettings) << "Could not open"
-		                                   << qs::windows::logPath(QString::fromWCharArray(uri))
-		                                   << ":" << result;
-	}
+		if (result <= 32) {
+			qCWarning(logNotificationSettings) << "Could not open"
+			                                   << qs::windows::logPath(uri) << ":" << result;
+		}
+	});
 }
 } // namespace
 

@@ -91,6 +91,25 @@ private slots:
 		QVERIFY(!text.contains("QThreadPool::globalInstance()"));
 		QVERIFY(text.contains("runLauncher("));
 	}
+
+	void settingsLaunchesUseTheLauncherPool_data() {
+		QTest::addColumn<QString>("file");
+		QTest::addColumn<int>("calls");
+		QTest::newRow("wallpaper") << QStringLiteral("wallpaper") << 1;
+		QTest::newRow("notifications") << QStringLiteral("notification_settings") << 1;
+		QTest::newRow("network") << QStringLiteral("network") << 2;
+		QTest::newRow("wifi-fallbacks") << QStringLiteral("network_wifi") << 2;
+	}
+
+	void settingsLaunchesUseTheLauncherPool() {
+		QFETCH(QString, file);
+		QFETCH(int, calls);
+		QFile source(QStringLiteral(QS_WINDOWS_SRC "/system/") + file + ".cpp");
+		QVERIFY(source.open(QIODevice::ReadOnly));
+		auto text = source.readAll();
+		QVERIFY(!text.contains("QThreadPool::globalInstance()"));
+		QCOMPARE(text.count("runLauncher("), calls);
+	}
 };
 
 int main(int argc, char** argv) {

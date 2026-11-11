@@ -17,6 +17,7 @@
 #include "../core/logcat.hpp"
 #include "appbar.hpp"
 #include "util.hpp"
+#include "window_responsiveness.hpp"
 
 namespace qs::windows {
 
@@ -61,7 +62,8 @@ constexpr const wchar_t* BACKGROUND_PROP = L"QuickshellDesktopBackground";
 // not placing themselves; this keeps their position guards out of the way
 // without a cross-panel flag.
 constexpr UINT PLACE_ZORDER_FLAGS =
-    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING;
+    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING
+    | SWP_ASYNCWINDOWPOS;
 
 DesktopHost* gHost = nullptr; // NOLINT
 
@@ -231,7 +233,7 @@ bool desktopBackgroundsMisordered(HWND parent, bool externalWallpaperEnabled) {
 }
 
 void placeDesktopBackgrounds(HWND parent, bool externalWallpaperEnabled) {
-	if (parent == nullptr || !IsWindow(parent)) return;
+	if (!windowResponding(parent)) return;
 
 	QList<HWND> backgrounds;
 	HWND bottomForeign = nullptr;
@@ -626,11 +628,20 @@ void DesktopHost::lookup() {
 	if (this->adoptedForTesting) return;
 #endif
 
+	auto* shell = FindWindowW(L"Progman", nullptr);
+	if (shell != nullptr && !windowResponding(shell)) {
+		// Keep the existing parent instead of provoking a synchronous detach
+		// from an unresponsive input queue. Discovery retries without relying
+		// on Explorer to send another event.
+		this->scheduleRefresh(SPAWN_RETRY_MS);
+		return;
+	}
+
 	auto first = !this->lookedUp;
 	this->lookedUp = true;
 
 	Lookup found;
-	auto* progman = FindWindowW(L"Progman", nullptr);
+	auto* progman = shell;
 	auto neededSpawn = false;
 
 	if (progman != nullptr) {
