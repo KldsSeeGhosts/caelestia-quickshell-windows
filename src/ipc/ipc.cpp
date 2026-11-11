@@ -46,7 +46,14 @@ void IpcServer::start() {
 
 void IpcServer::onNewConnection() {
 	while (auto* connection = this->server.nextPendingConnection()) {
-		new IpcServerConnection(connection, this);
+		if (!this->admission.acquire()) {
+			connection->abort();
+			connection->deleteLater();
+			continue;
+		}
+		auto* handler = new IpcServerConnection(connection, this);
+		// Async listeners reparent themselves, but still consume an accepted slot.
+		QObject::connect(handler, &QObject::destroyed, this, [this] { this->admission.release(); });
 	}
 }
 
@@ -54,6 +61,7 @@ IpcServerConnection::IpcServerConnection(QLocalSocket* socket, IpcServer* server
     : QObject(server)
     , socket(socket) {
 	socket->setParent(this);
+	this->inputGuard = new IpcInputGuard(socket);
 	this->stream.setDevice(socket);
 	QObject::connect(socket, &QLocalSocket::disconnected, this, &IpcServerConnection::onDisconnected);
 	QObject::connect(socket, &QLocalSocket::readyRead, this, &IpcServerConnection::onReadyRead);
@@ -68,6 +76,7 @@ void IpcServerConnection::onDisconnected() {
 }
 
 void IpcServerConnection::onReadyRead() {
+	if (this->socket->state() != QLocalSocket::ConnectedState) return;
 	this->stream.startTransaction();
 
 	this->stream.startTransaction();
@@ -77,6 +86,7 @@ void IpcServerConnection::onReadyRead() {
 		this->stream.rollbackTransaction();
 		return;
 	}
+	this->inputGuard->complete();
 
 	std::visit(
 	    [this]<typename Command>(Command& command) {

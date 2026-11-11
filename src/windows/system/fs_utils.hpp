@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 
 #include <qobject.h>
 #include <qqmlintegration.h>
@@ -24,8 +25,9 @@ public:
 	Q_INVOKABLE static bool isAccessibleDir(const QString& path);
 
 	// Lists path on a worker thread and returns a request id. The result arrives
-	// through listDirFinished on the GUI thread. A request is stale once a newer
-	// one starts, so a slow share cannot overwrite a newer folder's entries.
+	// through listDirFinished on the GUI thread. Every request is answered.
+	// Listings run on a small shared pool; requests for the same path that
+	// arrive before its listing starts are answered by that one listing.
 	// Each entry is { name, onDisk }; onDisk is false for a cloud placeholder
 	// whose content is not local.
 	Q_INVOKABLE int listDirAsync(const QString& path);
@@ -50,10 +52,11 @@ private:
 	static void deliver(
 	    const std::shared_ptr<Bridge>& bridge,
 	    FsUtils* owner,
-	    int request,
+	    const std::vector<int>& requests,
 	    const QString& path,
 	    const QVariantList& entries
 	);
+	static std::vector<int> takeWaiting(const std::shared_ptr<Bridge>& bridge, const QString& path);
 };
 
 } // namespace qs::windows::sys

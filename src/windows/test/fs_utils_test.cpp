@@ -12,9 +12,15 @@
 #include <qvariantlist.h>
 #include <qvariantmap.h>
 
+#include <qset.h>
 #include <qt_windows.h>
 
 #include "fs_utils.hpp"
+#include "listing_pool.hpp"
+
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 
 using qs::windows::sys::FsUtils;
 
@@ -53,6 +59,9 @@ private slots:
 	void asyncListingDeliversFiles();
 	void onDiskOnlyStillListsPlaceholders();
 	void missingDirectoryStillDelivers();
+	void workersAreBoundedAndCoalesce();
+	void everyRequestIsAnswered();
+	void otherPathsAreNotSuperseded();
 };
 
 void TestFsUtils::asyncListingDeliversFiles() {
@@ -124,6 +133,87 @@ void TestFsUtils::missingDirectoryStillDelivers() {
 
 	const auto entries = spy.takeFirst().at(2).toList();
 	QVERIFY(entries.isEmpty());
+}
+
+void TestFsUtils::workersAreBoundedAndCoalesce() {
+	using qs::windows::sys::ListingPool;
+	struct State {
+		std::mutex mutex;
+		std::condition_variable ready;
+		bool released = false;
+		std::atomic<int> started = 0;
+		std::atomic<int> finished = 0;
+		std::atomic<int> latest = 0;
+	};
+	auto state = std::make_shared<State>();
+	// Release even on assertion failure. Workers never retain stack locals.
+	struct Release {
+		std::shared_ptr<State> state;
+		~Release() {
+			std::lock_guard lock(state->mutex);
+			state->released = true;
+			state->ready.notify_all();
+		}
+	} release {state};
+	auto pool = std::make_unique<ListingPool>();
+	auto first = std::make_shared<ListingPool::Slot>();
+	auto second = std::make_shared<ListingPool::Slot>();
+	auto queued = std::make_shared<ListingPool::Slot>();
+	auto blocked = [state] {
+		++state->started;
+		std::unique_lock lock(state->mutex);
+		state->ready.wait(lock, [&] { return state->released; });
+		++state->finished;
+	};
+	pool->submit(first, blocked);
+	pool->submit(second, blocked);
+	QTRY_COMPARE(state->started.load(), 2);
+	for (int i = 1; i <= 1000; ++i) {
+		pool->submit(queued, [state, i] {
+			state->latest = i;
+			++state->finished;
+		});
+	}
+	pool->submit(first, [state] { ++state->finished; });
+	QCOMPARE(state->finished.load(), 0);
+	// Destruction must return while both workers remain blocked.
+	pool.reset();
+	{
+		std::lock_guard lock(state->mutex);
+		state->released = true;
+		state->ready.notify_all();
+	}
+	QTRY_COMPARE(state->finished.load(), 4);
+	QCOMPARE(state->latest.load(), 1000);
+}
+
+void TestFsUtils::everyRequestIsAnswered() {
+	QTemporaryDir dir;
+	QVERIFY(dir.isValid());
+	FsUtils utils;
+	QSignalSpy spy(&utils, &FsUtils::listDirFinished);
+	QSet<int> requested;
+	for (int i = 0; i < 1000; ++i) requested.insert(utils.listDirAsync(dir.path()));
+	QTRY_COMPARE_WITH_TIMEOUT(spy.count(), 1000, 5000);
+	QSet<int> answered;
+	for (const auto& args: spy) answered.insert(args.at(0).toInt());
+	QCOMPARE(answered, requested);
+}
+
+void TestFsUtils::otherPathsAreNotSuperseded() {
+	// FsUtils is a QML singleton: the dashboard and the wallpaper service list
+	// different folders through the same instance at startup.
+	QTemporaryDir first;
+	QTemporaryDir second;
+	QVERIFY(first.isValid() && second.isValid());
+	FsUtils utils;
+	QSignalSpy spy(&utils, &FsUtils::listDirFinished);
+	const auto a = utils.listDirAsync(first.path());
+	const auto b = utils.listDirAsync(second.path());
+	QTRY_COMPARE_WITH_TIMEOUT(spy.count(), 2, 5000);
+	QSet<int> answered;
+	for (const auto& args: spy) answered.insert(args.at(0).toInt());
+	QCOMPARE(answered, (QSet<int> {a, b}));
 }
 
 QTEST_GUILESS_MAIN(TestFsUtils)

@@ -181,6 +181,15 @@ target_include_directories(fs_utils_test PRIVATE ${QS_WINDOWS_SRC}/system)
 target_link_libraries(fs_utils_test PRIVATE Qt6::Core Qt6::Qml Qt6::Test)
 add_test(NAME fs_utils COMMAND fs_utils_test)
 
+find_package(Qt6 REQUIRED COMPONENTS Network)
+qs_add_test_executable(ipc_limits_test ipc_limits_test.cpp)
+target_link_libraries(ipc_limits_test PRIVATE Qt6::Core Qt6::Network Qt6::Test)
+add_test(NAME ipc_limits COMMAND ipc_limits_test)
+# Compile the production integration too, without starting a shell or linking
+# the command handlers' generation/runtime dependencies into this fixture.
+add_library(ipc_compile_check OBJECT ${QS_WINDOWS_SRC}/../ipc/ipc.cpp)
+target_link_libraries(ipc_compile_check PRIVATE Qt6::Quick Qt6::Network)
+
 # Capture color policy: one explicit 8-bit SDR format through the WGC frame
 # pool, the shared texture and the Qt consumer, with the tested SDR fallback.
 # No capture session and no desktop is observed.
@@ -1071,7 +1080,7 @@ add_test(NAME capture_native COMMAND capture_native_test)
 #   machine:  reads installed-app metadata from this machine.
 set(QS_TESTS_PORTABLE
 	wallpaper_target screen_identity hyprland_monitor panel_animation
-	screenshot_jobs fs_utils redaction log_scrub log_redaction_guard
+	screenshot_jobs fs_utils ipc_limits redaction log_scrub log_redaction_guard
 	tiling_layout dispatcher virtual_desktops hotkeys_routing keyboard_hook
 	bt_pairing_policy mpris_status mpris_art_cache pw_audio_control
 	upower_status tiling_observability tiling_manager tiling_drag tiling_reload
