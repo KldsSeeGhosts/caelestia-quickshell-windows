@@ -58,6 +58,8 @@ constexpr UINT WM_WALLPAPER_COMMAND = WM_APP + 1;
 constexpr WPARAM CMD_BOTTOM = 1;
 constexpr WPARAM CMD_TOP = 2;
 constexpr WPARAM CMD_REPLACE = 3;
+constexpr WPARAM CMD_STOP = 4;
+constexpr WPARAM CMD_PLAY = 5;
 
 // Only the long-lived owner windows end their process when destroyed; a
 // wallpaper child that is replaced must not.
@@ -159,6 +161,18 @@ LRESULT CALLBACK wallpaperProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
 			gWallpaper.child = next;
 			break;
 		}
+		case CMD_STOP:
+			// Wallpaper Engine's "-control stop": the desktop windows are
+			// destroyed while the process keeps running.
+			DestroyWindow(gWallpaper.child);
+			gWallpaper.child = nullptr;
+			break;
+		case CMD_PLAY:
+			// Its "-control play": a new child is created hidden directly inside
+			// the host, then shown. No parent change and no host reorder.
+			gWallpaper.child = createWindow(FOREIGN_CLASS, gWallpaper.host, WS_CHILD);
+			ShowWindow(gWallpaper.child, SW_SHOWNA);
+			break;
 		default: break;
 		}
 
@@ -191,6 +205,8 @@ int runWallpaperWindow(HWND host) {
 			if (line == "bottom") command = CMD_BOTTOM;
 			else if (line == "top") command = CMD_TOP;
 			else if (line == "replace") command = CMD_REPLACE;
+			else if (line == "stop") command = CMD_STOP;
+			else if (line == "play") command = CMD_PLAY;
 			PostMessageW(gWallpaper.holder, WM_WALLPAPER_COMMAND, command, 0);
 		}
 	}).detach();
@@ -508,6 +524,30 @@ private slots:
 		QVERIFY(host->underlayActive());
 	}
 
+	void stopPlayRecreatedInsideHostIsReclaimed() {
+		QVERIFY(attachWallpaperBelowShell());
+		auto* host = qs::windows::DesktopHost::instance();
+		QSignalSpy ackSpy(host, &qs::windows::DesktopHost::underlayActiveChanged);
+
+		// Stop: the wallpaper windows die while the process lives. With no
+		// foreign child left, the per-process hooks are removed.
+		QVERIFY(command("stop"));
+		QTRY_VERIFY_WITH_TIMEOUT(GetWindow(m_host, GW_CHILD) == m_shell, 3000);
+		QVERIFY(!qs::windows::desktopHostHasForeignChild(m_host, false));
+		QTRY_VERIFY_WITH_TIMEOUT(ackSpy.count() >= 1, 3000);
+		// Let the handback refresh settle before playing again.
+		QTest::qWait(800);
+		ackSpy.clear();
+
+		// Play: a new hidden child created directly in the host, then shown.
+		// Only the desktop-wide show route can see it; before it existed the
+		// shell stayed on top of the returning wallpaper.
+		QVERIFY(command("play"));
+		QTRY_VERIFY_WITH_TIMEOUT(orderIsCorrect(), 3000);
+		QTRY_VERIFY_WITH_TIMEOUT(ackSpy.count() >= 1, 3000);
+		QVERIFY(host->underlayActive());
+	}
+
 	void hiddenForeignReleasesBackgroundToTop() {
 		QVERIFY(attachWallpaperBelowShell());
 		auto* host = qs::windows::DesktopHost::instance();
@@ -817,6 +857,7 @@ private:
 		if (!line.startsWith("ok ")) return false;
 
 		m_foreign = reinterpret_cast<HWND>(static_cast<qintptr>(line.mid(3).toLongLong()));
+		if (name == "stop") return m_foreign == nullptr;
 		return IsWindow(m_foreign);
 	}
 
