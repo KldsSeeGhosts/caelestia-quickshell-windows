@@ -32,7 +32,7 @@ find_program(QS_SDK_MT NAMES mt.exe
 set(QS_SHARED_TEST_SOURCES
 	../core/redact ../core/model ../core/qmlscreen ../core/instanceinfo
 	activation_policy window_selectors transition_trace util screen_identity
-	tiling_scope tiling_layout system_surface fullscreen_occluders
+	tiling_scope tiling_layout tiling_persistence system_surface fullscreen_occluders
 	layer_rules panel_effects panel_animation startup input_settle
 	capture_device capture_format capture_texture
 	system/brightness system/gamma services/pipewire/pw_node services/pipewire/pw_types
@@ -284,6 +284,7 @@ add_test(NAME log_redaction_guard COMMAND log_redaction_guard_test)
 qs_add_test_executable(tiling_layout_test
 	tiling_layout_test.cpp
 	${QS_WINDOWS_SRC}/tiling_layout.cpp
+	${QS_WINDOWS_SRC}/tiling_persistence.cpp
 )
 
 target_include_directories(tiling_layout_test PRIVATE ${QS_WINDOWS_SRC})
@@ -312,6 +313,12 @@ add_library(dispatcher_compile_check OBJECT ${QS_WINDOWS_SRC}/hyprland/dispatche
 target_compile_definitions(dispatcher_compile_check PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(dispatcher_compile_check PRIVATE Qt6::Quick Qt6::Qml)
 
+# Compile the native persistence integration, but never run it. Runtime
+# tiling fixtures below keep the full Win32/desktop boundary replaced.
+add_library(tiling_compile_check OBJECT ${QS_WINDOWS_SRC}/tiling.cpp)
+target_compile_definitions(tiling_compile_check PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(tiling_compile_check PRIVATE Qt6::Quick Qt6::Qml)
+
 # Policy and telemetry seams only: no HWND, no tracker, no desktop access.
 qs_add_test_executable(tiling_observability_test
 	tiling_observability_test.cpp
@@ -328,6 +335,7 @@ target_link_libraries(tiling_observability_test PRIVATE Qt6::Core Qt6::Test)
 # Real manager and layout engine, compiled against the fake desktop boundary.
 # Never link native window_tracker/virtual_desktops/util into this executable.
 qs_add_test_executable(tiling_manager_test
+	${QS_WINDOWS_SRC}/tiling_persistence.cpp
 	tiling_manager_test.cpp
 	tiling_fake_desktop.hpp
 	${QS_WINDOWS_SRC}/tiling.cpp
@@ -351,6 +359,7 @@ target_link_libraries(tiling_manager_test PRIVATE Qt6::Gui Qt6::GuiPrivate Qt6::
 # Drag and drop of tiled windows: drop plan, preview geometry and commit,
 # against the same fake desktop boundary as tiling_manager_test.
 qs_add_test_executable(tiling_drag_test
+	${QS_WINDOWS_SRC}/tiling_persistence.cpp
 	tiling_drag_test.cpp
 	tiling_fake_desktop.hpp
 	${QS_WINDOWS_SRC}/tiling.cpp
@@ -374,6 +383,7 @@ target_link_libraries(tiling_drag_test PRIVATE Qt6::Gui Qt6::GuiPrivate Qt6::Qml
 # one facade generation, and the process-lifetime manager must keep serving the
 # newest one. Offscreen only; the fake desktop is the same boundary.
 qs_add_test_executable(tiling_reload_test
+	${QS_WINDOWS_SRC}/tiling_persistence.cpp
 	tiling_reload_test.cpp
 	tiling_fake_desktop.hpp
 	${QS_WINDOWS_SRC}/tiling.cpp

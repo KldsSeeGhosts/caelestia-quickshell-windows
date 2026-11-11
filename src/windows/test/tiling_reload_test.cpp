@@ -105,6 +105,10 @@ class TilingReloadTest: public QObject {
 
 	void reset() {
 		if (manager != nullptr && manager->enabled()) manager->setEnabled(false);
+		if (manager != nullptr) {
+			manager->snapshot = {};
+			manager->snapshotLoaded = true;
+		}
 		for (auto* engine: engines) delete engine;
 		engines.clear();
 		qDeleteAll(windows);
@@ -171,6 +175,41 @@ private slots:
 		// when the engine is interrupted and no JavaScript runs.
 		retire(replacement, true);
 		QVERIFY(!manager->enabled());
+	}
+
+	void stoppedReloadKeepsTreeOrderAndFloats() {
+		auto* a = add(1, QRect(40, 60, 600, 400));
+		auto* b = add(2, QRect(700, 60, 600, 400));
+		auto* c = add(3, QRect(700, 500, 600, 400));
+		auto facade = openFacade(FACADE_ENABLE_QML);
+		QVERIFY(facade.object != nullptr);
+		manager->sync();
+		auto* layout = manager->managed.at(a).layout;
+		QVERIFY(layout != nullptr);
+		layout->tree->swap(TilingManager::idOf(a), TilingManager::idOf(b));
+		layout->tree->splitRatio(TilingManager::idOf(b), 1.4, true);
+		QVERIFY(manager->setFloating(c, true, false));
+		manager->sync();
+		QHash<tiling::LayoutEngine::Id, tiling::LayoutEngine::Id> ids {
+		    {TilingManager::idOf(a), 1}, {TilingManager::idOf(b), 2},
+		};
+		auto state = layout->tree->saveState(ids);
+		retire(facade);
+		QVERIFY(!manager->enabled());
+		// Reverse discovery, and use rectangles whose order disagrees with
+		// the saved tree. Neither may determine adoption order.
+		WindowTracker::instance()->fixtures = {c, b, a};
+		fakeWindow(a->hwnd()).frame = QRect(0, 0, 600, 400);
+		fakeWindow(b->hwnd()).frame = QRect(900, 500, 600, 400);
+		auto replacement = openFacade(FACADE_ENABLE_QML);
+		QVERIFY(replacement.object != nullptr);
+		manager->sync();
+		auto* restored = manager->managed.at(a).layout;
+		QVERIFY(restored != nullptr);
+		QCOMPARE(restored->tree->saveState(ids), state);
+		QVERIFY(manager->managed.at(c).layout == nullptr);
+		QCOMPARE(manager->managed.at(c).override, TilingManager::Override::Float);
+		retire(replacement);
 	}
 
 	void observeModeNeverPlacesWindows() {

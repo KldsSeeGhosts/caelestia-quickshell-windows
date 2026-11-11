@@ -4,6 +4,7 @@
 #include <optional>
 
 #include <qhash.h>
+#include <qjsonobject.h>
 #include <qlist.h>
 #include <qpoint.h>
 #include <qrect.h>
@@ -97,6 +98,11 @@ public:
 	[[nodiscard]] virtual bool isParked(Id /*id*/) const { return false; }
 
 	[[nodiscard]] static std::unique_ptr<LayoutEngine> create(Kind kind);
+	// IDs on disk are HWNDs, never TrackedWindow pointers. The caller supplies
+	// only identity-validated survivors when restoring; missing leaves collapse.
+	[[nodiscard]] QJsonObject saveState(const QHash<Id, Id>& ids) const;
+	[[nodiscard]] static std::unique_ptr<LayoutEngine>
+	restoreState(Kind kind, const QJsonObject& state, const QHash<Id, Id>& ids);
 
 protected:
 	LayoutEngine(const LayoutEngine&) = default;
@@ -140,6 +146,7 @@ public:
 	[[nodiscard]] QRect box(Id id) const override;
 
 private:
+	friend class LayoutEngine;
 	struct Node {
 		Node* parent = nullptr;
 		std::unique_ptr<Node> first;
@@ -214,6 +221,7 @@ public:
 	[[nodiscard]] Id firstInStack() const;
 
 private:
+	friend class LayoutEngine;
 	struct Entry {
 		Id id = 0;
 		double weight = 1.0;
@@ -323,6 +331,7 @@ public:
 	[[nodiscard]] static const QList<double>& presets();
 
 private:
+	friend class LayoutEngine;
 	struct Window {
 		Id id = 0;
 		double weight = 1.0;

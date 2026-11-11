@@ -30,6 +30,7 @@ qt_add_library(quickshell-windows STATIC
 	window_surfaces.cpp
 	transition_trace.cpp
 	tiling_layout.cpp
+	tiling_persistence.cpp
 	tiling_scope.cpp
 	tiling.cpp
 	window_decorations.cpp
