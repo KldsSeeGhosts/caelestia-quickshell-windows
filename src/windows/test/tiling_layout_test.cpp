@@ -1,13 +1,16 @@
 #include <tuple>
 
 #include <qlist.h>
+#include <qjsondocument.h>
 #include <qobject.h>
 #include <qrect.h>
 #include <qsize.h>
 #include <qtest.h>
 #include <qtestcase.h>
+#include <qtemporarydir.h>
 
 #include "tiling_layout.hpp"
+#include "tiling_persistence.hpp"
 
 using qs::windows::tiling::CenterMode;
 using qs::windows::tiling::DwindleLayout;
@@ -65,6 +68,14 @@ class TestTilingLayout: public QObject {
 	Q_OBJECT;
 
 private slots:
+	void restorePlanning_data();
+	void restorePlanning();
+	void snapshotHintsFailClosed();
+	void snapshotRoundTrip();
+	void layoutStateRoundTrip_data();
+	void layoutStateRoundTrip();
+	void staleLayoutLeavesCollapse_data();
+	void staleLayoutLeavesCollapse();
 	void dwindleDropSplitsTheChosenSide_data();
 	void dwindleDropSplitsTheChosenSide();
 	void dwindleDropFollowsTheTargetAspect_data();
@@ -97,6 +108,161 @@ private slots:
 	void swapKeepsTheView();
 	void adoptedWindowsHaveNeighbours();
 };
+
+void TestTilingLayout::restorePlanning_data() {
+	QTest::addColumn<QList<quintptr>>("discovery");
+	QTest::addColumn<bool>("monitorPresent");
+	QTest::addColumn<bool>("reused");
+	QTest::addColumn<QList<quintptr>>("expected");
+	QTest::addColumn<QList<qsizetype>>("unmatched");
+	QTest::newRow("adopt-in-saved-order") << QList<quintptr>{3, 1, 2} << true << false
+	    << QList<quintptr>{1, 2, 3} << QList<qsizetype>{};
+	QTest::newRow("missing-monitor") << QList<quintptr>{3, 1, 2} << false << false
+	    << QList<quintptr>{} << QList<qsizetype>{0, 1, 2};
+	QTest::newRow("new-window-interleaved") << QList<quintptr>{3, 4, 1, 2} << true << false
+	    << QList<quintptr>{1, 2, 3} << QList<qsizetype>{1};
+	QTest::newRow("stale-entry") << QList<quintptr>{3, 1} << true << false
+	    << QList<quintptr>{1, 3} << QList<qsizetype>{};
+	QTest::newRow("hwnd-reused-by-another-process") << QList<quintptr>{3, 1, 2} << true << true
+	    << QList<quintptr>{1, 3} << QList<qsizetype>{2};
+}
+
+void TestTilingLayout::restorePlanning() {
+	using namespace qs::windows::tiling;
+	QFETCH(QList<quintptr>, discovery);
+	QFETCH(bool, monitorPresent);
+	QFETCH(bool, reused);
+	QFETCH(QList<quintptr>, expected);
+	QFETCH(QList<qsizetype>, unmatched);
+	QList<SavedWindow> saved;
+	for (quintptr i = 1; i <= 3; ++i) {
+		saved.append({{i, 10, 100, "app", QString::number(i)}, "monitor", "desktop"});
+	}
+	QList<WindowIdentity> live;
+	for (auto hwnd: discovery) {
+		live.append({hwnd, reused && hwnd == 2 ? 11U : 10U, 100, "app", QString::number(hwnd)});
+	}
+	auto plan = planRestore(
+	    saved, live, monitorPresent ? QSet<QString>{"monitor"} : QSet<QString>{},
+	    {"desktop"}
+	);
+	QList<quintptr> order;
+	for (const auto& match: plan.matched) order.append(live.at(match.current).hwnd);
+	QCOMPARE(order, expected);
+	QCOMPARE(plan.unmatched, unmatched);
+	// A removed virtual desktop must fall back just like a removed monitor.
+	QVERIFY(planRestore(saved, live, {"monitor"}, {}).matched.isEmpty());
+}
+
+void TestTilingLayout::snapshotHintsFailClosed() {
+	using namespace qs::windows::tiling;
+	QList<SavedWindow> saved {{{1, 10, 100, "app", "title"}, "monitor", "desktop"}};
+	auto plan = [&](const QList<WindowIdentity>& live) {
+		return planRestore(saved, live, {"monitor"}, {"desktop"});
+	};
+	QCOMPARE(plan({{2, 10, 100, "app", "title"}}).matched.size(), 1);
+	QVERIFY(plan({{2, 10, 101, "app", "title"}}).matched.isEmpty()); // PID reuse.
+	QVERIFY(plan({{1, 11, 100, "app", "title"}, {2, 10, 100, "app", "title"}}).matched.isEmpty());
+	QVERIFY(plan({{2, 10, 100, "app", "title"}, {3, 10, 100, "app", "title"}}).matched.isEmpty());
+	QVERIFY(plan({{1, 10, 0, "app", "title"}}).matched.isEmpty());
+	saved.append(saved.first());
+	QVERIFY(plan({{2, 10, 100, "app", "title"}}).matched.isEmpty());
+}
+
+void TestTilingLayout::snapshotRoundTrip() {
+	using namespace qs::windows::tiling;
+	QTemporaryDir directory;
+	QVERIFY(directory.isValid());
+	const auto path = directory.filePath("state/tiling-layout.json");
+	LayoutSnapshot snapshot;
+	snapshot.windows.append({
+	    {0x123, 42, 0x123456789abcdef0ULL, persistenceHint("app"), persistenceHint("title")},
+	    "monitor-hash", "desktop-guid", 1, true, false,
+	});
+	QVERIFY(writeSnapshot(path, snapshot));
+	QCOMPARE(encodeSnapshot(readSnapshot(path)), encodeSnapshot(snapshot));
+	QVERIFY(!QJsonDocument(encodeSnapshot(snapshot)).toJson().contains("\"title\":\"title\""));
+	auto future = encodeSnapshot(snapshot);
+	future.insert("version", 2);
+	QVERIFY(decodeSnapshot(future).windows.isEmpty());
+	snapshot.windows.clear();
+	QVERIFY(writeSnapshot(path, snapshot));
+	QVERIFY(readSnapshot(path).windows.isEmpty());
+	QVERIFY(writeSnapshot({}, snapshot));
+}
+
+void TestTilingLayout::layoutStateRoundTrip_data() {
+	QTest::addColumn<int>("kind");
+	QTest::newRow("dwindle") << 0;
+	QTest::newRow("master") << 1;
+	QTest::newRow("scrolling") << 2;
+}
+
+void TestTilingLayout::layoutStateRoundTrip() {
+	using namespace qs::windows::tiling;
+	QFETCH(int, kind);
+	auto layout = LayoutEngine::create(static_cast<Kind>(kind));
+	Options options;
+	layout->configure(options);
+	layout->insert(A, 0, nullptr);
+	layout->compute(AREA);
+	layout->insert(B, A, nullptr, Edge::Bottom);
+	layout->compute(AREA);
+	layout->insert(C, A, nullptr, Edge::Left);
+	layout->compute(AREA);
+	layout->insert(D, B, nullptr);
+	layout->compute(AREA);
+	layout->swap(A, C);
+	layout->splitRatio(B, 1.3, true);
+	layout->resize(B, 35, 25);
+	if (kind == 0) {
+		layout->toggleSplit(B);
+		layout->swapSplit(D);
+	} else if (kind == 2) {
+		auto& scroll = static_cast<ScrollingLayout&>(*layout);
+		scroll.setMonitors(AREA, {});
+		scroll.moveInto(B, Edge::Left);
+		scroll.setColumnWidth(A, 0.7, false);
+		scroll.activate(C);
+		scroll.scrollBy(65);
+	}
+	layout->compute(AREA);
+	// Serialize stable HWND tokens, then adopt different in-memory IDs.
+	QHash<Id, Id> tokens {{A, 101}, {B, 102}, {C, 103}, {D, 104}};
+	QHash<Id, Id> live {{101, 21}, {102, 22}, {103, 23}, {104, 24}};
+	auto state = layout->saveState(tokens);
+	auto restored = LayoutEngine::restoreState(static_cast<Kind>(kind), state, live);
+	restored->configure(options);
+	if (kind == 2) static_cast<ScrollingLayout&>(*restored).setMonitors(AREA, {});
+	restored->compute(AREA);
+	QList<Id> expectedOrder;
+	for (auto id: layout->ids()) expectedOrder.append(id + 20);
+	QCOMPARE(restored->ids(), expectedOrder);
+	for (auto id: {A, B, C, D}) QCOMPARE(restored->box(id + 20), layout->box(id));
+	QHash<Id, Id> again {{21, 101}, {22, 102}, {23, 103}, {24, 104}};
+	QCOMPARE(restored->saveState(again), state);
+}
+
+void TestTilingLayout::staleLayoutLeavesCollapse_data() { layoutStateRoundTrip_data(); }
+
+void TestTilingLayout::staleLayoutLeavesCollapse() {
+	using namespace qs::windows::tiling;
+	QFETCH(int, kind);
+	auto layout = LayoutEngine::create(static_cast<Kind>(kind));
+	layout->insert(A, 0, nullptr);
+	layout->compute(AREA);
+	layout->insert(B, A, nullptr);
+	layout->compute(AREA);
+	layout->insert(C, B, nullptr);
+	layout->compute(AREA);
+	auto state = layout->saveState({{A, 1}, {B, 2}, {C, 3}});
+	auto restored = LayoutEngine::restoreState(static_cast<Kind>(kind), state, {{1, 21}, {3, 23}});
+	restored->compute(AREA);
+	QCOMPARE(restored->ids(), (QList<Id>{21, 23}));
+	QVERIFY(!restored->box(21).isEmpty());
+	QVERIFY(!restored->box(23).isEmpty());
+	QVERIFY(LayoutEngine::restoreState(static_cast<Kind>(kind), state, {})->isEmpty());
+}
 
 void TestTilingLayout::dwindleDropSplitsTheChosenSide_data() {
 	QTest::addColumn<QPoint>("cursor");

@@ -10,6 +10,7 @@
 
 #include <dwmapi.h>
 #include <qcoreapplication.h>
+#include <qdir.h>
 #include <chrono>
 #include <qfileinfo.h>
 #include <qguiapplication.h>
@@ -25,6 +26,7 @@
 #include <qscreen.h>
 #include <qstring.h>
 #include <qstringlist.h>
+#include <qstandardpaths.h>
 #include <qtimer.h>
 #include <qtypes.h>
 #include "transition_trace.hpp"
@@ -34,6 +36,7 @@
 #include "test/tiling_fake_desktop.hpp"
 #else
 #include "util.hpp"
+#include "screen_identity.hpp"
 #include "virtual_desktops.hpp"
 #include "window_tracker.hpp"
 #endif
@@ -52,6 +55,7 @@ constexpr int VERIFY_DELAY_MS = 150;
 constexpr int FULLSCREEN_STYLE_RECHECK_MS = 120;
 constexpr int FULLSCREEN_STYLE_GRACE_MS = 300;
 constexpr int DEADLINE_MS = 2000;
+constexpr int SNAPSHOT_MS = 2000;
 // A self-resizing window must hold still this long before it is judged, and
 // may keep resizing itself this long before corrections resume anyway. The
 // poll is how often a waiting window is looked at again.
@@ -76,6 +80,41 @@ constexpr int DROP_HYSTERESIS_DP = 8;
 // the suspension began confirms an exit even when the rectangle still covers
 // the monitor (Windows restores the fullscreen-era normal placement).
 constexpr LONG_PTR FULLSCREEN_FRAME_STYLE = WS_CAPTION | WS_THICKFRAME;
+
+QString persistentMonitor(QScreen* screen) {
+	if (screen == nullptr) return {};
+#ifdef QS_TILING_FAKE_DESKTOP
+	auto index = fakeDesktop.screens.indexOf(screen);
+	return QStringLiteral("fixture-monitor-%1").arg(index);
+#else
+	auto identity = ScreenIdentityRegistry::instance()->identity(screen);
+	return identity.persistent ? ScreenIdentityRegistry::reservationKey(identity.stableId) : QString();
+#endif
+}
+
+tiling::WindowIdentity persistenceIdentity(TrackedWindow* window) {
+	tiling::WindowIdentity result;
+	result.hwnd = reinterpret_cast<quintptr>(window->hwnd());
+#ifdef QS_TILING_FAKE_DESKTOP
+	result.pid = fakeWindow(window->hwnd()).pid;
+	result.started = fakeWindow(window->hwnd()).started;
+#else
+	DWORD pid = 0;
+	GetWindowThreadProcessId(window->hwnd(), &pid);
+	result.pid = pid;
+	auto process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (process != nullptr) {
+		FILETIME creation {}, exit {}, kernel {}, user {};
+		if (GetProcessTimes(process, &creation, &exit, &kernel, &user)) {
+			result.started = (quint64(creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+		}
+		CloseHandle(process);
+	}
+#endif
+	result.app = tiling::persistenceHint(window->appId());
+	result.title = tiling::persistenceHint(window->title());
+	return result;
+}
 
 #ifndef QS_TILING_FAKE_DESKTOP
 qint64 tilingNow() {
@@ -422,8 +461,20 @@ TilingManager::TilingManager(QString mutexName): mutexName(std::move(mutexName))
 	this->snapTimer.setInterval(SNAP_STEP_MS);
 	QObject::connect(&this->snapTimer, &QTimer::timeout, this, &TilingManager::stepSnaps);
 
+#ifndef QS_TILING_FAKE_DESKTOP
+	auto state = qEnvironmentVariable("CAELESTIA_STATE_DIR");
+	if (state.isEmpty()) {
+		state = QStandardPaths::writableLocation(QStandardPaths::GenericStateLocation)
+		      + QStringLiteral("/caelestia");
+	}
+	this->snapshotPath = QDir(state).filePath(QStringLiteral("tiling-layout.json"));
+#endif
+	this->snapshotTimer.setInterval(SNAPSHOT_MS);
+	QObject::connect(&this->snapshotTimer, &QTimer::timeout, this, &TilingManager::persistLayout);
+
 	if (auto* app = QCoreApplication::instance()) {
 		QObject::connect(app, &QCoreApplication::aboutToQuit, this, [this]() {
+			if (this->mEnabled) this->persistLayout();
 			this->restoreBorderColours();
 			this->unparkAll();
 		});
@@ -433,6 +484,7 @@ TilingManager::TilingManager(QString mutexName): mutexName(std::move(mutexName))
 }
 
 TilingManager::~TilingManager() {
+	if (this->mEnabled) this->stop();
 	this->restoreBorderColours();
 	if (gManager == this) gManager = nullptr;
 }
@@ -569,6 +621,7 @@ void TilingManager::refreshBorderColours() {
 }
 
 void TilingManager::setPreserveSplit(bool preserve) {
+	this->configuredLayoutOptions.insert(QStringLiteral("preserveSplit"));
 	if (preserve == this->mPreserveSplit) return;
 	this->mPreserveSplit = preserve;
 	this->markAll();
@@ -596,6 +649,7 @@ void TilingManager::setIncluded(const QStringList& included) {
 }
 
 void TilingManager::setLayout(const QString& layout) {
+	this->configuredLayoutOptions.insert(QStringLiteral("layout"));
 	auto normalized = layout.trimmed().toLower();
 	if (normalized != QStringLiteral("master") && normalized != QStringLiteral("scrolling")) {
 		normalized = QStringLiteral("dwindle");
@@ -608,6 +662,7 @@ void TilingManager::setLayout(const QString& layout) {
 }
 
 void TilingManager::setSmartSplit(bool smart) {
+	this->configuredLayoutOptions.insert(QStringLiteral("smartSplit"));
 	if (smart == this->mSmartSplit) return;
 	this->mSmartSplit = smart;
 	this->markAll();
@@ -615,6 +670,7 @@ void TilingManager::setSmartSplit(bool smart) {
 }
 
 void TilingManager::setForceSplit(qint32 force) {
+	this->configuredLayoutOptions.insert(QStringLiteral("forceSplit"));
 	force = qBound(0, force, 2);
 	if (force == this->mForceSplit) return;
 	this->mForceSplit = force;
@@ -622,6 +678,7 @@ void TilingManager::setForceSplit(qint32 force) {
 }
 
 void TilingManager::setDefaultSplitRatio(double ratio) {
+	this->configuredLayoutOptions.insert(QStringLiteral("defaultSplitRatio"));
 	ratio = qBound(0.1, ratio, 1.9);
 	if (qFuzzyCompare(ratio, this->mDefaultSplitRatio)) return;
 	this->mDefaultSplitRatio = ratio;
@@ -629,6 +686,7 @@ void TilingManager::setDefaultSplitRatio(double ratio) {
 }
 
 void TilingManager::setMasterNewStatus(const QString& status) {
+	this->configuredLayoutOptions.insert(QStringLiteral("masterNewStatus"));
 	auto value = status.trimmed().toLower();
 	if (value != QStringLiteral("master") && value != QStringLiteral("inherit")) {
 		value = QStringLiteral("slave");
@@ -641,6 +699,7 @@ void TilingManager::setMasterNewStatus(const QString& status) {
 }
 
 void TilingManager::setMasterNewOnTop(bool onTop) {
+	this->configuredLayoutOptions.insert(QStringLiteral("masterNewOnTop"));
 	if (onTop == this->mMasterNewOnTop) return;
 	this->mMasterNewOnTop = onTop;
 	this->markAll();
@@ -648,6 +707,7 @@ void TilingManager::setMasterNewOnTop(bool onTop) {
 }
 
 void TilingManager::setMasterOrientation(const QString& orientation) {
+	this->configuredLayoutOptions.insert(QStringLiteral("masterOrientation"));
 	static const auto known = QStringList {
 	    QStringLiteral("left"),
 	    QStringLiteral("right"),
@@ -665,6 +725,7 @@ void TilingManager::setMasterOrientation(const QString& orientation) {
 }
 
 void TilingManager::setMasterFactor(double factor) {
+	this->configuredLayoutOptions.insert(QStringLiteral("masterFactor"));
 	factor = qBound(0.05, factor, 0.95);
 	if (qFuzzyCompare(factor, this->mMasterFactor)) return;
 	this->mMasterFactor = factor;
@@ -673,6 +734,7 @@ void TilingManager::setMasterFactor(double factor) {
 }
 
 void TilingManager::setScrollingColumnWidth(double width) {
+	this->configuredLayoutOptions.insert(QStringLiteral("scrollingColumnWidth"));
 	width = qBound(tiling::ScrollingLayout::MIN_WIDTH, width, tiling::ScrollingLayout::MAX_WIDTH);
 	if (qFuzzyCompare(width, this->mScrollingColumnWidth)) return;
 	this->mScrollingColumnWidth = width;
@@ -681,6 +743,7 @@ void TilingManager::setScrollingColumnWidth(double width) {
 }
 
 void TilingManager::setScrollingCenter(const QString& center) {
+	this->configuredLayoutOptions.insert(QStringLiteral("scrollingCenter"));
 	auto value = center.trimmed().toLower();
 	if (value != QStringLiteral("always") && value != QStringLiteral("never")) {
 		value = QStringLiteral("overflow");
@@ -813,6 +876,10 @@ QString TilingManager::start() {
 
 	this->tracker = WindowTracker::instance();
 	this->desktops = this->tracker->desktops();
+	// The tracker's first scan normally waits for the first shell frame.
+	// An interactive session must adopt one complete current set, not treat
+	// that later scan's enumeration as a stream of new arrivals.
+	this->tracker->rescan();
 
 	auto& c = this->connections;
 	c.append(
@@ -868,9 +935,11 @@ QString TilingManager::start() {
 		return ca.x() != cb.x() ? ca.x() < cb.x() : ca.y() < cb.y();
 	});
 
+	this->restoreLayout(windows);
 	QHash<Layout*, TrackedWindow*> previous;
 	for (auto* window: windows) {
 		auto& m = this->managed.at(window);
+		if (m.layout != nullptr) continue;
 		if (this->stateOf(m) != State::Tiled) continue;
 
 		auto* layout = this->layoutFor(window, true);
@@ -883,10 +952,14 @@ QString TilingManager::start() {
 	this->onActiveWindowChanged();
 	this->schedule();
 	this->refreshManagedCount();
+	this->snapshotTimer.start();
 	return {};
 }
 
 void TilingManager::stop() {
+	// Capture before unpark/restoreFloating and before discarding any tree.
+	this->persistLayout();
+	this->snapshotTimer.stop();
 	this->restoreBorderColours();
 	for (const auto& connection: this->connections) QObject::disconnect(connection);
 	this->connections.clear();
@@ -930,11 +1003,177 @@ void TilingManager::stop() {
 	this->mTelemetry->reset();
 }
 
+void TilingManager::persistLayout() {
+	if (this->tracker == nullptr || this->desktops == nullptr) return;
+	tiling::LayoutSnapshot next;
+	next.options = {
+	    {"layout", this->mLayout}, {"preserveSplit", this->mPreserveSplit},
+	    {"smartSplit", this->mSmartSplit}, {"forceSplit", this->mForceSplit},
+	    {"defaultSplitRatio", this->mDefaultSplitRatio}, {"masterNewStatus", this->mMasterNewStatus},
+	    {"masterNewOnTop", this->mMasterNewOnTop}, {"masterOrientation", this->mMasterOrientation},
+	    {"masterFactor", this->mMasterFactor}, {"scrollingColumnWidth", this->mScrollingColumnWidth},
+	    {"scrollingCenter", this->mScrollingCenter}, {"fitToggled", this->fitToggled},
+	};
+	QHash<tiling::LayoutEngine::Id, tiling::LayoutEngine::Id> ids;
+	for (const auto& [window, m]: this->managed) {
+		ids.insert(idOf(window), m.identity.hwnd);
+	}
+	QSet<TrackedWindow*> saved;
+	auto append = [&](const Managed& m) {
+		auto* window = m.window;
+		if (saved.contains(window) || m.identity.started == 0 || m.identity.pid == 0) return;
+		auto monitor =
+		    persistentMonitor(m.layout != nullptr ? m.layout->screen.data() : window->screen());
+		if (monitor.isEmpty()) return;
+		auto desktop = window->desktop();
+		if (m.layout == nullptr && (desktop < 0 || desktop >= this->desktops->count())) return;
+		// Refresh the title hint without re-querying the process lifetime.
+		auto identity = m.identity;
+		identity.app = tiling::persistenceHint(window->appId());
+		identity.title = tiling::persistenceHint(window->title());
+		next.windows.append({
+		    identity,
+		    monitor,
+		    VirtualDesktops::guidToString(
+		        m.layout != nullptr ? m.layout->desktop : this->desktops->desktops().at(desktop).id
+		    ),
+		    static_cast<int>(m.override), m.layout == nullptr, m.autoFloat,
+		});
+		saved.insert(window);
+	};
+	for (const auto& [key, layout]: this->layouts) {
+		auto monitor = persistentMonitor(layout->screen);
+		if (monitor.isEmpty()) continue; // Session-only monitor identities never reach disk.
+		// A change can arrive just before the periodic timer or teardown,
+		// ahead of its coalesced sync. Canonicalize geometry/viewport state
+		// without placing any windows.
+		this->computeTree(*layout->tree, layout->screen);
+		next.layouts.append({
+		    monitor, VirtualDesktops::guidToString(layout->desktop),
+		    static_cast<int>(layout->tree->kind()), layout->tree->saveState(ids),
+		});
+		for (auto id: layout->tree->ids()) {
+			if (auto* window = this->windowOf(id)) append(this->managed.at(window));
+		}
+	}
+	// Keep explicit floats as well as tiled/hidden/suspended leaves.
+	for (auto* window: this->tracker->windows()) {
+		auto iter = this->managed.find(window);
+		if (iter != this->managed.end()) append(iter->second);
+	}
+	this->snapshot = next;
+	this->snapshotLoaded = true;
+	auto object = tiling::encodeSnapshot(next);
+	if (object == this->writtenSnapshot) return;
+	if (tiling::writeSnapshot(this->snapshotPath, next)) this->writtenSnapshot = object;
+	else qCWarning(logTiling) << "Could not atomically save the tiling layout.";
+}
+
+void TilingManager::restoreLayout(const QList<TrackedWindow*>& windows) {
+	if (!this->snapshotLoaded) {
+		this->snapshot = tiling::readSnapshot(this->snapshotPath);
+		this->snapshotLoaded = true;
+	}
+	// Restore layout-only choices, never old allowlists, exclusions or opt-in.
+	// The new generation's explicitly applied settings take precedence.
+	auto option = [this](const QString& key, auto setter) {
+		if (!this->configuredLayoutOptions.contains(key) && this->snapshot.options.contains(key))
+			setter(this->snapshot.options.value(key));
+	};
+	option(QStringLiteral("layout"), [this](auto v) { this->setLayout(v.toString()); });
+	option(QStringLiteral("preserveSplit"), [this](auto v) { this->setPreserveSplit(v.toBool()); });
+	option(QStringLiteral("smartSplit"), [this](auto v) { this->setSmartSplit(v.toBool()); });
+	option(QStringLiteral("forceSplit"), [this](auto v) { this->setForceSplit(v.toInt()); });
+	option(QStringLiteral("defaultSplitRatio"), [this](auto v) { this->setDefaultSplitRatio(v.toDouble()); });
+	option(QStringLiteral("masterNewStatus"), [this](auto v) { this->setMasterNewStatus(v.toString()); });
+	option(QStringLiteral("masterNewOnTop"), [this](auto v) { this->setMasterNewOnTop(v.toBool()); });
+	option(QStringLiteral("masterOrientation"), [this](auto v) { this->setMasterOrientation(v.toString()); });
+	option(QStringLiteral("masterFactor"), [this](auto v) { this->setMasterFactor(v.toDouble()); });
+	option(QStringLiteral("scrollingColumnWidth"), [this](auto v) { this->setScrollingColumnWidth(v.toDouble()); });
+	// Keep fit's effective center mode too, unless config selected a new mode.
+	if (!this->configuredLayoutOptions.contains(QStringLiteral("scrollingCenter")))
+		this->fitToggled = this->snapshot.options.value("fitToggled").toBool();
+	option(QStringLiteral("scrollingCenter"), [this](auto v) { this->setScrollingCenter(v.toString()); });
+	QHash<QString, QScreen*> monitors;
+	for (auto* screen: QGuiApplication::screens()) {
+		auto key = persistentMonitor(screen);
+		if (!key.isEmpty()) monitors.insert(key, screen);
+	}
+	QHash<QString, qsizetype> desktops;
+	for (qsizetype i = 0; i < this->desktops->count(); ++i) {
+		desktops.insert(VirtualDesktops::guidToString(this->desktops->desktops().at(i).id), i);
+	}
+	QList<tiling::WindowIdentity> identities;
+	for (auto* window: windows) identities.append(this->managed.at(window).identity);
+	auto plan = tiling::planRestore(
+	    this->snapshot.windows, identities,
+	    QSet<QString>(monitors.keyBegin(), monitors.keyEnd()),
+	    QSet<QString>(desktops.keyBegin(), desktops.keyEnd())
+	);
+	QHash<tiling::LayoutEngine::Id, tiling::LayoutEngine::Id> restored;
+	for (const auto& match: plan.matched) {
+		const auto& saved = this->snapshot.windows.at(match.saved);
+		auto* window = windows.at(match.current);
+		auto& m = this->managed.at(window);
+		m.override = static_cast<Override>(saved.override);
+		m.autoFloat = saved.autoFloat;
+		m.autoFloatScreen = monitors.value(saved.monitor);
+		m.autoFloatDesktop = this->desktops->desktops().at(desktops.value(saved.desktop)).id;
+		m.restoreScreen = monitors.value(saved.monitor);
+		// Re-evaluate current allowlists and safety rules. Persistence must not
+		// turn a newly excluded/elevated/owned window into a tile.
+		if (this->stateOf(m) == State::Out || saved.floating) continue;
+		auto desktop = desktops.value(saved.desktop);
+		if (window->desktop() != desktop && !this->desktops->moveWindow(window->hwnd(), desktop))
+			continue;
+		restored.insert(saved.identity.hwnd, idOf(window));
+	}
+	for (const auto& saved: this->snapshot.layouts) {
+		if (saved.kind != static_cast<int>(this->layoutKind())
+		    || !monitors.contains(saved.monitor) || !desktops.contains(saved.desktop)) continue;
+		QHash<tiling::LayoutEngine::Id, tiling::LayoutEngine::Id> ids;
+		for (const auto& w: this->snapshot.windows) {
+			if (w.monitor != saved.monitor || w.desktop != saved.desktop) continue;
+			auto id = restored.value(w.identity.hwnd);
+			auto* window = this->windowOf(id);
+			if (window != nullptr && this->managed.at(window).layout == nullptr)
+				ids.insert(w.identity.hwnd, id);
+		}
+		auto tree = tiling::LayoutEngine::restoreState(this->layoutKind(), saved.tree, ids);
+		if (tree->isEmpty()) continue;
+		auto* layout = this->layoutAt(
+		    this->desktops->desktops().at(desktops.value(saved.desktop)).id,
+		    monitors.value(saved.monitor), true
+		);
+		// Ignore duplicate/corrupt layout records rather than orphaning leaves.
+		if (layout == nullptr || !layout->tree->isEmpty()) continue;
+		layout->tree = std::move(tree);
+		for (auto id: layout->tree->ids()) {
+			auto* window = this->windowOf(id);
+			auto& m = this->managed.at(window);
+			QRect frame;
+			readFrame(window->hwnd(), m.preTiling, frame);
+			m.layout = layout;
+			m.restoring = true;
+			m.parked = this->stateOf(m) != State::Tiled;
+			this->notifyTilingChanged(window);
+		}
+		// New unmatched insertions need the restored leaves' real aspect and
+		// hidden state, just as ordinary insertions into an existing layout do.
+		this->computeTree(*layout->tree, layout->screen);
+		this->markLayout(layout);
+	}
+	for (auto& [window, m]: this->managed) {
+		if (m.layout == nullptr) m.restoreScreen = nullptr;
+	}
+}
+
 void TilingManager::manage(TrackedWindow* window) {
 	if (this->managed.contains(window)) return;
 
 	auto& m = this->managed[window];
 	m.window = window;
+	m.identity = persistenceIdentity(window);
 	m.placement.window = reinterpret_cast<quintptr>(window->hwnd());
 	m.placement.lifetime = ++this->lifetimeCounter;
 	m.elevated = isMoreElevated(window->hwnd());
@@ -1139,7 +1378,8 @@ tiling::WindowFacts TilingManager::factsOf(const Managed& m) const {
 	facts.exePath = m.window->exePath();
 	facts.title = m.window->title();
 	facts.className = windowClass(hwnd);
-	facts.screenName = screenName(m.window->screen());
+	facts.screenName =
+	    screenName(m.restoreScreen != nullptr ? m.restoreScreen.data() : m.window->screen());
 	facts.ownProcess = isOwnProcessWindow(hwnd);
 	facts.elevated = m.elevated;
 	facts.owned = owner != nullptr && IsWindowVisible(owner);
@@ -1402,10 +1642,26 @@ void TilingManager::syncWindow(TrackedWindow* window) {
 
 	Layout* want = nullptr;
 	auto* current = m.layout;
+	if (m.restoring && current != nullptr && this->layoutAlive(current)) {
+		auto caughtUp = window->screen() == current->screen && IsEqualGUID(desktop, current->desktop);
+		if (caughtUp || (m.restoreUntil != 0 && tilingNow() >= m.restoreUntil)) {
+			m.restoring = false;
+			m.restoreScreen = nullptr;
+		} else {
+			desktop = current->desktop;
+			if (state == State::Tiled && m.restoreUntil == 0) {
+				m.restoreUntil = tilingNow() + DEADLINE_MS;
+				QPointer<TrackedWindow> guarded(window);
+				QTimer::singleShot(DEADLINE_MS, Qt::PreciseTimer, this, [this, guarded]() {
+					if (guarded) this->markWindow(guarded);
+				});
+			}
+		}
+	}
 	if (current != nullptr && this->layoutAlive(current) && IsEqualGUID(current->desktop, desktop)) {
 		want = current;
 
-		if (state == State::Tiled && !m.verifying && !m.offscreen
+		if (state == State::Tiled && !m.restoring && !m.verifying && !m.offscreen
 		    && window->screen() != current->screen)
 		{
 			this->moveToLayout(m, this->layoutFor(window, true), nullptr);
@@ -1486,6 +1742,9 @@ void TilingManager::takeOut(Managed& m) {
 	if (layout->lastFocused == m.window) layout->lastFocused = nullptr;
 
 	m.layout = nullptr;
+	m.restoring = false;
+	m.restoreScreen = nullptr;
+	m.restoreUntil = 0;
 	m.target = QRect();
 	m.accepted = QRect();
 	m.verifying = false;

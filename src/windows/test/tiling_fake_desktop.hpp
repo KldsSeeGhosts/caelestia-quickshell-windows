@@ -70,6 +70,9 @@ struct FakeWindow {
 	QString appId = QStringLiteral("editor");
 	QString title = QStringLiteral("Editor");
 	QString className = QStringLiteral("TestWindow");
+	quint32 pid = 100;
+	quint64 started = 1000;
+	int desktop = 0;
 	bool own = false;
 	bool elevated = false;
 	bool minimized = false;
@@ -398,14 +401,20 @@ public:
 	};
 	using AccessorState::setAccessorLoaded;
 	using AccessorState::setPinExports;
-	const QList<Desktop>& desktops() const {
-		static QList<Desktop> list {Desktop {}};
-		return list;
-	}
-	qsizetype count() const { return 1; }
+	QList<Desktop> fixtures {Desktop {}};
+	bool refuseMoves = false;
+	const QList<Desktop>& desktops() const { return fixtures; }
+	qsizetype count() const { return fixtures.size(); }
 	qsizetype currentIndex() const { return 0; }
 	qsizetype indexOf(const GUID& id) const { return desktopIndexOf(this->desktops(), id); }
-	static QString guidToString(const GUID&) { return QStringLiteral("fake-desktop"); }
+	static QString guidToString(const GUID& guid) {
+		return QStringLiteral("fake-desktop-%1").arg(guid.Data1);
+	}
+	bool moveWindow(HWND hwnd, qsizetype index) {
+		if (refuseMoves || index < 0 || index >= this->count()) return false;
+		fakeWindow(hwnd).desktop = static_cast<int>(index);
+		return true;
+	}
 signals:
 	void desktopsChanged();
 };
@@ -458,7 +467,7 @@ public:
 		native.fullscreen = detection.fullscreen;
 		emit this->fullscreenChanged();
 	}
-	int desktop() const { return 0; }
+	int desktop() const { return fakeWindow(handle).desktop; }
 	void activate() { qFatal("Unexpected focus mutation in fixture"); }
 signals:
 	void minimizedChanged();
@@ -486,6 +495,12 @@ public:
 		return &tracker;
 	}
 	QList<TrackedWindow*> fixtures;
+	QList<TrackedWindow*> pendingDiscovery;
+	void rescan() {
+		// Synthetic startup enumeration, never EnumWindows or native input.
+		fixtures.append(pendingDiscovery);
+		pendingDiscovery.clear();
+	}
 	VirtualDesktops fakeDesktops;
 	const QList<TrackedWindow*>& windows() const { return fixtures; }
 	VirtualDesktops* desktops() { return &fakeDesktops; }

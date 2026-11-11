@@ -24,6 +24,7 @@
 #include <qtypes.h>
 
 #include "tiling_layout.hpp"
+#include "tiling_persistence.hpp"
 #include "tiling_scope.hpp"
 
 namespace qs::windows {
@@ -225,6 +226,7 @@ private:
 
 	struct Managed {
 		TrackedWindow* window = nullptr;
+		tiling::WindowIdentity identity;
 		tiling::PlacementIdentity placement;
 		tiling::PlacementDisposition disposition = tiling::PlacementDisposition::Idle;
 		Layout* layout = nullptr;
@@ -280,6 +282,11 @@ private:
 		// focused monitor, as in Hyprland, instead of wherever Windows first
 		// placed it. Cleared the first time the window is looked at.
 		QPointer<QScreen> placeOn;
+		// Tracker facts can lag an asynchronous restore across monitors or
+		// desktops. Do not interpret those old facts as a new user move.
+		bool restoring = false;
+		qint64 restoreUntil = 0;
+		QPointer<QScreen> restoreScreen;
 	};
 
 	// What releasing a dragged tiled window would do. The preview and the
@@ -342,6 +349,8 @@ private:
 	// reason when it was refused.
 	[[nodiscard]] QString start();
 	void stop();
+	void persistLayout();
+	void restoreLayout(const QList<TrackedWindow*>& windows);
 	void manage(TrackedWindow* window);
 	void unmanage(TrackedWindow* window);
 
@@ -462,6 +471,9 @@ private:
 	double mScrollingColumnWidth = 0.5;
 	QString mScrollingCenter = QStringLiteral("overflow");
 	bool fitToggled = false;
+	// Runtime layout choices survive a process restart. Explicit writes from
+	// the new profile/facade always win, including a write of a default value.
+	QSet<QString> configuredLayoutOptions;
 	tiling::ScopeRules scopeRules;
 	tiling::TilingTelemetry* mTelemetry = nullptr;
 	// Windows that already exist when tiling starts are not new arrivals:
@@ -489,6 +501,11 @@ private:
 	QTimer verifyTimer;
 	QTimer deadlineTimer;
 	QTimer snapTimer;
+	QTimer snapshotTimer;
+	QString snapshotPath;
+	bool snapshotLoaded = false;
+	tiling::LayoutSnapshot snapshot;
+	QJsonObject writtenSnapshot;
 	QList<QMetaObject::Connection> connections;
 };
 

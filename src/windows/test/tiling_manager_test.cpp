@@ -7,6 +7,7 @@
 #include <qsignalspy.h>
 #include <qscopeguard.h>
 #include <qtest.h>
+#include <qtemporarydir.h>
 
 #include "../fullscreen_geometry.hpp"
 #include "../hyprland/pin_support.hpp"
@@ -104,6 +105,162 @@ class TilingManagerTest: public QObject {
 	}
 
 private slots:
+	void snapshotCanonicalizesPendingScrollingWithoutPlacement() {
+		manager->setLayout(QStringLiteral("scrolling"));
+		auto* a = add(1);
+		auto* b = add(2);
+		enable();
+		auto* layout = manager->managed.at(a).layout;
+		layout->tree->swap(TilingManager::idOf(a), TilingManager::idOf(b));
+		layout->tree->splitRatio(TilingManager::idOf(a), 1.4, true);
+		manager->markLayout(layout);
+		auto moves = fakeWindow(a->hwnd()).moves + fakeWindow(b->hwnd()).moves;
+		manager->persistLayout(); // Deliberately before the pending sync.
+		QCOMPARE(fakeWindow(a->hwnd()).moves + fakeWindow(b->hwnd()).moves, moves);
+		QVERIFY(!manager->snapshot.layouts.isEmpty());
+		const auto state = manager->snapshot.layouts.first().tree;
+		auto restored = tiling::LayoutEngine::restoreState(
+		    tiling::Kind::Scrolling, state,
+		    {{1, TilingManager::idOf(a)}, {2, TilingManager::idOf(b)}}
+		);
+		manager->computeTree(*restored, layout->screen);
+		QCOMPARE(restored->saveState({
+		    {TilingManager::idOf(a), 1}, {TilingManager::idOf(b), 2},
+		}), state);
+	}
+
+	void restorationMovesToSavedDesktop_data() {
+		QTest::addColumn<bool>("refused");
+		QTest::newRow("restored") << false;
+		QTest::newRow("provider-refuses") << true;
+	}
+
+	void restorationMovesToSavedDesktop() {
+		QFETCH(bool, refused);
+		auto& desktops = WindowTracker::instance()->fakeDesktops;
+		VirtualDesktops::Desktop second;
+		second.id.Data1 = 1;
+		desktops.fixtures.append(second);
+		auto* a = add(1);
+		fakeWindow(a->hwnd()).desktop = 1;
+		enable();
+		QCOMPARE(manager->managed.at(a).layout->desktop.Data1, DWORD(1));
+		manager->setEnabled(false);
+		fakeWindow(a->hwnd()).desktop = 0;
+		desktops.refuseMoves = refused;
+		enable();
+		QCOMPARE(a->desktop(), refused ? 0 : 1);
+		QVERIFY(manager->managed.at(a).layout != nullptr);
+		QCOMPARE(manager->managed.at(a).layout->desktop.Data1, DWORD(refused ? 0 : 1));
+	}
+
+	void explicitlyAppliedLayoutOptionsWinOverTheSnapshot() {
+		manager->snapshotLoaded = true;
+		manager->snapshot.options = {{"layout", "master"}, {"masterOrientation", "top"}};
+		// These are explicit config writes even though both equal defaults.
+		manager->setLayout(QStringLiteral("dwindle"));
+		manager->setMasterOrientation(QStringLiteral("left"));
+		auto* a = add(1);
+		enable();
+		QCOMPARE(manager->layout(), QStringLiteral("dwindle"));
+		QCOMPARE(manager->masterOrientation(), QStringLiteral("left"));
+		QCOMPARE(manager->managed.at(a).layout->tree->kind(), tiling::Kind::Dwindle);
+	}
+
+	void restorationEvaluatesScopeOnTheSavedMonitor() {
+		auto* left = addLeftMonitor();
+		auto* a = add(1);
+		auto* b = add(2);
+		fakeWindow(a->hwnd()).monitor = 1;
+		fakeWindow(b->hwnd()).monitor = 1;
+		manager->setIncluded({QStringLiteral("screen:fixture-secondary")});
+		enable();
+		QVERIFY(manager->managed.at(a).layout != nullptr);
+		manager->setEnabled(false);
+		fakeWindow(a->hwnd()).monitor = 0;
+		fakeWindow(b->hwnd()).monitor = 0;
+		enable();
+		QVERIFY(manager->managed.at(a).layout != nullptr);
+		QCOMPARE(manager->managed.at(a).layout->screen.data(), left->screen());
+		QCOMPARE(manager->managed.at(a).layout, manager->managed.at(b).layout);
+		removeMonitor(left);
+	}
+
+	void processRestartRestoresDiskSnapshotBeforeNewWindows_data() {
+		QTest::addColumn<QString>("layoutName");
+		QTest::newRow("dwindle") << QStringLiteral("dwindle");
+		QTest::newRow("master") << QStringLiteral("master");
+		QTest::newRow("scrolling") << QStringLiteral("scrolling");
+	}
+
+	void processRestartRestoresDiskSnapshotBeforeNewWindows() {
+		QFETCH(QString, layoutName);
+		QTemporaryDir directory;
+		QVERIFY(directory.isValid());
+		auto path = directory.filePath("state/tiling-layout.json");
+		manager->snapshotPath = path;
+		manager->setLayout(layoutName);
+		manager->setMasterOrientation(QStringLiteral("top"));
+		manager->setMasterFactor(0.62);
+		auto* left = addLeftMonitor();
+		auto* a = add(1);
+		auto* b = add(2);
+		auto* c = add(3);
+		fakeWindow(a->hwnd()).monitor = 1;
+		fakeWindow(b->hwnd()).monitor = 1;
+		enable();
+		auto* layout = manager->managed.at(a).layout;
+		QVERIFY(layout != nullptr);
+		layout->tree->swap(TilingManager::idOf(a), TilingManager::idOf(b));
+		layout->tree->splitRatio(TilingManager::idOf(a), 1.4, true);
+		manager->markLayout(layout);
+		manager->setFloating(c, true, false);
+		manager->sync();
+		auto before = layout->tree->saveState({
+		    {TilingManager::idOf(a), 1}, {TilingManager::idOf(b), 2},
+		});
+		// The periodic callback saves without relying on clean shutdown.
+		QVERIFY(QMetaObject::invokeMethod(&manager->snapshotTimer, "timeout", Qt::DirectConnection));
+		QVERIFY(!tiling::readSnapshot(path).layouts.isEmpty());
+		manager->setEnabled(false);
+		delete manager;
+		manager = nullptr;
+		qDeleteAll(windows);
+		windows.clear();
+		WindowTracker::instance()->fixtures.clear();
+		// A new manager and new TrackedWindows have no in-memory state. Also
+		// put the old HWNDs back on the primary monitor before adoption.
+		auto* newB = add(2);
+		auto* newC = add(3);
+		auto* newA = add(1);
+		fakeWindow(newA->hwnd()).monitor = 0;
+		fakeWindow(newB->hwnd()).monitor = 0;
+		// Production delays its first scan until the first shell frame.
+		// Enabling must explicitly enumerate before planning adoption.
+		WindowTracker::instance()->pendingDiscovery = WindowTracker::instance()->fixtures;
+		WindowTracker::instance()->fixtures.clear();
+		manager = new TilingManager(QStringLiteral("Local\\QuickshellTiling-fixture"));
+		manager->snapshotPath = path;
+		enable();
+		QCOMPARE(manager->layout(), layoutName);
+		QCOMPARE(manager->masterOrientation(), QStringLiteral("top"));
+		QCOMPARE(manager->masterFactor(), 0.62);
+		auto* restored = manager->managed.at(newA).layout;
+		QVERIFY(restored != nullptr);
+		QCOMPARE(restored->screen.data(), left->screen());
+		QCOMPARE(manager->managed.at(newB).layout, restored);
+		QCOMPARE(restored->tree->saveState({
+		    {TilingManager::idOf(newA), 1}, {TilingManager::idOf(newB), 2},
+		}), before);
+		QVERIFY(manager->managed.at(newC).layout == nullptr);
+		auto* fresh = add(4);
+		manager->manage(fresh);
+		QVERIFY(manager->managed.at(fresh).layout != nullptr);
+		// A new arrival cannot displace a saved window onto its own monitor.
+		QCOMPARE(manager->managed.at(newA).layout, restored);
+		removeMonitor(left);
+	}
+
 	void acceptedPlacementNeedsAnObservation() {
 		auto* window = add(1);
 		fakeWindow(window->hwnd()).ignoreMoves = true;
@@ -905,6 +1062,8 @@ private slots:
 
 	void init() {
 		fakeDesktop = {};
+		WindowTracker::instance()->fakeDesktops.fixtures = {VirtualDesktops::Desktop {}};
+		WindowTracker::instance()->fakeDesktops.refuseMoves = false;
 		manager = new TilingManager(QStringLiteral("Local\\QuickshellTiling-fixture"));
 	}
 	void cleanup() {
