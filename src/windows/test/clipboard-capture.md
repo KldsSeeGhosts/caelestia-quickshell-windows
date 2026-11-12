@@ -36,10 +36,11 @@ This is invalidation, not secure memory erasure or cancellation of copy commands
 ## Deterministic boundary
 
 The fixture compiles the real `clipboard.cpp`, its meta-object, and real
-redaction. `ClipboardTestAccess` uses a private, non-QML constructor with an
-explicit provider, disposable directory and worker pool. It bypasses cache-path
-resolution, stale-cache pruning and listener registration. Stubs abort if the
-production service-window or cache-pruning path is accidentally entered.
+redaction. `ClipboardTestAccess` uses a private, non-QML constructor with
+explicit read, write and listener providers, a disposable directory and a worker
+pool. It enables history through the production setter with a fake listener.
+It bypasses personal cache-path resolution and stale-cache pruning. Stubs abort
+if the production service-window or cache-pruning path is accidentally entered.
 No real clipboard or Windows history API is called.
 
 The fake replaces ordinary content at the exact open operation. Availability
@@ -58,44 +59,54 @@ bounded retries, stale own-write results, duplicates and suppression.
 No race is scheduled with sleeps, clipboard secrets or huge images.
 Each semaphore/pool wait is bounded at five seconds.
 
-## Target registration request
+## Registration
 
-The focused sources are supplied without changing shared test registration.
-The test-entry owner should register this target using the existing manifest
-helper, classify `clipboard_capture` in exactly one runtime tier (recommended
-`portable`, synthetic content only), and create its disposable output directory
-in the build tree:
-
-```cmake
-qs_add_test_executable(clipboard_capture_test
-    clipboard_capture_test.cpp
-    clipboard_capture_test_stubs.cpp
-    ${QS_WINDOWS_SRC}/system/clipboard.cpp
-    ${QS_WINDOWS_SRC}/system/clipboard.hpp
-    ${QS_WINDOWS_SRC}/../core/redact.cpp
-)
-target_compile_definitions(clipboard_capture_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(clipboard_capture_test PRIVATE
-    Qt6::Gui Qt6::Qml Qt6::Test user32 gdi32
-)
-file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/clipboard-fixture-data")
-add_test(NAME clipboard_capture COMMAND clipboard_capture_test
-    -o "${CMAKE_CURRENT_BINARY_DIR}/clipboard-qt.xml,xml" -o -,txt
-)
-set_tests_properties(clipboard_capture PROPERTIES ENVIRONMENT
-    "QS_CLIPBOARD_FIXTURE_ROOT=${CMAKE_CURRENT_BINARY_DIR}/clipboard-fixture-data"
-)
-```
+`clipboard_capture` and `clipboard_writer` use the manifest helper and the
+`portable` tier in `CMakeLists.txt`. Both receive an explicit disposable
+`clipboard-fixture-data` directory in the build tree and run offscreen.
 
 The fixture refuses to run without an existing absolute
 `QS_CLIPBOARD_FIXTURE_ROOT`. It never falls back to a personal profile/cache.
-Use a dedicated disposable directory, the existing Qt runtime on PATH and
-`QT_FORCE_STDERR_LOGGING=1`. Once registered:
+Use the existing Qt runtime on PATH and `QT_QPA_PLATFORM=offscreen`:
 
 ```powershell
-cmake --build <build> --target clipboard_capture_test --parallel 2
-ctest --test-dir <build> -R '^clipboard_capture$' --no-tests=error --output-on-failure
+cmake --build <build> --target clipboard_capture_test clipboard_writer_test --parallel 2
+ctest --test-dir <build> -R '^clipboard_(capture|writer)$' --no-tests=error --output-on-failure
 ```
+
+## Write-only API and opt-in observation
+
+`Quickshell.Windows.ClipboardWriter` is a QML singleton with no history storage,
+read provider, listener, or cache path. `copyImageFile(path)` and `copyText(text)`
+return positive integer operation IDs, not success flags.
+`writeFinished(id, ok, error)` delivers one result per operation on the GUI thread,
+after the method returns. `error` is empty on success, otherwise `read-failed`,
+`decode-failed`, `allocation-failed`, `clipboard-busy`, or `set-failed`.
+The last code also covers failure to empty the clipboard. Files are read before
+returning, so callers may delete their hand-over file immediately. Image decode
+runs on the worker pool. Writes retry open five times with 10 ms between attempts.
+Destroying the singleton cancels pending results and frees untransferred data.
+
+The legacy `Clipboard.copyImageFile` still returns a bool indicating file-read
+acceptance, not write success. `Clipboard.copyText` still returns void. Both use
+the same write implementation as `ClipboardWriter`, as does copying a history
+entry. Only successful writes update history's own-write suppression.
+
+`Clipboard.historyEnabled` defaults to false. Disabled construction does not
+resolve a cache path, prune stale caches, install a handler, register a listener,
+or read clipboard data. Enabling retains the `shell.qml` filename guard.
+Disabling removes the handler, releases the shared native listener registration
+when the last observer stops, cancels capture generations and wipes entries and
+the instance cache directory. A cancelled worker cannot publish or retain its
+late result. The privacy-marker checks above are unchanged.
+
+`clipboard_writer` exercises these paths with fake registration and Win32 write
+boundaries. Production dormant constructors also run with fatal native-window
+and prune stubs. The fixture checks asynchronous success and every error code,
+distinct overlapping IDs, GUI-thread delivery, fifth-attempt success, bounded
+open failure, legacy compatibility and failed-write suppression. Fake data
+ownership detects double frees, transfer mistakes and leaks when destruction
+cancels a queued retry or a decoded result. No test opens the real clipboard.
 
 ## Evidence limits and remaining native acceptance
 

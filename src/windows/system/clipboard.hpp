@@ -13,11 +13,39 @@
 #include <qtypes.h>
 
 #include "clipboard_capture.hpp"
+#include "clipboard_write.hpp"
 
 class QImage;
 class QThreadPool;
 
 namespace qs::windows::sys {
+
+class ClipboardWriteController;
+
+// Write-only singleton. IDs identify asynchronous outcomes, not acceptance.
+class ClipboardWriter: public QObject {
+	Q_OBJECT;
+	QML_ELEMENT;
+	QML_SINGLETON;
+
+public:
+	explicit ClipboardWriter(QObject* parent = nullptr);
+	~ClipboardWriter() override;
+	Q_DISABLE_COPY_MOVE(ClipboardWriter);
+
+	Q_INVOKABLE int copyImageFile(const QString& path);
+	Q_INVOKABLE int copyText(const QString& text);
+
+signals:
+	void writeFinished(int id, bool ok, const QString& error);
+
+private:
+	friend class ClipboardTestAccess;
+	ClipboardWriter(std::shared_ptr<ClipboardWriteProvider> provider, QThreadPool* pool);
+	int nextOperationId();
+	int lastId = 0;
+	std::unique_ptr<ClipboardWriteController> writer;
+};
 
 struct ClipboardEntry {
 	qint64 id = 0;
@@ -44,6 +72,8 @@ class Clipboard: public QObject {
 	QML_ELEMENT;
 	QML_SINGLETON;
 	Q_PROPERTY(QStringList entries READ default NOTIFY entriesChanged BINDABLE bindableEntries);
+	Q_PROPERTY(bool historyEnabled READ historyEnabled WRITE setHistoryEnabled NOTIFY
+	               historyEnabledChanged);
 
 public:
 	explicit Clipboard(QObject* parent = nullptr);
@@ -51,6 +81,8 @@ public:
 	Q_DISABLE_COPY_MOVE(Clipboard);
 
 	[[nodiscard]] QBindable<QStringList> bindableEntries() const { return &this->bEntries; }
+	[[nodiscard]] bool historyEnabled() const { return this->mHistoryEnabled; }
+	void setHistoryEnabled(bool enabled);
 
 	Q_INVOKABLE void copy(qint64 id);
 	Q_INVOKABLE void deleteEntry(qint64 id);
@@ -64,6 +96,7 @@ public:
 
 signals:
 	void entriesChanged();
+	void historyEnabledChanged();
 
 private:
 	friend class ClipboardTestAccess;
@@ -71,6 +104,8 @@ private:
 	// resolve a personal path. Only focused fixtures supply this boundary.
 	Clipboard(
 	    std::shared_ptr<ClipboardReadProvider> provider,
+	    std::shared_ptr<ClipboardListenerProvider> listener,
+	    std::shared_ptr<ClipboardWriteProvider> writeProvider,
 	    const QString& directory,
 	    QThreadPool* pool
 	);
@@ -85,8 +120,6 @@ private:
 	void noteOwnWrite();
 	QString cacheDir();
 
-	void writeData(quint32 format, void* data, std::function<void(Clipboard*)> done, int attempt = 1);
-
 	std::vector<ClipboardEntry> storage;
 	QString mCacheDir;
 	qint64 nextId = 1;
@@ -99,9 +132,13 @@ private:
 	bool cleared = false;
 	quint32 clearSequence = 0;
 	std::shared_ptr<ClipboardReadProvider> readProvider;
-	std::shared_ptr<ClipboardCaptureGeneration> captureGeneration =
-	    std::make_shared<ClipboardCaptureGeneration>();
+	std::shared_ptr<ClipboardCaptureGeneration> captureGeneration;
 	QThreadPool* readPool = nullptr;
+	bool mHistoryEnabled = false;
+	bool production = true;
+	std::shared_ptr<ClipboardListenerProvider> listener;
+	std::unique_ptr<QObject> listenerContext;
+	std::unique_ptr<ClipboardWriteController> writer;
 
 	Q_OBJECT_BINDABLE_PROPERTY(Clipboard, QStringList, bEntries, &Clipboard::entriesChanged);
 };
