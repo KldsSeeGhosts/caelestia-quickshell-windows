@@ -26,6 +26,10 @@
 
 namespace qs::io {
 
+#ifdef QS_FILEVIEW_TEST
+void prepareFileViewCommit(QSaveFile& file);
+#endif
+
 namespace {
 QS_LOGGING_CATEGORY(logFileView, "quickshell.io.fileview", QtWarningMsg);
 }
@@ -286,8 +290,12 @@ void FileViewWriter::write(
 	if (shouldCancel.loadAcquire()) return;
 
 	if (doAtomicWrite) {
+#ifdef QS_FILEVIEW_TEST
+		prepareFileViewCommit(*static_cast<QSaveFile*>(file.get()));
+#endif
 		if (!reinterpret_cast<QSaveFile*>(file.get())->commit()) {
 			qmlWarning(view) << "Write of " << state.path << " failed: Atomic commit failed.";
+			state.error = FileViewError::Unknown;
 		}
 	}
 }
@@ -363,38 +371,41 @@ void FileView::operationFinished() {
 	}
 
 	qCDebug(logFileView) << "Async operation finished for" << this;
+	const auto reader = this->liveReader() != nullptr;
+	auto* operation = std::exchange(this->liveOperation, nullptr);
+	auto state = std::move(operation->state);
 	this->writeData = FileViewData();
-	this->updateState(this->liveOperation->state);
+	this->updateState(state, !reader);
 
-	if (this->liveReader()) {
-		if (this->state.error) emit this->loadFailed(this->state.error);
+	if (reader) {
+		if (state.error) emit this->loadFailed(state.error);
 		else emit this->loaded();
 	} else {
-		if (this->state.error) emit this->saveFailed(this->state.error);
+		if (state.error) emit this->saveFailed(state.error);
 		else emit this->saved();
 	}
-
-	this->liveOperation = nullptr;
 }
 
 void FileView::reload() { this->updatePath(); }
 
 bool FileView::waitForJob() {
 	if (this->liveOperation != nullptr) {
-		QObject::disconnect(this->liveOperation, nullptr, this, nullptr);
-		this->liveOperation->block();
+		const auto reader = this->liveReader() != nullptr;
+		auto* operation = std::exchange(this->liveOperation, nullptr);
+		QObject::disconnect(operation, nullptr, this, nullptr);
+		operation->block();
+		auto state = std::move(operation->state);
 		this->writeData = FileViewData();
-		this->updateState(this->liveOperation->state);
+		this->updateState(state, !reader);
 
-		if (this->liveReader()) {
-			if (this->state.error) emit this->loadFailed(this->state.error);
+		if (reader) {
+			if (state.error) emit this->loadFailed(state.error);
 			else emit this->loaded();
 		} else {
-			if (this->state.error) emit this->saveFailed(this->state.error);
+			if (state.error) emit this->saveFailed(state.error);
 			else emit this->saved();
 		}
 
-		this->liveOperation = nullptr;
 		return true;
 	} else return false;
 }
@@ -409,7 +420,7 @@ void FileView::loadSync() {
 		FileViewReader::read(this, state, false);
 		this->updateState(state);
 
-		if (this->state.error) emit this->loadFailed(this->state.error);
+		if (state.error) emit this->loadFailed(state.error);
 		else emit this->loaded();
 	}
 }
@@ -427,14 +438,16 @@ void FileView::saveSync() {
 		state.printErrors = this->bPrintErrors;
 		FileViewWriter::write(this, state, this->bAtomicWrites);
 		this->writeData = FileViewData();
-		this->updateState(state);
+		this->updateState(state, true);
 
-		if (this->state.error) emit this->saveFailed(this->state.error);
+		if (state.error) emit this->saveFailed(state.error);
 		else emit this->saved();
 	}
 }
 
-void FileView::updateState(FileViewState& newState) {
+void FileView::updateState(FileViewState& newState, bool write) {
+	// A failed write's attempted bytes are not the file's committed contents.
+	if (write && newState.error) newState.data = this->state.data;
 	DEFINE_DROP_EMIT_IF(newState.path != this->state.path, this, pathChanged);
 	// assume if the path was changed the data also changed
 	auto dataChanged = pathChanged || newState.data != this->state.data;
@@ -601,7 +614,7 @@ QString FileView::text() {
 }
 
 void FileView::setData(const QByteArray& data) {
-	if (this->writeCmpData().operator const QByteArray&() == data) return;
+	if (!this->state.error && this->writeCmpData().operator const QByteArray&() == data) return;
 	this->writeData = data;
 
 	if (this->bBlockWrites) this->saveSync();
@@ -609,7 +622,7 @@ void FileView::setData(const QByteArray& data) {
 }
 
 void FileView::setText(const QString& text) {
-	if (this->writeCmpData().operator const QString&() == text) return;
+	if (!this->state.error && this->writeCmpData().operator const QString&() == text) return;
 	this->writeData = text;
 
 	if (this->bBlockWrites) this->saveSync();

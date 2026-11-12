@@ -1123,6 +1123,16 @@ target_link_libraries(capture_native_test PRIVATE
 )
 add_test(NAME capture_native COMMAND capture_native_test)
 
+qs_add_test_executable(fileview_transaction_test
+	fileview_transaction_test.cpp
+	${QS_WINDOWS_SRC}/../io/fileview.cpp
+	${QS_WINDOWS_SRC}/../io/fileview.hpp
+)
+target_compile_definitions(fileview_transaction_test PRIVATE QS_FILEVIEW_TEST)
+target_link_libraries(fileview_transaction_test PRIVATE Qt6::Qml Qt6::Test)
+add_test(NAME fileview_transaction COMMAND fileview_transaction_test)
+set_tests_properties(fileview_transaction PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 # Runtime tiers. Every registered fixture belongs to exactly one tier, and
 # configuration fails on an unclassified or doubly classified fixture.
 #   portable: fakes and offscreen Qt only; required in hosted CI.
@@ -1146,6 +1156,7 @@ set(QS_TESTS_PORTABLE
 	super_drag_wait network_wifi_route runtime_paths lazyloader
 	fullscreen_ownership display_transaction clipboard_capture capture_dimensions
 	erm625_native_desktop_facade network_wifi_identity capture_affinity window_stack
+	fileview_transaction
 )
 set(QS_TESTS_NATIVE
 	appbar_call tray_hook tray_host keyboard_layout native_lifetime
