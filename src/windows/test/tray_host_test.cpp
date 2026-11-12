@@ -38,7 +38,6 @@ bool TrayHook::running() { return false; }
 QVariantMap TrayHook::capability() { return {}; }
 void TrayHook::announceTo(std::vector<HWND>) {}
 void seedFromExplorer(TrayIconSink, std::function<void(bool)>) {}
-std::vector<ExplorerIconData> readExplorerToolbars() { return {}; }
 } // namespace qs::windows::services::systray
 
 using namespace qs::windows::services::systray;
