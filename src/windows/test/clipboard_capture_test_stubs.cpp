@@ -6,9 +6,9 @@
 #include "../../core/logcat.hpp"
 #include "../services/message_window.hpp"
 
-// Tests link the real clipboard.cpp, but inject its private read-only provider
-// constructor. Any accidental use of the normal listener/cache-pruning path
-// must fail, not touch the desktop or the real clipboard.
+// Tests link the real clipboard.cpp and inject read/write/listener providers.
+// Production constructors are safe while history is disabled. Any accidental
+// native message-window or cache-pruning access must fail, not touch the desktop.
 InstanceInfo InstanceInfo::CURRENT;
 
 QThreadPool* BackgroundThreadPool::instance() {

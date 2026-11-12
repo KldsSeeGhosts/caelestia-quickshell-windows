@@ -1034,6 +1034,22 @@ set_tests_properties(clipboard_capture PROPERTIES ENVIRONMENT
 	"QS_CLIPBOARD_FIXTURE_ROOT=${CMAKE_CURRENT_BINARY_DIR}/clipboard-fixture-data;QT_QPA_PLATFORM=offscreen"
 )
 
+qs_add_test_executable(clipboard_writer_test
+	clipboard_writer_test.cpp
+	clipboard_capture_test_stubs.cpp
+	${QS_WINDOWS_SRC}/system/clipboard.cpp
+	${QS_WINDOWS_SRC}/system/clipboard.hpp
+	${QS_WINDOWS_SRC}/../core/redact.cpp
+)
+target_compile_definitions(clipboard_writer_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(clipboard_writer_test PRIVATE Qt6::Gui Qt6::Qml Qt6::Test user32 gdi32)
+add_test(NAME clipboard_writer COMMAND clipboard_writer_test
+	-o "${CMAKE_CURRENT_BINARY_DIR}/clipboard-writer-qt.xml,xml" -o -,txt
+)
+set_tests_properties(clipboard_writer PROPERTIES ENVIRONMENT
+	"QS_CLIPBOARD_FIXTURE_ROOT=${CMAKE_CURRENT_BINARY_DIR}/clipboard-fixture-data;QT_QPA_PLATFORM=offscreen"
+)
+
 qs_add_test_executable(capture_dimensions_test capture_dimensions_test.cpp)
 target_compile_definitions(capture_dimensions_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(capture_dimensions_test PRIVATE ${QS_WINDOWS_SRC})
@@ -1144,7 +1160,7 @@ set(QS_TESTS_PORTABLE
 	panel_topmost power_profiles brightness_route display_identity
 	native_desktop_recovery pw_session_worker idle_request launcher_exit input_settle
 	super_drag_wait network_wifi_route runtime_paths lazyloader
-	fullscreen_ownership display_transaction clipboard_capture capture_dimensions
+	fullscreen_ownership display_transaction clipboard_capture clipboard_writer capture_dimensions
 	erm625_native_desktop_facade network_wifi_identity capture_affinity window_stack
 )
 set(QS_TESTS_NATIVE

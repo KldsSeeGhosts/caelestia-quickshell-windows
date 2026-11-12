@@ -3,8 +3,6 @@
 #include <memory>
 #include <optional>
 
-#include <qt_windows.h>
-
 #include <qcoreapplication.h>
 #include <qcoreevent.h>
 #include <qdir.h>
@@ -12,11 +10,13 @@
 #include <qhash.h>
 #include <qimage.h>
 #include <qsemaphore.h>
+#include <qt_windows.h>
 #include <qtemporarydir.h>
 #include <qtest.h>
 #include <qthreadpool.h>
 
 #include "../system/clipboard.hpp"
+#include "clipboard_test_providers.hpp"
 
 using namespace qs::windows::sys;
 
@@ -29,7 +29,15 @@ public:
 	    const QString& directory,
 	    QThreadPool& pool
 	) {
-		return std::unique_ptr<Clipboard>(new Clipboard(std::move(provider), directory, &pool));
+		auto clipboard = std::unique_ptr<Clipboard>(new Clipboard(
+		    std::move(provider),
+		    std::make_shared<FakeClipboardListener>(),
+		    std::make_shared<FakeClipboardWrite>(),
+		    directory,
+		    &pool
+		));
+		clipboard->setHistoryEnabled(true);
+		return clipboard;
 	}
 	static void update(Clipboard& clipboard) { clipboard.onClipboardUpdate(); }
 	static bool capturing(const Clipboard& clipboard) { return clipboard.capturing; }
@@ -86,10 +94,11 @@ Snapshot content(int kind, quint32 sequence = 100) {
 	Snapshot snapshot;
 	snapshot.sequence = sequence;
 	if (kind == 2) snapshot.formats.insert(CF_DIB, dibBytes());
-	else snapshot.formats.insert(
-	    CF_UNICODETEXT,
-	    textBytes(kind == 1 ? QString(32769, QChar(u'x')) : QStringLiteral("generated fixture"))
-	);
+	else
+		snapshot.formats.insert(
+		    CF_UNICODETEXT,
+		    textBytes(kind == 1 ? QString(32769, QChar(u'x')) : QStringLiteral("generated fixture"))
+		);
 	return snapshot;
 }
 
@@ -193,7 +202,8 @@ struct Fixture {
 		if (!this->directory.isValid()) qFatal("Cannot create disposable fixture directory");
 		this->pool.setMaxThreadCount(1);
 		this->provider->current = content(kind);
-		this->clipboard = ClipboardTestAccess::create(this->provider, this->directory.path(), this->pool);
+		this->clipboard =
+		    ClipboardTestAccess::create(this->provider, this->directory.path(), this->pool);
 	}
 	~Fixture() {
 		// Assertion failures must not leave a held worker behind.
@@ -213,8 +223,7 @@ void lateData() {
 	QTest::addColumn<bool>("queued");
 	for (int kind: {1, 2}) {
 		for (bool queued: {false, true}) {
-			QTest::newRow(qPrintable(QStringLiteral("%1-%2").arg(kind).arg(queued)))
-			    << kind << queued;
+			QTest::newRow(qPrintable(QStringLiteral("%1-%2").arg(kind).arg(queued))) << kind << queued;
 		}
 	}
 }
