@@ -256,6 +256,7 @@ private:
 
 	QHash<HWND, Dirty> dirty;
 	QSet<HWND> candidates;
+	mutable QSet<HWND> desktopCandidates;
 	QSet<HWND> moving;
 	bool foregroundDirty = false;
 	QTimer flushTimer;

@@ -1,9 +1,20 @@
 #include "native_desktop_accessor.hpp"
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <utility>
 
 #include <objectarray.h>
+#include <qcoreapplication.h>
+#include <qhash.h>
 #include <qloggingcategory.h>
 #include <qpointer.h>
+#include <qscopedvaluerollback.h>
 #include <servprov.h>
 #include <shobjidl_core.h>
 #include <wrl/client.h>
@@ -75,26 +86,22 @@ struct Provider {
 	QList<ComPtr<Desktop>> snapshot;
 	QList<GUID> ids;
 	int current = -1;
-	bool supported = false;
 	bool structuredException = false;
+	bool privateEnabled = true;
 	DesktopAvailability availability = DesktopAvailability::MissingProvider;
 	HRESULT lastError = S_OK;
-	QPointer<QObject> context;
-	std::function<void()> recovered;
-	DesktopRecovery recovery {
-	    [this] { return this->acquire(); },
-	    [this] {
-		    if (this->context && this->recovered) this->recovered();
-	    }
-	};
 
-	void drop() {
+	void dropPrivate() {
 		release(this->snapshot);
 		this->ids.clear();
 		this->current = -1;
-		release(this->publicApi);
 		release(this->views);
 		release(this->manager);
+	}
+
+	void drop() {
+		this->dropPrivate();
+		release(this->publicApi);
 	}
 
 	void exception(const char* operation) {
@@ -103,7 +110,6 @@ struct Provider {
 		this->lastError = E_UNEXPECTED;
 		this->availability = DesktopAvailability::Disconnected;
 		this->drop();
-		this->recovery.disconnected();
 	}
 
 	template <typename T>
@@ -130,7 +136,6 @@ struct Provider {
 		{
 			this->drop();
 			this->availability = DesktopAvailability::Disconnected;
-			this->recovery.disconnected();
 		}
 		return false;
 	}
@@ -139,8 +144,10 @@ struct Provider {
 		this->drop();
 		this->lastError = S_OK;
 		this->structuredException = false;
+		this->availability = DesktopAvailability::MissingProvider;
 		ComPtr<IServiceProvider> shell;
 		bool ok;
+		bool publicAcquired = false;
 #ifdef QS_TEST
 		if (this->factory) {
 			ok = this->invoke(
@@ -153,48 +160,63 @@ struct Provider {
 			    },
 			    "Test desktop acquisition"
 			);
+			publicAcquired = ok && this->publicApi;
 		} else
 #endif
 		{
-			ok = this->invoke(
-			         [&] {
-				         return CoCreateInstance(
-				             immersiveShell,
-				             nullptr,
-				             CLSCTX_LOCAL_SERVER,
-				             IID_PPV_ARGS(&shell)
-				         );
-			         },
-			         "ImmersiveShell"
-			     )
-			  && this->invoke(
-			      [&] { return shell->QueryService(desktopService, IID_PPV_ARGS(&this->manager)); },
-			      "DesktopManager 24H2 GUID"
-			  )
-			  && this->invoke(
-			      [&] {
-				      return shell->QueryService(__uuidof(ViewCollection), IID_PPV_ARGS(&this->views));
-			      },
-			      "ApplicationViewCollection GUID"
-			  )
-			  && this->invoke(
-			      [&] {
-				      return CoCreateInstance(
-				          publicManager,
-				          nullptr,
-				          CLSCTX_INPROC_SERVER,
-				          IID_PPV_ARGS(&this->publicApi)
-				      );
-			      },
-			      "PublicDesktopManager"
-			  );
+			// Public window queries do not depend on the private ABI or its
+			// opt-in. Retain them when private acquisition alone is refused.
+			const auto publicOk = this->invoke(
+			    [&] {
+				    return CoCreateInstance(
+				        publicManager,
+				        nullptr,
+				        CLSCTX_INPROC_SERVER,
+				        IID_PPV_ARGS(&this->publicApi)
+				    );
+			    },
+			    "PublicDesktopManager"
+			);
+			publicAcquired = publicOk && this->publicApi;
+			const auto privateOk =
+			    (!this->privateEnabled
+			     || (this->invoke(
+			             [&] {
+				             return CoCreateInstance(
+				                 immersiveShell,
+				                 nullptr,
+				                 CLSCTX_LOCAL_SERVER,
+				                 IID_PPV_ARGS(&shell)
+				             );
+			             },
+			             "ImmersiveShell"
+			         )
+			         && this->invoke(
+			             [&] {
+				             return shell->QueryService(desktopService, IID_PPV_ARGS(&this->manager));
+			             },
+			             "DesktopManager 24H2 GUID"
+			         )
+			         && this->invoke(
+			             [&] {
+				             return shell->QueryService(
+				                 __uuidof(ViewCollection),
+				                 IID_PPV_ARGS(&this->views)
+				             );
+			             },
+			             "ApplicationViewCollection GUID"
+			         )));
+			ok = publicOk && privateOk;
 		}
-		ok = ok && this->refresh();
+		ok = ok && (!this->privateEnabled || this->refresh());
 		// Finish local cleanup before publishing acquisition success, including
 		// timer-driven acquisitions which have no outer facade SEH guard.
 		ok = this->releaseLocal(shell) && ok;
 		if (!ok) {
-			this->drop();
+			if (!publicAcquired || this->structuredException
+			    || this->availability == DesktopAvailability::Disconnected)
+				this->drop();
+			else this->dropPrivate();
 			if (this->lastError == E_ACCESSDENIED) {
 				this->availability = DesktopAvailability::PermissionDenied;
 			} else if (this->structuredException || this->lastError == RPC_E_DISCONNECTED
@@ -272,9 +294,11 @@ struct Provider {
 	}
 };
 
+thread_local Provider* activeProvider = nullptr;
 Provider& provider() {
-	static Provider instance;
-	return instance;
+	// Constructed and destroyed inside the worker's COM apartment.
+	Q_ASSERT(activeProvider);
+	return *activeProvider;
 }
 
 int desktopCount() {
@@ -283,50 +307,9 @@ int desktopCount() {
 	if (p.availability != DesktopAvailability::Disconnected) {
 		p.availability = p.lastError == E_ACCESSDENIED ? DesktopAvailability::PermissionDenied
 		                                               : DesktopAvailability::MissingProvider;
-		p.drop();
-		p.recovery.disconnected();
+		p.dropPrivate();
 	}
 	return -1;
-}
-
-GUID desktopId(int index) {
-	auto& ids = provider().ids;
-	return index >= 0 && index < ids.size() ? ids[index] : GUID {};
-}
-
-int indexOf(const GUID& id) {
-	if (IsEqualGUID(id, GUID {})) return -1;
-	auto& ids = provider().ids;
-	for (qsizetype i = 0; i < ids.size(); ++i) {
-		if (IsEqualGUID(id, ids[i])) return static_cast<int>(i);
-	}
-	return -1;
-}
-
-int currentDesktop() { return provider().current; }
-
-int windowDesktop(HWND window) {
-	GUID id {};
-	auto& p = provider();
-	if (!p.manager
-	    || !p.invoke(
-	        [&] { return p.publicApi->GetWindowDesktopId(window, &id); },
-	        "GetWindowDesktopId"
-	    ))
-		return -1;
-	return indexOf(id);
-}
-
-int onCurrent(HWND window) {
-	BOOL current = FALSE;
-	auto& p = provider();
-	return p.manager
-	            && p.invoke(
-	                [&] { return p.publicApi->IsWindowOnCurrentVirtualDesktop(window, &current); },
-	                "IsWindowOnCurrentDesktop"
-	            )
-	         ? static_cast<int>(current)
-	         : -1;
 }
 
 int switchDesktop(int index) {
@@ -370,6 +353,463 @@ int moveWindow(HWND window, int index) {
 	    && p.invoke([&] { return p.manager->MoveViewToDesktop(view, desktop); }, "MoveViewToDesktop");
 	return p.releaseLocal(unknown) && ok ? 0 : -1;
 }
+
+using Clock = std::chrono::steady_clock;
+constexpr auto callBound = std::chrono::milliseconds(100);
+constexpr int workerLimit = 4;
+constexpr qsizetype windowLimit = 4096;
+
+struct WindowSnapshot {
+	GUID id {};
+	int onCurrent = -1;
+	DWORD pid = 0;
+	DWORD thread = 0;
+};
+
+struct Snapshot {
+	QList<GUID> ids;
+	int current = -1;
+	QHash<quintptr, WindowSnapshot> windows;
+	DesktopAvailability availability = DesktopAvailability::MissingProvider;
+	HRESULT error = S_OK;
+	int result = -1;
+	quint64 sequence = 0;
+	bool publicReady = false;
+};
+
+struct Request {
+	HANDLE finished = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	~Request() {
+		if (this->finished) CloseHandle(this->finished);
+	}
+	std::function<int()> operation;
+	QList<quintptr> windows;
+	std::promise<Snapshot> completion;
+	Clock::time_point deadline = Clock::now() + callBound;
+	quint64 sequence = 0;
+};
+
+// Intentionally process-lived. A retired apartment may still be inside RPC
+// during static destruction. It owns no QObject or GUI-owned storage.
+std::atomic<int>& liveWorkers() {
+	static auto* count = new std::atomic<int>(0);
+	return *count;
+}
+
+struct Worker {
+	std::mutex mutex;
+	std::condition_variable wake;
+	std::deque<std::shared_ptr<Request>> queue;
+	bool stopping = false;
+	std::promise<void> exited;
+	std::shared_future<void> exit = exited.get_future().share();
+
+	void stop() {
+		{
+			std::lock_guard lock(this->mutex);
+			this->stopping = true;
+			this->queue.clear();
+		}
+		this->wake.notify_one();
+	}
+
+	std::future<Snapshot> submit(const std::shared_ptr<Request>& request) {
+		auto result = request->completion.get_future();
+		{
+			std::lock_guard lock(this->mutex);
+			// The GUI permits only one refresh and one synchronous command.
+			Q_ASSERT(this->queue.size() < 2);
+			if (!this->stopping) this->queue.push_back(request);
+		}
+		this->wake.notify_one();
+		return result;
+	}
+
+	void
+	run(bool privateEnabled
+#ifdef QS_TEST
+	    ,
+	    NativeDesktopFactory factory,
+	    std::function<bool(HWND)> validator
+#endif
+	) {
+		const auto apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+		Provider p;
+		p.privateEnabled = privateEnabled;
+		if (FAILED(apartment)) p.lastError = apartment;
+#ifdef QS_TEST
+		p.factory = std::move(factory);
+		p.windowValidator = std::move(validator);
+#endif
+		activeProvider = &p;
+		for (;;) {
+			std::shared_ptr<Request> request;
+			{
+				std::unique_lock lock(this->mutex);
+				this->wake.wait(lock, [&] { return this->stopping || !this->queue.empty(); });
+				if (this->stopping) break;
+				request = std::move(this->queue.front());
+				this->queue.pop_front();
+			}
+			if (Clock::now() >= request->deadline) {
+				Snapshot expired;
+				expired.error = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+				expired.availability = DesktopAvailability::Disconnected;
+				expired.sequence = request->sequence;
+				request->completion.set_value(std::move(expired));
+				SetEvent(request->finished);
+				continue;
+			}
+			Snapshot snapshot;
+			snapshot.sequence = request->sequence;
+			try {
+				snapshot.result = FAILED(apartment) ? -1 : request->operation();
+				for (const auto value: request->windows) {
+					auto hwnd = reinterpret_cast<HWND>(value);
+					WindowSnapshot window;
+					window.thread = GetWindowThreadProcessId(hwnd, &window.pid);
+					snapshot.windows.insert(value, window);
+					if (!p.publicApi || !p.validWindow(hwnd)) continue;
+					// A window disappearing is not a provider failure. Disconnects
+					// and structured exceptions still invalidate the apartment.
+					if (!p.invoke(
+					        [&] { return p.publicApi->GetWindowDesktopId(hwnd, &window.id); },
+					        "GetWindowDesktopId"
+					    ))
+						window.id = {};
+					BOOL current = TRUE;
+					if (p.publicApi
+					    && p.invoke(
+					        [&] { return p.publicApi->IsWindowOnCurrentVirtualDesktop(hwnd, &current); },
+					        "IsWindowOnCurrentDesktop"
+					    ))
+						window.onCurrent = current != FALSE;
+					DWORD pid = 0;
+					if (window.thread == GetWindowThreadProcessId(hwnd, &pid) && window.pid == pid)
+						snapshot.windows.insert(value, window);
+				}
+				snapshot.ids = p.ids;
+				snapshot.current = p.current;
+				snapshot.availability = p.availability;
+				snapshot.error = p.lastError;
+				snapshot.publicReady = p.publicApi != nullptr;
+			} catch (...) {
+				snapshot.availability = DesktopAvailability::Disconnected;
+				snapshot.error = E_UNEXPECTED;
+			}
+			request->completion.set_value(std::move(snapshot));
+			SetEvent(request->finished);
+		}
+		// Release and even CoUninitialize may block. Both belong to this
+		// retired worker and count against the cap until they finish.
+		p.drop();
+		activeProvider = nullptr;
+		if (SUCCEEDED(apartment)) CoUninitialize();
+		--liveWorkers();
+		this->exited.set_value();
+	}
+};
+
+struct Channel {
+	std::shared_ptr<Worker> worker;
+	Snapshot snapshot;
+	QSet<quintptr> watchedWindows;
+	QPointer<QObject> context;
+	std::function<void()> recovered;
+	std::function<void()> updated;
+	QTimer poll;
+	std::future<Snapshot> refreshResult;
+	Clock::time_point refreshDeadline;
+	bool supported = false;
+	bool privateEnabled = false;
+	bool refusedBuild = false;
+	bool refreshAgain = false;
+	bool waiting = false;
+	quint64 sequence = 0;
+	quint64 applied = 0;
+#ifdef QS_TEST
+	NativeDesktopFactory factory;
+	std::function<bool(HWND)> validator;
+#endif
+	DesktopRecovery recovery {
+	    [this] { return this->acquire(); },
+	    [this] {
+		    this->notify();
+		    if (this->context && this->recovered) this->recovered();
+	    }
+	};
+
+	Channel() {
+		this->poll.setInterval(10);
+		QObject::connect(&this->poll, &QTimer::timeout, &this->poll, [this] { this->collect(); });
+		if (auto* app = QCoreApplication::instance()) {
+			QObject::connect(app, &QCoreApplication::aboutToQuit, &this->poll, [this] {
+				this->shutdown();
+			});
+		}
+	}
+
+	void shutdown() {
+		this->poll.stop();
+		this->recovery.reset();
+		if (auto previous = std::exchange(this->worker, {})) previous->stop();
+		this->refreshResult = {};
+		this->refreshAgain = false;
+	}
+
+	void notify() {
+		// No event loop runs inside a bounded command wait. Notifications
+		// always run later on the GUI, never reenter its command dispatch.
+		if (this->context && this->updated) QTimer::singleShot(0, this->context, this->updated);
+	}
+
+	void retire(HRESULT error) {
+		if (auto previous = std::exchange(this->worker, {})) previous->stop();
+		this->refreshResult = {};
+		this->poll.stop();
+		this->snapshot.availability = DesktopAvailability::Disconnected;
+		this->snapshot.error = error;
+		// Keep the last desktop/window values as explicitly stale state.
+		this->recovery.disconnected();
+		this->notify();
+	}
+
+	bool apply(Snapshot result) {
+		if (result.sequence < this->applied) return true;
+		this->applied = result.sequence;
+		if (result.availability != DesktopAvailability::Available) {
+			const auto state = result.availability;
+			const auto error = result.error;
+			if (result.publicReady) {
+				this->snapshot.windows = std::move(result.windows);
+				this->snapshot.availability = state;
+				this->snapshot.error = error;
+				this->recovery.disconnected();
+				return false;
+			}
+			this->retire(error);
+			this->snapshot.availability = state;
+			return false;
+		}
+		this->snapshot = std::move(result);
+		return true;
+	}
+
+	int execute(
+	    std::function<int()> operation,
+	    bool queryWindows = false,
+	    bool publicOperation = false
+	) {
+		if (!this->worker) return -1;
+		if (this->waiting) {
+			this->snapshot.error = HRESULT_FROM_WIN32(ERROR_BUSY);
+			return -1;
+		}
+		QScopedValueRollback waiting(this->waiting, true);
+		const auto owner = this->worker;
+		auto request = std::make_shared<Request>();
+		if (!request->finished) {
+			this->snapshot.error = HRESULT_FROM_WIN32(GetLastError());
+			return -1;
+		}
+		request->sequence = ++this->sequence;
+		request->operation = std::move(operation);
+		if (queryWindows) request->windows = this->watchedWindows.values();
+		auto result = owner->submit(request);
+		// COM can synchronously notify GUI windows. Preserve sent-message
+		// dispatch without consuming posted Qt events or extending the bound.
+		while (owner == this->worker
+		       && result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+		{
+			const auto remaining = request->deadline - Clock::now();
+			if (remaining <= Clock::duration::zero()) break;
+			const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+			const auto status = MsgWaitForMultipleObjectsEx(
+			    1,
+			    &request->finished,
+			    static_cast<DWORD>(milliseconds.count() + 1),
+			    QS_SENDMESSAGE,
+			    MWMO_INPUTAVAILABLE
+			);
+			if (status == WAIT_OBJECT_0) break;
+			if (status != WAIT_OBJECT_0 + 1) break;
+			MSG message {};
+			PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+		}
+		if (owner != this->worker) return -1;
+		if (result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+			this->retire(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+			return -1;
+		}
+		try {
+			auto value = result.get();
+			const auto outcome = value.result;
+			const auto publicReady = value.publicReady;
+			// A command snapshot must not erase the last window membership.
+			if (!queryWindows) value.windows = this->snapshot.windows;
+			const auto available = this->apply(std::move(value));
+			return available || (publicOperation && publicReady) ? outcome : -1;
+		} catch (...) {
+			this->retire(E_UNEXPECTED);
+			return -1;
+		}
+	}
+
+	bool acquire() {
+		if (this->worker) {
+			if (this->snapshot.availability == DesktopAvailability::Available) return true;
+			return this->execute([] { return provider().acquire() ? 0 : -1; }, true) == 0;
+		}
+		auto count = liveWorkers().load();
+		do {
+			if (count >= workerLimit) {
+				this->snapshot.error = HRESULT_FROM_WIN32(ERROR_BUSY);
+				return false;
+			}
+		} while (!liveWorkers().compare_exchange_weak(count, count + 1));
+		std::shared_ptr<Worker> next;
+		try {
+			next = std::make_shared<Worker>();
+			std::thread([next,
+			             enabled = this->privateEnabled
+#ifdef QS_TEST
+			             ,
+			             factory = this->factory,
+			             validator = this->validator
+#endif
+			] {
+				next->run(
+				    enabled
+#ifdef QS_TEST
+				    ,
+				    factory,
+				    validator
+#endif
+				);
+			}).detach();
+		} catch (...) {
+			--liveWorkers();
+			this->snapshot.error = E_OUTOFMEMORY;
+			return false;
+		}
+		this->worker = std::move(next);
+		return this->execute([] { return provider().acquire() ? 0 : -1; }, true) == 0;
+	}
+
+	void pruneWindows() {
+#ifdef QS_TEST
+		if (this->validator) return;
+#endif
+		this->watchedWindows.removeIf([](quintptr value) {
+			return !IsWindow(reinterpret_cast<HWND>(value));
+		});
+	}
+
+	void requestRefresh() {
+		if (!this->worker) return;
+		if (this->refreshResult.valid()) {
+			this->refreshAgain = true;
+			return;
+		}
+		this->pruneWindows();
+		auto request = std::make_shared<Request>();
+		if (!request->finished) {
+			this->retire(HRESULT_FROM_WIN32(GetLastError()));
+			return;
+		}
+		request->sequence = ++this->sequence;
+		request->operation = [] {
+			return provider().privateEnabled ? (desktopCount() < 0 ? -1 : 0) : 0;
+		};
+		request->windows = this->watchedWindows.values();
+		this->refreshDeadline = request->deadline;
+		this->refreshResult = this->worker->submit(request);
+		this->poll.start();
+	}
+
+	void collect() {
+		if (!this->refreshResult.valid()) return;
+		if (this->refreshResult.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+			try {
+				auto value = this->refreshResult.get();
+				this->refreshResult = {};
+				this->poll.stop();
+				if (value.sequence < this->applied) this->refreshAgain = true;
+				this->apply(std::move(value));
+				this->notify();
+				if (std::exchange(this->refreshAgain, false)) this->requestRefresh();
+			} catch (...) {
+				this->retire(E_UNEXPECTED);
+			}
+		} else if (Clock::now() >= this->refreshDeadline) {
+			this->retire(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+		}
+	}
+
+	WindowSnapshot window(HWND hwnd) {
+		if (!hwnd) return {};
+		const auto value = reinterpret_cast<quintptr>(hwnd);
+		DWORD pid = 0;
+		const auto thread = GetWindowThreadProcessId(hwnd, &pid);
+		auto entry = this->snapshot.windows.constFind(value);
+		if (entry != this->snapshot.windows.cend() && entry->pid == pid && entry->thread == thread)
+			return *entry;
+		if (entry != this->snapshot.windows.cend()) {
+			this->snapshot.windows.remove(value);
+			this->watchedWindows.remove(value);
+		}
+		if (this->watchedWindows.size() >= windowLimit) this->pruneWindows();
+		if (this->watchedWindows.size() < windowLimit && !this->watchedWindows.contains(value)) {
+			this->watchedWindows.insert(value);
+			this->requestRefresh();
+		}
+		return {};
+	}
+};
+
+Channel& channel() {
+	static auto* instance = new Channel;
+	return *instance;
+}
+
+int cachedCount() {
+	const auto& c = channel();
+	return c.snapshot.availability == DesktopAvailability::Available
+	         ? static_cast<int>(c.snapshot.ids.size())
+	         : -1;
+}
+int cachedCurrent() { return channel().snapshot.current; }
+GUID cachedId(int index) {
+	const auto& ids = channel().snapshot.ids;
+	return index >= 0 && index < ids.size() ? ids[index] : GUID {};
+}
+int cachedWindow(HWND hwnd) {
+	const auto id = channel().window(hwnd).id;
+	const auto& ids = channel().snapshot.ids;
+	for (qsizetype i = 0; i < ids.size(); ++i)
+		if (!IsEqualGUID(id, GUID {}) && IsEqualGUID(id, ids[i])) return static_cast<int>(i);
+	return -1;
+}
+int cachedOnCurrent(HWND hwnd) { return channel().window(hwnd).onCurrent; }
+int workerIndex(GUID id) {
+	const auto& ids = provider().ids;
+	for (qsizetype i = 0; i < ids.size(); ++i)
+		if (!IsEqualGUID(id, GUID {}) && IsEqualGUID(id, ids[i])) return static_cast<int>(i);
+	return -1;
+}
+int boundedSwitch(int index) {
+	const auto id = cachedId(index);
+	return channel().execute([id] { return switchDesktop(workerIndex(id)); });
+}
+int boundedCreate() {
+	return channel().execute([] { return createDesktop(); });
+}
+int boundedMove(HWND hwnd, int index) {
+	const auto id = cachedId(index);
+	const auto result = channel().execute([hwnd, id] { return moveWindow(hwnd, workerIndex(id)); });
+	if (result == 0) channel().requestRefresh();
+	return result;
+}
 } // namespace
 
 bool loadNativeDesktopAccessor(
@@ -377,80 +817,137 @@ bool loadNativeDesktopAccessor(
     QObject* context,
     std::function<void()> recovered
 ) {
-	auto& p = provider();
+	auto& p = channel();
 	const auto build = windowsBuild();
 	// These build families share the 24H2 ABI. Never guess a vtable on another
 	// build, or try unrelated interface GUIDs after QueryService refuses it.
 	if (build != 26100 && build != 26200 && build != 26300) {
 		qCWarning(logNativeDesktops) << "Desktop dispatch refused on unrecognized Windows build"
 		                             << build;
-		p.availability = DesktopAvailability::UnsupportedBuild;
+		p.snapshot.availability = DesktopAvailability::UnsupportedBuild;
+		p.refusedBuild = true;
+		p.supported = false;
+		accessor = {};
 		return false;
 	}
 	p.supported = true;
+	p.refusedBuild = false;
 	p.context = context;
 	p.recovered = std::move(recovered);
-	accessor.getDesktopCount = &desktopCount;
-	accessor.getCurrentDesktopNumber = &currentDesktop;
-	accessor.getDesktopIdByNumber = &desktopId;
-	accessor.getWindowDesktopNumber = &windowDesktop;
-	accessor.isWindowOnCurrentVirtualDesktop = &onCurrent;
-	accessor.goToDesktopNumber = &switchDesktop;
-	accessor.moveWindowToDesktopNumber = &moveWindow;
-	accessor.createDesktop = &createDesktop;
+	accessor.getDesktopCount = &cachedCount;
+	accessor.getCurrentDesktopNumber = &cachedCurrent;
+	accessor.getDesktopIdByNumber = &cachedId;
+	accessor.getWindowDesktopNumber = &cachedWindow;
+	accessor.isWindowOnCurrentVirtualDesktop = &cachedOnCurrent;
+	accessor.goToDesktopNumber = &boundedSwitch;
+	accessor.moveWindowToDesktopNumber = &boundedMove;
+	accessor.createDesktop = &boundedCreate;
 	// Removal, pinning and notification hooks intentionally remain absent.
+	p.shutdown();
+	p.privateEnabled = true;
 	if (p.acquire()) return true;
 	p.recovery.disconnected();
 	return false;
 }
 
 bool retryNativeDesktopAccessor() {
-	auto& p = provider();
+	auto& p = channel();
 	if (!p.supported) return false;
 	p.recovery.retryOnDispatch();
-	return p.availability == DesktopAvailability::Available && p.manager && !p.recovery.active();
+	return p.snapshot.availability == DesktopAvailability::Available && p.worker
+	    && !p.recovery.active();
 }
 
 void invalidateNativeDesktopAccessor(HRESULT error) {
-	auto& p = provider();
-	if (!p.supported) return;
-	if (FAILED(error)) p.lastError = error;
-	p.availability = DesktopAvailability::Disconnected;
-	p.drop();
-	p.recovery.disconnected();
+	channel().retire(FAILED(error) ? error : RPC_E_DISCONNECTED);
 }
 
-DesktopAvailability nativeDesktopAvailability() { return provider().availability; }
-HRESULT nativeDesktopLastError() { return provider().lastError; }
+DesktopAvailability nativeDesktopAvailability() {
+	return channel().refusedBuild ? DesktopAvailability::UnsupportedBuild
+	                              : channel().snapshot.availability;
+}
+HRESULT nativeDesktopLastError() { return channel().snapshot.error; }
+
+void initializeNativeDesktopQueries(QObject* context, std::function<void()> updated) {
+	auto& c = channel();
+	c.context = context;
+	c.updated = std::move(updated);
+	QObject::connect(context, &QObject::destroyed, &c.poll, [&c] {
+		c.shutdown();
+		c.context = nullptr;
+		c.recovered = {};
+		c.updated = {};
+	});
+	if (!c.worker && !c.recovery.active() && !c.acquire()) c.recovery.disconnected();
+}
+
+void requestNativeDesktopRefresh() { channel().requestRefresh(); }
+GUID nativeWindowDesktopId(HWND hwnd) { return channel().window(hwnd).id; }
+int nativeWindowOnCurrentDesktop(HWND hwnd) { return channel().window(hwnd).onCurrent; }
+std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop) {
+	if (!channel().worker) return std::nullopt;
+	const auto result = channel().execute(
+	    [hwnd, desktop] {
+		    auto& p = provider();
+		    if (!p.publicApi) return -2;
+		    return p.invoke(
+		               [&] { return p.publicApi->MoveWindowToDesktop(hwnd, desktop); },
+		               "MoveWindowToDesktop"
+		           )
+		             ? 0
+		             : -1;
+	    },
+	    false,
+	    true
+	);
+	if (result == 0) channel().requestRefresh();
+	return result == -2 ? std::nullopt : std::optional<bool>(result == 0);
+}
+void shutdownNativeDesktopAccessor() { channel().shutdown(); }
 
 #ifdef QS_TEST
 void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
-	auto& p = provider();
+	auto& p = channel();
 	// Clear an injected test clock first: it may capture a caller's local that
 	// is already out of scope when a RAII reset guard runs this.
 	p.recovery.setAgeForTest({});
-	p.drop();
-	p.recovery.reset();
+	auto previous = p.worker;
+	p.shutdown();
+	// Test fixtures own their fakes on the stack. A bounded teardown barrier
+	// lets them verify cleanup before destroying those fakes.
+	if (previous) previous->exit.wait_for(callBound);
 	p.context = nullptr;
 	p.recovered = {};
+	p.updated = {};
 	p.supported = false;
-	p.availability = DesktopAvailability::MissingProvider;
-	p.lastError = S_OK;
+	p.privateEnabled = false;
+	p.refusedBuild = false;
+	p.applied = 0;
+	p.snapshot = {};
+	p.watchedWindows.clear();
 	p.factory = std::move(factory);
-	p.windowValidator = {};
+	p.validator = {};
 }
 
 void setNativeDesktopWindowValidatorForTest(std::function<bool(HWND)> validator) {
-	provider().windowValidator = std::move(validator);
+	auto& c = channel();
+	c.validator = validator;
+	c.execute([validator = std::move(validator)] {
+		provider().windowValidator = validator;
+		return 0;
+	});
 }
 
 void setNativeDesktopRecoveryAgeForTest(std::function<qint64()> age) {
-	provider().recovery.setAgeForTest(std::move(age));
+	channel().recovery.setAgeForTest(std::move(age));
 }
 
-int nativeDesktopRecoveryPendingDelayForTest() {
-	return provider().recovery.pendingDelay();
+int nativeDesktopRecoveryPendingDelayForTest() { return channel().recovery.pendingDelay(); }
+
+int refreshNativeDesktopForTest() {
+	return channel().execute([] { return desktopCount(); }, true);
 }
+int nativeDesktopWorkerCountForTest() { return liveWorkers().load(); }
 #endif
 
 } // namespace qs::windows

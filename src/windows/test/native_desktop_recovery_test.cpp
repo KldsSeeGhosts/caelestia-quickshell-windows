@@ -1,3 +1,5 @@
+#include <atomic>
+
 #include <qtest.h>
 
 #include "desktop_recovery.hpp"
@@ -37,14 +39,20 @@ private slots:
 		QCOMPARE(calls, 0);
 	}
 	void acquisitionDenied() {
+		int calls = 0;
 		setNativeDesktopFactoryForTest(
-		    [](DesktopManager**, ViewCollection**, IVirtualDesktopManager**) { return E_ACCESSDENIED; }
+		    [&](DesktopManager**, ViewCollection**, IVirtualDesktopManager**) {
+			    ++calls;
+			    return E_ACCESSDENIED;
+		    }
 		);
 		VirtualDesktops::Accessor accessor;
 		QObject context;
 		QVERIFY(!loadNativeDesktopAccessor(accessor, &context, [] {}));
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::PermissionDenied);
 		QCOMPARE(nativeDesktopLastError(), E_ACCESSDENIED);
+		initializeNativeDesktopQueries(&context, [] {});
+		QCOMPARE(calls, 1); // Attaching the GUI observer must not bypass backoff.
 	}
 	void unexpectedHresultIsNotStructuredException() {
 		setNativeDesktopFactoryForTest(
@@ -144,11 +152,14 @@ private slots:
 			result = accessor.moveWindowToDesktopNumber(window, 1);
 		else if (operation == "create" || operation == "local-create-release")
 			result = accessor.createDesktop();
-		else if (operation == "window-id") result = accessor.getWindowDesktopNumber(nullptr);
-		else if (operation == "on-current") result = accessor.isWindowOnCurrentVirtualDesktop(nullptr);
-		else if (operation == "switch" || operation == "broken-release")
+		else if (operation == "window-id" || operation == "on-current") {
+			// Reads are cached. Register a window and explicitly refresh the
+			// worker before asserting the fault result.
+			accessor.getWindowDesktopNumber(window);
+			result = refreshNativeDesktopForTest();
+		} else if (operation == "switch" || operation == "broken-release")
 			result = accessor.goToDesktopNumber(1);
-		else result = accessor.getDesktopCount();
+		else result = refreshNativeDesktopForTest();
 		old.clearFaults();
 		active.faultOnRelease = false;
 		QCOMPARE(result, -1);
@@ -180,8 +191,9 @@ private slots:
 		QCOMPARE(accessor.getDesktopCount(), -1);
 		QCOMPARE(old.manager.enumerations, enumerations);
 		QCOMPARE(old.manager.switches, switches);
-		QVERIFY(IsEqualGUID(accessor.getDesktopIdByNumber(0), GUID {}));
-		QCOMPARE(accessor.getCurrentDesktopNumber(), -1);
+		// Commands fail while unavailable; reads retain their last snapshot.
+		QVERIFY(IsEqualGUID(accessor.getDesktopIdByNumber(0), old.one.id));
+		QCOMPARE(accessor.getCurrentDesktopNumber(), 0);
 		QCOMPARE(acquisitions, 1); // Dispatch cannot bypass the active backoff.
 		online = true;
 		QTRY_COMPARE_WITH_TIMEOUT(recovered, 1, 1500);
@@ -372,16 +384,16 @@ private slots:
 		QVERIFY(IsEqualGUID(accessor.getDesktopIdByNumber(0), one.id));
 		QVERIFY(IsEqualGUID(accessor.getDesktopIdByNumber(1), two.id));
 		QCOMPARE(accessor.getCurrentDesktopNumber(), 0);
-		QCOMPARE(manager.enumerations, before + 1); // One array per refresh.
+		QCOMPARE(manager.enumerations, before); // Cached reads never enumerate.
 		manager.result = failure;
 		online = false;
-		QCOMPARE(accessor.getDesktopCount(), -1);
+		QCOMPARE(refreshNativeDesktopForTest(), -1);
 		QCOMPARE(nativeDesktopAvailability(), static_cast<DesktopAvailability>(availability));
-		QVERIFY(IsEqualGUID(accessor.getDesktopIdByNumber(0), GUID {}));
-		QCOMPARE(accessor.getCurrentDesktopNumber(), -1);
+		QVERIFY(IsEqualGUID(accessor.getDesktopIdByNumber(0), one.id));
+		QCOMPARE(accessor.getCurrentDesktopNumber(), 0);
 		QCOMPARE(manager.refs, 1UL);
 		QCOMPARE(views.refs, 1UL);
-		QCOMPARE(publicApi.refs, 1UL);
+		QCOMPARE(publicApi.refs, failure == E_ACCESSDENIED || failure == E_FAIL ? 2UL : 1UL);
 		QCOMPARE(one.refs, 1UL);
 		QCOMPARE(two.refs, 1UL);
 		QCOMPARE(accessor.goToDesktopNumber(1), -1);
@@ -399,8 +411,229 @@ private slots:
 		QCOMPARE(accessor.goToDesktopNumber(2), 0);
 		QCOMPARE(manager.switches, 1);
 		invalidateNativeDesktopAccessor(); // TaskbarCreated takes the same path.
-		QVERIFY(IsEqualGUID(accessor.getDesktopIdByNumber(0), GUID {}));
+		QVERIFY(IsEqualGUID(accessor.getDesktopIdByNumber(0), three.id));
 		QTRY_COMPARE_WITH_TIMEOUT(recovered, 2, 1500);
+	}
+	void blockedCallsAreBounded_data() {
+		QTest::addColumn<QString>("operation");
+		for (const auto* operation:
+		     {"activation",
+		      "enumeration",
+		      "switch",
+		      "create",
+		      "move",
+		      "window-query",
+		      "own-window-move",
+		      "release"})
+			QTest::newRow(operation) << QString::fromLatin1(operation);
+	}
+	void blockedCallsAreBounded() {
+		QFETCH(QString, operation);
+		auto old = std::make_shared<Fixture>();
+		auto fresh = std::make_shared<Fixture>();
+		fresh->one.id.Data1 = 101;
+		auto blocked = std::make_shared<BlockingCall>();
+		std::atomic<int> acquisitions = 0;
+		std::atomic<DWORD> apartmentThread = 0;
+		setNativeDesktopFactoryForTest([&, old, fresh, blocked](
+		                                   DesktopManager** m,
+		                                   ViewCollection** v,
+		                                   IVirtualDesktopManager** p
+		                               ) {
+			apartmentThread = GetCurrentThreadId();
+			const auto first = ++acquisitions == 1;
+			if (first && operation == "activation") (*blocked)();
+			return (first ? old : fresh)->acquire(m, v, p);
+		});
+		struct Reset {
+			~Reset() { setNativeDesktopFactoryForTest({}); }
+		} reset;
+		Unblock unblock {blocked};
+		QObject context;
+		VirtualDesktops::Accessor accessor;
+		QElapsedTimer elapsed;
+		elapsed.start();
+		const auto loaded = loadNativeDesktopAccessor(accessor, &context, [] {});
+		QVERIFY2(
+		    elapsed.elapsed() < 250,
+		    "Activation exceeded the 100 ms wait plus scheduling allowance"
+		);
+		if (operation != "activation") QVERIFY(loaded);
+		else QVERIFY(!loaded);
+		QVERIFY(apartmentThread.load() != GetCurrentThreadId());
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb2));
+		if (loaded) setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		const auto block = [blocked] { (*blocked)(); };
+		if (operation == "enumeration") old->manager.beforeEnumeration = block;
+		if (operation == "switch") old->manager.beforeSwitch = block;
+		if (operation == "create") old->manager.beforeCreate = block;
+		if (operation == "move") old->manager.beforeMove = block;
+		if (operation == "window-query") old->publicApi.beforeQuery = block;
+		if (operation == "own-window-move") old->publicApi.beforeMove = block;
+		if (operation == "release") old->one.beforeRelease = block;
+		elapsed.restart();
+		if (operation == "enumeration" || operation == "release") {
+			requestNativeDesktopRefresh();
+			QVERIFY(elapsed.elapsed() < 50);
+			QTRY_COMPARE_WITH_TIMEOUT(
+			    nativeDesktopAvailability(),
+			    DesktopAvailability::Disconnected,
+			    250
+			);
+		} else if (operation == "window-query") {
+			QVERIFY(IsEqualGUID(nativeWindowDesktopId(window), GUID {}));
+			QVERIFY(elapsed.elapsed() < 50);
+			QTRY_COMPARE_WITH_TIMEOUT(
+			    nativeDesktopAvailability(),
+			    DesktopAvailability::Disconnected,
+			    250
+			);
+		} else if (operation == "switch") QCOMPARE(accessor.goToDesktopNumber(1), -1);
+		else if (operation == "create") QCOMPARE(accessor.createDesktop(), -1);
+		else if (operation == "move") QCOMPARE(accessor.moveWindowToDesktopNumber(window, 1), -1);
+		else if (operation == "own-window-move") {
+			const auto result = moveNativeDesktopOwnWindow(window, old->two.id);
+			QVERIFY(result.has_value() && !*result);
+		}
+		QVERIFY(elapsed.elapsed() < 250);
+		QCOMPARE(WaitForSingleObject(blocked->entered, 0), DWORD(WAIT_OBJECT_0));
+		QCOMPARE(nativeDesktopLastError(), HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Disconnected);
+		// GUI snapshots and invalidation never wait for the stuck COM owner.
+		elapsed.restart();
+		for (int i = 0; i < 100; ++i) {
+			accessor.getDesktopCount();
+			accessor.getCurrentDesktopNumber();
+			accessor.getDesktopIdByNumber(0);
+			(void) nativeWindowDesktopId(window);
+			(void) nativeWindowOnCurrentDesktop(window);
+		}
+		QVERIFY(elapsed.elapsed() < 50);
+		// The replacement succeeds while the previous apartment stays blocked.
+		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopAvailability(), DesktopAvailability::Available, 1500);
+		QCOMPARE(acquisitions.load(), 2);
+		QVERIFY(IsEqualGUID(accessor.getDesktopIdByNumber(0), fresh->one.id));
+		blocked->release();
+		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 1, 500);
+		QCoreApplication::processEvents();
+		// A late acquisition/refresh/command must not overwrite this generation.
+		QVERIFY(IsEqualGUID(accessor.getDesktopIdByNumber(0), fresh->one.id));
+		QCOMPARE(fresh->manager.switches, 0);
+		QCOMPARE(fresh->manager.creates, 0);
+	}
+	void shutdownDoesNotWaitForRelease() {
+		auto old = std::make_shared<Fixture>();
+		auto blocked = std::make_shared<BlockingCall>();
+		setNativeDesktopFactoryForTest(
+		    [old](DesktopManager** m, ViewCollection** v, IVirtualDesktopManager** p) {
+			    return old->acquire(m, v, p);
+		    }
+		);
+		Unblock unblock {blocked};
+		QObject context;
+		VirtualDesktops::Accessor accessor;
+		QVERIFY(loadNativeDesktopAccessor(accessor, &context, [] {}));
+		old->manager.beforeRelease = [blocked] { (*blocked)(); };
+		QElapsedTimer elapsed;
+		elapsed.start();
+		shutdownNativeDesktopAccessor();
+		QVERIFY(elapsed.elapsed() < 50);
+		QTRY_COMPARE_WITH_TIMEOUT(WaitForSingleObject(blocked->entered, 0), DWORD(WAIT_OBJECT_0), 200);
+		blocked->release();
+		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 0, 500);
+	}
+	void retiredApartmentsHaveAGlobalCap() {
+		auto blocked = std::make_shared<BlockingCall>();
+		std::atomic<int> attempts = 0;
+		setNativeDesktopFactoryForTest(
+		    [blocked, &attempts](DesktopManager**, ViewCollection**, IVirtualDesktopManager**) {
+			    ++attempts;
+			    (*blocked)();
+			    return E_FAIL;
+		    }
+		);
+		Unblock unblock {blocked};
+		QObject context;
+		VirtualDesktops::Accessor accessor;
+		for (int i = 0; i < 6; ++i) {
+			QElapsedTimer elapsed;
+			elapsed.start();
+			QVERIFY(!loadNativeDesktopAccessor(accessor, &context, [] {}));
+			QVERIFY(elapsed.elapsed() < 250);
+			QVERIFY(nativeDesktopWorkerCountForTest() <= 4);
+		}
+		QCOMPARE(attempts.load(), 4);
+		QCOMPARE(nativeDesktopLastError(), HRESULT_FROM_WIN32(ERROR_BUSY));
+		blocked->release();
+		shutdownNativeDesktopAccessor();
+		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 0, 1000);
+	}
+	void queuedCommandExpiresWithoutDispatch() {
+		auto old = std::make_shared<Fixture>();
+		auto blocked = std::make_shared<BlockingCall>();
+		setNativeDesktopFactoryForTest(
+		    [old](DesktopManager** m, ViewCollection** v, IVirtualDesktopManager** p) {
+			    return old->acquire(m, v, p);
+		    }
+		);
+		Unblock unblock {blocked};
+		QObject context;
+		VirtualDesktops::Accessor accessor;
+		QVERIFY(loadNativeDesktopAccessor(accessor, &context, [] {}));
+		old->manager.beforeEnumeration = [blocked] { (*blocked)(); };
+		requestNativeDesktopRefresh();
+		QTRY_COMPARE_WITH_TIMEOUT(WaitForSingleObject(blocked->entered, 0), DWORD(WAIT_OBJECT_0), 100);
+		QElapsedTimer elapsed;
+		elapsed.start();
+		QCOMPARE(accessor.goToDesktopNumber(1), -1);
+		QVERIFY(elapsed.elapsed() < 250);
+		blocked->release();
+		shutdownNativeDesktopAccessor();
+		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 0, 500);
+		QCOMPARE(old->manager.switches, 0);
+	}
+	void publicQueriesRemainAvailableOnUnknownBuild() {
+		auto fake = std::make_shared<Fixture>();
+		setNativeDesktopFactoryForTest(
+		    [fake](DesktopManager** m, ViewCollection** v, IVirtualDesktopManager** p) {
+			    return fake->acquire(m, v, p);
+		    }
+		);
+		testBuild = 99999;
+		QObject context;
+		VirtualDesktops::Accessor accessor;
+		QVERIFY(!loadNativeDesktopAccessor(accessor, &context, [] {}));
+		initializeNativeDesktopQueries(&context, [] {});
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb2));
+		QVERIFY(IsEqualGUID(nativeWindowDesktopId(window), GUID {}));
+		QTRY_VERIFY_WITH_TIMEOUT(IsEqualGUID(nativeWindowDesktopId(window), fake->one.id), 250);
+		QCOMPARE(nativeWindowOnCurrentDesktop(window), 1);
+		QCOMPARE(fake->manager.enumerations, 0);
+		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::UnsupportedBuild);
+		QVERIFY(!accessor.goToDesktopNumber);
+	}
+	void privateRefusalDoesNotDisablePublicWindowQueries() {
+		auto fake = std::make_shared<Fixture>();
+		fake->manager.result = E_NOINTERFACE;
+		setNativeDesktopFactoryForTest(
+		    [fake](DesktopManager** m, ViewCollection** v, IVirtualDesktopManager** p) {
+			    return fake->acquire(m, v, p);
+		    }
+		);
+		QObject context;
+		VirtualDesktops::Accessor accessor;
+		QVERIFY(!loadNativeDesktopAccessor(accessor, &context, [] {}));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb2));
+		QVERIFY(IsEqualGUID(nativeWindowDesktopId(window), GUID {}));
+		QTRY_VERIFY_WITH_TIMEOUT(IsEqualGUID(nativeWindowDesktopId(window), fake->one.id), 200);
+		QCOMPARE(nativeWindowOnCurrentDesktop(window), 1);
+		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::MissingProvider);
+		const auto moved = moveNativeDesktopOwnWindow(window, fake->two.id);
+		QVERIFY(moved.has_value() && *moved);
+		fake->manager.result = S_OK;
+		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopAvailability(), DesktopAvailability::Available, 1500);
 	}
 	void boundedBackoffAndDispatchRetry() {
 		qint64 age = 0;

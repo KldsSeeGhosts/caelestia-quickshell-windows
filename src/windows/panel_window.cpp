@@ -262,6 +262,12 @@ public:
 			    VirtualDesktops::instance(),
 			    [] { stack->followCurrentDesktop(); }
 			);
+			QObject::connect(
+			    VirtualDesktops::instance(),
+			    &VirtualDesktops::windowDesktopsChanged,
+			    VirtualDesktops::instance(),
+			    [] { stack->followCurrentDesktop(); }
+			);
 
 			auto* self = stack;
 			QObject::connect(

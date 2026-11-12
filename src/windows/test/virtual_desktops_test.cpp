@@ -1,13 +1,17 @@
-#include <qsignalspy.h>
-#include <qtest.h>
+#include <atomic>
+#include <functional>
+
+#include <qelapsedtimer.h>
 #include <qqmlcomponent.h>
 #include <qqmlcontext.h>
 #include <qqmlengine.h>
+#include <qsignalspy.h>
+#include <qtest.h>
 
-#include "virtual_desktops.hpp"
+#include "erm625_desktop_fakes.hpp"
 #include "hyprland/pin_support.hpp"
-
-#include <functional>
+#include "native_desktop_accessor.hpp"
+#include "virtual_desktops.hpp"
 
 using namespace qs::windows;
 
@@ -19,6 +23,11 @@ void afterFirstFrame(QObject*, std::function<void()>) {}
 
 namespace qs::windows {
 DWORD windowsBuild() { return 22631; }
+struct NativeDesktopFacadeTestHook {
+	static void observe(VirtualDesktops& desktops) {
+		initializeNativeDesktopQueries(&desktops, [&desktops] { desktops.applyNativeSnapshot(); });
+	}
+};
 } // namespace qs::windows
 
 namespace {
@@ -120,10 +129,60 @@ private slots:
 	}
 
 	void cleanup() {
+		setNativeDesktopFactoryForTest({});
 		if (this->desktops != nullptr) {
 			this->desktops->destroyForTest();
 			this->desktops = nullptr;
 		}
+	}
+
+	void windowReadsStayCachedWhilePublicProviderBlocksAndRecovers() {
+		auto old = std::make_shared<erm625::Fixture>();
+		auto fresh = std::make_shared<erm625::Fixture>();
+		old->publicApi.desktopId = REAL_DESKTOP_ONE;
+		old->publicApi.onCurrent = FALSE;
+		fresh->publicApi.desktopId = REAL_DESKTOP_TWO;
+		auto acquisitions = std::make_shared<std::atomic<int>>(0);
+		setNativeDesktopFactoryForTest([old, fresh, acquisitions](
+		                                   native_desktop::DesktopManager** m,
+		                                   native_desktop::ViewCollection** v,
+		                                   IVirtualDesktopManager** p
+		                               ) {
+			return (++*acquisitions == 1 ? old : fresh)->acquire(m, v, p);
+		});
+		auto seed = hooks();
+		seed.desktops[0].id = REAL_DESKTOP_ONE;
+		seed.desktops[1].id = REAL_DESKTOP_TWO;
+		auto* desktops = this->make(seed);
+		NativeDesktopFacadeTestHook::observe(*desktops);
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		QSignalSpy membership(desktops, &VirtualDesktops::windowDesktopsChanged);
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb2));
+		QCOMPARE(desktops->windowDesktopIndex(window), qsizetype(-1));
+		QVERIFY(desktops->isWindowOnCurrent(window)); // Existing unknown-window fallback.
+		QTRY_COMPARE_WITH_TIMEOUT(desktops->windowDesktopIndex(window), qsizetype(0), 250);
+		QVERIFY(!desktops->isWindowOnCurrent(window));
+		auto blocked = std::make_shared<erm625::BlockingCall>();
+		erm625::Unblock unblock {blocked};
+		old->publicApi.beforeQuery = [blocked] { (*blocked)(); };
+		requestNativeDesktopRefresh();
+		QElapsedTimer elapsed;
+		elapsed.start();
+		for (int i = 0; i < 100; ++i) {
+			QVERIFY(IsEqualGUID(desktops->windowDesktopId(window), REAL_DESKTOP_ONE));
+			QCOMPARE(desktops->windowDesktopIndex(window), qsizetype(0));
+			QVERIFY(!desktops->isWindowOnCurrent(window));
+		}
+		QVERIFY(elapsed.elapsed() < 50);
+		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopAvailability(), DesktopAvailability::Disconnected, 250);
+		QVERIFY(IsEqualGUID(desktops->windowDesktopId(window), REAL_DESKTOP_ONE));
+		QTRY_COMPARE_WITH_TIMEOUT(desktops->windowDesktopIndex(window), qsizetype(1), 1500);
+		QVERIFY(desktops->isWindowOnCurrent(window));
+		QVERIFY(membership.count() > 0);
+		QCOMPARE(acquisitions->load(), 2);
+		blocked->release();
+		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 1, 500);
+		QVERIFY(IsEqualGUID(desktops->windowDesktopId(window), REAL_DESKTOP_TWO));
 	}
 
 	void placeholderOnlyDesktopIsAddressable() {

@@ -17,8 +17,6 @@
 #include "accessor_state.hpp"
 #include "desktop_contract.hpp"
 
-struct IVirtualDesktopManager;
-
 namespace qs::windows {
 
 class RegistryWatcher: public QThread {
@@ -55,8 +53,8 @@ public:
 
 	// The accessor table is public so tests can inject a fake without loading a
 	// provider. The in-process COM provider uses the same table. Every
-	// desktop-changing operation requires accessorLoaded(); there is no
-	// synthetic-input fallback.
+	// private desktop-changing operation requires accessorLoaded(); public
+	// own-window moves remain independent. There is no synthetic-input fallback.
 	struct Accessor {
 		int (*getCurrentDesktopNumber)() = nullptr;
 		int (*getDesktopCount)() = nullptr;
@@ -110,7 +108,7 @@ public:
 	static QString guidToString(const GUID& guid);
 
 #ifdef QS_TEST
-	// Seed without registry/DLL access. Installation uses the same AccessorState
+	// Seed without registry or COM access. Installation uses the same AccessorState
 	// export checks and deferred notifications as production and tiling fakes.
 	struct TestHooks {
 		Accessor accessor;
@@ -129,6 +127,7 @@ public:
 signals:
 	void desktopsChanged();
 	void currentChanged();
+	void windowDesktopsChanged();
 	void accessorReady();
 	void capabilityChanged();
 	void lastCommandChanged();
@@ -145,8 +144,9 @@ private:
 	~VirtualDesktops() override;
 	Q_DISABLE_COPY_MOVE(VirtualDesktops);
 
-	[[nodiscard]] IVirtualDesktopManager* manager() const;
 	void loadAccessor();
+	void applyNativeSnapshot();
+	void notifyCapability();
 	bool readRegistry(QList<GUID>& ids, GUID& current) const;
 	[[nodiscard]] QString readDesktopName(const GUID& id) const;
 	void createNext();
@@ -175,8 +175,7 @@ private:
 	GUID mCurrentId {};
 	DWORD sessionId = 0;
 
-	mutable IVirtualDesktopManager* mManager = nullptr;
-	mutable bool managerTried = false;
+	bool applyingNativeSnapshot = false;
 	RegistryWatcher* watcher = nullptr;
 	QTimer cloakTimer;
 	QTimer creationTimer;
@@ -197,6 +196,7 @@ private:
 	int mWorkspaceLimit = 5;
 	DesktopAvailability testAvailability = DesktopAvailability::MissingProvider;
 	DesktopCommandResult mCommandResult;
+	QVariantMap emittedCapability;
 	struct PendingSwitch {
 		quint64 id;
 		qsizetype index;

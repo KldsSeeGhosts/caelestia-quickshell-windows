@@ -1,3 +1,4 @@
+#include <qelapsedtimer.h>
 #include <qsignalspy.h>
 #include <qtest.h>
 #include <wrl/client.h>
@@ -18,6 +19,9 @@ struct NativeDesktopFacadeTestHook {
 	static void selectNative(VirtualDesktops& desktops) {
 		desktops.nativeAccessor = true;
 		desktops.testAvailability = DesktopAvailability::Disconnected;
+	}
+	static void observeSnapshots(VirtualDesktops& desktops) {
+		initializeNativeDesktopQueries(&desktops, [&desktops] { desktops.applyNativeSnapshot(); });
 	}
 	static QVariantMap nativeCapability(VirtualDesktops& desktops) {
 		const auto testMode = desktops.testMode;
@@ -98,6 +102,7 @@ private slots:
 		    }
 		);
 		QVERIFY(loadNativeDesktopAccessor(this->accessor, this->desktops, [this] { this->install(); }));
+		NativeDesktopFacadeTestHook::observeSnapshots(*this->desktops);
 		this->install();
 		QCoreApplication::processEvents();
 	}
@@ -146,7 +151,10 @@ private slots:
 		QVERIFY(this->desktops->switchTo(1));
 		QCOMPARE(this->fresh.manager.switches, 1);
 		QCOMPARE(this->old.manager.switches, 1);
-		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("observed"));
+		QTRY_COMPARE(
+		    this->desktops->lastCommand().value("outcome").toString(),
+		    QStringLiteral("observed")
+		);
 	}
 	void outerReleaseFaultInvalidates_data() {
 		QTest::addColumn<bool>("unloaded");
@@ -195,6 +203,10 @@ private slots:
 		}
 		const auto accepted = this->desktops->lastCommand();
 		QCOMPARE(accepted.value("outcome").toString(), QStringLiteral("accepted"));
+		QCOMPARE(
+		    refreshNativeDesktopForTest(),
+		    2
+		); // Drain the command's refresh before arming a fault.
 		if (outerRelease) {
 			outerFaultView = &this->old.views.view;
 			this->old.views.view.faultOnRelease = true;
@@ -206,6 +218,7 @@ private slots:
 			this->old.manager.faultOnEnumeration = true;
 		}
 		this->desktops->refresh();
+		QTRY_VERIFY_WITH_TIMEOUT(!this->desktops->accessorLoaded(), 200);
 		this->old.clearFaults();
 		outerFaultView = nullptr;
 		this->verifyUnavailable();
@@ -219,6 +232,50 @@ private slots:
 		QVERIFY(NativeDesktopFacadeTestHook::pendingIsEmpty(*this->desktops));
 		QTRY_VERIFY_WITH_TIMEOUT(this->desktops->accessorLoaded(), 1500);
 		QCOMPARE(results.count(), 2); // Recovery never resurrects/replays the request.
+	}
+	void blockedCommandReportsTimeoutAndNeverReplays_data() {
+		QTest::addColumn<QString>("operation");
+		for (const auto* operation: {"switch", "create", "move"})
+			QTest::newRow(operation) << QString::fromLatin1(operation);
+	}
+	void blockedCommandReportsTimeoutAndNeverReplays() {
+		QFETCH(QString, operation);
+		auto blocked = std::make_shared<BlockingCall>();
+		Unblock unblock {blocked};
+		const auto block = [blocked] { (*blocked)(); };
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb2));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		if (operation == "switch") this->old.manager.beforeSwitch = block;
+		if (operation == "create") this->old.manager.beforeCreate = block;
+		if (operation == "move") this->old.manager.beforeMove = block;
+		QSignalSpy results(this->desktops, &VirtualDesktops::commandResult);
+		int completions = 0;
+		QElapsedTimer elapsed;
+		elapsed.start();
+		if (operation == "switch") QVERIFY(!this->desktops->switchTo(1));
+		if (operation == "move") QVERIFY(!this->desktops->moveWindow(window, 1));
+		if (operation == "create")
+			this->desktops->ensureCount(3, [&](bool ok) {
+				QVERIFY(!ok);
+				++completions;
+			});
+		QVERIFY(elapsed.elapsed() < 250);
+		QCOMPARE(
+		    this->desktops->lastCommand().value("reason").toString(),
+		    QStringLiteral("provider-timeout")
+		);
+		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("denied"));
+		QCOMPARE(completions, operation == "create" ? 1 : 0);
+		QCOMPARE(this->desktops->count(), qsizetype(2));
+		QVERIFY(NativeDesktopFacadeTestHook::pendingIsEmpty(*this->desktops));
+		QTRY_VERIFY_WITH_TIMEOUT(this->desktops->accessorLoaded(), 1500);
+		QCOMPARE(results.count(), 1);
+		QCOMPARE(this->fresh.manager.switches, 0);
+		QCOMPARE(this->fresh.manager.creates, 0);
+		QCOMPARE(this->fresh.manager.moves, 0);
+		blocked->release();
+		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 1, 500);
+		QCOMPARE(results.count(), 1);
 	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)
