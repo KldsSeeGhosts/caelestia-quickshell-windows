@@ -43,10 +43,49 @@ class HotkeysRoutingTest: public QObject {
 	Q_OBJECT;
 
 private slots:
+	void taskbarSwitchControlsRegistrationAndEmptyMapOwnership() {
+		using namespace qs::windows::hotkeys;
+		auto* manager = HotkeyManager::instance();
+		manager->unregisterAll();
+		hotkey_fixture::registerChords = true;
+		manager->parse(
+		    R"({"binds":[
+			{"keys":"Super+B","register":true,"action":"global","name":"taskbar"}
+		]})",
+		    "fixture"
+		);
+		manager->registerAll();
+		QCOMPARE(manager->triggers.size(), 1);
+		QCOMPARE(
+		    manager->triggers.at(0).mechanism,
+		    taskbarShortcutFilterEnabled() ? Bind::Mechanism::Hotkey : Bind::Mechanism::Hook
+		);
+		QVERIFY(hotkey_fixture::running);
+		manager->unregisterAll();
+		manager->binds.clear();
+		manager->registerAll();
+		QCOMPARE(hotkey_fixture::running, taskbarShortcutFilterEnabled());
+	}
+
+	void backendFilterAllowsRegisteredBindsToWin() {
+		for (int mods = 0; mods < 16; mods++) {
+			for (int vk = 0; vk < 256; vk++) {
+				if (!supervisorOwnsChord(mods, vk)) continue;
+				QVERIFY(!shouldRegisterHotkey(HookTrigger::Combo, mods, vk, true, false));
+				QVERIFY(shouldRegisterHotkey(HookTrigger::Combo, mods, vk, true, true));
+				QVERIFY(!shouldRegisterHotkey(HookTrigger::Combo, mods, vk, false, true));
+			}
+		}
+	}
+
 	void cleanup() {
 		auto* manager = qs::windows::hotkeys::HotkeyManager::instance();
 		manager->unregisterAll();
 		manager->binds.clear();
+		// Reset the fake hook between cases. With the taskbar policy enabled,
+		// an empty map intentionally keeps the production hook running.
+		manager->hookRunning = false;
+		qs::windows::hotkeys::KeyboardHook::stop();
 		hotkey_fixture::registerChords = false;
 		hotkey_fixture::canStart = true;
 	}

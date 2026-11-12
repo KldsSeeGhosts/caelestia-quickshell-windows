@@ -48,6 +48,8 @@ uint8_t gHoldActive = 0;           // NOLINT
 // native chord exposed Win-down, keep the legacy masked-release fallback.
 bool gSuperChordConsumed = false; // NOLINT
 bool gEscapeClaimed = false; // NOLINT
+TaskbarShortcutFilter gTaskbarFilter; // NOLINT
+UINT_PTR gWinLeaseTimer = 0;          // NOLINT
 // Suppressed Win downs do not update GetAsyncKeyState. Keep the two sides
 // separately, and publish only the physical hold for the mouse hook.
 struct WinKey {
@@ -112,6 +114,15 @@ constexpr DWORD STALE_REPEAT_MS = 1500;
 // Do not retain local holds forever in that case. Win repeats refresh this
 // lease; a motionless hold longer than this is deliberately cancelled.
 constexpr DWORD WIN_LEASE_MS = 30000;
+
+void updateWinLeaseTimer() {
+	if (gWin[0].down || gWin[1].down) {
+		if (gWinLeaseTimer == 0) gWinLeaseTimer = SetTimer(nullptr, 0, 1000, nullptr);
+	} else if (gWinLeaseTimer != 0) {
+		KillTimer(nullptr, gWinLeaseTimer);
+		gWinLeaseTimer = 0;
+	}
+}
 
 bool isDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
@@ -243,6 +254,7 @@ void cancelWin(const HookSnapshot* snapshot) {
 		gWin[i] = {};
 	}
 	gWinDown.store(false);
+	updateWinLeaseTimer();
 	if ((gHoldActive & ModSuper) != 0) {
 		gHoldActive &= ~ModSuper;
 		if (snapshot != nullptr) postAll(*snapshot, HookTrigger::Hold, ModSuper, HookReleased);
@@ -318,6 +330,7 @@ void resetPhysicalState() {
 	gSuppressLoneSuperTap.store(false);
 	gSuperChordConsumed = false;
 	gEscapeClaimed = false;
+	gTaskbarFilter.reset();
 
 	for (size_t vk = 0; vk < std::size(gReplayed); vk++) {
 		if (!gReplayed[vk]) continue;
@@ -398,7 +411,12 @@ LRESULT forwardWin(const KBDLLHOOKSTRUCT* info, bool mask) {
 	return 1;
 }
 
-LRESULT onWin(const HookSnapshot& snapshot, const KBDLLHOOKSTRUCT* info, bool up) {
+LRESULT onWin(
+    const HookSnapshot& snapshot,
+    const KBDLLHOOKSTRUCT* info,
+    bool up,
+    bool taskbarMaskedRelease = false
+) {
 	auto index = info->vkCode == VK_LWIN ? 0 : 1;
 	auto& key = gWin[index];
 	auto& other = gWin[1 - index];
@@ -444,7 +462,7 @@ LRESULT onWin(const HookSnapshot& snapshot, const KBDLLHOOKSTRUCT* info, bool up
 		}
 		return 0;
 	}
-	if (!key.down) return 0;
+	if (!key.down) return taskbarMaskedRelease && injectMaskedRelease(info) ? 1 : 0;
 	auto forwarded = key.forwarded;
 	auto consumed = key.consumed;
 	auto chordConsumed = gSuperChordConsumed;
@@ -466,6 +484,11 @@ LRESULT onWin(const HookSnapshot& snapshot, const KBDLLHOOKSTRUCT* info, bool up
 	}
 	// A local tap, hold or shell chord never exposed a Win-down to Explorer.
 	// No mask or replayed release exists for another hook to corrupt.
+	// The taskbar policy also masks a down that passed directly through,
+	// including over an elevated foreground. On failure pass the physical up.
+	if (taskbarMaskedRelease && (forwarded || !consumed)) {
+		return injectMaskedRelease(info) ? 1 : 0;
+	}
 	if (forwarded && chordConsumed && !other.down && !gForegroundBlocked.load()) {
 		return injectMaskedRelease(info) ? 1 : 0;
 	}
@@ -586,7 +609,12 @@ LRESULT onModifier(const HookSnapshot& snapshot, const KBDLLHOOKSTRUCT* info, ui
 	return swallowModifierRelease(plan, replayed) ? 1 : 0;
 }
 
-LRESULT onKey(const HookSnapshot& snapshot, const KBDLLHOOKSTRUCT* info, bool up) {
+LRESULT onKey(
+    const HookSnapshot& snapshot,
+    const KBDLLHOOKSTRUCT* info,
+    bool up,
+    TaskbarShortcutDecision taskbar = {}
+) {
 	auto vk = static_cast<uint8_t>(info->vkCode);
 	auto& held = gHeld.at(vk);
 
@@ -600,7 +628,7 @@ LRESULT onKey(const HookSnapshot& snapshot, const KBDLLHOOKSTRUCT* info, bool up
 
 	if (up) {
 		gMaskHeld[vk] = false;
-		if (!held.active) return 0;
+		if (!held.active) return taskbar.swallow ? 1 : 0;
 		held.active = false;
 		post(HookReleased, held.id, held.serial);
 		return 1;
@@ -618,7 +646,7 @@ LRESULT onKey(const HookSnapshot& snapshot, const KBDLLHOOKSTRUCT* info, bool up
 		held.active = false;
 	}
 
-	if (gForegroundBlocked.load()) return 0;
+	if (gForegroundBlocked.load()) return taskbar.swallow ? 1 : 0;
 
 	auto mods = heldModifiers();
 
@@ -651,6 +679,12 @@ LRESULT onKey(const HookSnapshot& snapshot, const KBDLLHOOKSTRUCT* info, bool up
 		return 1;
 	}
 
+	// Both hook-backed and RegisterHotKey binds win over the taskbar policy.
+	// Do not forward a deferred Win-down for a filtered chord.
+	if (!registered && taskbar.swallow) {
+		gSuperChordConsumed = true;
+		return 1;
+	}
 	return forwardWin(info, registered);
 }
 
@@ -661,6 +695,10 @@ LRESULT CALLBACK hookProc(int code, WPARAM wParam, LPARAM lParam) {
 	qs::windows::noteHookDelay(true, info->time);
 
 	if ((info->flags & LLKHF_INJECTED) != 0 && info->dwExtraInfo == KeyboardHook::INJECTION_MARKER) {
+		if (taskbarShortcutFilterEnabled()) {
+			gTaskbarFilter
+			    .handle(static_cast<int>(info->vkCode), (info->flags & LLKHF_UP) != 0, true, 0, false);
+		}
 		return CallNextHookEx(nullptr, code, wParam, lParam);
 	}
 
@@ -668,6 +706,29 @@ LRESULT CALLBACK hookProc(int code, WPARAM wParam, LPARAM lParam) {
 	auto snapshot = gSnapshot.load(std::memory_order_acquire);
 	auto& routing = snapshot != nullptr ? *snapshot : gNoRouting;
 	auto swallow = 0;
+	TaskbarShortcutDecision taskbar;
+	if (taskbarShortcutFilterEnabled()) {
+		auto mods = heldModifiers();
+		bool bound = false;
+		if (!gForegroundBlocked.load()) {
+			for (const auto& trigger: routing.triggers) {
+				bound |= trigger.kind == HookTrigger::Combo && trigger.combo.vk == info->vkCode
+				      && trigger.combo.mods == mods;
+			}
+			for (const auto& combo: routing.masks) {
+				bound |= combo.vk == info->vkCode && combo.mods == mods;
+			}
+		}
+		taskbar = gTaskbarFilter.handle(
+		    static_cast<int>(info->vkCode),
+		    up,
+		    false,
+		    mods,
+		    gWin[info->vkCode == VK_LWIN ? 1 : 0].down
+		        || isDown(info->vkCode == VK_LWIN ? VK_RWIN : VK_LWIN),
+		    bound
+		);
+	}
 
 	// Routing stopped. Drop the keys its binds owned: their releases pass
 	// through instead of being swallowed for a map that no longer exists, and
@@ -706,9 +767,11 @@ LRESULT CALLBACK hookProc(int code, WPARAM wParam, LPARAM lParam) {
 		auto bit = modifierBit(info->vkCode);
 
 		expireWin(info->time);
-		swallow = bit == ModSuper ? onWin(routing, info, up)
-		    : bit != 0 ? onModifier(routing, info, bit, up) : onKey(routing, info, up);
+		swallow = bit == ModSuper ? onWin(routing, info, up, taskbar.maskedRelease)
+		        : bit != 0        ? onModifier(routing, info, bit, up)
+		                          : onKey(routing, info, up, taskbar);
 	}
+	updateWinLeaseTimer();
 
 	// Record the physical transition after the decision, so a swallowed down
 	// is known to have no GetAsyncKeyState counterpart, then notify the
@@ -788,8 +851,6 @@ void hookThreadMain() {
 
 	gForegroundBlocked.store(isHiddenFromUs(GetForegroundWindow()));
 	seedPhysicalState();
-	// Thread timer only, never wait in the low-level callback.
-	auto timer = SetTimer(nullptr, 0, 1000, nullptr);
 	signalReady();
 
 	while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -797,14 +858,15 @@ void hookThreadMain() {
 			armObserver(*reinterpret_cast<InputObserverRequest*>(msg.wParam)); // NOLINT
 			continue;
 		}
-		if (msg.message == WM_TIMER && msg.wParam == timer) expireWin(GetTickCount());
+		if (msg.message == WM_TIMER && gWinLeaseTimer != 0 && msg.wParam == gWinLeaseTimer) {
+			expireWin(GetTickCount());
+		}
 		TranslateMessage(&msg);
 		DispatchMessageW(&msg);
 	}
 
 	if (desktopHook != nullptr) UnhookWinEvent(desktopHook);
 	if (foregroundHook != nullptr) UnhookWinEvent(foregroundHook);
-	if (timer != 0) KillTimer(nullptr, timer);
 	resetPhysicalState();
 	UnhookWindowsHookEx(hook);
 
@@ -919,7 +981,8 @@ void KeyboardHook::stop() {
 	setSnapshot(nullptr);
 	gRoutingStopped.store(true, std::memory_order_release);
 
-	if (gOwnership.needed()) return;
+	// Opted-in taskbar filtering owns the hook for the process lifetime.
+	if (gOwnership.needed() || taskbarShortcutFilterEnabled()) return;
 
 	stopHookThread();
 }
@@ -934,7 +997,7 @@ bool KeyboardHook::retain() {
 
 void KeyboardHook::release() {
 	gOwnership.drop();
-	if (gOwnership.needed()) return;
+	if (gOwnership.needed() || taskbarShortcutFilterEnabled()) return;
 
 	stopHookThread();
 }
