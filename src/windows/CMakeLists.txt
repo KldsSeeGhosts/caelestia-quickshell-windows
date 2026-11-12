@@ -68,6 +68,7 @@ qt_add_library(quickshell-windows STATIC
 	system/network_wifi_item.cpp
 	system/network_connectivity.cpp
 	system/wallpaper.cpp
+	system/wallpaper_worker.cpp
 	system/fs_utils.cpp
 	system/equalizer_apo.cpp
 	system/file_index.cpp

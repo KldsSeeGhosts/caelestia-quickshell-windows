@@ -1,10 +1,10 @@
 #include "wallpaper.hpp"
-
 #include <atomic>
 #include <string>
 #include <thread>
 #include <utility>
 
+#include <objbase.h>
 #include <qcolor.h>
 #include <qcoreapplication.h>
 #include <qdir.h>
@@ -15,26 +15,23 @@
 #include <qmetaobject.h>
 #include <qpointer.h>
 #include <qstring.h>
-#include <qvariant.h>
-
 #include <qt_windows.h>
-
-#include <objbase.h>
+#include <qvariant.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
-#include <winstring.h>
-#include <wrl/client.h>
-
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Storage.h>
 #include <winrt/Windows.System.UserProfile.h>
+#include <winstring.h>
+#include <wrl/client.h>
 
 #include "../redact.hpp"
 #include "../services/message_window.hpp"
 #include "../util.hpp"
 #include "../virtual_desktops.hpp"
 #include "wallpaper_target.hpp"
+#include "wallpaper_worker.hpp"
 
 using Microsoft::WRL::ComPtr;
 
@@ -60,15 +57,18 @@ QString wallpaperDevicePath(const QString& screenName) {
 	return wallpaper_target::devicePath(live, screenName);
 }
 
-std::wstring wallpaperMonitorPath(IDesktopWallpaper* wallpaper, const QString& target) {
+std::wstring
+wallpaperMonitorPath(IDesktopWallpaper* wallpaper, const QString& target, HRESULT& error) {
 	UINT count = 0;
-	if (FAILED(wallpaper->GetMonitorDevicePathCount(&count))) return {};
+	error = wallpaper->GetMonitorDevicePathCount(&count);
+	if (FAILED(error)) return {};
 
 	QStringList paths;
 	for (UINT index = 0; index < count; ++index) {
 		LPWSTR path = nullptr;
 		auto hr = wallpaper->GetMonitorDevicePathAt(index, &path);
 		if (FAILED(hr) || !path) {
+			error = hr;
 			CoTaskMemFree(path);
 			return {};
 		}
@@ -98,46 +98,74 @@ ShellVirtualDesktop: public IUnknown {};
 MIDL_INTERFACE("53F5CA0B-158F-4124-900C-057158060B27")
 ShellVirtualDesktopManager: public IUnknown {
 public:
-	virtual HRESULT STDMETHODCALLTYPE GetCount(UINT* count) = 0;
+	virtual HRESULT STDMETHODCALLTYPE GetCount(UINT * count) = 0;
 	virtual HRESULT STDMETHODCALLTYPE
-	MoveViewToDesktop(IUnknown* view, ShellVirtualDesktop* desktop) = 0;
-	virtual HRESULT STDMETHODCALLTYPE CanViewMoveDesktops(IUnknown* view, BOOL* canMove) = 0;
-	virtual HRESULT STDMETHODCALLTYPE GetCurrentDesktop(ShellVirtualDesktop** desktop) = 0;
-	virtual HRESULT STDMETHODCALLTYPE GetDesktops(IObjectArray** desktops) = 0;
+	    MoveViewToDesktop(IUnknown * view, ShellVirtualDesktop * desktop) = 0;
+	virtual HRESULT STDMETHODCALLTYPE CanViewMoveDesktops(IUnknown * view, BOOL * canMove) = 0;
+	virtual HRESULT STDMETHODCALLTYPE GetCurrentDesktop(ShellVirtualDesktop * *desktop) = 0;
+	virtual HRESULT STDMETHODCALLTYPE GetDesktops(IObjectArray * *desktops) = 0;
 	virtual HRESULT STDMETHODCALLTYPE
-	GetAdjacentDesktop(ShellVirtualDesktop* from, int direction, ShellVirtualDesktop** desktop) = 0;
-	virtual HRESULT STDMETHODCALLTYPE SwitchDesktop(ShellVirtualDesktop* desktop) = 0;
+	GetAdjacentDesktop(ShellVirtualDesktop * from, int direction, ShellVirtualDesktop** desktop) = 0;
+	virtual HRESULT STDMETHODCALLTYPE SwitchDesktop(ShellVirtualDesktop * desktop) = 0;
+	virtual HRESULT STDMETHODCALLTYPE SwitchDesktopAndMoveForegroundView(
+	    ShellVirtualDesktop * desktop
+	) = 0;
+	virtual HRESULT STDMETHODCALLTYPE CreateDesktop(ShellVirtualDesktop * *desktop) = 0;
+	virtual HRESULT STDMETHODCALLTYPE MoveDesktop(ShellVirtualDesktop * desktop, int index) = 0;
 	virtual HRESULT STDMETHODCALLTYPE
-	SwitchDesktopAndMoveForegroundView(ShellVirtualDesktop* desktop) = 0;
-	virtual HRESULT STDMETHODCALLTYPE CreateDesktop(ShellVirtualDesktop** desktop) = 0;
-	virtual HRESULT STDMETHODCALLTYPE MoveDesktop(ShellVirtualDesktop* desktop, int index) = 0;
-	virtual HRESULT STDMETHODCALLTYPE
-	RemoveDesktop(ShellVirtualDesktop* desktop, ShellVirtualDesktop* fallback) = 0;
+	    RemoveDesktop(ShellVirtualDesktop * desktop, ShellVirtualDesktop * fallback) = 0;
 	virtual HRESULT STDMETHODCALLTYPE FindDesktop(const GUID* id, ShellVirtualDesktop** desktop) = 0;
 	virtual HRESULT STDMETHODCALLTYPE GetDesktopSwitchIncludeExcludeViews(
-	    ShellVirtualDesktop* desktop,
-	    IObjectArray** include,
-	    IObjectArray** exclude
+	    ShellVirtualDesktop * desktop,
+	    IObjectArray * *include,
+	    IObjectArray * *exclude
 	) = 0;
-	virtual HRESULT STDMETHODCALLTYPE SetDesktopName(ShellVirtualDesktop* desktop, HSTRING name) = 0;
+	virtual HRESULT STDMETHODCALLTYPE SetDesktopName(ShellVirtualDesktop * desktop, HSTRING name) = 0;
 	virtual HRESULT STDMETHODCALLTYPE
-	SetDesktopWallpaper(ShellVirtualDesktop* desktop, HSTRING path) = 0;
+	SetDesktopWallpaper(ShellVirtualDesktop * desktop, HSTRING path) = 0;
 };
 
-struct BackgroundWallpaper {
-	SRWLOCK lock = SRWLOCK_INIT;
-	std::wstring pending;
-	bool running = false;
+class NativeWallpaperProvider: public wallpaper_worker::Provider {
+public:
+	wallpaper_worker::Result execute(const wallpaper_worker::Request& request) override;
+
+private:
+	QString currentWallpaper();
+	QString currentWallpaperForScreen(const QString& target);
+	bool setWallpaper(const QString& path, bool animate);
+	bool setWallpaperForScreen(const QString& path, const QString& target);
+	bool setDesktopWallpapers(const QList<wallpaper_worker::DesktopPath>& paths);
+	HRESULT record(HRESULT hr) {
+		if (FAILED(hr)) this->error = hr;
+		return hr;
+	}
+	HRESULT error = S_OK;
+	bool readSucceeded = false;
+	QHash<QString, QString> appliedDesktopWallpapers;
 };
 
-BackgroundWallpaper& backgroundWallpaper() {
-	static auto* state = new BackgroundWallpaper(); // NOLINT
-	return *state;
+QList<QPointer<Wallpaper>>& wallpaperObservers() {
+	static auto* observers = new QList<QPointer<Wallpaper>>();
+	return *observers;
 }
 
-QHash<QString, QString>& appliedDesktopWallpapers() {
-	static auto* applied = new QHash<QString, QString>(); // NOLINT
-	return *applied;
+wallpaper_worker::Channel& wallpaperChannel() {
+	// Process-lived, like the desktop worker. A stuck worker must never retain
+	// a GUI object, nor run Release during static destruction.
+	static auto* channel = [] {
+		auto* app = QCoreApplication::instance();
+		auto* result = new wallpaper_worker::Channel(
+		    [] { return std::make_unique<NativeWallpaperProvider>(); },
+		    app
+		);
+		QObject::connect(app, &QCoreApplication::aboutToQuit, app, [result] { result->shutdown(); });
+		auto* window = services::ServiceMessageWindow::instance();
+		window->addHandler(RegisterWindowMessageW(L"TaskbarCreated"), app, [result](WPARAM, LPARAM) {
+			result->invalidate();
+		});
+		return result;
+	}();
+	return *channel;
 }
 
 void broadcastSettingChange(const wchar_t* setting) {
@@ -255,7 +283,8 @@ void openUri(const wchar_t* uri) {
 
 		if (result <= 32) {
 			qCWarning(logWallpaper) << "Could not open"
-			                        << qs::windows::logPath(QString::fromStdWString(uri)) << ":" << result;
+			                        << qs::windows::logPath(QString::fromStdWString(uri)) << ":"
+			                        << result;
 		}
 	});
 }
@@ -297,65 +326,77 @@ QString Wallpaper::screenTargetId(const QString& screenName) {
 	return wallpaper_target::targetId(wallpaperDevicePath(screenName));
 }
 
-QString Wallpaper::currentWallpaperForScreen(const QString& screenName) {
-	auto target = wallpaperDevicePath(screenName);
-	if (target.isEmpty()) return {};
-
+QString NativeWallpaperProvider::currentWallpaperForScreen(const QString& target) {
 	ComPtr<IDesktopWallpaper> wallpaper;
-	auto hr = CoCreateInstance(CLSID_DesktopWallpaper, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&wallpaper));
+	auto hr = this->record(
+	    CoCreateInstance(CLSID_DesktopWallpaper, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&wallpaper))
+	);
 	if (FAILED(hr) || !wallpaper) return {};
 
-	auto monitor = wallpaperMonitorPath(wallpaper.Get(), target);
+	auto monitor = wallpaperMonitorPath(wallpaper.Get(), target, this->error);
 	if (monitor.empty()) return {};
 
 	LPWSTR path = nullptr;
-	hr = wallpaper->GetWallpaper(monitor.c_str(), &path);
+	hr = this->record(wallpaper->GetWallpaper(monitor.c_str(), &path));
 	auto result = SUCCEEDED(hr) && path ? QString::fromWCharArray(path) : QString();
 	CoTaskMemFree(path);
 	return result;
 }
 
-bool Wallpaper::setWallpaperForScreen(const QString& path, const QString& screenName) {
+bool NativeWallpaperProvider::setWallpaperForScreen(const QString& path, const QString& target) {
 	if (path.isEmpty()) return false;
-	auto target = wallpaperDevicePath(screenName);
 	if (target.isEmpty()) return false;
 
 	auto nativePath = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath()).toStdWString();
 	ComPtr<IDesktopWallpaper> wallpaper;
-	auto hr = CoCreateInstance(CLSID_DesktopWallpaper, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&wallpaper));
+	auto hr = this->record(
+	    CoCreateInstance(CLSID_DesktopWallpaper, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&wallpaper))
+	);
 	if (FAILED(hr) || !wallpaper) return false;
 
-	auto monitor = wallpaperMonitorPath(wallpaper.Get(), target);
+	auto monitor = wallpaperMonitorPath(wallpaper.Get(), target, this->error);
 	if (monitor.empty()) return false;
 
 	// Position and SPI are global. This route must affect only the exact target.
-	return SUCCEEDED(wallpaper->SetWallpaper(monitor.c_str(), nativePath.c_str()));
+	return SUCCEEDED(this->record(wallpaper->SetWallpaper(monitor.c_str(), nativePath.c_str())));
 }
 
-QString Wallpaper::currentWallpaper() {
+QString NativeWallpaperProvider::currentWallpaper() {
 	ComPtr<IDesktopWallpaper> wallpaper;
-	auto hr =
-	    CoCreateInstance(CLSID_DesktopWallpaper, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&wallpaper));
+	auto hr = this->record(
+	    CoCreateInstance(CLSID_DesktopWallpaper, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&wallpaper))
+	);
 
 	if (SUCCEEDED(hr) && wallpaper) {
 		LPWSTR path = nullptr;
-		hr = wallpaper->GetWallpaper(nullptr, &path);
+		hr = this->record(wallpaper->GetWallpaper(nullptr, &path));
 		if (SUCCEEDED(hr) && path != nullptr) {
+			this->readSucceeded = true;
 			auto result = QString::fromWCharArray(path);
 			CoTaskMemFree(path);
 			if (!result.isEmpty()) return result;
-		}
+		} else CoTaskMemFree(path);
 
 		UINT count = 0;
-		if (SUCCEEDED(wallpaper->GetMonitorDevicePathCount(&count))) {
+		if (SUCCEEDED(this->record(wallpaper->GetMonitorDevicePathCount(&count)))) {
 			for (UINT i = 0; i < count; i++) {
 				LPWSTR monitorId = nullptr;
-				if (FAILED(wallpaper->GetMonitorDevicePathAt(i, &monitorId)) || monitorId == nullptr) continue;
+				if (FAILED(this->record(wallpaper->GetMonitorDevicePathAt(i, &monitorId)))
+				    || monitorId == nullptr)
+				{
+					CoTaskMemFree(monitorId);
+					continue;
+				}
 
 				LPWSTR monitorPath = nullptr;
-				auto ok = SUCCEEDED(wallpaper->GetWallpaper(monitorId, &monitorPath)) && monitorPath != nullptr;
+				auto ok = SUCCEEDED(this->record(wallpaper->GetWallpaper(monitorId, &monitorPath)))
+				       && monitorPath != nullptr;
 				CoTaskMemFree(monitorId);
-				if (!ok) continue;
+				if (!ok) {
+					CoTaskMemFree(monitorPath);
+					continue;
+				}
+				this->readSucceeded = true;
 
 				auto result = QString::fromWCharArray(monitorPath);
 				CoTaskMemFree(monitorPath);
@@ -368,47 +409,47 @@ QString Wallpaper::currentWallpaper() {
 
 	wchar_t buf[MAX_PATH] = {};
 	if (SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, buf, 0)) {
+		this->readSucceeded = true;
 		return QString::fromWCharArray(buf);
 	}
 
 	return {};
 }
 
-bool Wallpaper::setWallpaper(const QString& path, bool animate) {
+bool NativeWallpaperProvider::setWallpaper(const QString& path, bool animate) {
 	if (path.isEmpty()) return false;
 
 	auto wpath = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath()).toStdWString();
-	appliedDesktopWallpapers().clear();
-
-	auto& background = backgroundWallpaper();
-	AcquireSRWLockExclusive(&background.lock);
-	background.pending = background.running ? wpath : std::wstring();
-	ReleaseSRWLockExclusive(&background.lock);
+	this->appliedDesktopWallpapers.clear();
 
 	if (!animate && setWallpaperWithoutAnimation(wpath)) return true;
 
 	ComPtr<IDesktopWallpaper> wallpaper;
-	auto hr =
-	    CoCreateInstance(CLSID_DesktopWallpaper, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&wallpaper));
+	auto hr = this->record(
+	    CoCreateInstance(CLSID_DesktopWallpaper, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&wallpaper))
+	);
 
 	if (FAILED(hr) || !wallpaper) {
 		qCWarning(logWallpaper) << "IDesktopWallpaper unavailable:" << Qt::hex << hr;
 		return false;
 	}
 
-	wallpaper->SetPosition(DWPOS_FILL);
+	this->record(wallpaper->SetPosition(DWPOS_FILL));
 
 	bool anyOk = false;
 
 	UINT count = 0;
-	if (SUCCEEDED(wallpaper->GetMonitorDevicePathCount(&count)) && count > 0) {
+	if (SUCCEEDED(this->record(wallpaper->GetMonitorDevicePathCount(&count))) && count > 0) {
 		for (UINT i = 0; i < count; i++) {
 			LPWSTR monitorId = nullptr;
-			if (FAILED(wallpaper->GetMonitorDevicePathAt(i, &monitorId)) || monitorId == nullptr) {
+			if (FAILED(this->record(wallpaper->GetMonitorDevicePathAt(i, &monitorId)))
+			    || monitorId == nullptr)
+			{
+				CoTaskMemFree(monitorId);
 				continue;
 			}
 
-			auto setHr = wallpaper->SetWallpaper(monitorId, wpath.c_str());
+			auto setHr = this->record(wallpaper->SetWallpaper(monitorId, wpath.c_str()));
 			if (SUCCEEDED(setHr)) {
 				anyOk = true;
 			} else {
@@ -421,7 +462,7 @@ bool Wallpaper::setWallpaper(const QString& path, bool animate) {
 	}
 
 	if (!anyOk) {
-		auto setHr = wallpaper->SetWallpaper(nullptr, wpath.c_str());
+		auto setHr = this->record(wallpaper->SetWallpaper(nullptr, wpath.c_str()));
 		anyOk = SUCCEEDED(setHr);
 		if (!anyOk) qCWarning(logWallpaper) << "SetWallpaper(all monitors) failed:" << Qt::hex << setHr;
 	}
@@ -429,42 +470,14 @@ bool Wallpaper::setWallpaper(const QString& path, bool animate) {
 	return anyOk;
 }
 
-void Wallpaper::setWallpaperInBackground(const QString& path) {
-	if (path.isEmpty()) return;
-
-	auto wpath = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath()).toStdWString();
-	auto& state = backgroundWallpaper();
-
-	AcquireSRWLockExclusive(&state.lock);
-	state.pending = std::move(wpath);
-	auto start = !state.running;
-	state.running = true;
-	ReleaseSRWLockExclusive(&state.lock);
-
-	if (!start) return;
-
-	std::thread([&state]() {
-		while (true) {
-			AcquireSRWLockExclusive(&state.lock);
-			if (state.pending.empty() || gShuttingDown.load()) {
-				state.running = false;
-				ReleaseSRWLockExclusive(&state.lock);
-				return;
-			}
-
-			auto next = std::exchange(state.pending, std::wstring());
-			ReleaseSRWLockExclusive(&state.lock);
-
-			setWallpaperWithoutAnimation(next);
-		}
-	}).detach();
-}
-
-bool Wallpaper::setDesktopWallpapers(const QVariantMap& paths, const QString& fallback) {
+bool NativeWallpaperProvider::setDesktopWallpapers(const QList<wallpaper_worker::DesktopPath>& paths
+) {
 	if (windowsBuild() < 22000) return false;
 
 	ComPtr<IServiceProvider> shell;
-	auto hr = CoCreateInstance(CLSID_IMMERSIVE_SHELL, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&shell));
+	auto hr = this->record(
+	    CoCreateInstance(CLSID_IMMERSIVE_SHELL, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&shell))
+	);
 
 	if (FAILED(hr) || !shell) {
 		qCInfo(logWallpaper) << "Immersive shell unavailable for per desktop wallpapers:" << Qt::hex
@@ -473,7 +486,9 @@ bool Wallpaper::setDesktopWallpapers(const QVariantMap& paths, const QString& fa
 	}
 
 	ComPtr<ShellVirtualDesktopManager> manager;
-	hr = shell->QueryService(SID_VIRTUAL_DESKTOP_MANAGER_INTERNAL, IID_PPV_ARGS(&manager));
+	hr =
+	    this->record(shell->QueryService(SID_VIRTUAL_DESKTOP_MANAGER_INTERNAL, IID_PPV_ARGS(&manager))
+	    );
 
 	if (FAILED(hr) || !manager) {
 		qCInfo(logWallpaper) << "Per desktop wallpapers aren't available on Windows build"
@@ -482,48 +497,129 @@ bool Wallpaper::setDesktopWallpapers(const QVariantMap& paths, const QString& fa
 	}
 
 	static const GUID null {};
-	const auto desktopList = VirtualDesktops::instance()->desktops();
 	auto attempts = 0;
 	auto applied = 0;
 
-	for (const auto& desktop: desktopList) {
+	for (const auto& desktop: paths) {
 		if (IsEqualGUID(desktop.id, null)) continue;
 
 		auto id = VirtualDesktops::guidToString(desktop.id);
-		auto target = paths.value(id).toString();
-		if (target.isEmpty()) target = fallback;
+		auto target = desktop.path;
 		if (target.isEmpty()) continue;
 
 		auto native = QDir::toNativeSeparators(QFileInfo(target).absoluteFilePath());
 		auto key = (QString::fromWCharArray(kVirtualDesktopsKey) + id).toStdWString();
 		auto current = readString(HKEY_CURRENT_USER, key.c_str(), L"Wallpaper");
 
-		if (current.isEmpty()) current = appliedDesktopWallpapers().value(id);
+		if (current.isEmpty()) current = this->appliedDesktopWallpapers.value(id);
 		if (current.compare(native, Qt::CaseInsensitive) == 0) continue;
 
 		ComPtr<ShellVirtualDesktop> shellDesktop;
-		hr = manager->FindDesktop(&desktop.id, &shellDesktop);
+		hr = this->record(manager->FindDesktop(&desktop.id, &shellDesktop));
 		if (FAILED(hr) || !shellDesktop) {
-			qCWarning(logWallpaper) << "FindDesktop failed for" << qs::windows::logId(id)
-			                        << ":" << Qt::hex << hr;
+			qCWarning(logWallpaper) << "FindDesktop failed for" << qs::windows::logId(id) << ":"
+			                        << Qt::hex << hr;
 			continue;
 		}
 
 		auto value = winrt::hstring(native.toStdWString());
 		auto* rawValue = static_cast<HSTRING>(winrt::get_abi(value));
 		attempts++;
-		hr = manager->SetDesktopWallpaper(shellDesktop.Get(), rawValue);
+		hr = this->record(manager->SetDesktopWallpaper(shellDesktop.Get(), rawValue));
 		if (FAILED(hr)) {
-			qCWarning(logWallpaper) << "SetDesktopWallpaper failed for" << qs::windows::logId(id)
-			                        << ":" << Qt::hex << hr;
+			qCWarning(logWallpaper) << "SetDesktopWallpaper failed for" << qs::windows::logId(id) << ":"
+			                        << Qt::hex << hr;
 			continue;
 		}
 
 		applied++;
-		appliedDesktopWallpapers().insert(id, native);
+		this->appliedDesktopWallpapers.insert(id, native);
 	}
 
-	return attempts == 0 || applied > 0;
+	return wallpaper_worker::desktopBatchSucceeded(attempts, applied);
+}
+
+wallpaper_worker::Result NativeWallpaperProvider::execute(const wallpaper_worker::Request& request
+) {
+	using namespace wallpaper_worker;
+	this->error = S_OK;
+	Result result;
+	switch (request.kind) {
+	case Kind::Read:
+		this->readSucceeded = false;
+		result.path = this->currentWallpaper();
+		result.ok = this->readSucceeded;
+		break;
+	case Kind::ReadScreen:
+		result.path = this->currentWallpaperForScreen(request.target);
+		result.ok = SUCCEEDED(this->error);
+		break;
+	case Kind::Set: result.ok = this->setWallpaper(request.path, request.animate); break;
+	case Kind::SetScreen:
+		result.ok = this->setWallpaperForScreen(request.path, request.target);
+		break;
+	case Kind::SetDesktops: result.ok = this->setDesktopWallpapers(request.desktops); break;
+	case Kind::Background:
+		this->appliedDesktopWallpapers.clear();
+		result.ok = setWallpaperWithoutAnimation(request.path.toStdWString());
+		break;
+	}
+	result.disconnected = this->error == RPC_E_DISCONNECTED
+	                   || this->error == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE)
+	                   || this->error == HRESULT_FROM_WIN32(RPC_S_CALL_FAILED)
+	                   || this->error == CO_E_OBJNOTCONNECTED;
+	return result;
+}
+
+QString Wallpaper::currentWallpaper() { return wallpaperChannel().read({}); }
+
+QString Wallpaper::currentWallpaperForScreen(const QString& screenName) {
+	auto target = wallpaperDevicePath(screenName);
+	if (target.isEmpty()) return {};
+	wallpaper_worker::Request request;
+	request.kind = wallpaper_worker::Kind::ReadScreen;
+	request.target = target;
+	return wallpaperChannel().read(std::move(request));
+}
+
+bool Wallpaper::setWallpaperForScreen(const QString& path, const QString& screenName) {
+	auto target = wallpaperDevicePath(screenName);
+	if (path.isEmpty() || target.isEmpty()) return false;
+	wallpaper_worker::Request request;
+	request.kind = wallpaper_worker::Kind::SetScreen;
+	request.path = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
+	request.target = target;
+	return wallpaperChannel().command(std::move(request));
+}
+
+bool Wallpaper::setWallpaper(const QString& path, bool animate) {
+	if (path.isEmpty()) return false;
+	wallpaper_worker::Request request;
+	request.kind = wallpaper_worker::Kind::Set;
+	request.path = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
+	request.animate = animate;
+	return wallpaperChannel().command(std::move(request));
+}
+
+void Wallpaper::setWallpaperInBackground(const QString& path) {
+	if (path.isEmpty()) return;
+	wallpaper_worker::Request request;
+	request.kind = wallpaper_worker::Kind::Background;
+	request.path = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
+	request.animate = false;
+	wallpaperChannel().background(std::move(request));
+}
+
+bool Wallpaper::setDesktopWallpapers(const QVariantMap& paths, const QString& fallback) {
+	if (windowsBuild() < 22000) return false;
+	wallpaper_worker::Request request;
+	request.kind = wallpaper_worker::Kind::SetDesktops;
+	for (const auto& desktop: VirtualDesktops::instance()->desktops()) {
+		auto path = paths.value(VirtualDesktops::guidToString(desktop.id)).toString();
+		if (path.isEmpty()) path = fallback;
+		if (!path.isEmpty()) request.desktops.append({desktop.id, path});
+	}
+	return wallpaperChannel().command(std::move(request));
 }
 
 void Wallpaper::trackDesktops() {
@@ -594,10 +690,11 @@ bool Wallpaper::setAccentColor(const QString& hex) {
 	}
 
 	DWORD accentColor = 0xFF000000u | (static_cast<DWORD>(color.blue()) << 16)
-	                   | (static_cast<DWORD>(color.green()) << 8) | static_cast<DWORD>(color.red());
+	                  | (static_cast<DWORD>(color.green()) << 8) | static_cast<DWORD>(color.red());
 
 	DWORD colorizationColor = 0xC4000000u | (static_cast<DWORD>(color.red()) << 16)
-	                         | (static_cast<DWORD>(color.green()) << 8) | static_cast<DWORD>(color.blue());
+	                        | (static_cast<DWORD>(color.green()) << 8)
+	                        | static_cast<DWORD>(color.blue());
 
 	DWORD current = 0;
 	auto unchanged = readDword(HKEY_CURRENT_USER, kDwmKey, L"AccentColor", current)
@@ -629,16 +726,47 @@ Wallpaper::Wallpaper(QObject* parent): QObject(parent) {
 	QObject::connect(qApp, &QCoreApplication::aboutToQuit, []() { gShuttingDown.store(true); });
 
 	this->mSystemDarkMode = Wallpaper::isDarkMode();
+	// Bool setters accept live in-flight work at the GUI deadline. Their late
+	// outcomes use this signal; refused calls do not emit a result.
+	wallpaperObservers().append(this);
+	wallpaperChannel().finished =
+	    [](const wallpaper_worker::Request& request, bool ok, const QString& reason) {
+		    QString operation;
+		    switch (request.kind) {
+		    case wallpaper_worker::Kind::Set: operation = QStringLiteral("setWallpaper"); break;
+		    case wallpaper_worker::Kind::SetScreen:
+			    operation = QStringLiteral("setWallpaperForScreen");
+			    break;
+		    case wallpaper_worker::Kind::SetDesktops:
+			    operation = QStringLiteral("setDesktopWallpapers");
+			    break;
+		    case wallpaper_worker::Kind::Background:
+			    operation = QStringLiteral("setWallpaperInBackground");
+			    break;
+		    default: return;
+		    }
+		    auto& observers = wallpaperObservers();
+		    observers.removeIf([](const auto& observer) { return observer.isNull(); });
+		    const auto snapshot = observers;
+		    const auto target = wallpaper_target::targetId(request.target);
+		    for (const auto& observer: snapshot)
+			    if (observer)
+				    emit observer->wallpaperOperationFinished(operation, request.path, target, ok, reason);
+	    };
 
 	auto* window = qs::windows::services::ServiceMessageWindow::instance();
-	window->addHandler(WM_SETTINGCHANGE, this, [self = QPointer(this)](WPARAM /*wparam*/, LPARAM lparam) {
-		if (!self || lparam == 0) return;
+	window->addHandler(
+	    WM_SETTINGCHANGE,
+	    this,
+	    [self = QPointer(this)](WPARAM /*wparam*/, LPARAM lparam) {
+		    if (!self || lparam == 0) return;
 
-		auto name = QString::fromWCharArray(reinterpret_cast<const wchar_t*>(lparam)); // NOLINT
-		if (name.compare(QStringLiteral("ImmersiveColorSet"), Qt::CaseInsensitive) == 0) {
-			self->refreshSystemDarkMode();
-		}
-	});
+		    auto name = QString::fromWCharArray(reinterpret_cast<const wchar_t*>(lparam)); // NOLINT
+		    if (name.compare(QStringLiteral("ImmersiveColorSet"), Qt::CaseInsensitive) == 0) {
+			    self->refreshSystemDarkMode();
+		    }
+	    }
+	);
 }
 
 void Wallpaper::refreshSystemDarkMode() {

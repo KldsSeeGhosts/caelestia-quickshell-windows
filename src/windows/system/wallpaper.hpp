@@ -12,7 +12,8 @@ class Wallpaper: public QObject {
 	Q_OBJECT;
 	QML_ELEMENT;
 	QML_SINGLETON;
-	Q_PROPERTY(bool lockScreenImageSupported READ lockScreenImageSupported NOTIFY lockScreenImageSupportedChanged);
+	Q_PROPERTY(bool lockScreenImageSupported READ lockScreenImageSupported NOTIFY
+	               lockScreenImageSupportedChanged);
 	Q_PROPERTY(bool systemDarkMode READ systemDarkMode NOTIFY systemDarkModeChanged);
 	Q_PROPERTY(QString currentDesktop READ currentDesktop NOTIFY currentDesktopChanged);
 	Q_PROPERTY(QVariantList desktops READ desktops NOTIFY desktopsChanged);
@@ -56,6 +57,17 @@ public:
 	Q_INVOKABLE static QString lockScreenMode();
 
 signals:
+	// The bool setters return true for success or live in-flight acceptance.
+	// False means refused/completed failure and emits no result. Late outcomes
+	// use this signal. For screen picks, target is screenTargetId(screenName);
+	// for global/per-desktop batches it is empty. Path is native absolute form.
+	void wallpaperOperationFinished(
+	    const QString& operation,
+	    const QString& path,
+	    const QString& target,
+	    bool ok,
+	    const QString& reason
+	);
 	void lockScreenImageSupportedChanged();
 	void lockScreenImageApplied(bool ok);
 	void systemDarkModeChanged();
