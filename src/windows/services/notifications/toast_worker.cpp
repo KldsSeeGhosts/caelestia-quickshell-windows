@@ -47,6 +47,11 @@ constexpr int POLL_INTERVAL_MS = 2000;
 // own banners so a missed event cannot leave them off, and slowly otherwise.
 constexpr int ACTIVE_ACCESS_CHECK_INTERVAL_MS = 2000;
 constexpr int ACCESS_CHECK_INTERVAL_MS = 10000;
+// A subscribed capability event is the primary signal, so an active mirror only
+// needs the backstop for an event Windows failed to deliver. Checking every two
+// seconds there woke the worker thread ten times as often as a working event
+// subscription needs.
+constexpr int SUBSCRIBED_ACCESS_CHECK_INTERVAL_MS = 30000;
 constexpr int EVENT_COALESCE_MS = 150;
 constexpr float LOGO_SIZE = 96;
 constexpr uint32_t MAX_LOGO_BYTES = 4 * 1024 * 1024;
@@ -317,7 +322,9 @@ void ToastMirrorWorker::restartAccessBackstop() {
 
 	auto interval = ToastMirrorWorker::testAccessCheckIntervalMs;
 	if (interval <= 0) {
-		interval = this->mActive ? ACTIVE_ACCESS_CHECK_INTERVAL_MS : ACCESS_CHECK_INTERVAL_MS;
+		if (!this->mActive) interval = ACCESS_CHECK_INTERVAL_MS;
+		else if (this->mCapabilityEvents) interval = SUBSCRIBED_ACCESS_CHECK_INTERVAL_MS;
+		else interval = ACTIVE_ACCESS_CHECK_INTERVAL_MS;
 	}
 
 	this->mAccessTimer->setInterval(interval);
