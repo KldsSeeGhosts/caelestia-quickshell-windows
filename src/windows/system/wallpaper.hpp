@@ -57,8 +57,10 @@ public:
 	Q_INVOKABLE static QString lockScreenMode();
 
 signals:
-	// Emitted for accepted wallpaper mutations, including late completion or
-	// retirement. The bool setters return false if success is not yet confirmed.
+	// The bool setters return true for success or live in-flight acceptance.
+	// False means refused/completed failure and emits no result. Late outcomes
+	// use this signal. For screen picks, target is screenTargetId(screenName);
+	// for global/per-desktop batches it is empty. Path is native absolute form.
 	void wallpaperOperationFinished(
 	    const QString& operation,
 	    const QString& path,

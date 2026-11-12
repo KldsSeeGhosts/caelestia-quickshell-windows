@@ -24,6 +24,8 @@ struct FakeState {
 	bool disconnect = false;
 	bool blockDestruction = false;
 	int delay = 0;
+	int desktopAttempts = -1;
+	int desktopApplied = 0;
 	QString path = QStringLiteral("original");
 	std::atomic<int> calls = 0;
 	std::atomic<int> factories = 0;
@@ -66,6 +68,8 @@ struct FakeProvider: worker::Provider {
 		}
 		if (s.delay) std::this_thread::sleep_for(std::chrono::milliseconds(s.delay));
 		if (s.refuse) return {false, {}, s.disconnect};
+		if (request.kind == worker::Kind::SetDesktops && s.desktopAttempts >= 0)
+			return {worker::desktopBatchSucceeded(s.desktopAttempts, s.desktopApplied), {}, false};
 		if (request.kind != worker::Kind::Read && request.kind != worker::Kind::ReadScreen)
 			s.path = request.path;
 		return {true, s.path, s.disconnect};
@@ -138,7 +142,7 @@ private slots:
 		QCOMPARE(channel.read({}), QStringLiteral("original"));
 		QVERIFY(elapsed.elapsed() < 250);
 		elapsed.restart();
-		QVERIFY(!channel.command(setRequest()));
+		QVERIFY(channel.command(setRequest()));
 		QVERIFY(elapsed.elapsed() < 250);
 		int completions = 0;
 		channel.finished = [&](const worker::Request&, bool ok, const QString&) {
@@ -181,8 +185,9 @@ private slots:
 		    request.kind == worker::Kind::Read || request.kind == worker::Kind::ReadScreen;
 		if (read) QCOMPARE(channel.read(request), QString());
 		else if (request.kind == worker::Kind::Background) channel.background(request);
-		else QVERIFY(!channel.command(request));
+		else QVERIFY(channel.command(request));
 		QVERIFY(elapsed.elapsed() < 250);
+		QCOMPARE(results, 0);
 		QTest::qWait(350);
 		QCOMPARE(state->factories.load(), 1);
 		if (read) {
@@ -196,7 +201,15 @@ private slots:
 		}
 	}
 
+	void lateRefusalAndBusyCommandKeepOriginalRequest_data() {
+		QTest::addColumn<int>("kind");
+		QTest::newRow("global") << static_cast<int>(worker::Kind::Set);
+		QTest::newRow("screen") << static_cast<int>(worker::Kind::SetScreen);
+		QTest::newRow("desktops") << static_cast<int>(worker::Kind::SetDesktops);
+	}
+
 	void lateRefusalAndBusyCommandKeepOriginalRequest() {
+		QFETCH(int, kind);
 		auto state = std::make_shared<FakeState>();
 		state->delay = 300;
 		state->refuse = true;
@@ -204,20 +217,98 @@ private slots:
 		int results = 0;
 		channel.finished = [&](const worker::Request& request, bool ok, const QString& reason) {
 			QVERIFY(!ok);
+			QCOMPARE(static_cast<int>(request.kind), kind);
 			QCOMPARE(request.path, QStringLiteral("new"));
 			QCOMPARE(reason, QStringLiteral("provider-refused"));
 			++results;
 		};
-		QVERIFY(!channel.command(setRequest()));
-		auto newer = setRequest();
+		QElapsedTimer accepted;
+		accepted.start();
+		QVERIFY(channel.command(setRequest(static_cast<worker::Kind>(kind))));
+		QVERIFY(accepted.elapsed() < 250);
+		QCOMPARE(results, 0);
+		auto newer = setRequest(static_cast<worker::Kind>(kind));
 		newer.path = QStringLiteral("not-accepted");
 		QElapsedTimer elapsed;
 		elapsed.start();
 		QVERIFY(!channel.command(newer));
 		QVERIFY(elapsed.elapsed() < 50);
+		QCOMPARE(results, 0);
 		QTRY_COMPARE(results, 1);
 		QCOMPARE(state->calls.load(), 1);
 		QCOMPARE(state->factories.load(), 1);
+	}
+
+	void refusedCommandsReturnFalseWithoutCompletion_data() {
+		QTest::addColumn<int>("kind");
+		QTest::newRow("global") << static_cast<int>(worker::Kind::Set);
+		QTest::newRow("screen") << static_cast<int>(worker::Kind::SetScreen);
+		QTest::newRow("desktops") << static_cast<int>(worker::Kind::SetDesktops);
+	}
+
+	void refusedCommandsReturnFalseWithoutCompletion() {
+		QFETCH(int, kind);
+		auto state = std::make_shared<FakeState>();
+		state->refuse = true;
+		worker::Channel channel(factory(state), this);
+		int results = 0;
+		channel.finished = [&](const worker::Request&, bool, const QString&) { ++results; };
+		QVERIFY(!channel.command(setRequest(static_cast<worker::Kind>(kind))));
+		QTest::qWait(30);
+		QCOMPARE(results, 0);
+		QCOMPARE(state->calls.load(), 1);
+		channel.shutdown();
+		QVERIFY(!channel.command(setRequest(static_cast<worker::Kind>(kind))));
+		QCOMPARE(results, 0);
+
+		worker::Channel unavailable([] { return std::unique_ptr<worker::Provider>(); }, this);
+		unavailable.finished = [&](const worker::Request&, bool, const QString&) { ++results; };
+		QVERIFY(!unavailable.command(setRequest(static_cast<worker::Kind>(kind))));
+		QTest::qWait(30);
+		QCOMPARE(results, 0);
+	}
+
+	void desktopBatchPartialSuccess_data() {
+		QTest::addColumn<int>("attempts");
+		QTest::addColumn<int>("applied");
+		QTest::addColumn<int>("delay");
+		QTest::addColumn<bool>("success");
+		for (int delay: {0, 300}) {
+			const auto suffix = QByteArray::number(delay);
+			QTest::newRow(("no-set-attempts-" + suffix).constData()) << 0 << 0 << delay << true;
+			QTest::newRow(("all-applied-" + suffix).constData()) << 2 << 2 << delay << true;
+			QTest::newRow(("partial-success-" + suffix).constData()) << 2 << 1 << delay << true;
+			QTest::newRow(("all-setters-failed-" + suffix).constData()) << 2 << 0 << delay << false;
+		}
+	}
+
+	void desktopBatchPartialSuccess() {
+		QFETCH(int, attempts);
+		QFETCH(int, applied);
+		QFETCH(int, delay);
+		QFETCH(bool, success);
+		auto state = std::make_shared<FakeState>();
+		state->desktopAttempts = attempts;
+		state->desktopApplied = applied;
+		state->delay = delay;
+		worker::Channel channel(factory(state), this);
+		int results = 0;
+		channel.finished = [&](const worker::Request& request, bool ok, const QString& reason) {
+			QCOMPARE(request.kind, worker::Kind::SetDesktops);
+			QCOMPARE(ok, success);
+			QCOMPARE(reason, success ? QString() : QStringLiteral("provider-refused"));
+			++results;
+		};
+		QElapsedTimer elapsed;
+		elapsed.start();
+		QCOMPARE(channel.command(setRequest(worker::Kind::SetDesktops)), delay > 0 || success);
+		QVERIFY(elapsed.elapsed() < 250);
+		if (delay > 0) {
+			QCOMPARE(results, 0);
+			QTRY_COMPARE(results, 1);
+		} else {
+			QCOMPARE(results, success ? 1 : 0);
+		}
 	}
 
 	void retiredWorkerCapRecoversWhenCapacityReturns() {
@@ -248,6 +339,10 @@ private slots:
 		QTest::qWait(250);
 		QCOMPARE(worker::Channel::liveCount(), 4);
 		QCOMPARE(generation.load(), 4);
+		int results = 0;
+		channel.finished = [&](const worker::Request&, bool, const QString&) { ++results; };
+		QVERIFY(!channel.command(setRequest()));
+		QCOMPARE(results, 0);
 		for (const auto& state: states) state->release();
 		QTRY_COMPARE_WITH_TIMEOUT(generation.load(), 5, 6000);
 		QTRY_COMPARE(channel.read({}), QStringLiteral("original"));
@@ -300,7 +395,7 @@ private slots:
 			++results;
 		};
 		QVERIFY(!channel.command(setRequest()));
-		QCOMPARE(results, 1);
+		QCOMPARE(results, 0);
 		QTRY_COMPARE(replacement->calls.load(), 1);
 		QCOMPARE(old->calls.load(), 1);
 		QCOMPARE(channel.read({}), QStringLiteral("original"));
@@ -342,7 +437,7 @@ private slots:
 		};
 		QElapsedTimer elapsed;
 		elapsed.start();
-		QVERIFY(!channel.command(setRequest()));
+		QVERIFY(channel.command(setRequest()));
 		QVERIFY(elapsed.elapsed() < 250);
 		QCOMPARE(results, 0); // 100 ms GUI expiry is not a stuck verdict.
 		QCOMPARE(old->factories.load(), 1);
@@ -369,7 +464,7 @@ private slots:
 		    this
 		);
 		QCOMPARE(channel.read({}), QString());
-		QVERIFY(!channel.command(setRequest()));
+		QVERIFY(channel.command(setRequest()));
 		int results = 0;
 		channel.finished = [&](const worker::Request&, bool ok, const QString& reason) {
 			QVERIFY(!ok);

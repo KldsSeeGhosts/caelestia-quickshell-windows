@@ -536,7 +536,7 @@ bool NativeWallpaperProvider::setDesktopWallpapers(const QList<wallpaper_worker:
 		this->appliedDesktopWallpapers.insert(id, native);
 	}
 
-	return attempts == 0 || applied > 0;
+	return wallpaper_worker::desktopBatchSucceeded(attempts, applied);
 }
 
 wallpaper_worker::Result NativeWallpaperProvider::execute(const wallpaper_worker::Request& request
@@ -726,8 +726,8 @@ Wallpaper::Wallpaper(QObject* parent): QObject(parent) {
 	QObject::connect(qApp, &QCoreApplication::aboutToQuit, []() { gShuttingDown.store(true); });
 
 	this->mSystemDarkMode = Wallpaper::isDarkMode();
-	// Existing bool calls still report confirmed success. A false result at
-	// the GUI deadline is not cancellation; this signal reports the outcome.
+	// Bool setters accept live in-flight work at the GUI deadline. Their late
+	// outcomes use this signal; refused calls do not emit a result.
 	wallpaperObservers().append(this);
 	wallpaperChannel().finished =
 	    [](const wallpaper_worker::Request& request, bool ok, const QString& reason) {
@@ -748,10 +748,10 @@ Wallpaper::Wallpaper(QObject* parent): QObject(parent) {
 		    auto& observers = wallpaperObservers();
 		    observers.removeIf([](const auto& observer) { return observer.isNull(); });
 		    const auto snapshot = observers;
+		    const auto target = wallpaper_target::targetId(request.target);
 		    for (const auto& observer: snapshot)
 			    if (observer)
-				    emit observer
-				        ->wallpaperOperationFinished(operation, request.path, request.target, ok, reason);
+				    emit observer->wallpaperOperationFinished(operation, request.path, target, ok, reason);
 	    };
 
 	auto* window = qs::windows::services::ServiceMessageWindow::instance();

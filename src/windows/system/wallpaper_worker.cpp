@@ -31,6 +31,9 @@ bool mutation(Kind kind) { return kind != Kind::Read && kind != Kind::ReadScreen
 
 struct Job {
 	Request request;
+	// GUI-owned. A failure before the bool command returns is reported by
+	// that return value, not by a second failure notification.
+	bool synchronousWait = false;
 	std::promise<Result> promise;
 	std::shared_future<Result> result = promise.get_future().share();
 	HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -160,7 +163,8 @@ struct Channel::Impl {
 		this->poll.setInterval(this->backoff);
 		this->backoff = std::min(this->backoff * 2, 4000);
 		this->poll.start();
-		for (const auto& job: old) this->notify(job->request, false, reason);
+		for (const auto& job: old)
+			if (!job->synchronousWait) this->notify(job->request, false, reason);
 	}
 	bool acquire() {
 		if (this->stopped || !this->context) return false;
@@ -191,7 +195,7 @@ struct Channel::Impl {
 		this->poll.start();
 		return job;
 	}
-	void apply(const Request& request, const Result& result) {
+	void apply(const Request& request, const Result& result, bool report) {
 		if (result.ok) {
 			if (request.kind == Kind::Read || request.kind == Kind::ReadScreen)
 				this->cache.insert(request.target, result.path);
@@ -202,7 +206,8 @@ struct Channel::Impl {
 			this->backoff = 250;
 			this->recovering = false;
 		}
-		this->notify(request, result.ok, result.ok ? QString() : QStringLiteral("provider-refused"));
+		if (report)
+			this->notify(request, result.ok, result.ok ? QString() : QStringLiteral("provider-refused"));
 	}
 	void collect() {
 		if (this->stopped || this->waiting || this->notifying) return;
@@ -219,7 +224,7 @@ struct Channel::Impl {
 				this->retire(QStringLiteral("provider-unavailable"));
 				return;
 			}
-			this->apply(job->request, result);
+			this->apply(job->request, result, !job->synchronousWait || result.ok);
 		}
 		for (const auto& job: this->pending) {
 			if (job->stalled(this->stallLimit)) {
@@ -298,10 +303,17 @@ bool Channel::command(Request request) {
 	}
 	auto job = p.submit(std::move(request));
 	if (!job) return false;
+	job->synchronousWait = true;
 	const auto generation = p.worker;
 	p.wait(job);
-	// False means no confirmed success, never cancellation of an entered RPC.
-	return generation == p.worker && job->ready() && job->result.get().ok;
+	// Capture readiness once. A completion racing the GUI deadline must either
+	// be collected as synchronous failure, or belong to an accepted request.
+	const auto completed = job->ready();
+	if (completed) p.collect();
+	job->synchronousWait = false;
+	// The short GUI bound never rejects a request that is still owned by a
+	// live generation. Its eventual failure or success uses finished.
+	return generation == p.worker && (!completed || job->result.get().ok);
 }
 
 void Channel::background(Request request) {

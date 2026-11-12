@@ -32,6 +32,11 @@ struct Result {
 	bool disconnected = false;
 };
 
+// Preserve the native per-desktop batch's existing no-op/partial-success rule.
+constexpr bool desktopBatchSucceeded(int attempts, int applied) {
+	return attempts == 0 || applied > 0;
+}
+
 class Provider {
 public:
 	virtual ~Provider() = default;
@@ -49,6 +54,8 @@ public:
 	Channel& operator=(const Channel&) = delete;
 
 	QString read(Request request);
+	// True means completed successfully or accepted on a live worker.
+	// False means refused or completed with failure; no finished callback.
 	bool command(Request request);
 	void background(Request request);
 	void invalidate();
