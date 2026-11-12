@@ -41,7 +41,7 @@ jobs:
       - name: Start candidate receipt before setup
         run: |
           python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" init `
-            --backend-sha $env:CANDIDATE_BACKEND_SHA --shell-sha $env:CANDIDATE_SHELL_SHA
+            --backend-sha $env:CANDIDATE_BACKEND_SHA --shell-sha $env:CANDIDATE_SHELL_SHA --hosted-native
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Checkout canonical public toolchain contract
@@ -163,6 +163,15 @@ jobs:
             -Phase Portable -ContractRoot toolchain-contract -ToolRoot $env:TOOL_ROOT -BuildRoot $env:BUILD_ROOT -Results $env:RESULTS
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Run hosted-native fixtures
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" run `
+            --stage hosted-native --junit "$env:RESULTS/hosted-native.raw.xml" --echo -- `
+            powershell.exe -NoProfile -NonInteractive -File .github/scripts/Invoke-WindowsFixtureGate.ps1 `
+            -Phase HostedNative -ContractRoot toolchain-contract -ToolRoot $env:TOOL_ROOT -BuildRoot $env:BUILD_ROOT -Results $env:RESULTS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Finalize sanitized candidate result
         if: always()
         env:
@@ -180,6 +189,7 @@ jobs:
           name: fixture-results-${{ github.run_id }}
           path: |
             C:\ci-fixtures\portable.xml
+            C:\ci-fixtures\hosted-native.xml
             C:\ci-fixtures\candidate-result.json
             C:\ci-fixtures\sccache-stats.json
           if-no-files-found: warn

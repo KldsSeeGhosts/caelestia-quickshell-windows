@@ -1178,6 +1178,13 @@ set(QS_TESTS_NATIVE
 	appbar_call tray_hook tray_host keyboard_layout native_lifetime
 	notification_mirror_consent desktop_underlay capture_native daemon_handshake
 )
+# Additional hosted selection, not a replacement runtime tier. These fixtures
+# supply their own windows/services and need neither Explorer nor D3D hardware.
+# capture_native requires DWM composition for display-affinity round trips.
+set(QS_TESTS_HOSTED_NATIVE
+	appbar_call tray_hook tray_host keyboard_layout native_lifetime
+	notification_mirror_consent desktop_underlay daemon_handshake
+)
 set(QS_TESTS_DESKTOP system_surface desktop_zorder panel_hidden_reembed)
 set(QS_TESTS_GPU capture_format capture_device video_node)
 set(QS_TESTS_MACHINE mpris_app_identity)
@@ -1196,9 +1203,17 @@ foreach(test IN LISTS QS_REGISTERED_TESTS)
 		message(FATAL_ERROR "Fixture '${test}' needs exactly one runtime tier, has: '${tiers}'")
 	endif()
 	set_tests_properties(${test} PROPERTIES LABELS ${tiers} TIMEOUT 120)
+	if(test IN_LIST QS_TESTS_HOSTED_NATIVE)
+		set_property(TEST ${test} APPEND PROPERTY LABELS hosted-native)
+	endif()
 	# Without a console Qt Test sends its log to OutputDebugString, so CTest
 	# would capture no assertion or skip text.
 	set_property(TEST ${test} APPEND PROPERTY ENVIRONMENT QT_FORCE_STDERR_LOGGING=1)
+endforeach()
+foreach(test IN LISTS QS_TESTS_HOSTED_NATIVE)
+	if(NOT test IN_LIST QS_TESTS_NATIVE)
+		message(FATAL_ERROR "Hosted fixture '${test}' must belong to the native tier")
+	endif()
 endforeach()
 foreach(tier PORTABLE NATIVE DESKTOP GPU MACHINE)
 	foreach(test IN LISTS QS_TESTS_${tier})
