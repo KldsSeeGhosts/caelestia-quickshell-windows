@@ -140,6 +140,7 @@ private:
 		return hr;
 	}
 	HRESULT error = S_OK;
+	bool readSucceeded = false;
 	QHash<QString, QString> appliedDesktopWallpapers;
 };
 
@@ -370,6 +371,7 @@ QString NativeWallpaperProvider::currentWallpaper() {
 		LPWSTR path = nullptr;
 		hr = this->record(wallpaper->GetWallpaper(nullptr, &path));
 		if (SUCCEEDED(hr) && path != nullptr) {
+			this->readSucceeded = true;
 			auto result = QString::fromWCharArray(path);
 			CoTaskMemFree(path);
 			if (!result.isEmpty()) return result;
@@ -394,6 +396,7 @@ QString NativeWallpaperProvider::currentWallpaper() {
 					CoTaskMemFree(monitorPath);
 					continue;
 				}
+				this->readSucceeded = true;
 
 				auto result = QString::fromWCharArray(monitorPath);
 				CoTaskMemFree(monitorPath);
@@ -406,6 +409,7 @@ QString NativeWallpaperProvider::currentWallpaper() {
 
 	wchar_t buf[MAX_PATH] = {};
 	if (SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, buf, 0)) {
+		this->readSucceeded = true;
 		return QString::fromWCharArray(buf);
 	}
 
@@ -542,8 +546,9 @@ wallpaper_worker::Result NativeWallpaperProvider::execute(const wallpaper_worker
 	Result result;
 	switch (request.kind) {
 	case Kind::Read:
+		this->readSucceeded = false;
 		result.path = this->currentWallpaper();
-		result.ok = !result.path.isEmpty();
+		result.ok = this->readSucceeded;
 		break;
 	case Kind::ReadScreen:
 		result.path = this->currentWallpaperForScreen(request.target);

@@ -115,6 +115,9 @@ private slots:
 		}
 		QCOMPARE(results, 3);
 		QCOMPARE(channel.read({}), QStringLiteral("new"));
+		// A healthy empty wallpaper, such as a solid color, clears the cache.
+		state->path.clear();
+		QCOMPARE(channel.read({}), QString());
 		QVERIFY(state->owner != gui);
 		channel.shutdown();
 		QTRY_COMPARE(state->destroyed.load(), 1);
