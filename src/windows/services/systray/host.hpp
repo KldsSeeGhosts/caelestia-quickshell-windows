@@ -56,7 +56,6 @@ private:
 	void scheduleSnapshot(int delayMs);
 	void onSnapshotDone(bool ok);
 	void recoverCallbacks();
-	void onToolbarData(const std::vector<ExplorerIconData>& icons);
 	void requestTitle(const QString& exePath);
 	void readTitles();
 	void onTitles(const QHash<QString, QString>& found);
@@ -111,8 +110,6 @@ private:
 
 	QTimer pollTimer;
 	QTimer recoverTimer;
-	bool toolbarReading = false;
-	bool recoverAgain = false;
 
 	QHash<QString, QString> titles;
 	QList<QString> titleQueue;

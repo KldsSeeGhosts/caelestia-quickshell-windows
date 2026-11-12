@@ -513,38 +513,8 @@ void TrayHost::recoverCallbacks() {
 
 	if (!missing) return;
 
-	if (this->toolbarReading) {
-		this->recoverAgain = true;
-		return;
-	}
-
-	this->toolbarReading = true;
-
-	std::thread([this]() {
-		SetThreadDescription(GetCurrentThread(), L"qs tray toolbars");
-		auto icons = readExplorerToolbars();
-
-		QMetaObject::invokeMethod(
-		    this,
-		    [this, icons = std::move(icons)]() { this->onToolbarData(icons); },
-		    Qt::QueuedConnection
-		);
-	}).detach();
-}
-
-void TrayHost::onToolbarData(const std::vector<ExplorerIconData>& icons) {
-	this->toolbarReading = false;
-
-	for (const auto& icon: icons) {
-		auto* item = this->find(icon.hwnd, icon.uid, QUuid());
-		if (item == nullptr || item->hasCallback()) continue;
-
-		qCDebug(logTrayHost) << "Callback message of"
-		                     << qs::windows::logId(item->bindableId().value())
-		                     << "from explorer's notification area";
-		item->applyExplorerData(icon.callbackMessage, icon.version);
-	}
-
+	// Explorer's icon list has no callback messages. Ask the owners to add
+	// their icons again so the hook sees them.
 	auto now = GetTickCount64();
 	std::vector<HWND> owners;
 
@@ -558,11 +528,6 @@ void TrayHost::onToolbarData(const std::vector<ExplorerIconData>& icons) {
 		qCDebug(logTrayHost) << "Asking" << owners.size()
 		                     << "tray icon owners to add their icons again";
 		TrayHook::announceTo(std::move(owners));
-	}
-
-	if (this->recoverAgain) {
-		this->recoverAgain = false;
-		this->recoverCallbacks();
 	}
 }
 

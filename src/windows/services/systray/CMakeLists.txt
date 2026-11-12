@@ -2,7 +2,6 @@ qt_add_library(quickshell-windows-systray STATIC
 	hook.cpp
 	tray_reorder.cpp
 	seed.cpp
-	toolbar.cpp
 	host.cpp
 	item.cpp
 	qml.cpp

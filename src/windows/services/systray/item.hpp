@@ -97,7 +97,6 @@ public:
 	[[nodiscard]] const QString& executable() const { return this->exePath; }
 
 	void update(const TrayIconMessage& message);
-	void applyExplorerData(UINT callbackMessage, UINT version);
 	void refreshFromExplorer(const TrayIconMessage& message);
 	void setIdentity(const QString& id, const QString& title, const QString& exePath);
 	void setCategory(Category::Enum category) { this->bCategory = category; }

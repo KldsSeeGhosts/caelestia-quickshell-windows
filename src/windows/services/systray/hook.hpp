@@ -66,13 +66,4 @@ public:
 void seedFromExplorer(TrayIconSink sink, std::function<void(bool ok)> done);
 [[nodiscard]] QImage imageFromIcon(HICON icon);
 
-struct ExplorerIconData {
-	HWND hwnd = nullptr;
-	UINT uid = 0;
-	UINT callbackMessage = 0;
-	UINT version = 0;
-};
-
-std::vector<ExplorerIconData> readExplorerToolbars();
-
 } // namespace qs::windows::services::systray

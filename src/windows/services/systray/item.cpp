@@ -97,16 +97,6 @@ void SystemTrayItem::update(const TrayIconMessage& message) {
 	}
 }
 
-void SystemTrayItem::applyExplorerData(UINT callbackMessage, UINT version) {
-	this->version = version;
-
-	TrayIconMessage message;
-	message.message = NIM_MODIFY;
-	message.flags = NIF_MESSAGE;
-	message.callbackMessage = callbackMessage;
-	this->update(message);
-}
-
 void SystemTrayItem::refreshFromExplorer(const TrayIconMessage& message) {
 	if (!message.icon.isNull() && message.icon != this->image.image) {
 		this->image.image = message.icon;
