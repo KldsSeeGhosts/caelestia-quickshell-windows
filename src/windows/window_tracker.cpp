@@ -551,6 +551,13 @@ WindowTracker::WindowTracker() {
 	    this,
 	    &WindowTracker::onDesktopsChanged
 	);
+	QObject::connect(this->mDesktops, &VirtualDesktops::windowDesktopsChanged, this, [this] {
+		// Reconsider windows rejected while their first membership query
+		// was pending, without enumerating the desktop on every snapshot.
+		for (auto hwnd: std::exchange(this->desktopCandidates, {}))
+			if (IsWindow(hwnd)) this->candidates.insert(hwnd);
+		this->onDesktopsChanged();
+	});
 
 	QObject::connect(this->mDesktops, &VirtualDesktops::currentChanged, this, [this]() {
 		for (auto* window: this->mWindows) {
@@ -832,7 +839,9 @@ bool WindowTracker::isEligible(HWND hwnd) const {
 	// A window that is already tracked keeps its fullscreen episode and tile
 	// through a cloak change. Cloaked windows are never added to the task
 	// model; the shell and foreground consumers use cloaked()/isShown instead.
-	if (identity.cloaked && this->mDesktops->isWindowOnCurrent(hwnd) && !this->byHwnd.contains(hwnd)) {
+	if (identity.cloaked && this->mDesktops->isWindowOnCurrent(hwnd) && !this->byHwnd.contains(hwnd))
+	{
+		this->desktopCandidates.insert(hwnd);
 		return false;
 	}
 

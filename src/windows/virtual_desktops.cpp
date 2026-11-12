@@ -20,7 +20,6 @@
 #include "services/message_window.hpp"
 
 #include <objbase.h>
-#include <shobjidl_core.h>
 
 namespace qs::windows {
 
@@ -238,7 +237,7 @@ VirtualDesktops::VirtualDesktops() {
 
 VirtualDesktops::~VirtualDesktops() {
 	if (this->watcher != nullptr) this->watcher->stop();
-	if (this->mManager != nullptr) this->mManager->Release();
+	if (!this->testMode) shutdownNativeDesktopAccessor();
 }
 
 template <typename R, typename... P, typename... A>
@@ -271,38 +270,49 @@ void VirtualDesktops::accessorFailed() const {
 	this->setAccessorLoaded(false);
 }
 
-void VirtualDesktops::loadAccessor() {
-	if (qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR") != "1"
-	    || qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR_DISPATCH") != "1")
-	{
-		// Desktop control is opt-in. Without both gates it stays disabled, and
-		// there is no out-of-process provider to fall back to.
-		return;
+void VirtualDesktops::applyNativeSnapshot() {
+	this->applyingNativeSnapshot = true;
+	if (this->nativeAccessor)
+		this->setAccessorLoaded(nativeDesktopAvailability() == DesktopAvailability::Available);
+	if (!nativeDesktopRequestPending()) {
+		if (this->pendingSwitch && !this->switchDeadline.isActive()) this->switchDeadline.start();
+		if (this->creationTarget != 0 && !this->creationTimer.isActive()) this->creationTimer.start();
 	}
+	this->refresh(true);
+	this->applyingNativeSnapshot = false;
+	const auto revision = nativeDesktopWindowSnapshotRevision();
+	if (revision != this->appliedWindowRevision) {
+		this->appliedWindowRevision = revision;
+		emit this->windowDesktopsChanged();
+	}
+	this->notifyCapability();
+}
 
-	this->nativeAccessor = true;
-	if (loadNativeDesktopAccessor(this->accessor, this, [this] {
-		    this->updateAccessorExports();
-		    this->setAccessorLoaded(true);
-		    if (this->mManager) this->mManager->Release();
-		    this->mManager = nullptr;
-		    this->managerTried = false;
-		    this->refresh(true);
-		    emit this->accessorReady();
-	    }))
-	{
-		this->updateAccessorExports();
-		this->setAccessorLoaded(true);
-	}
-	emit this->capabilityChanged();
-	services::ServiceMessageWindow::instance()->addHandler(
-	    RegisterWindowMessageW(L"TaskbarCreated"), this, [this](WPARAM, LPARAM) {
+void VirtualDesktops::loadAccessor() {
+	services::ServiceMessageWindow::instance()
+	    ->addHandler(RegisterWindowMessageW(L"TaskbarCreated"), this, [this](WPARAM, LPARAM) {
 		    invalidateNativeDesktopAccessor();
-		    this->setAccessorLoaded(false);
-		    if (this->mManager) this->mManager->Release();
-		    this->mManager = nullptr;
-		    this->managerTried = false;
+		    if (this->nativeAccessor) this->setAccessorLoaded(false);
 	    });
+	if (qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR") == "1"
+	    && qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR_DISPATCH") == "1")
+	{
+		this->nativeAccessor = true;
+		if (loadNativeDesktopAccessor(this->accessor, this, [this] {
+			    this->updateAccessorExports();
+			    this->setAccessorLoaded(true);
+			    this->refresh(true);
+			    emit this->accessorReady();
+		    }))
+		{
+			this->updateAccessorExports();
+			this->setAccessorLoaded(true);
+		}
+	}
+	// Public queries share the private worker when enabled. Otherwise create
+	// only a public manager, without bypassing a failed acquisition's backoff.
+	initializeNativeDesktopQueries(this, [this] { this->applyNativeSnapshot(); });
+	this->notifyCapability();
 }
 
 QString VirtualDesktops::readDesktopName(const GUID& id) const {
@@ -362,6 +372,8 @@ void VirtualDesktops::noteCloakChange() {
 }
 
 void VirtualDesktops::refresh(bool rereadNames) {
+	if (!this->applyingNativeSnapshot && (!this->testMode || this->nativeAccessor))
+		requestNativeDesktopRefresh();
 #ifdef QS_TEST
 	if (this->testMode) {
 		auto count = this->accessorLoaded()
@@ -409,9 +421,6 @@ void VirtualDesktops::refresh(bool rereadNames) {
 		auto count = this->call(-1, a.getDesktopCount);
 		if (count < 0 && this->nativeAccessor) {
 			this->setAccessorLoaded(false);
-			if (this->mManager) this->mManager->Release();
-			this->mManager = nullptr;
-			this->managerTried = false;
 		}
 		if (count > 0) {
 			ids.resize(count);
@@ -494,40 +503,7 @@ qsizetype VirtualDesktops::indexOf(const GUID& id) const {
 	return desktopIndexOf(this->mDesktops, id);
 }
 
-IVirtualDesktopManager* VirtualDesktops::manager() const {
-	if (this->managerTried) return this->mManager;
-	this->managerTried = true;
-
-	static constexpr GUID clsid = {
-	    0xaa509086,
-	    0x5ca9,
-	    0x4c25,
-	    {0x8f, 0x95, 0x58, 0x9d, 0x3c, 0x07, 0xb4, 0x8a}
-	};
-
-	auto hr = CoCreateInstance(
-	    clsid,
-	    nullptr,
-	    CLSCTX_ALL,
-	    __uuidof(IVirtualDesktopManager),
-	    reinterpret_cast<void**>(&this->mManager)
-	);
-
-	if (FAILED(hr)) {
-		qCWarning(logDesktops) << "IVirtualDesktopManager unavailable:" << Qt::hex << hr;
-		this->mManager = nullptr;
-	}
-
-	return this->mManager;
-}
-
-GUID VirtualDesktops::windowDesktopId(HWND hwnd) const {
-	GUID id {};
-	auto* manager = this->manager();
-	if (manager == nullptr || hwnd == nullptr) return id;
-	if (FAILED(manager->GetWindowDesktopId(hwnd, &id))) return GUID {};
-	return id;
-}
+GUID VirtualDesktops::windowDesktopId(HWND hwnd) const { return nativeWindowDesktopId(hwnd); }
 
 qsizetype VirtualDesktops::windowDesktopIndex(HWND hwnd) const {
 	auto index = this->indexOf(this->windowDesktopId(hwnd));
@@ -543,11 +519,7 @@ qsizetype VirtualDesktops::windowDesktopIndex(HWND hwnd) const {
 }
 
 bool VirtualDesktops::isWindowOnCurrent(HWND hwnd) const {
-	auto* manager = this->manager();
-	if (manager == nullptr || hwnd == nullptr) return true;
-	BOOL onCurrent = TRUE;
-	if (FAILED(manager->IsWindowOnCurrentVirtualDesktop(hwnd, &onCurrent))) return true;
-	return onCurrent != FALSE;
+	return nativeWindowOnCurrentDesktop(hwnd) != 0;
 }
 
 void VirtualDesktops::sendShortcut(WORD key, int times) const {
@@ -624,6 +596,10 @@ void VirtualDesktops::initCommandObservation() {
 	this->creationTimer.setSingleShot(true);
 	this->creationTimer.setInterval(CREATION_TIMEOUT_MS);
 	QObject::connect(&this->creationTimer, &QTimer::timeout, this, [this] {
+		if (this->nativeAccessor && nativeDesktopRequestPending()) {
+			this->creationTimer.start();
+			return;
+		}
 		this->finishCreation(DesktopCommandOutcome::TimedOut, QStringLiteral("observation-timeout"));
 	});
 	QObject::connect(this, &VirtualDesktops::desktopsChanged, this,
@@ -631,10 +607,14 @@ void VirtualDesktops::initCommandObservation() {
 	this->switchDeadline.setSingleShot(true);
 	this->switchDeadline.setInterval(1500);
 	QObject::connect(&this->switchDeadline, &QTimer::timeout, this, [this] {
+		if (this->nativeAccessor && nativeDesktopRequestPending()) {
+			this->switchDeadline.start();
+			return;
+		}
 		this->finishSwitch(DesktopCommandOutcome::TimedOut, QStringLiteral("observation-timeout"));
 	});
 	QObject::connect(this, &AccessorState::accessorStateChanged, this, [this] {
-		emit this->capabilityChanged();
+		this->notifyCapability();
 		if (!this->accessorLoaded()) {
 			this->finishSwitch(DesktopCommandOutcome::Denied, this->commandFailureReason());
 			this->creationTimer.stop();
@@ -643,7 +623,18 @@ void VirtualDesktops::initCommandObservation() {
 	});
 }
 
+void VirtualDesktops::notifyCapability() {
+	const auto value = this->capability();
+	if (value == this->emittedCapability) return;
+	this->emittedCapability = value;
+	emit this->capabilityChanged();
+}
+
 QString VirtualDesktops::commandFailureReason() const {
+	if (nativeDesktopLastError() == HRESULT_FROM_WIN32(ERROR_TIMEOUT))
+		return QStringLiteral("provider-timeout");
+	if (nativeDesktopLastError() == HRESULT_FROM_WIN32(ERROR_BUSY))
+		return QStringLiteral("provider-busy");
 	const auto reason = desktopAvailabilityReason(this->availability());
 	if (!reason.isEmpty()) return reason;
 	if (this->nativeAccessor && nativeDesktopLastError() == E_ACCESSDENIED)
@@ -680,6 +671,10 @@ void VirtualDesktops::observeSwitch() {
 
 bool VirtualDesktops::switchTo(qsizetype index) {
 	this->retryAccessor();
+	if (this->nativeAccessor && nativeDesktopCommandPending()) {
+		this->refuseCommand(QStringLiteral("switch"), QStringLiteral("provider-busy"));
+		return false;
+	}
 	if (!this->supports(DesktopOperation::Switch)) {
 		this->warnAccessorOnly("switch desktops");
 		this->refuseCommand(QStringLiteral("switch"),
@@ -707,7 +702,7 @@ bool VirtualDesktops::switchTo(qsizetype index) {
 
 	const auto id = ++this->nextRequest;
 	this->pendingSwitch = PendingSwitch {id, index, this->mDesktops[index].id};
-	this->switchDeadline.start();
+	if (!this->nativeAccessor || !nativeDesktopRequestPending()) this->switchDeadline.start();
 	this->publishCommand(DesktopRequestResult {id, QStringLiteral("switch"), DesktopCommandOutcome::Accepted, {}});
 	this->refresh();
 	return true;
@@ -715,6 +710,11 @@ bool VirtualDesktops::switchTo(qsizetype index) {
 
 void VirtualDesktops::ensureCount(qsizetype count, std::function<void(bool)> done) {
 	this->retryAccessor();
+	if (this->nativeAccessor && nativeDesktopCommandPending()) {
+		this->refuseCommand(QStringLiteral("create"), QStringLiteral("provider-busy"));
+		done(false);
+		return;
+	}
 	if (!this->supports(DesktopOperation::Create)) {
 		this->warnAccessorOnly("create desktops");
 		this->refuseCommand(QStringLiteral("create"),
@@ -770,12 +770,13 @@ void VirtualDesktops::createNext() {
 		return;
 	}
 
-	this->creationTimer.start();
+	if (!this->nativeAccessor || !nativeDesktopRequestPending()) this->creationTimer.start();
 	this->refresh();
 }
 
 void VirtualDesktops::observeCreation() {
 	if (this->creationTarget == 0) return;
+	if (this->nativeAccessor && nativeDesktopCommandPending()) return;
 	if (!this->accessorLoaded() || this->accessor.createDesktop == nullptr) {
 		this->warnAccessorOnly("create desktops");
 		this->creationTimer.stop();
@@ -787,7 +788,6 @@ void VirtualDesktops::observeCreation() {
 		this->createNext();
 		return;
 	}
-
 }
 
 void VirtualDesktops::finishCreation(DesktopCommandOutcome failure, const QString& reason) {
@@ -839,10 +839,14 @@ bool VirtualDesktops::moveWindow(HWND hwnd, qsizetype index) {
 	};
 
 	if (isOwnWindow(hwnd)) {
-		if (auto* manager = this->manager()) {
-			const auto hr = manager->MoveWindowToDesktop(hwnd, this->mDesktops[index].id);
-			return result(SUCCEEDED(hr), hr == E_ACCESSDENIED
-			    ? QStringLiteral("permission-denied") : QStringLiteral("command-rejected"));
+		const auto ok = moveNativeDesktopOwnWindow(hwnd, this->mDesktops[index].id);
+		if (ok) {
+			const auto error = nativeDesktopLastError();
+			auto reason = error == E_ACCESSDENIED ? QStringLiteral("permission-denied")
+			                                     : QStringLiteral("command-rejected");
+			if (error == HRESULT_FROM_WIN32(ERROR_TIMEOUT) || error == HRESULT_FROM_WIN32(ERROR_BUSY))
+				reason = this->commandFailureReason();
+			return result(*ok, reason);
 		}
 	}
 

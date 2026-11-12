@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+
 #include <objectarray.h>
 #include <qlist.h>
 
@@ -12,17 +14,39 @@ using namespace qs::windows::native_desktop;
 
 inline void fault() { RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr); }
 
+// A fake COM call blocks only its worker. Tests release it before destroying
+// stack-owned fake interfaces. No Explorer object or window is involved.
+struct BlockingCall {
+	HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	HANDLE resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	~BlockingCall() {
+		CloseHandle(this->entered);
+		CloseHandle(this->resume);
+	}
+	void operator()() const {
+		SetEvent(this->entered);
+		WaitForSingleObject(this->resume, INFINITE);
+	}
+	void release() const { SetEvent(this->resume); }
+};
+struct Unblock {
+	std::shared_ptr<BlockingCall> call;
+	~Unblock() { this->call->release(); }
+};
+
 template <typename Interface>
 struct FakeCom: Interface {
 	ULONG refs = 1;
 	int releases = 0;
 	bool faultOnRelease = false;
+	std::function<void()> beforeRelease;
 	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override {
 		*out = nullptr;
 		return E_NOINTERFACE;
 	}
 	ULONG STDMETHODCALLTYPE AddRef() override { return ++this->refs; }
 	ULONG STDMETHODCALLTYPE Release() override {
+		if (this->beforeRelease) this->beforeRelease();
 		++this->releases;
 		const auto remaining = --this->refs;
 		if (this->faultOnRelease) fault();
@@ -70,11 +94,16 @@ struct FakeManager: FakeCom<DesktopManager> {
 	int canMoves = 0;
 	int moves = 0;
 	HRESULT moveResult = S_OK;
+	HRESULT switchResult = S_OK;
+	bool publishSwitch = false;
+	bool publishCreation = false;
 	ApplicationView* expectedView = nullptr;
 	FakeDesktop* current = nullptr;
 	FakeDesktop* created = nullptr;
+	std::function<void()> beforeEnumeration, beforeSwitch, beforeCreate, beforeMove;
 	HRESULT STDMETHODCALLTYPE GetCount(UINT* out) override { return this->array.GetCount(out); }
 	HRESULT STDMETHODCALLTYPE MoveViewToDesktop(ApplicationView* view, Desktop*) override {
+		if (this->beforeMove) this->beforeMove();
 		++this->moves;
 		if (this->faultOnMove) fault();
 		return view == this->expectedView ? this->moveResult : E_INVALIDARG;
@@ -93,6 +122,7 @@ struct FakeManager: FakeCom<DesktopManager> {
 		return S_OK;
 	}
 	HRESULT STDMETHODCALLTYPE GetDesktops(IObjectArray** out) override {
+		if (this->beforeEnumeration) this->beforeEnumeration();
 		++this->enumerations;
 		if (this->faultOnEnumeration) fault();
 		if (FAILED(this->result) || this->result == RPC_S_SERVER_UNAVAILABLE) return this->result;
@@ -103,20 +133,25 @@ struct FakeManager: FakeCom<DesktopManager> {
 	HRESULT STDMETHODCALLTYPE GetAdjacentDesktop(Desktop*, int, Desktop**) override {
 		return E_NOTIMPL;
 	}
-	HRESULT STDMETHODCALLTYPE SwitchDesktop(Desktop*) override {
+	HRESULT STDMETHODCALLTYPE SwitchDesktop(Desktop* desktop) override {
+		if (this->beforeSwitch) this->beforeSwitch();
 		++this->switches;
 		if (this->faultOnSwitch) fault();
-		return S_OK;
+		if (SUCCEEDED(this->switchResult) && this->publishSwitch)
+			this->current = static_cast<FakeDesktop*>(desktop);
+		return this->switchResult;
 	}
 	HRESULT STDMETHODCALLTYPE SwitchDesktopAndMoveForegroundView(Desktop*) override {
 		return E_NOTIMPL;
 	}
 	HRESULT STDMETHODCALLTYPE CreateDesktop(Desktop** out) override {
+		if (this->beforeCreate) this->beforeCreate();
 		++this->creates;
 		if (!this->created) return E_NOTIMPL;
 		this->created->AddRef();
 		*out = this->created;
 		if (this->faultOnCreate) fault(); // Also test ownership of a partial output.
+		if (this->publishCreation) this->array.desktops.append(this->created);
 		return S_OK;
 	}
 };
@@ -143,15 +178,26 @@ struct FakeViews: FakeCom<ViewCollection> {
 };
 struct FakePublic: FakeCom<IVirtualDesktopManager> {
 	bool faultOnRead = false;
-	HRESULT STDMETHODCALLTYPE IsWindowOnCurrentVirtualDesktop(HWND, BOOL*) override {
+	std::function<void()> beforeQuery, beforeMove;
+	GUID desktopId {};
+	BOOL onCurrent = TRUE;
+	HRESULT STDMETHODCALLTYPE IsWindowOnCurrentVirtualDesktop(HWND, BOOL* out) override {
+		if (this->beforeQuery) this->beforeQuery();
 		if (this->faultOnRead) fault();
-		return E_NOTIMPL;
+		*out = this->onCurrent;
+		return S_OK;
 	}
-	HRESULT STDMETHODCALLTYPE GetWindowDesktopId(HWND, GUID*) override {
+	HRESULT STDMETHODCALLTYPE GetWindowDesktopId(HWND, GUID* out) override {
+		if (this->beforeQuery) this->beforeQuery();
 		if (this->faultOnRead) fault();
-		return E_NOTIMPL;
+		*out = this->desktopId;
+		return S_OK;
 	}
-	HRESULT STDMETHODCALLTYPE MoveWindowToDesktop(HWND, REFGUID) override { return E_NOTIMPL; }
+	HRESULT STDMETHODCALLTYPE MoveWindowToDesktop(HWND, REFGUID id) override {
+		if (this->beforeMove) this->beforeMove();
+		this->desktopId = id;
+		return S_OK;
+	}
 };
 
 struct Fixture {
@@ -165,8 +211,17 @@ struct Fixture {
 		this->manager.current = &this->one;
 		this->manager.created = &this->three;
 		this->manager.expectedView = reinterpret_cast<ApplicationView*>(&this->views.view);
+		this->publicApi.desktopId = this->one.id;
 	}
 	void clearFaults() {
+		this->manager.publishSwitch = this->manager.publishCreation = false;
+		this->manager.switchResult = this->manager.moveResult = S_OK;
+		this->manager.beforeEnumeration = this->manager.beforeSwitch = {};
+		this->manager.beforeCreate = this->manager.beforeMove = {};
+		this->manager.beforeRelease = this->manager.array.beforeRelease = {};
+		this->one.beforeRelease = this->two.beforeRelease = this->three.beforeRelease = {};
+		this->views.beforeRelease = this->views.view.beforeRelease = {};
+		this->publicApi.beforeRelease = this->publicApi.beforeQuery = this->publicApi.beforeMove = {};
 		this->one.faultOnRelease = this->two.faultOnRelease = this->three.faultOnRelease = false;
 		this->one.faultOnId = this->two.faultOnId = this->three.faultOnId = false;
 		this->manager.faultOnRelease = this->manager.array.faultOnRelease = false;

@@ -1,3 +1,8 @@
+#include <atomic>
+#include <chrono>
+#include <thread>
+
+#include <qelapsedtimer.h>
 #include <qsignalspy.h>
 #include <qtest.h>
 #include <wrl/client.h>
@@ -18,6 +23,9 @@ struct NativeDesktopFacadeTestHook {
 	static void selectNative(VirtualDesktops& desktops) {
 		desktops.nativeAccessor = true;
 		desktops.testAvailability = DesktopAvailability::Disconnected;
+	}
+	static void observeSnapshots(VirtualDesktops& desktops) {
+		initializeNativeDesktopQueries(&desktops, [&desktops] { desktops.applyNativeSnapshot(); });
 	}
 	static QVariantMap nativeCapability(VirtualDesktops& desktops) {
 		const auto testMode = desktops.testMode;
@@ -98,6 +106,7 @@ private slots:
 		    }
 		);
 		QVERIFY(loadNativeDesktopAccessor(this->accessor, this->desktops, [this] { this->install(); }));
+		NativeDesktopFacadeTestHook::observeSnapshots(*this->desktops);
 		this->install();
 		QCoreApplication::processEvents();
 	}
@@ -107,12 +116,21 @@ private slots:
 		restoreEnvironment("CAELESTIA_WINDOWS_HYPR", this->previousHypr);
 		restoreEnvironment("CAELESTIA_WINDOWS_HYPR_DISPATCH", this->previousDispatch);
 		outerFaultView = nullptr;
+		setNativeDesktopFactoryForTest({});
+		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 0, 1000);
 		this->old.clearFaults();
 		this->fresh.clearFaults();
-		setNativeDesktopFactoryForTest({});
 		if (this->desktops) this->desktops->destroyForTest();
 		this->desktops = nullptr;
 		this->old.manager.switches = this->fresh.manager.switches = 0;
+		this->old.manager.creates = this->fresh.manager.creates = 0;
+		this->old.manager.moves = this->fresh.manager.moves = 0;
+		this->old.manager.array.desktops = {&this->old.one, &this->old.two};
+		this->fresh.manager.array.desktops = {&this->fresh.one, &this->fresh.two};
+		this->old.manager.created = &this->old.three;
+		this->fresh.manager.created = &this->fresh.three;
+		this->old.publicApi.desktopId = this->old.one.id;
+		this->fresh.publicApi.desktopId = this->fresh.one.id;
 		this->old.manager.current = &this->old.one;
 		this->fresh.manager.current = &this->fresh.one;
 		QCOMPARE(this->old.manager.refs, 1UL);
@@ -146,7 +164,10 @@ private slots:
 		QVERIFY(this->desktops->switchTo(1));
 		QCOMPARE(this->fresh.manager.switches, 1);
 		QCOMPARE(this->old.manager.switches, 1);
-		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("observed"));
+		QTRY_COMPARE(
+		    this->desktops->lastCommand().value("outcome").toString(),
+		    QStringLiteral("observed")
+		);
 	}
 	void outerReleaseFaultInvalidates_data() {
 		QTest::addColumn<bool>("unloaded");
@@ -195,6 +216,10 @@ private slots:
 		}
 		const auto accepted = this->desktops->lastCommand();
 		QCOMPARE(accepted.value("outcome").toString(), QStringLiteral("accepted"));
+		QCOMPARE(
+		    refreshNativeDesktopForTest(),
+		    2
+		); // Drain the command's refresh before arming a fault.
 		if (outerRelease) {
 			outerFaultView = &this->old.views.view;
 			this->old.views.view.faultOnRelease = true;
@@ -206,6 +231,7 @@ private slots:
 			this->old.manager.faultOnEnumeration = true;
 		}
 		this->desktops->refresh();
+		QTRY_VERIFY_WITH_TIMEOUT(!this->desktops->accessorLoaded(), 200);
 		this->old.clearFaults();
 		outerFaultView = nullptr;
 		this->verifyUnavailable();
@@ -219,6 +245,266 @@ private slots:
 		QVERIFY(NativeDesktopFacadeTestHook::pendingIsEmpty(*this->desktops));
 		QTRY_VERIFY_WITH_TIMEOUT(this->desktops->accessorLoaded(), 1500);
 		QCOMPARE(results.count(), 2); // Recovery never resurrects/replays the request.
+	}
+	void blockedCommandReportsTimeoutAndNeverReplays_data() {
+		QTest::addColumn<QString>("operation");
+		for (const auto* operation: {"switch", "create", "move"})
+			QTest::newRow(operation) << QString::fromLatin1(operation);
+	}
+	void slowCommandRemainsAccepted_data() {
+		QTest::addColumn<QString>("operation");
+		QTest::addColumn<bool>("succeed");
+		for (const auto* operation: {"switch", "create", "move"}) {
+			QTest::newRow(qPrintable(QString::fromLatin1(operation) + "-success"))
+			    << QString::fromLatin1(operation) << true;
+			QTest::newRow(qPrintable(QString::fromLatin1(operation) + "-refused"))
+			    << QString::fromLatin1(operation) << false;
+		}
+	}
+	void slowCommandRemainsAccepted() {
+		QFETCH(QString, operation);
+		QFETCH(bool, succeed);
+		const auto delay = [] { std::this_thread::sleep_for(std::chrono::milliseconds(300)); };
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb2));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		QTRY_COMPARE_WITH_TIMEOUT(this->desktops->windowDesktopIndex(window), qsizetype(0), 500);
+		QCoreApplication::processEvents();
+		QSignalSpy membership(this->desktops, &VirtualDesktops::windowDesktopsChanged);
+		this->old.manager.publishSwitch = this->old.manager.publishCreation = true;
+		if (operation == "switch") {
+			this->old.manager.beforeSwitch = delay;
+			this->old.manager.switchResult = succeed ? S_OK : E_ACCESSDENIED;
+		}
+		if (operation == "create") {
+			this->old.manager.beforeCreate = delay;
+			if (!succeed) this->old.manager.created = nullptr;
+		}
+		if (operation == "move") {
+			this->old.manager.beforeMove = [this, delay, succeed] {
+				delay();
+				if (succeed) this->old.publicApi.desktopId = this->old.two.id;
+			};
+			this->old.manager.moveResult = succeed ? S_OK : E_ACCESSDENIED;
+		}
+		struct Completion {
+			int calls = 0;
+			bool ok = false;
+		};
+		auto completion = std::make_shared<Completion>();
+		QElapsedTimer elapsed;
+		elapsed.start();
+		if (operation == "switch") QVERIFY(this->desktops->switchTo(1));
+		if (operation == "move") QVERIFY(this->desktops->moveWindow(window, 1));
+		if (operation == "create")
+			this->desktops->ensureCount(3, [completion](bool ok) {
+				++completion->calls;
+				completion->ok = ok;
+			});
+		QVERIFY(elapsed.elapsed() < 250);
+		const auto accepted = this->desktops->lastCommand();
+		QCOMPARE(
+		    accepted.value("outcome").toString(),
+		    operation == "move" ? QStringLiteral("unknown") : QStringLiteral("accepted")
+		);
+		QVERIFY(nativeDesktopCommandPending());
+		QVERIFY(this->desktops->accessorLoaded());
+		QCOMPARE(nativeDesktopWorkerCountForTest(), 1);
+		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
+		QCOMPARE(completion->calls, 0);
+		QTRY_VERIFY_WITH_TIMEOUT(!nativeDesktopCommandPending(), 1000);
+		QCOMPARE(this->acquisitions, 1);
+		if (operation == "move") {
+			QTRY_COMPARE_WITH_TIMEOUT(
+			    this->desktops->windowDesktopIndex(window),
+			    succeed ? qsizetype(1) : qsizetype(0),
+			    1000
+			);
+			QCOMPARE(this->desktops->lastCommand(), accepted); // No promised move observation.
+			QTRY_VERIFY_WITH_TIMEOUT(!nativeDesktopRequestPending(), 1000);
+			QCoreApplication::processEvents();
+			if (!succeed) QCOMPARE(membership.count(), 0); // No unchanged signal that reissues a panel move.
+		} else {
+			QTRY_COMPARE_WITH_TIMEOUT(
+			    this->desktops->lastCommand().value("outcome").toString(),
+			    succeed ? QStringLiteral("observed") : QStringLiteral("timed-out"),
+			    2500
+			);
+			QCOMPARE(this->desktops->lastCommand().value("requestId"), accepted.value("requestId"));
+			if (!succeed)
+				QCOMPARE(
+				    this->desktops->lastCommand().value("reason").toString(),
+				    QStringLiteral("observation-timeout")
+				);
+		}
+		if (operation == "create") {
+			QCOMPARE(completion->calls, 1);
+			QCOMPARE(completion->ok, succeed);
+			QCOMPARE(this->old.manager.creates, 1);
+		}
+		if (operation == "switch") QCOMPARE(this->old.manager.switches, 1);
+		if (operation == "move") QCOMPARE(this->old.manager.moves, 1);
+	}
+	void busyCommandsDoNotSupersedeAnAcceptedSwitch() {
+		auto blocked = std::make_shared<BlockingCall>();
+		Unblock unblock {blocked};
+		this->old.manager.beforeSwitch = [blocked] { (*blocked)(); };
+		this->old.manager.publishSwitch = true;
+		QVERIFY(this->desktops->switchTo(1));
+		const auto accepted = this->desktops->lastCommand();
+		QSignalSpy results(this->desktops, &VirtualDesktops::commandResult);
+		QElapsedTimer elapsed;
+		elapsed.start();
+		QVERIFY(!this->desktops->switchTo(0));
+		QCOMPARE(
+		    this->desktops->lastCommand().value("reason").toString(),
+		    QStringLiteral("provider-busy")
+		);
+		bool creationRefused = false;
+		this->desktops->ensureCount(3, [&](bool ok) { creationRefused = !ok; });
+		QVERIFY(creationRefused);
+		QVERIFY(!this->desktops->moveWindow(reinterpret_cast<HWND>(ULONG_PTR(0xb2)), 1));
+		QCOMPARE(
+		    this->desktops->lastCommand().value("reason").toString(),
+		    QStringLiteral("provider-busy")
+		);
+		QVERIFY(elapsed.elapsed() < 50);
+		QVERIFY(nativeDesktopCommandPending());
+		blocked->release();
+		QTRY_COMPARE_WITH_TIMEOUT(
+		    this->desktops->lastCommand().value("outcome").toString(),
+		    QStringLiteral("observed"),
+		    1000
+		);
+		QCOMPARE(this->desktops->lastCommand().value("requestId"), accepted.value("requestId"));
+		QCOMPARE(this->old.manager.switches, 1);
+		QCOMPARE(this->old.manager.creates, 0);
+		QCOMPARE(this->old.manager.moves, 0);
+		QCOMPARE(results.count(), 4); // Three busy refusals and the original switch observation.
+	}
+	void aCommandCanWaitBehindOneSlowRefresh() {
+		auto first = std::make_shared<std::atomic<bool>>(true);
+		this->old.manager.beforeEnumeration = [first] {
+			if (first->exchange(false)) std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		};
+		this->old.manager.publishSwitch = true;
+		requestNativeDesktopRefresh();
+		QElapsedTimer elapsed;
+		elapsed.start();
+		QVERIFY(this->desktops->switchTo(1));
+		QVERIFY(elapsed.elapsed() < 250);
+		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("accepted"));
+		QTRY_COMPARE_WITH_TIMEOUT(
+		    this->desktops->lastCommand().value("outcome").toString(),
+		    QStringLiteral("observed"),
+		    1000
+		);
+		QCOMPARE(this->old.manager.switches, 1);
+		QCOMPARE(this->acquisitions, 1);
+		QCOMPARE(nativeDesktopWorkerCountForTest(), 1);
+	}
+	void creationObservationBudgetStartsAfterTheInFlightCommand() {
+		auto blocked = std::make_shared<BlockingCall>();
+		Unblock unblock {blocked};
+		this->old.manager.beforeCreate = [blocked] { (*blocked)(); };
+		this->old.manager.publishCreation = true;
+		auto completed = std::make_shared<int>(0);
+		this->desktops->ensureCount(3, [completed](bool ok) { *completed = ok ? 1 : -1; });
+		QTest::qWait(1200
+		); // Longer than the 1 s creation observation budget, shorter than the 5 s stall verdict.
+		QCOMPARE(*completed, 0);
+		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("accepted"));
+		QVERIFY(nativeDesktopCommandPending());
+		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
+		blocked->release();
+		QTRY_COMPARE_WITH_TIMEOUT(*completed, 1, 1000);
+		QCOMPARE(this->old.manager.creates, 1);
+		QCOMPARE(this->acquisitions, 1);
+	}
+	void onlyTheStuckBoundRetiresAnInFlightCommand() {
+		setNativeDesktopStuckBoundForTest(200);
+		auto blocked = std::make_shared<BlockingCall>();
+		Unblock unblock {blocked};
+		this->old.manager.beforeSwitch = [blocked] { (*blocked)(); };
+		QVERIFY(this->desktops->switchTo(1));
+		const auto accepted = this->desktops->lastCommand();
+		QCOMPARE(accepted.value("outcome").toString(), QStringLiteral("accepted"));
+		QVERIFY(this->desktops->accessorLoaded());
+		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
+		QTRY_VERIFY_WITH_TIMEOUT(!this->desktops->accessorLoaded(), 300);
+		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("denied"));
+		QCOMPARE(
+		    this->desktops->lastCommand().value("reason").toString(),
+		    QStringLiteral("provider-timeout")
+		);
+		QCOMPARE(this->desktops->lastCommand().value("requestId"), accepted.value("requestId"));
+		QTRY_VERIFY_WITH_TIMEOUT(this->desktops->accessorLoaded(), 1500);
+		QCOMPARE(this->acquisitions, 2);
+		QCOMPARE(this->fresh.manager.switches, 0);
+		blocked->release();
+		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 1, 500);
+		QCOMPARE(this->fresh.manager.switches, 0);
+	}
+	void observationWaitsForASlowPostCommandSnapshot() {
+		this->old.manager.publishSwitch = true;
+		this->old.manager.beforeSwitch = [] {
+			std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		};
+		this->old.manager.beforeEnumeration = [] {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1700));
+		};
+		QVERIFY(this->desktops->switchTo(1));
+		QTest::qWait(1750); // The command is done, but its confirming snapshot is still in flight.
+		QVERIFY(!nativeDesktopCommandPending());
+		QVERIFY(nativeDesktopRequestPending());
+		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("accepted"));
+		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
+		QTRY_COMPARE_WITH_TIMEOUT(
+		    this->desktops->lastCommand().value("outcome").toString(),
+		    QStringLiteral("observed"),
+		    1000
+		);
+		QCOMPARE(this->acquisitions, 1);
+		QCOMPARE(this->old.manager.switches, 1);
+	}
+	void blockedCommandReportsTimeoutAndNeverReplays() {
+		QFETCH(QString, operation);
+		setNativeDesktopStuckBoundForTest(50);
+		auto blocked = std::make_shared<BlockingCall>();
+		Unblock unblock {blocked};
+		const auto block = [blocked] { (*blocked)(); };
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb2));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		if (operation == "switch") this->old.manager.beforeSwitch = block;
+		if (operation == "create") this->old.manager.beforeCreate = block;
+		if (operation == "move") this->old.manager.beforeMove = block;
+		QSignalSpy results(this->desktops, &VirtualDesktops::commandResult);
+		int completions = 0;
+		QElapsedTimer elapsed;
+		elapsed.start();
+		if (operation == "switch") QVERIFY(!this->desktops->switchTo(1));
+		if (operation == "move") QVERIFY(!this->desktops->moveWindow(window, 1));
+		if (operation == "create")
+			this->desktops->ensureCount(3, [&](bool ok) {
+				QVERIFY(!ok);
+				++completions;
+			});
+		QVERIFY(elapsed.elapsed() < 250);
+		QCOMPARE(
+		    this->desktops->lastCommand().value("reason").toString(),
+		    QStringLiteral("provider-timeout")
+		);
+		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("denied"));
+		QCOMPARE(completions, operation == "create" ? 1 : 0);
+		QCOMPARE(this->desktops->count(), qsizetype(2));
+		QVERIFY(NativeDesktopFacadeTestHook::pendingIsEmpty(*this->desktops));
+		QTRY_VERIFY_WITH_TIMEOUT(this->desktops->accessorLoaded(), 1500);
+		QCOMPARE(results.count(), 1);
+		QCOMPARE(this->fresh.manager.switches, 0);
+		QCOMPARE(this->fresh.manager.creates, 0);
+		QCOMPARE(this->fresh.manager.moves, 0);
+		blocked->release();
+		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 1, 500);
+		QCOMPARE(results.count(), 1);
 	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)
