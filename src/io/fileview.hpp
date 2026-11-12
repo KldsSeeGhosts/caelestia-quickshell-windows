@@ -372,7 +372,7 @@ private:
 	void cancelAsync();
 	void loadSync();
 	void saveSync();
-	void updateState(FileViewState& newState);
+	void updateState(FileViewState& newState, bool write = false);
 	void updatePath();
 	void updateWatchedFiles();
 	void onWatchedFileChanged();
