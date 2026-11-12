@@ -445,9 +445,71 @@ class ContractTests(unittest.TestCase):
         receipt = passing("downstream")
         self.assertEqual(set(schema["required"]), set(receipt))
         self.assertEqual(set(schema["properties"]["stages"]["properties"]),
-                         set(receipt["stages"]))
+                         set(receipt["stages"]) | {"hosted-native"})
         self.assertEqual(set(schema["$defs"]["stage"]["required"]),
                          set(receipt["stages"]["build"]))
+
+    def hosted_receipt(self):
+        receipt = passing()
+        template = c.new_receipt("standalone", "a" * 40, "b" * 40, hosted_native=True)
+        receipt["flags"] = template["flags"]
+        receipt["stages"]["hosted-native"] = copy.deepcopy(receipt["stages"]["portable"])
+        receipt["stages"]["configure"]["diagnostics"]["hostedNativeInventory"] = ["synthetic"]
+        receipt["tests"]["hosted-native"] = {
+            "total": 1, "executed": 1, "failed": 0, "skipped": 0, "skips": []}
+        return receipt
+
+    def test_hosted_receipt_requires_stage_results_inventory_and_no_skips(self):
+        c.validate(self.hosted_receipt())
+        for field in ("stages", "tests"):
+            receipt = self.hosted_receipt()
+            del receipt[field]["hosted-native"]
+            self.rejected(receipt)
+        for inventory in ([], ["synthetic", "synthetic"], ["synthetic", "missing"]):
+            receipt = self.hosted_receipt()
+            receipt["stages"]["configure"]["diagnostics"]["hostedNativeInventory"] = inventory
+            self.rejected(receipt)
+        receipt = self.hosted_receipt()
+        receipt["tests"]["hosted-native"]["skips"] = [
+            {"test": "synthetic", "reason": "qt-reported-skip"}]
+        self.rejected(receipt)
+
+    def test_hosted_junit_exposes_internal_skip_without_hiding_failure(self):
+        path = self.root / "hosted.raw.xml"
+        path.write_text(
+            '<testsuite tests="2"><testcase name="synthetic"><system-out>'
+            'SKIP   : Synthetic::optional() private detail\n'
+            '</system-out></testcase><testcase name="failed"><failure/>'
+            '<system-out>SKIP   : Synthetic::other() private detail\n</system-out>'
+            '</testcase></testsuite>', encoding="utf-8")
+        counts, xml = c.junit(path, hosted_native=True)
+        self.assertEqual((counts["executed"], counts["skipped"], counts["failed"]), (1, 1, 1))
+        self.assertEqual(len(counts["skips"]), 2)
+        self.assertIn('<skipped message="qt-reported-skip;', xml)
+        self.assertIn("<failure", xml)
+        self.assertNotIn("private", xml)
+
+    def test_hosted_run_rejects_skip_missing_extra_duplicate_or_failed_test(self):
+        for cases in (
+                '<testcase name="synthetic"><skipped/></testcase>',
+                '<testcase name="synthetic"><system-out>SKIP   : optional\n'
+                '</system-out></testcase>',
+                '<testcase name="other"/>',
+                '<testcase name="synthetic"/><testcase name="extra"/>',
+                '<testcase name="synthetic"/><testcase name="synthetic"/>',
+                '<testcase name="synthetic"><failure/></testcase>'):
+            receipt = self.hosted_receipt()
+            receipt["stages"]["hosted-native"] = c.new_receipt(
+                "standalone", "a" * 40, "b" * 40, True)["stages"]["hosted-native"]
+            path = self.root / "hosted.raw.xml"
+            xml = f"<testsuite>{cases}</testsuite>"
+            command = f"from pathlib import Path; Path({str(path)!r}).write_text({xml!r})"
+            args = argparse.Namespace(
+                receipt=str(self.root / "result.json"), stage="hosted-native",
+                junit=str(path), unittest=False, echo=False,
+                command=[sys.executable, "-B", "-c", command])
+            self.assertNotEqual(c.run_command(args, receipt), 0)
+            self.assertFalse(c.finalize(receipt, "success"))
 
     def run_fixture(self, code, junit=None, unittest_mode=False, echo=False):
         receipt = c.new_receipt("standalone", "a" * 40, "b" * 40)

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('Configure', 'Build', 'Portable')][string]$Phase,
+    [Parameter(Mandatory)][ValidateSet('Configure', 'Build', 'Portable', 'HostedNative')][string]$Phase,
     [Parameter(Mandatory)][string]$ContractRoot,
     [Parameter(Mandatory)][string]$ToolRoot,
     [Parameter(Mandatory)][string]$BuildRoot,
@@ -54,6 +54,7 @@ New-Item -ItemType Directory -Force -Path $temporaryRoot | Out-Null
 $env:TEMP = $temporaryRoot
 $env:TMP = $temporaryRoot
 # The parent recorder removes this raw file after producing allowlisted XML.
-ctest --test-dir $BuildRoot -L '^portable$' --no-tests=error --output-on-failure `
-    --output-junit "$Results/portable.raw.xml"
+$tier = if ($Phase -eq 'HostedNative') { 'hosted-native' } else { 'portable' }
+ctest --test-dir $BuildRoot -L "^$tier$" --no-tests=error --output-on-failure `
+    --output-junit "$Results/$tier.raw.xml"
 exit $LASTEXITCODE

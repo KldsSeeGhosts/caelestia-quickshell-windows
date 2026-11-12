@@ -90,6 +90,23 @@ JUnit and any failure are non-pass, even if the command exits zero.
 `omittedTiers` records configured native/desktop/gpu/machine counts and explicit
 separate-acceptance reasons. Those are not executed tests.
 
+The standalone hosted workflow opts in with `init --hosted-native`. This adds
+`flags.hostedNativeSelection: ^hosted-native$`, a required `hosted-native` command
+stage and `tests.hosted-native` summary. `inventory` records the exact selected
+names in `stages.configure.diagnostics.hostedNativeInventory` and removes those
+tests from the omitted native count. The recorder requires an exact JUnit name
+match, including multiplicity. It writes sanitized `hosted-native.xml` alongside
+`portable.xml`. A CTest skip or internal Qt skip remains visible in the summary
+and JUnit and fails hosted qualification. A failure never becomes a skip.
+An internal Qt skip marks the containing executable skipped in hosted JUnit,
+unless that executable also failed, in which case its failure remains.
+The stage duration records the added hosted execution time.
+
+This is an opt-in v1 extension for standalone receipts. Existing portable-only
+and downstream receipts keep their previous shape and validation behavior.
+The shell must update its hash-pinned producer before consuming receipts from
+this workflow. This does not claim interactive desktop or GPU acceptance.
+
 `workflowOutcome` is the job status observed by the finalizer, before uploading.
 `result` starts `incomplete` and becomes `pass`, `non-pass`, or `cancelled`.
 Stage receipts are written atomically before starting commands and after they
@@ -123,7 +140,7 @@ python -B .github/scripts/candidate_contract.py --receipt <results>/candidate-re
 
 The existing workflow prepares tools through the pinned shell
 `Prepare-Toolchain.ps1`. `Invoke-WindowsFixtureGate.ps1` runs phases `Configure`,
-`Build` and `Portable`, taking `-ContractRoot`, `-ToolRoot`, `-BuildRoot`,
+`Build`, `Portable` and `HostedNative`, taking `-ContractRoot`, `-ToolRoot`, `-BuildRoot`,
 `-Results` and optional `-Jobs` (1–16, default 2 for direct callers). CI selects
 hardware-aware parallelism and passes `-Jobs $env:BUILD_JOBS`.
 Each phase runs through the helper's `run`

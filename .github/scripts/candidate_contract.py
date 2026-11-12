@@ -63,12 +63,14 @@ def write(path, value):
     temporary.replace(path)
 
 
-def stages(kind):
+def stages(kind, hosted_native=False):
     require(kind in ("standalone", "downstream"), "invalid candidate kind")
-    return STAGES + (("integration",) if kind == "downstream" else ())
+    require(not hosted_native or kind == "standalone", "hosted native requires standalone")
+    return (STAGES + (("integration",) if kind == "downstream" else ())
+            + (("hosted-native",) if hosted_native else ()))
 
 
-def new_receipt(kind, backend_sha, shell_sha):
+def new_receipt(kind, backend_sha, shell_sha, hosted_native=False):
     for sha in (backend_sha, shell_sha):
         require(SHA.fullmatch(sha or ""), "immutable full lowercase SHA required")
     return {
@@ -84,11 +86,11 @@ def new_receipt(kind, backend_sha, shell_sha):
         },
         "toolchain": {"specSha256": None, "contractSha256": None, "expected": {}, "actual": {}},
         "producer": {},
-        "flags": FLAGS.copy(),
+        "flags": FLAGS | ({"hostedNativeSelection": "^hosted-native$"} if hosted_native else {}),
         "stages": {
             name: {"outcome": "not_run", "exitCode": None, "startedAt": None,
                    "finishedAt": None, "durationSeconds": None, "diagnostics": {}}
-            for name in stages(kind)
+            for name in stages(kind, hosted_native)
         },
         "tests": {},
         "omittedTiers": {},
@@ -159,7 +161,7 @@ def safe_name(value):
     return value if IDENTIFIER.fullmatch(value or "") else "redacted"
 
 
-def junit(path):
+def junit(path, hosted_native=False):
     """Rebuild only safe structure. Never copy XML attributes/text wholesale."""
     root = ET.parse(path).getroot()
     require(root.tag in ("testsuite", "testsuites"), "invalid JUnit root")
@@ -202,6 +204,17 @@ def junit(path):
                 == summary["failed"], "JUnit failure count mismatch")
     if "skipped" in root.attrib:
         require(int(root.get("skipped")) == summary["skipped"], "JUnit skip count mismatch")
+    if hosted_native:
+        # Qt can return zero despite an internal skip. Expose that executable
+        # as skipped in sanitized JUnit too, and never qualify it as a pass.
+        skipped_names = {skip["test"] for skip in summary["skips"]}
+        for item in clean:
+            if (item.get("name") in skipped_names and item.find("skipped") is None
+                    and item.find("failure") is None):
+                ET.SubElement(item, "skipped", message="qt-reported-skip; details-excluded")
+                summary["skipped"] += 1
+                summary["executed"] -= 1
+        clean.set("skipped", str(summary["skipped"]))
     return summary, ET.tostring(clean, encoding="unicode")
 
 
@@ -222,7 +235,8 @@ def diagnostics(output):
 
 
 def start(receipt, stage):
-    require(stage in stages(receipt["kind"]), "unknown stage")
+    require(stage in stages(receipt["kind"], "hostedNativeSelection" in receipt["flags"]),
+            "unknown stage")
     require(receipt["stages"][stage]["outcome"] == "not_run", "stage already attempted")
     receipt["stages"][stage].update(outcome="running", startedAt=now())
     receipt["finishedAt"] = None
@@ -245,7 +259,10 @@ def validate(receipt, *, kind=None, backend_sha=None, shell_sha=None,
     require(receipt["schemaVersion"] == 1 and type(receipt["schemaVersion"]) is int,
             "unsupported version")
     require(receipt["evidenceClass"] == "component-offscreen", "invalid evidence class")
-    require(receipt["flags"] == FLAGS, "canonical flags mismatch")
+    hosted_native = "hostedNativeSelection" in receipt["flags"]
+    require(receipt["flags"] == FLAGS | (
+        {"hostedNativeSelection": "^hosted-native$"} if hosted_native else {}),
+        "canonical flags mismatch")
     check_sources(receipt)
     if kind is not None:
         require(receipt["kind"] == kind, "unexpected candidate kind")
@@ -263,7 +280,8 @@ def validate(receipt, *, kind=None, backend_sha=None, shell_sha=None,
     require(created.utcoffset() == dt.timedelta(0)
             and finished.utcoffset() == dt.timedelta(0) and finished >= created,
             "invalid receipt timestamps")
-    require(set(receipt["stages"]) == set(stages(receipt["kind"])), "required stage set mismatch")
+    require(set(receipt["stages"]) == set(stages(receipt["kind"], hosted_native)),
+            "required stage set mismatch")
     for stage in receipt["stages"].values():
         require(isinstance(stage, dict) and set(stage) == {
             "outcome", "exitCode", "startedAt", "finishedAt", "durationSeconds", "diagnostics"},
@@ -310,6 +328,8 @@ def validate(receipt, *, kind=None, backend_sha=None, shell_sha=None,
     require(set(receipt["producer"]) == {"pythonVersion"}, "producer fields mismatch")
     required_tests = {"producer", "portable"} | (
         {"integration"} if receipt["kind"] == "downstream" else set())
+    if hosted_native:
+        required_tests.add("hosted-native")
     require(set(receipt["tests"]) == required_tests, "required test results missing")
     for counts in receipt["tests"].values():
         require(isinstance(counts, dict) and set(counts) == {
@@ -330,6 +350,14 @@ def validate(receipt, *, kind=None, backend_sha=None, shell_sha=None,
         require(set(tier) == {"count", "reason"} and type(tier["count"]) is int
                 and tier["count"] >= 0 and tier["reason"],
                 "invalid omitted tier")
+    if hosted_native:
+        inventory = receipt["stages"]["configure"]["diagnostics"]["hostedNativeInventory"]
+        require(isinstance(inventory, list) and inventory
+                and all(isinstance(name, str) and IDENTIFIER.fullmatch(name) for name in inventory)
+                and len(set(inventory)) == len(inventory), "invalid hosted native inventory")
+        counts = receipt["tests"]["hosted-native"]
+        require(counts["total"] == len(inventory) and not counts["skips"]
+                and counts["skipped"] == 0, "hosted native inventory incomplete or skipped")
 
 
 def finalize(receipt, workflow_outcome):
@@ -432,11 +460,19 @@ def run_command(args, receipt):
                 code = code or 1
                 reason = "zero-tests-executed"
         if args.junit:
-            counts, xml = junit(args.junit)
+            hosted_native = args.stage == "hosted-native"
+            counts, xml = junit(args.junit, hosted_native=hosted_native)
             receipt["tests"][args.stage] = counts
             (Path(args.receipt).parent / f"{args.stage}.xml").write_text(xml, encoding="utf-8")
             if not counts["executed"] or counts["failed"]:
                 code = code or 1
+            if hosted_native:
+                inventory = receipt["stages"]["configure"]["diagnostics"]["hostedNativeInventory"]
+                names = [case.get("name") for case in ET.fromstring(xml)]
+                require(sorted(names) == sorted(inventory), "hosted native inventory mismatch")
+                if counts["skips"]:
+                    code = code or 1
+                    reason = "hosted-native-reported-skip"
     except (OSError, ValueError, ET.ParseError):
         code = code or 1
         reason = "command-launch-or-test-report-invalid"
@@ -461,6 +497,7 @@ def main():
     init.add_argument("--kind", choices=("standalone", "downstream"), default="standalone")
     init.add_argument("--backend-sha", required=True)
     init.add_argument("--shell-sha", required=True)
+    init.add_argument("--hosted-native", action="store_true")
     join = sub.add_parser("merge")
     join.add_argument("--fixture", required=True)
     join.add_argument("--integration", required=True)
@@ -501,7 +538,8 @@ def main():
             return 0
         if args.action == "init":
             require(not Path(args.receipt).exists(), "receipt already exists")
-            write(args.receipt, new_receipt(args.kind, args.backend_sha, args.shell_sha))
+            write(args.receipt, new_receipt(
+                args.kind, args.backend_sha, args.shell_sha, args.hosted_native))
             return 0
         receipt = read(args.receipt)
         if args.action == "run":
@@ -525,11 +563,26 @@ def main():
                 require(result.returncode == 0, "CTest inventory failed")
                 tests = json.loads(result.stdout)["tests"]
                 require(isinstance(tests, list) and tests, "CTest inventory is empty")
+                hosted_native = "hostedNativeSelection" in receipt["flags"]
+                selected = [test["name"] for test in tests for prop in test["properties"]
+                            if prop["name"] == "LABELS" and "hosted-native" in prop["value"]]
+                if hosted_native:
+                    require(bool(selected) and len(selected) == len(set(selected))
+                            and all(IDENTIFIER.fullmatch(name) for name in selected),
+                            "hosted native inventory empty or invalid")
+                    native = {test["name"] for test in tests for prop in test["properties"]
+                              if prop["name"] == "LABELS" and "native" in prop["value"]}
+                    require(set(selected) <= native, "hosted native must be a native subset")
+                    receipt["stages"]["configure"]["diagnostics"]["hostedNativeInventory"] = sorted(selected)
                 for label in ("native", "desktop", "gpu", "machine"):
                     count = sum(label in prop["value"] for test in tests
-                                for prop in test["properties"] if prop["name"] == "LABELS")
+                                for prop in test["properties"] if prop["name"] == "LABELS"
+                                and not (hosted_native and test["name"] in selected))
                     receipt["omittedTiers"][label] = {
-                        "count": count, "reason": "outside-portable-gate; trusted-separate-acceptance"}
+                        "count": count, "reason": (
+                            "outside-portable-and-hosted-native-gate; trusted-separate-acceptance"
+                            if hosted_native else
+                            "outside-portable-gate; trusted-separate-acceptance")}
             except (ValueError, KeyError, TypeError, OSError):
                 receipt["omittedTiers"] = {}
                 receipt["stages"]["configure"]["diagnostics"]["inventory"] = "unavailable-or-invalid"
