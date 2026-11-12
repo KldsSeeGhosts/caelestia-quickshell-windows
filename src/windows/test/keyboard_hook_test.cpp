@@ -12,6 +12,8 @@ UINT WINAPI fakeSendInput(UINT count, LPINPUT inputs, int size);
 SHORT WINAPI fakeGetAsyncKeyState(int vk);
 LRESULT WINAPI fakeCallNextHookEx(HHOOK hook, int code, WPARAM message, LPARAM data);
 BOOL WINAPI fakePostMessageW(HWND target, UINT message, WPARAM id, LPARAM serial);
+UINT_PTR WINAPI fakeSetTimer(HWND, UINT_PTR, UINT, TIMERPROC);
+BOOL WINAPI fakeKillTimer(HWND, UINT_PTR);
 } // namespace
 
 // Exercise the actual callbacks and replay path, without installing a hook,
@@ -20,12 +22,16 @@ BOOL WINAPI fakePostMessageW(HWND target, UINT message, WPARAM id, LPARAM serial
 #define GetAsyncKeyState fakeGetAsyncKeyState
 #define CallNextHookEx fakeCallNextHookEx
 #define PostMessageW fakePostMessageW
+#define SetTimer fakeSetTimer
+#define KillTimer fakeKillTimer
 #include "../keyboard_hook.cpp"
 #include "../input_mask.cpp"
 #undef SendInput
 #undef GetAsyncKeyState
 #undef CallNextHookEx
 #undef PostMessageW
+#undef SetTimer
+#undef KillTimer
 
 namespace qs::windows {
 void prioritizeInputThread(int) {}
@@ -67,9 +73,22 @@ struct FakeDesktop {
 	bool inMouseHook = false;
 	int maskChainCalls = 0;
 	int otherChainCalls = 0;
+	int timersArmed = 0;
+	int timersKilled = 0;
 };
 
 FakeDesktop desktop;
+
+UINT_PTR WINAPI fakeSetTimer(HWND, UINT_PTR, UINT interval, TIMERPROC) {
+	desktop.timersArmed++;
+	Q_ASSERT(interval == 1000);
+	return 42;
+}
+BOOL WINAPI fakeKillTimer(HWND, UINT_PTR timer) {
+	desktop.timersKilled++;
+	Q_ASSERT(timer == 42);
+	return TRUE;
+}
 
 UINT WINAPI fakeSendInput(UINT count, LPINPUT inputs, int size) {
 	desktop.injections++;
@@ -184,6 +203,171 @@ class KeyboardHookTest: public QObject {
 	Q_OBJECT;
 
 private slots:
+	void taskbarSwitchRoutesThroughTheExistingHook_data() {
+		QTest::addColumn<bool>("deferred");
+		QTest::addColumn<bool>("fail");
+		QTest::newRow("forwarded") << false << false;
+		QTest::newRow("deferred") << true << false;
+		QTest::newRow("failed-mask-release") << false << true;
+	}
+
+	void taskbarSwitchRoutesThroughTheExistingHook() {
+		QFETCH(bool, deferred);
+		QFETCH(bool, fail);
+		if (!deferred) KeyboardHook::setSnapshot(nullptr);
+		physical(VK_LWIN, false, 100);
+		physical('B', false, 110);
+		physical('B', false, 120);
+		physical('B', true, 130);
+		desktop.failInjection = fail;
+		physical(VK_LWIN, true, 140);
+		QVERIFY(!desktop.down[VK_LWIN]);
+		auto deliveredB =
+		    std::count_if(desktop.delivered.begin(), desktop.delivered.end(), [](const auto& info) {
+			    return info.vkCode == 'B';
+		    });
+		QCOMPARE(deliveredB, taskbarShortcutFilterEnabled() ? 0 : 3);
+		QVERIFY(!desktop.startOpened || fail);
+		if (taskbarShortcutFilterEnabled() && !deferred) {
+			QCOMPARE(desktop.injections, 1);
+		}
+	}
+
+	void taskbarHookBindHasPriority() {
+		auto snapshot = std::make_shared<HookSnapshot>();
+		snapshot->triggers.push_back(
+		    {.kind = HookTrigger::Combo, .combo = {.mods = ModSuper, .vk = 'B'}, .id = 25}
+		);
+		KeyboardHook::setSnapshot(snapshot);
+		physical(VK_LWIN, false, 100);
+		physical('B', false, 110);
+		physical('B', true, 120);
+		physical(VK_LWIN, true, 130);
+		QCOMPARE(desktop.posted, (std::vector<HookEvent> {HookPressed, HookReleased}));
+		QCOMPARE(desktop.hookPosts.front().wParam, WPARAM(25));
+		QVERIFY(desktop.delivered.empty());
+		QVERIFY(!desktop.startOpened);
+	}
+
+	void taskbarMaskedReleasePreservesMetadataAndFailureFallback_data() {
+		QTest::addColumn<int>("limit");
+		for (int limit = 0; limit <= 3; limit++) {
+			QTest::newRow(qPrintable(QString::number(limit))) << limit;
+		}
+	}
+
+	void taskbarMaskedReleasePreservesMetadataAndFailureFallback() {
+		QFETCH(int, limit);
+		TaskbarShortcutFilter filter;
+		filter.handle(VK_RWIN, false, false, 0, false);
+		QVERIFY(filter.handle('T', false, false, ModSuper, false).swallow);
+		auto decision = filter.handle(VK_RWIN, true, false, 0, false);
+		QVERIFY(decision.maskedRelease);
+		KBDLLHOOKSTRUCT up {
+		    .vkCode = VK_RWIN,
+		    .scanCode = 0x5C,
+		    .flags = LLKHF_UP | LLKHF_EXTENDED,
+		    .time = 200,
+		    .dwExtraInfo = 0
+		};
+		desktop.maxInjection = limit;
+		// No local Win-down, as when an elevated foreground passed it through.
+		QCOMPARE(onWin(gNoRouting, &up, true, decision.maskedRelease), LRESULT(limit == 3));
+		QCOMPARE(desktop.injections, 1);
+		QCOMPARE(desktop.injected.size(), size_t(limit));
+		if (limit == 3) {
+			auto replay = desktop.injected.back().ki;
+			QCOMPARE(replay.wVk, WORD(VK_RWIN));
+			QCOMPARE(replay.wScan, WORD(0x5C));
+			QCOMPARE(replay.dwFlags, DWORD(KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY));
+			QCOMPARE(replay.dwExtraInfo, KeyboardHook::INJECTION_MARKER);
+		}
+	}
+
+	void taskbarPolicyExactDecisionTable() {
+		// Every modifier combination, all ten digits, and unrelated Win
+		// chords from the supervisor's policy contract.
+		for (int mods = 0; mods < 16; mods++) {
+			for (int vk = 0; vk < 256; vk++) {
+				bool win = (mods & ModSuper) != 0;
+				bool shift = (mods & ModShift) != 0;
+				bool ctrl = (mods & ModCtrl) != 0;
+				bool alt = (mods & ModAlt) != 0;
+				bool expected = win
+				             && ((vk == 'T' && !ctrl && !alt) || (vk == 'B' && !shift && !ctrl && !alt)
+				                 || (vk == VK_RETURN && alt && !shift && !ctrl)
+				                 || (vk >= '0' && vk <= '9' && (alt ? !shift && !ctrl : !(shift && ctrl))));
+				TaskbarShortcutFilter filter;
+				QCOMPARE(filter.handle(vk, false, false, mods, false).swallow, expected);
+			}
+		}
+	}
+
+	void taskbarRepeatsAndKeyUpRemainOwnedAfterModifiersChange() {
+		TaskbarShortcutFilter filter;
+		QVERIFY(filter.handle('T', false, false, ModSuper, false).swallow);
+		QVERIFY(filter.handle('T', false, false, ModCtrl, false).swallow);
+		QVERIFY(filter.handle('T', true, false, 0, false).swallow);
+		QVERIFY(!filter.handle('T', true, false, 0, false).swallow);
+		auto release = filter.handle(VK_LWIN, true, false, 0, false);
+		QVERIFY(release.maskedRelease);
+		QVERIFY(!filter.handle(VK_LWIN, true, false, 0, false).maskedRelease);
+	}
+
+	void taskbarWaitsForLastWinAndIgnoresOwnInjections() {
+		TaskbarShortcutFilter filter;
+		filter.handle(VK_LWIN, false, false, 0, false);
+		filter.handle(VK_RWIN, false, false, ModSuper, true);
+		QVERIFY(!filter.handle('T', false, true, ModSuper, true).swallow);
+		QVERIFY(filter.handle('T', false, false, ModSuper, true).swallow);
+		QVERIFY(!filter.handle(VK_LWIN, true, false, 0, true).maskedRelease);
+		QVERIFY(filter.handle(VK_RWIN, true, false, 0, false).maskedRelease);
+	}
+
+	void taskbarNewSequenceAndResetClearPendingMask() {
+		TaskbarShortcutFilter filter;
+		filter.handle(VK_LWIN, false, false, 0, false);
+		filter.handle('1', false, false, ModSuper, false);
+		// Repeats preserve the pending mask.
+		filter.handle(VK_LWIN, false, false, ModSuper, false);
+		QVERIFY(filter.handle(VK_LWIN, true, false, 0, false).maskedRelease);
+		filter.handle(VK_LWIN, false, false, 0, false);
+		filter.handle('2', false, false, ModSuper, false);
+		// Only our injected up was seen, then a new physical sequence.
+		filter.handle(VK_LWIN, true, true, 0, false);
+		filter.handle(VK_LWIN, false, false, 0, false);
+		QVERIFY(!filter.handle(VK_LWIN, true, false, 0, false).maskedRelease);
+		filter.reset();
+		QVERIFY(!filter.handle('2', true, false, 0, false).swallow);
+		QVERIFY(!filter.handle(-1, false, false, ModSuper, false).swallow);
+		QVERIFY(!filter.handle(256, false, false, ModSuper, false).swallow);
+	}
+
+	void taskbarBindsWinWithoutClaimingTheirRelease() {
+		TaskbarShortcutFilter filter;
+		QVERIFY(!filter.handle('B', false, false, ModSuper, false, true).swallow);
+		QVERIFY(!filter.handle(VK_LWIN, true, false, 0, false).maskedRelease);
+	}
+
+	void winLeaseTimerOnlyRunsDuringTrackedHolds() {
+		physical('A', false, 100);
+		QCOMPARE(desktop.timersArmed, 0);
+		physical(VK_LWIN, false, 110);
+		QCOMPARE(desktop.timersArmed, 1);
+		physical(VK_RWIN, false, 120);
+		physical(VK_LWIN, true, 130);
+		QCOMPARE(desktop.timersArmed, 1);
+		QCOMPARE(desktop.timersKilled, 0);
+		physical(VK_RWIN, true, 140);
+		QCOMPARE(desktop.timersKilled, 1);
+		physical(VK_LWIN, false, 200);
+		expireWin(200 + WIN_LEASE_MS);
+		drainInput();
+		QCOMPARE(desktop.timersArmed, 2);
+		QCOMPARE(desktop.timersKilled, 2);
+		QVERIFY(!gWinDown.load());
+	}
+
 	// Routing stopping must not strand physical state: the Super down the hook
 	// swallowed still has to clear on its release, or ordinary clicks become
 	// Super drags forever.
@@ -395,6 +579,8 @@ private slots:
 
 	void init() {
 		desktop = {};
+		gTaskbarFilter.reset();
+		gWinLeaseTimer = 0;
 		gHeld.fill({});
 		for (auto& masked: gMaskHeld) masked = false;
 		for (auto& replayed: gReplayed) replayed = false;
@@ -704,14 +890,21 @@ private slots:
 		QCOMPARE(taps(), 1);
 	}
 
+	void registeredChordStillReachesWindows_data() {
+		QTest::addColumn<int>("vk");
+		QTest::newRow("ordinary") << int('I');
+		QTest::newRow("taskbar-policy") << int('B');
+	}
+
 	void registeredChordStillReachesWindows() {
+		QFETCH(int, vk);
 		auto snapshot = std::make_shared<HookSnapshot>();
-		snapshot->masks.push_back({.mods = ModSuper, .vk = 'I'});
+		snapshot->masks.push_back({.mods = ModSuper, .vk = static_cast<uint8_t>(vk)});
 		KeyboardHook::setSnapshot(snapshot);
-		desktop.registeredVk = 'I';
+		desktop.registeredVk = vk;
 		physical(VK_LWIN, false, 100);
-		physical('I', false, 120);
-		physical('I', true, 150);
+		physical(vk, false, 120);
+		physical(vk, true, 150);
 		physical(VK_LWIN, true, 200);
 		QCOMPARE(desktop.hotkeys, 1);
 		QVERIFY(!desktop.startOpened);

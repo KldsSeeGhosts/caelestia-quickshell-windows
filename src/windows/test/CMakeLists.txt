@@ -569,6 +569,9 @@ target_compile_definitions(hotkeys_routing_test PRIVATE NOMINMAX WIN32_LEAN_AND_
 target_include_directories(hotkeys_routing_test PRIVATE ${QS_WINDOWS_SRC})
 target_link_libraries(hotkeys_routing_test PRIVATE Qt6::Quick Qt6::Qml Qt6::Test user32)
 add_test(NAME hotkeys_routing COMMAND hotkeys_routing_test)
+add_test(NAME hotkeys_routing_taskbar_filter COMMAND hotkeys_routing_test)
+set_tests_properties(hotkeys_routing_taskbar_filter PROPERTIES
+	ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QS_WINDOWS_TASKBAR_SHORTCUT_FILTER=1")
 
 # Target selection, read-only KLID/name resolution and switch result codes.
 # The production name source is included with ActivateKeyboardLayout renamed,
@@ -593,6 +596,9 @@ target_link_libraries(keyboard_hook_test PRIVATE
 	Qt6::Gui Qt6::GuiPrivate Qt6::Qml Qt6::Test user32 advapi32
 )
 add_test(NAME keyboard_hook COMMAND keyboard_hook_test)
+add_test(NAME keyboard_hook_taskbar_filter COMMAND keyboard_hook_test)
+set_tests_properties(keyboard_hook_taskbar_filter PROPERTIES
+	ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QS_WINDOWS_TASKBAR_SHORTCUT_FILTER=1")
 
 qs_add_test_executable(native_lifetime_test
 	native_lifetime_test.cpp
@@ -1113,7 +1119,8 @@ add_test(NAME capture_native COMMAND capture_native_test)
 set(QS_TESTS_PORTABLE
 	wallpaper_target screen_identity hyprland_monitor panel_animation
 	screenshot_jobs fs_utils ipc_limits redaction log_scrub log_redaction_guard
-	tiling_layout dispatcher virtual_desktops hotkeys_routing keyboard_hook
+	tiling_layout dispatcher virtual_desktops hotkeys_routing hotkeys_routing_taskbar_filter
+	keyboard_hook keyboard_hook_taskbar_filter
 	bt_pairing_policy mpris_status mpris_art_cache pw_audio_control
 	upower_status tiling_observability tiling_manager tiling_drag tiling_reload
 	transition_trace foreground_observer activation_policy fullscreen_app_state

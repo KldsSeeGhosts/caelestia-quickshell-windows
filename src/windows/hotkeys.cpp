@@ -1001,6 +1001,7 @@ void HotkeyManager::registerTriggers() {
 		auto registered = false;
 
 		if (trigger.preferRegister && trigger.kind == HookTrigger::Combo
+		    && !taskbarShortcutFilterEnabled()
 		    && supervisorOwnsChord(trigger.combo.mods, trigger.combo.vk))
 		{
 			qCInfo(logHotkeys) << "Ignoring register for" << this->binds.at(trigger.binds.first()).keys
@@ -1011,7 +1012,8 @@ void HotkeyManager::registerTriggers() {
 		        trigger.kind,
 		        trigger.combo.mods,
 		        trigger.combo.vk,
-		        trigger.preferRegister
+		        trigger.preferRegister,
+		        taskbarShortcutFilterEnabled()
 		    ))
 		{
 			auto modifiers = hotkeyModifiers(trigger.combo.mods) | (trigger.repeat ? 0 : MOD_NOREPEAT);
@@ -1044,7 +1046,8 @@ void HotkeyManager::registerTriggers() {
 	// An active map also needs the existing hook's desktop-switch notification,
 	// even when every key in that map was accepted by RegisterHotKey.
 	if (snapshot->triggers.empty() && snapshot->masks.empty() && !this->gateActive
-	    && this->mActiveSubmap.isEmpty()) {
+	    && this->mActiveSubmap.isEmpty() && !taskbarShortcutFilterEnabled())
+	{
 		KeyboardHook::stop();
 		this->hookRunning = false;
 	} else {

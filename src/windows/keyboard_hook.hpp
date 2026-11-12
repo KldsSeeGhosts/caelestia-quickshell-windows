@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -79,6 +80,73 @@ struct TriggerMechanism {
 	return !(shift && ctrl);
 }
 
+// Cached once, shared by routing and the hook for the process lifetime.
+[[nodiscard]] inline bool taskbarShortcutFilterEnabled() {
+	static const bool enabled = [] {
+		wchar_t value[2] {};
+		return GetEnvironmentVariableW(L"QS_WINDOWS_TASKBAR_SHORTCUT_FILTER", value, 2) == 1
+		    && value[0] == L'1';
+	}();
+	return enabled;
+}
+
+struct TaskbarShortcutDecision {
+	bool swallow = false;
+	bool maskedRelease = false;
+};
+
+// Port of DesktopTakeover.cs's TaskbarShortcutFilter. No platform calls:
+// the caller executes a masked release and swallows it only on full success.
+class TaskbarShortcutFilter {
+public:
+	TaskbarShortcutDecision handle(
+	    int vk,
+	    bool up,
+	    bool ownInjection,
+	    uint8_t mods,
+	    bool otherWinDown,
+	    bool bindOwnsChord = false
+	) {
+		if (vk < 0 || vk > 255) return {};
+		auto win = vk == VK_LWIN || vk == VK_RWIN;
+		auto side = vk == VK_LWIN ? 0 : 1;
+		if (ownInjection) {
+			if (up && win) this->winDown[side] = false;
+			return {};
+		}
+		if (up) {
+			if (win) {
+				this->winDown[side] = false;
+				if (!this->maskPending || otherWinDown) return {};
+				this->maskPending = false;
+				return {.maskedRelease = true};
+			}
+			auto swallowed = this->down[vk];
+			this->down[vk] = false;
+			return {.swallow = swallowed};
+		}
+		if (win) {
+			if (this->winDown[side]) return {};
+			if (this->maskPending && !otherWinDown) this->maskPending = false;
+			this->winDown[side] = true;
+			return {};
+		}
+		if (this->down[vk]) return {.swallow = true};
+		if (bindOwnsChord) return {};
+		if (!supervisorOwnsChord(mods, static_cast<uint8_t>(vk))) return {};
+		this->down[vk] = true;
+		this->maskPending = true;
+		return {.swallow = true};
+	}
+
+	void reset() { *this = {}; }
+
+private:
+	std::array<bool, 256> down {};
+	bool maskPending = false;
+	bool winDown[2] {};
+};
+
 /// Whether a trigger is offered to RegisterHotKey before the hook.
 ///
 /// Only a WM_HOTKEY delivery gives the process the foreground permission that
@@ -86,16 +154,18 @@ struct TriggerMechanism {
 /// Chords without the Windows key always try registration first. A chord with
 /// the Windows key stays on the hook, exactly as it was, unless a bind asks
 /// for registration (`"register": true`) and the supervisor does not consume
-/// the chord. Lone-modifier taps and holds only exist on the hook.
+/// the chord. When the backend owns the taskbar filter, registration can win
+/// over that filter. Lone-modifier taps and holds only exist on the hook.
 [[nodiscard]] constexpr bool shouldRegisterHotkey(
     HookTrigger::Kind kind,
     uint8_t mods,
     uint8_t vk,
-    bool preferRegister
+    bool preferRegister,
+    bool taskbarFilter = false
 ) {
 	if (kind != HookTrigger::Combo) return false;
 	if ((mods & ModSuper) == 0) return true;
-	return preferRegister && !supervisorOwnsChord(mods, vk);
+	return preferRegister && (taskbarFilter || !supervisorOwnsChord(mods, vk));
 }
 
 /// Decide how one trigger is delivered once RegisterHotKey has (or has not)
