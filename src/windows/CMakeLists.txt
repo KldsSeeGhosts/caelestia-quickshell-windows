@@ -36,7 +36,6 @@ qt_add_library(quickshell-windows STATIC
 	window_decorations.cpp
 	window_manager.cpp
 	super_drag.cpp
-	taskbar.cpp
 	capture.cpp
 	capture_device.cpp
 	capture_format.cpp

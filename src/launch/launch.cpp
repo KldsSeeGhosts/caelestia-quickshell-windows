@@ -170,6 +170,8 @@ int launch(const LaunchArgs& args, char** argv) {
 	};
 
 #if CRASH_HANDLER
+	// A supervisor that restarts the shell itself sets QS_DISABLE_CRASH_RELAUNCH
+	// instead: the handler then keeps the dump and the desktop cleanup.
 	if (qEnvironmentVariableIsSet("QS_DISABLE_CRASH_HANDLER")) {
 		qInfo() << "Crash handling disabled.";
 	} else {

@@ -17,7 +17,6 @@
 #include "native_desktop_accessor.hpp"
 #include "startup.hpp"
 #include "redact.hpp"
-#include "util.hpp"
 #include "services/message_window.hpp"
 
 #include <objbase.h>
@@ -27,8 +26,6 @@ namespace qs::windows {
 
 namespace {
 Q_LOGGING_CATEGORY(logDesktops, "quickshell.windows.desktops", QtWarningMsg);
-
-constexpr ULONGLONG ACCESSOR_RESTART_INTERVAL = 60000;
 
 template <typename R, typename... P, typename... A>
 bool sehCall(R (*fn)(P...), R& out, A... args) {
@@ -40,22 +37,10 @@ bool sehCall(R (*fn)(P...), R& out, A... args) {
 	}
 }
 
-bool sehCallVoid(void (*fn)()) {
-	__try {
-		fn();
-		return true;
-	} __except (EXCEPTION_EXECUTE_HANDLER) {
-		return false;
-	}
-}
-
 constexpr const wchar_t* DESKTOPS_KEY =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops";
 constexpr const wchar_t* SESSION_KEY_FORMAT =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SessionInfo\\%1\\VirtualDesktops";
-
-constexpr UINT ACCESSOR_MESSAGE = WM_APP + 0x100;
-constexpr const wchar_t* LISTENER_CLASS = L"QuickshellVirtualDesktops";
 
 constexpr qsizetype MAX_DESKTOPS = 20;
 constexpr int CREATION_TIMEOUT_MS = 1000;
@@ -235,7 +220,6 @@ VirtualDesktops::VirtualDesktops() {
 
 	startup::afterFirstFrame(this, [this]() {
 		this->loadAccessor();
-		this->installListener();
 		this->refresh();
 		if (this->accessorLoaded()) emit this->accessorReady();
 	});
@@ -254,17 +238,7 @@ VirtualDesktops::VirtualDesktops() {
 
 VirtualDesktops::~VirtualDesktops() {
 	if (this->watcher != nullptr) this->watcher->stop();
-
-	if (this->listener != nullptr) {
-		if (this->accessor.unregisterPostMessageHook != nullptr) {
-			this->call(-1, this->accessor.unregisterPostMessageHook, this->listener);
-		}
-
-		DestroyWindow(this->listener);
-	}
-
 	if (this->mManager != nullptr) this->mManager->Release();
-	if (this->accessor.module != nullptr) FreeLibrary(this->accessor.module);
 }
 
 template <typename R, typename... P, typename... A>
@@ -284,152 +258,51 @@ R VirtualDesktops::call(R fallback, R (*fn)(P...), A... args) const {
 }
 
 void VirtualDesktops::accessorFailed() const {
-	auto& a = this->accessor;
-	if (this->nativeAccessor) {
-		qCWarning(logDesktops) << "Native desktop provider raised an exception; invalidating interfaces"
-		                       << "and entering bounded recovery";
-		// Defense in depth for faults outside a native leaf guard, including
-		// local COM cleanup. Never let dispatch re-enable the stale provider.
-		invalidateNativeDesktopAccessor(E_UNEXPECTED);
+	if (!this->nativeAccessor) {
 		this->setAccessorLoaded(false);
 		return;
 	}
-	if (!this->accessorLoaded()) return;
 
-	auto now = GetTickCount64();
-	if (a.restart != nullptr
-	    && (this->accessorRestartedAt == 0 || now - this->accessorRestartedAt > ACCESSOR_RESTART_INTERVAL))
-	{
-		this->accessorRestartedAt = now;
-		qCWarning(logDesktops) << "VirtualDesktopAccessor.dll crashed; restarting it";
-		if (sehCallVoid(a.restart)) return;
-	}
-
-	qCWarning(logDesktops) << "VirtualDesktopAccessor.dll keeps crashing; desktop control is"
-	                       << "unavailable until it is restarted";
+	qCWarning(logDesktops) << "Native desktop provider raised an exception; invalidating interfaces"
+	                       << "and entering bounded recovery";
+	// Defense in depth for faults outside a native leaf guard, including
+	// local COM cleanup. Never let dispatch re-enable the stale provider.
+	invalidateNativeDesktopAccessor(E_UNEXPECTED);
 	this->setAccessorLoaded(false);
 }
 
 void VirtualDesktops::loadAccessor() {
-	if (qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR") == "1"
-	    && qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR_DISPATCH") == "1") {
-		this->nativeAccessor = true;
-		if (loadNativeDesktopAccessor(this->accessor, this, [this] {
-			this->updateAccessorExports();
-			this->setAccessorLoaded(true);
-			if (this->mManager) this->mManager->Release();
-			this->mManager = nullptr;
-			this->managerTried = false;
-			this->refresh(true);
-			emit this->accessorReady();
-		})) {
-			this->updateAccessorExports();
-			this->setAccessorLoaded(true);
-		}
-		emit this->capabilityChanged();
-		services::ServiceMessageWindow::instance()->addHandler(
-		    RegisterWindowMessageW(L"TaskbarCreated"), this, [this](WPARAM, LPARAM) {
-			    invalidateNativeDesktopAccessor();
-			    this->setAccessorLoaded(false);
-			    if (this->mManager) this->mManager->Release();
-			    this->mManager = nullptr;
-			    this->managerTried = false;
-		    });
-		// A refused native ABI must not silently fall back to a DLL or input.
+	if (qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR") != "1"
+	    || qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR_DISPATCH") != "1")
+	{
+		// Desktop control is opt-in. Without both gates it stays disabled, and
+		// there is no out-of-process provider to fall back to.
 		return;
 	}
 
-	auto path = QCoreApplication::applicationDirPath()
-	          + (windowsBuild() < 22000 ? "/win10/VirtualDesktopAccessor.dll" : "/VirtualDesktopAccessor.dll");
-	auto wpath = path.toStdWString();
-	auto* module = LoadLibraryW(wpath.c_str());
-
-	if (module == nullptr) {
-		qCInfo(logDesktops) << "VirtualDesktopAccessor.dll not found next to the executable;"
-		                    << "desktop switching and creation are unavailable.";
-		return;
+	this->nativeAccessor = true;
+	if (loadNativeDesktopAccessor(this->accessor, this, [this] {
+		    this->updateAccessorExports();
+		    this->setAccessorLoaded(true);
+		    if (this->mManager) this->mManager->Release();
+		    this->mManager = nullptr;
+		    this->managerTried = false;
+		    this->refresh(true);
+		    emit this->accessorReady();
+	    }))
+	{
+		this->updateAccessorExports();
+		this->setAccessorLoaded(true);
 	}
-
-	auto& a = this->accessor;
-	a.module = module;
-
-	auto load = [module](auto& fn, const char* name) {
-		fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(GetProcAddress(module, name));
-		return fn != nullptr;
-	};
-
-	auto ok = load(a.getCurrentDesktopNumber, "GetCurrentDesktopNumber")
-	       && load(a.getDesktopCount, "GetDesktopCount")
-	       && load(a.goToDesktopNumber, "GoToDesktopNumber")
-	       && load(a.moveWindowToDesktopNumber, "MoveWindowToDesktopNumber")
-	       && load(a.isWindowOnCurrentVirtualDesktop, "IsWindowOnCurrentVirtualDesktop");
-
-	load(a.getDesktopIdByNumber, "GetDesktopIdByNumber");
-	load(a.getWindowDesktopNumber, "GetWindowDesktopNumber");
-	load(a.createDesktop, "CreateDesktop");
-	load(a.removeDesktop, "RemoveDesktop");
-	load(a.registerPostMessageHook, "RegisterPostMessageHook");
-	load(a.unregisterPostMessageHook, "UnregisterPostMessageHook");
-	load(a.isPinnedWindow, "IsPinnedWindow");
-	load(a.pinWindow, "PinWindow");
-	load(a.unPinWindow, "UnPinWindow");
-	load(a.restart, "RestartVirtualDesktopAccessor");
-	this->updateAccessorExports();
-
-	if (!ok || this->call(-1, a.getDesktopCount) <= 0) {
-		qCWarning(logDesktops) << "VirtualDesktopAccessor.dll"
-		                       << qs::windows::logPath(path)
-		                       << "does not work on this Windows build; ignoring it.";
-		FreeLibrary(module);
-		a = Accessor();
-		return;
-	}
-
-	this->setAccessorLoaded(true);
-	qCInfo(logDesktops) << "Loaded" << qs::windows::logPath(path);
-}
-
-LRESULT CALLBACK VirtualDesktops::listenerProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-	if (msg == ACCESSOR_MESSAGE) {
-		VirtualDesktops::instance()->refresh();
-		return 0;
-	}
-
-	return DefWindowProcW(hwnd, msg, wparam, lparam);
-}
-
-void VirtualDesktops::installListener() {
-	if (this->accessor.registerPostMessageHook == nullptr) return;
-
-	auto* module = GetModuleHandleW(nullptr);
-	WNDCLASSW cls {};
-	cls.lpfnWndProc = &VirtualDesktops::listenerProc;
-	cls.hInstance = module;
-	cls.lpszClassName = LISTENER_CLASS;
-	RegisterClassW(&cls);
-
-	this->listener = CreateWindowExW(
-	    0,
-	    LISTENER_CLASS,
-	    L"",
-	    0,
-	    0,
-	    0,
-	    0,
-	    0,
-	    HWND_MESSAGE,
-	    nullptr,
-	    module,
-	    nullptr
-	);
-
-	if (this->listener == nullptr) {
-		qCWarning(logDesktops) << "Failed to create the desktop change listener window:"
-		                       << GetLastError();
-		return;
-	}
-
-	this->call(-1, this->accessor.registerPostMessageHook, this->listener, ACCESSOR_MESSAGE);
+	emit this->capabilityChanged();
+	services::ServiceMessageWindow::instance()->addHandler(
+	    RegisterWindowMessageW(L"TaskbarCreated"), this, [this](WPARAM, LPARAM) {
+		    invalidateNativeDesktopAccessor();
+		    this->setAccessorLoaded(false);
+		    if (this->mManager) this->mManager->Release();
+		    this->mManager = nullptr;
+		    this->managerTried = false;
+	    });
 }
 
 QString VirtualDesktops::readDesktopName(const GUID& id) const {
@@ -485,7 +358,6 @@ bool VirtualDesktops::readRegistry(QList<GUID>& ids, GUID& current) const {
 }
 
 void VirtualDesktops::noteCloakChange() {
-	if (this->listener != nullptr && this->accessorLoaded()) return;
 	if (!this->cloakTimer.isActive()) this->cloakTimer.start();
 }
 
@@ -980,7 +852,7 @@ bool VirtualDesktops::moveWindow(HWND hwnd, qsizetype index) {
 	}
 
 	qCWarning(logDesktops) << "Moving another application's window to a desktop needs"
-	                       << "VirtualDesktopAccessor.dll";
+	                       << "a working desktop provider";
 	return result(false, this->commandFailureReason());
 }
 

@@ -25,9 +25,9 @@
 #include "../../core/logcat.hpp"
 #include "../../core/paths.hpp"
 #include "../redact.hpp"
-#include "../taskbar.hpp"
 #include "../tiling.hpp"
 #include "../window_decorations.hpp"
+#include "relaunch_policy.hpp"
 
 namespace qs::crash {
 
@@ -46,6 +46,7 @@ qint64 gLaunchTimeMs = 0;
 QtMessageHandler gPreviousMessageHandler = nullptr;
 
 std::atomic<bool> gHandling {false};
+bool gRelaunchEnabled = true;
 
 qint64 currentEpochMs() {
 	FILETIME ft {};
@@ -175,12 +176,11 @@ void handleCrash(const wchar_t* reason, EXCEPTION_POINTERS* ep) {
 			CloseHandle(dumpFile);
 		}
 
-		qs::windows::TaskbarManager::restoreForCrash();
 		qs::windows::DecorationManager::restoreForCrash();
 		qs::windows::TilingManager::restoreForCrash();
 
 		auto elapsed = currentEpochMs() - gLaunchTimeMs;
-		if (gLaunchTimeMs == 0 || elapsed >= 10000) {
+		if (gRelaunchEnabled && (gLaunchTimeMs == 0 || elapsed >= 10000)) {
 			relaunch(reason);
 		}
 
@@ -266,6 +266,11 @@ void maybeTriggerDebugCrash() {
 
 void CrashHandler::init() {
 	qCDebug(logCrashHandler) << "Starting crash handler...";
+
+	gRelaunchEnabled = !crashRelaunchDisabled();
+	if (!gRelaunchEnabled) {
+		qCInfo(logCrashHandler) << "Crash relaunch disabled; dumps and desktop cleanup are kept.";
+	}
 
 	gPreviousMessageHandler = qInstallMessageHandler(
 	    [](QtMsgType type, const QMessageLogContext& context, const QString& message) {
