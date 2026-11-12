@@ -54,11 +54,10 @@ public:
 	};
 
 	// The accessor table is public so tests can inject a fake without loading a
-	// DLL. The in-process COM provider uses the same table. Every desktop-changing
-	// operation requires accessorLoaded(); there is no
+	// provider. The in-process COM provider uses the same table. Every
+	// desktop-changing operation requires accessorLoaded(); there is no
 	// synthetic-input fallback.
 	struct Accessor {
-		HMODULE module = nullptr;
 		int (*getCurrentDesktopNumber)() = nullptr;
 		int (*getDesktopCount)() = nullptr;
 		GUID (*getDesktopIdByNumber)(int) = nullptr;
@@ -68,12 +67,9 @@ public:
 		int (*isWindowOnCurrentVirtualDesktop)(HWND) = nullptr;
 		int (*createDesktop)() = nullptr;
 		int (*removeDesktop)(int, int) = nullptr;
-		int (*registerPostMessageHook)(HWND, UINT) = nullptr;
-		int (*unregisterPostMessageHook)(HWND) = nullptr;
 		int (*isPinnedWindow)(HWND) = nullptr;
 		int (*pinWindow)(HWND) = nullptr;
 		int (*unPinWindow)(HWND) = nullptr;
-		void (*restart)() = nullptr;
 	};
 
 	// Injection point for tests. Production never installs a sender: desktop
@@ -151,7 +147,6 @@ private:
 
 	[[nodiscard]] IVirtualDesktopManager* manager() const;
 	void loadAccessor();
-	void installListener();
 	bool readRegistry(QList<GUID>& ids, GUID& current) const;
 	[[nodiscard]] QString readDesktopName(const GUID& id) const;
 	void createNext();
@@ -175,8 +170,6 @@ private:
 	R call(R fallback, R (*fn)(P...), A... args) const;
 	void accessorFailed() const;
 
-	static LRESULT CALLBACK listenerProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
-
 	QList<Desktop> mDesktops;
 	qsizetype mCurrent = -1;
 	GUID mCurrentId {};
@@ -185,7 +178,6 @@ private:
 	mutable IVirtualDesktopManager* mManager = nullptr;
 	mutable bool managerTried = false;
 	RegistryWatcher* watcher = nullptr;
-	HWND listener = nullptr;
 	QTimer cloakTimer;
 	QTimer creationTimer;
 	qsizetype creationTarget = 0;
@@ -196,8 +188,6 @@ private:
 		std::function<void(bool)> done;
 	};
 	QList<CreationWaiter> creationWaiters;
-
-	mutable ULONGLONG accessorRestartedAt = 0;
 
 	mutable QSet<QString> warnedOperations;
 	ChordSender chordSender;

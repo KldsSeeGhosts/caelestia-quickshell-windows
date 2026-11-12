@@ -71,7 +71,6 @@ int fakeCreateDesktop() {
 	if (fake.publishCreation) fake.count++;
 	return fake.count;
 }
-void fakeRestart() {}
 int fakeIsPinned(HWND) { return 1; }
 int fakePin(HWND) { return 0; }
 
@@ -81,7 +80,6 @@ VirtualDesktops::Accessor fakeAccessor(bool withCreate = true) {
 	accessor.getDesktopCount = &fakeDesktopCount;
 	accessor.goToDesktopNumber = &fakeGoToDesktop;
 	accessor.createDesktop = withCreate ? &fakeCreateDesktop : nullptr;
-	accessor.restart = &fakeRestart;
 	return accessor;
 }
 
