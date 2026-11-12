@@ -131,7 +131,15 @@ enable us to fix bugs far more easily.
 
 To disable: `-DCRASH_HANDLER=OFF`
 
-Dependencies: `cpptrace`
+On Windows this uses the inbox `dbghelp.dll` through the Windows SDK and adds
+no third-party dependency or reporter executable. A supervisor can set
+`QS_DISABLE_CRASH_RELAUNCH` to keep local dumps and desktop cleanup without
+starting a replacement process. The next handler-enabled start keeps the newest
+three recognized crash sets. Dumps contain process memory and cannot be
+redacted. See [Windows crash diagnostics and privacy](src/windows/crash/README.md)
+for the location, retention exceptions and reporting boundary.
+
+Non-Windows dependencies: `cpptrace`
 
 Note: `-DVENDOR_CPPTRACE=ON` can be set to vendor cpptrace using FetchContent.
 
