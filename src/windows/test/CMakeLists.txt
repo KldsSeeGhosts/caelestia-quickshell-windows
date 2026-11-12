@@ -96,8 +96,12 @@ function(qs_add_test_executable target)
 	)
 endfunction()
 
-qs_add_test_executable(wallpaper_target_test wallpaper_target_test.cpp)
-target_link_libraries(wallpaper_target_test PRIVATE Qt6::Gui Qt6::Test)
+qs_add_test_executable(wallpaper_target_test
+	wallpaper_target_test.cpp
+	${QS_WINDOWS_SRC}/system/wallpaper_worker.cpp
+)
+target_compile_definitions(wallpaper_target_test PRIVATE QS_TEST NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(wallpaper_target_test PRIVATE Qt6::Gui Qt6::Test ole32 user32)
 add_test(NAME wallpaper_target COMMAND wallpaper_target_test)
 
 qs_add_test_executable(screen_identity_test

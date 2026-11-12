@@ -12,7 +12,8 @@ class Wallpaper: public QObject {
 	Q_OBJECT;
 	QML_ELEMENT;
 	QML_SINGLETON;
-	Q_PROPERTY(bool lockScreenImageSupported READ lockScreenImageSupported NOTIFY lockScreenImageSupportedChanged);
+	Q_PROPERTY(bool lockScreenImageSupported READ lockScreenImageSupported NOTIFY
+	               lockScreenImageSupportedChanged);
 	Q_PROPERTY(bool systemDarkMode READ systemDarkMode NOTIFY systemDarkModeChanged);
 	Q_PROPERTY(QString currentDesktop READ currentDesktop NOTIFY currentDesktopChanged);
 	Q_PROPERTY(QVariantList desktops READ desktops NOTIFY desktopsChanged);
@@ -56,6 +57,15 @@ public:
 	Q_INVOKABLE static QString lockScreenMode();
 
 signals:
+	// Emitted for accepted wallpaper mutations, including late completion or
+	// retirement. The bool setters return false if success is not yet confirmed.
+	void wallpaperOperationFinished(
+	    const QString& operation,
+	    const QString& path,
+	    const QString& target,
+	    bool ok,
+	    const QString& reason
+	);
 	void lockScreenImageSupportedChanged();
 	void lockScreenImageApplied(bool ok);
 	void systemDarkModeChanged();
