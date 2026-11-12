@@ -10,6 +10,7 @@
 #include <qcoreapplication.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
+#include <qmetaobject.h>
 #include <qpoint.h>
 #include <qregion.h>
 #include <qtimer.h>
@@ -63,6 +64,13 @@ constexpr int LATE_REPORT_INTERVAL_MS = 10000;
 std::atomic<quint32> lateMouseEvents = 0; // NOLINT
 std::atomic<quint32> lateKeyEvents = 0;   // NOLINT
 std::atomic<DWORD> worstLateMs = 0;       // NOLINT
+// Late events are recorded on the input hook threads, but the report timer
+// lives on the tracker's thread, which is the application thread. The mark
+// turns a storm of late events into one wakeup per report window and an idle
+// shell into no wakeups at all. The owner is written and cleared on that same
+// thread, so a queued wakeup never outlives the tracker.
+std::atomic<bool> lateReportArmed = false;                // NOLINT
+std::atomic<InputMaskTracker*> lateReportOwner = nullptr; // NOLINT
 
 QPoint localPoint(POINT cursor, const RECT& rect, qreal dpr) {
 	return QPoint(
@@ -148,7 +156,71 @@ void noteHookDelay(bool keyboard, DWORD eventTime) {
 
 	auto worst = worstLateMs.load(std::memory_order_relaxed);
 	while (delay > worst && !worstLateMs.compare_exchange_weak(worst, delay)) {}
+
+	InputMaskTracker::requestLateReport();
 }
+
+void InputMaskTracker::requestLateReport() {
+	if (lateReportArmed.exchange(true, std::memory_order_relaxed)) return;
+
+	auto* app = QCoreApplication::instance();
+	if (app != nullptr
+	    && QMetaObject::invokeMethod(app, &InputMaskTracker::startLateReport, Qt::QueuedConnection))
+	{
+		return;
+	}
+
+	lateReportArmed.store(false, std::memory_order_relaxed);
+}
+
+void InputMaskTracker::startLateReport() {
+	auto* owner = lateReportOwner.load(std::memory_order_acquire);
+	if (owner == nullptr) {
+		// Nothing to arm the report on right now. The counts are kept, so the next
+		// late event reports them along with its own.
+		lateReportArmed.store(false, std::memory_order_relaxed);
+		return;
+	}
+
+	if (!owner->lateReportTimer.isActive()) owner->lateReportTimer.start();
+}
+
+void InputMaskTracker::reportLateInput() {
+	auto mouse = lateMouseEvents.exchange(0);
+	auto keys = lateKeyEvents.exchange(0);
+	auto worst = worstLateMs.exchange(0);
+
+	if (mouse != 0 || keys != 0) {
+		qCWarning(logInputMask).nospace()
+		    << "Input reached the hooks late in the last " << LATE_REPORT_INTERVAL_MS / 1000 << " s: "
+		    << mouse << " mouse and " << keys << " keyboard events over " << LATE_INPUT_MS
+		    << " ms, the worst " << worst << " ms.";
+	}
+
+	// The window ends with this report and the next late event starts a new one,
+	// so an idle shell keeps no timer. Late input recorded while the report was
+	// draining re-arms it instead of waiting for one more event; the mark stays
+	// set for that check so a hook thread does not post a second wakeup.
+	lateReportArmed.store(false, std::memory_order_relaxed);
+	if (lateMouseEvents.load(std::memory_order_relaxed) == 0
+	    && lateKeyEvents.load(std::memory_order_relaxed) == 0)
+	{
+		return;
+	}
+
+	if (lateReportArmed.exchange(true, std::memory_order_relaxed)) return;
+	QMetaObject::invokeMethod(this, &InputMaskTracker::startLateReport, Qt::QueuedConnection);
+}
+
+#ifdef QS_TEST
+InputMaskTracker::LateReportState InputMaskTracker::lateReportStateForTesting() {
+	return {
+	    .armed = lateReportArmed.load(std::memory_order_relaxed),
+	    .mouse = lateMouseEvents.load(std::memory_order_relaxed),
+	    .keys = lateKeyEvents.load(std::memory_order_relaxed),
+	};
+}
+#endif
 
 InputMaskTracker* InputMaskTracker::instance() {
 	static QPointer<InputMaskTracker> tracker; // NOLINT
@@ -198,22 +270,19 @@ InputMaskTracker::InputMaskTracker(QObject* parent): QObject(parent) {
 	    &InputMaskTracker::onCursorTrail
 	);
 
+	this->lateReportTimer.setSingleShot(true);
 	this->lateReportTimer.setInterval(LATE_REPORT_INTERVAL_MS);
-	QObject::connect(&this->lateReportTimer, &QTimer::timeout, this, []() {
-		auto mouse = lateMouseEvents.exchange(0);
-		auto keys = lateKeyEvents.exchange(0);
-		auto worst = worstLateMs.exchange(0);
-		if (mouse == 0 && keys == 0) return;
-
-		qCWarning(logInputMask).nospace()
-		    << "Input reached the hooks late in the last " << LATE_REPORT_INTERVAL_MS / 1000 << " s: "
-		    << mouse << " mouse and " << keys << " keyboard events over " << LATE_INPUT_MS
-		    << " ms, the worst " << worst << " ms.";
-	});
-	this->lateReportTimer.start();
+	QObject::connect(
+	    &this->lateReportTimer,
+	    &QTimer::timeout,
+	    this,
+	    &InputMaskTracker::reportLateInput
+	);
+	lateReportOwner.store(this, std::memory_order_release);
 }
 
 InputMaskTracker::~InputMaskTracker() {
+	lateReportOwner.store(nullptr, std::memory_order_release);
 	this->stopHook();
 	gMasks.store(nullptr, std::memory_order_release);
 

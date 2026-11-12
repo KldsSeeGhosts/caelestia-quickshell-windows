@@ -1127,6 +1127,48 @@ private slots:
 		QCOMPARE(taps(), 0);
 		QCOMPARE(desktop.delivered.size(), size_t(2));
 	}
+
+	// The late-input report is armed by late hook input, not by a timer: input
+	// that arrives on time counts nothing and opens no window, one window posts
+	// a single wakeup however many late events land in it, and the counts stay
+	// for the report when the wakeup finds no tracker to arm.
+	void lateInputReportOnlyRunsWhileSomethingIsLate() {
+		// Settle any wakeup an earlier case posted.
+		QCoreApplication::processEvents();
+		const auto before = qs::windows::InputMaskTracker::lateReportStateForTesting();
+		QVERIFY(!before.armed);
+
+		// Hook input that arrives on time is neither counted nor armed.
+		physical('A', false, GetTickCount());
+		physical('A', true, GetTickCount());
+		mouse(WM_MOUSEMOVE, GetTickCount());
+		const auto onTime = qs::windows::InputMaskTracker::lateReportStateForTesting();
+		QCOMPARE(onTime.keys, before.keys);
+		QCOMPARE(onTime.mouse, before.mouse);
+		QVERIFY(!onTime.armed);
+
+		// The first late event opens the report window.
+		physical('B', false, GetTickCount() - 500);
+		const auto armed = qs::windows::InputMaskTracker::lateReportStateForTesting();
+		QCOMPARE(armed.keys, before.keys + 1);
+		QVERIFY(armed.armed);
+
+		// A storm inside one window adds counts but no second wakeup.
+		mouse(WM_LBUTTONDOWN, GetTickCount() - 500);
+		mouse(WM_MOUSEMOVE, GetTickCount() - 500);
+		const auto storm = qs::windows::InputMaskTracker::lateReportStateForTesting();
+		QCOMPARE(storm.mouse, before.mouse + 2);
+		QCOMPARE(storm.keys, before.keys + 1);
+		QVERIFY(storm.armed);
+
+		// This fixture never instantiates the tracker, so the wakeup has nothing
+		// to arm: the mark clears and the counts wait for the next report.
+		QCoreApplication::processEvents();
+		const auto drained = qs::windows::InputMaskTracker::lateReportStateForTesting();
+		QVERIFY(!drained.armed);
+		QCOMPARE(drained.mouse, before.mouse + 2);
+		QCOMPARE(drained.keys, before.keys + 1);
+	}
 };
 
 int main(int argc, char** argv) {

@@ -964,6 +964,69 @@ private slots:
 		mirror.setEnabled(false);
 	}
 
+	// The subscribed capability event is the primary consent signal, so an
+	// active mirror only needs the slow backstop for a missed event. The two
+	// second poll is for the case where the subscription itself failed.
+	void subscribedAccessEventSlowsTheActiveBackstop() {
+		struct IntervalGuard {
+			int saved;
+			~IntervalGuard() { ToastMirrorWorker::testAccessCheckIntervalMs = this->saved; }
+		} guard {ToastMirrorWorker::testAccessCheckIntervalMs};
+		// Park the fixture override so the production intervals apply.
+		ToastMirrorWorker::testAccessCheckIntervalMs = 0;
+
+		fakeStatusReadable = true;
+		fakeStatus = SeamStatus::Allowed;
+
+		ToastMirror mirror;
+		mirror.setEnabled(true);
+		QTRY_VERIFY_WITH_TIMEOUT(mirror.isActive(), 5000);
+
+		// `initTestCase` installs the AccessChanged seam, so the backstop must be
+		// slow while mirroring: two idle seconds is inside the old 2 s poll.
+		const int queriesBefore = fakeStatusQueries;
+		QTest::qWait(2500);
+		QCOMPARE(fakeStatusQueries, queriesBefore);
+
+		// The event still applies a consent change immediately.
+		fakeStatus = SeamStatus::Denied;
+		triggerFakeAccessChanged();
+		QTRY_COMPARE_WITH_TIMEOUT(mirror.access(), SystemNotificationAccess::Denied, 5000);
+		QVERIFY(!mirror.isActive());
+
+		fakeStatus = SeamStatus::Allowed;
+		triggerFakeAccessChanged();
+		QTRY_VERIFY_WITH_TIMEOUT(mirror.isActive(), 5000);
+		mirror.setEnabled(false);
+		QTRY_VERIFY(!mirror.isActive());
+	}
+
+	// Without a capability subscription nothing but the backstop reports a
+	// consent change, so the active mirror keeps polling every two seconds.
+	void failedAccessEventSubscriptionKeepsTheFastActiveBackstop() {
+		struct IntervalGuard {
+			int saved;
+			~IntervalGuard() { ToastMirrorWorker::testAccessCheckIntervalMs = this->saved; }
+		} guard {ToastMirrorWorker::testAccessCheckIntervalMs};
+		ToastMirrorWorker::testAccessCheckIntervalMs = 0;
+
+		auto& seam = ToastListenerSeam::instance();
+		seam.watchAccessChanged = nullptr; // the subscription is unavailable
+		fakeStatusReadable = true;
+		fakeStatus = SeamStatus::Allowed;
+
+		ToastMirror mirror;
+		mirror.setEnabled(true);
+		QTRY_VERIFY_WITH_TIMEOUT(mirror.isActive(), 5000);
+
+		const int queriesBefore = fakeStatusQueries;
+		QTRY_VERIFY_WITH_TIMEOUT(fakeStatusQueries > queriesBefore, 5000);
+
+		mirror.setEnabled(false);
+		QTRY_VERIFY(!mirror.isActive());
+		seam.watchAccessChanged = &fakeWatchAccessChanged;
+	}
+
 	// Observation is independent of active mirroring: the backstop watches a
 	// denied grant and the following re-grant while mirroring is off.
 	void observationSurvivesMirroringWithdrawal() {

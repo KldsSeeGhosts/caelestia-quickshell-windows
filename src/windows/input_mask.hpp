@@ -46,7 +46,22 @@ public:
 	void releaseHook();
 	[[nodiscard]] bool hookActive() const { return this->hookRunning; }
 
+	// Records that a hook saw input late and arms the report window. Called from
+	// both input hook threads, so it only posts a wakeup for the tracker's
+	// thread. While nothing is late no report timer runs at all.
+	static void requestLateReport();
+
 #ifdef QS_TEST
+	struct LateReportState {
+		bool armed = false;
+		quint32 mouse = 0;
+		quint32 keys = 0;
+	};
+
+	// Test seam: the report window's recording state, observable without a
+	// message window, an installed hook or a tracker instance.
+	static LateReportState lateReportStateForTesting();
+
 	static LRESULT CALLBACK dispatchMouseHookForTesting(int code, WPARAM message, LPARAM data) {
 		return mouseHookProc(code, message, data);
 	}
@@ -75,7 +90,9 @@ private:
 	void onHookFailed(DWORD error, quint32 generation);
 	void onCursorMoved();
 	void onButtonPressed(QPoint position, quint32 time);
+	void reportLateInput();
 
+	static void startLateReport();
 	static LRESULT CALLBACK messageWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 	static LRESULT CALLBACK mouseHookProc(int code, WPARAM wParam, LPARAM lParam);
 	static void hookThreadMain(quint32 generation);
