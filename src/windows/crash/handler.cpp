@@ -28,6 +28,7 @@
 #include "../tiling.hpp"
 #include "../window_decorations.hpp"
 #include "relaunch_policy.hpp"
+#include "retention.hpp"
 
 namespace qs::crash {
 
@@ -307,6 +308,7 @@ void CrashHandler::setRelaunchInfo(const RelaunchInfo& info) {
 	swprintf(gLaunchTimeStr, std::size(gLaunchTimeStr), L"%lld", static_cast<long long>(gLaunchTimeMs)); // NOLINT
 
 	auto dir = QsPaths::crashDir(info.instance.instanceId);
+	pruneCrashReports(QDir(QFileInfo(dir.absolutePath()).absolutePath()));
 	if (dir.mkpath(".")) {
 		copyToBuffer(dir.path(), gCrashDir, PATH_CHARS);
 

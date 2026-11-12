@@ -193,6 +193,10 @@ target_compile_definitions(crash_relaunch_policy_test PRIVATE NOMINMAX WIN32_LEA
 target_include_directories(crash_relaunch_policy_test PRIVATE ${QS_WINDOWS_SRC})
 target_link_libraries(crash_relaunch_policy_test PRIVATE Qt6::Core Qt6::Test)
 add_test(NAME crash_relaunch_policy COMMAND crash_relaunch_policy_test)
+qs_add_test_executable(crash_retention_test crash_retention_test.cpp)
+target_compile_definitions(crash_retention_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(crash_retention_test PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME crash_retention COMMAND crash_retention_test)
 # Compile the production integration too, without starting a shell or linking
 # the command handlers' generation/runtime dependencies into this fixture.
 add_library(ipc_compile_check OBJECT ${QS_WINDOWS_SRC}/../ipc/ipc.cpp)
@@ -1127,7 +1131,7 @@ add_test(NAME capture_native COMMAND capture_native_test)
 set(QS_TESTS_PORTABLE
 	wallpaper_target screen_identity hyprland_monitor panel_animation
 	screenshot_jobs fs_utils ipc_limits redaction log_scrub log_redaction_guard
-	crash_relaunch_policy
+	crash_relaunch_policy crash_retention
 	tiling_layout dispatcher virtual_desktops hotkeys_routing hotkeys_routing_taskbar_filter
 	keyboard_hook keyboard_hook_taskbar_filter
 	bt_pairing_policy mpris_status mpris_art_cache pw_audio_control
