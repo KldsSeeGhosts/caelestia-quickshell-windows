@@ -356,6 +356,7 @@ int moveWindow(HWND window, int index) {
 
 using Clock = std::chrono::steady_clock;
 constexpr auto callBound = std::chrono::milliseconds(100);
+constexpr auto stuckBound = std::chrono::milliseconds(5000);
 constexpr int workerLimit = 4;
 constexpr qsizetype windowLimit = 4096;
 
@@ -364,6 +365,10 @@ struct WindowSnapshot {
 	int onCurrent = -1;
 	DWORD pid = 0;
 	DWORD thread = 0;
+	bool operator==(const WindowSnapshot& other) const {
+		return IsEqualGUID(this->id, other.id) && this->onCurrent == other.onCurrent
+		    && this->pid == other.pid && this->thread == other.thread;
+	}
 };
 
 struct Snapshot {
@@ -385,8 +390,15 @@ struct Request {
 	std::function<int()> operation;
 	QList<quintptr> windows;
 	std::promise<Snapshot> completion;
-	Clock::time_point deadline = Clock::now() + callBound;
+	Clock::time_point submitted = Clock::now();
+	std::atomic<Clock::duration::rep> started = 0;
 	quint64 sequence = 0;
+
+	bool stalled(std::chrono::milliseconds bound) const {
+		const auto ticks = this->started.load();
+		const auto since = ticks ? Clock::time_point(Clock::duration(ticks)) : this->submitted;
+		return Clock::now() - since >= bound;
+	}
 };
 
 // Intentionally process-lived. A retired apartment may still be inside RPC
@@ -451,15 +463,7 @@ struct Worker {
 				request = std::move(this->queue.front());
 				this->queue.pop_front();
 			}
-			if (Clock::now() >= request->deadline) {
-				Snapshot expired;
-				expired.error = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
-				expired.availability = DesktopAvailability::Disconnected;
-				expired.sequence = request->sequence;
-				request->completion.set_value(std::move(expired));
-				SetEvent(request->finished);
-				continue;
-			}
+			request->started.store(Clock::now().time_since_epoch().count());
 			Snapshot snapshot;
 			snapshot.sequence = request->sequence;
 			try {
@@ -511,6 +515,13 @@ struct Worker {
 };
 
 struct Channel {
+	enum class Kind { Command, Acquisition, Probe };
+	struct Pending {
+		std::shared_ptr<Request> request;
+		std::future<Snapshot> result;
+		Kind kind = Kind::Command;
+		bool queryWindows = false;
+	};
 	std::shared_ptr<Worker> worker;
 	Snapshot snapshot;
 	QSet<quintptr> watchedWindows;
@@ -518,8 +529,9 @@ struct Channel {
 	std::function<void()> recovered;
 	std::function<void()> updated;
 	QTimer poll;
-	std::future<Snapshot> refreshResult;
-	Clock::time_point refreshDeadline;
+	std::optional<Pending> refresh;
+	std::optional<Pending> pending;
+	std::chrono::milliseconds stallLimit = stuckBound;
 	bool supported = false;
 	bool privateEnabled = false;
 	bool refusedBuild = false;
@@ -527,6 +539,7 @@ struct Channel {
 	bool waiting = false;
 	quint64 sequence = 0;
 	quint64 applied = 0;
+	quint64 windowRevision = 0;
 #ifdef QS_TEST
 	NativeDesktopFactory factory;
 	std::function<bool(HWND)> validator;
@@ -553,7 +566,8 @@ struct Channel {
 		this->poll.stop();
 		this->recovery.reset();
 		if (auto previous = std::exchange(this->worker, {})) previous->stop();
-		this->refreshResult = {};
+		this->refresh.reset();
+		this->pending.reset();
 		this->refreshAgain = false;
 	}
 
@@ -565,7 +579,8 @@ struct Channel {
 
 	void retire(HRESULT error) {
 		if (auto previous = std::exchange(this->worker, {})) previous->stop();
-		this->refreshResult = {};
+		this->refresh.reset();
+		this->pending.reset();
 		this->poll.stop();
 		this->snapshot.availability = DesktopAvailability::Disconnected;
 		this->snapshot.error = error;
@@ -577,6 +592,9 @@ struct Channel {
 	bool apply(Snapshot result) {
 		if (result.sequence < this->applied) return true;
 		this->applied = result.sequence;
+		if ((result.availability == DesktopAvailability::Available || result.publicReady)
+		    && result.windows != this->snapshot.windows)
+			++this->windowRevision;
 		if (result.availability != DesktopAvailability::Available) {
 			const auto state = result.availability;
 			const auto error = result.error;
@@ -598,10 +616,16 @@ struct Channel {
 	int execute(
 	    std::function<int()> operation,
 	    bool queryWindows = false,
-	    bool publicOperation = false
+	    bool publicOperation = false,
+	    Kind kind = Kind::Command
 	) {
-		if (!this->worker) return -1;
 		if (this->waiting) {
+			this->snapshot.error = HRESULT_FROM_WIN32(ERROR_BUSY);
+			return -1;
+		}
+		this->collect();
+		if (!this->worker) return -1;
+		if (this->pending) {
 			this->snapshot.error = HRESULT_FROM_WIN32(ERROR_BUSY);
 			return -1;
 		}
@@ -616,30 +640,40 @@ struct Channel {
 		request->operation = std::move(operation);
 		if (queryWindows) request->windows = this->watchedWindows.values();
 		auto result = owner->submit(request);
+		const auto guiDeadline = request->submitted + callBound;
 		// COM can synchronously notify GUI windows. Preserve sent-message
 		// dispatch without consuming posted Qt events or extending the bound.
 		while (owner == this->worker
 		       && result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
 		{
-			const auto remaining = request->deadline - Clock::now();
+			if (request->stalled(this->stallLimit) || this->stalled()) break;
+			const auto remaining = guiDeadline - Clock::now();
 			if (remaining <= Clock::duration::zero()) break;
 			const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
 			const auto status = MsgWaitForMultipleObjectsEx(
 			    1,
 			    &request->finished,
-			    static_cast<DWORD>(milliseconds.count() + 1),
+			    static_cast<DWORD>(std::min<qint64>(milliseconds.count() + 1, 10)),
 			    QS_SENDMESSAGE,
 			    MWMO_INPUTAVAILABLE
 			);
 			if (status == WAIT_OBJECT_0) break;
+			if (status == WAIT_TIMEOUT) continue;
 			if (status != WAIT_OBJECT_0 + 1) break;
 			MSG message {};
 			PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
 		}
 		if (owner != this->worker) return -1;
 		if (result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
-			this->retire(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
-			return -1;
+			if (request->stalled(this->stallLimit) || this->stalled()) {
+				this->retire(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+				return -1;
+			}
+			// The request is still owned by this generation, not failed.
+			// Keep its future so the GUI can apply the eventual result.
+			this->pending.emplace(Pending {request, std::move(result), kind, queryWindows});
+			this->poll.start();
+			return kind == Kind::Command ? 0 : -1;
 		}
 		try {
 			auto value = result.get();
@@ -648,6 +682,7 @@ struct Channel {
 			// A command snapshot must not erase the last window membership.
 			if (!queryWindows) value.windows = this->snapshot.windows;
 			const auto available = this->apply(std::move(value));
+			if (kind == Kind::Acquisition && available) ++this->windowRevision;
 			return available || (publicOperation && publicReady) ? outcome : -1;
 		} catch (...) {
 			this->retire(E_UNEXPECTED);
@@ -656,9 +691,16 @@ struct Channel {
 	}
 
 	bool acquire() {
+		if (this->pending) return false;
 		if (this->worker) {
 			if (this->snapshot.availability == DesktopAvailability::Available) return true;
-			return this->execute([] { return provider().acquire() ? 0 : -1; }, true) == 0;
+			return this->execute(
+			           [] { return provider().acquire() ? 0 : -1; },
+			           true,
+			           false,
+			           Kind::Acquisition
+			       )
+			    == 0;
 		}
 		auto count = liveWorkers().load();
 		do {
@@ -693,7 +735,13 @@ struct Channel {
 			return false;
 		}
 		this->worker = std::move(next);
-		return this->execute([] { return provider().acquire() ? 0 : -1; }, true) == 0;
+		return this->execute(
+		           [] { return provider().acquire() ? 0 : -1; },
+		           true,
+		           false,
+		           Kind::Acquisition
+		       )
+		    == 0;
 	}
 
 	void pruneWindows() {
@@ -707,7 +755,7 @@ struct Channel {
 
 	void requestRefresh() {
 		if (!this->worker) return;
-		if (this->refreshResult.valid()) {
+		if (this->refresh || this->pending) {
 			this->refreshAgain = true;
 			return;
 		}
@@ -722,27 +770,59 @@ struct Channel {
 			return provider().privateEnabled ? (desktopCount() < 0 ? -1 : 0) : 0;
 		};
 		request->windows = this->watchedWindows.values();
-		this->refreshDeadline = request->deadline;
-		this->refreshResult = this->worker->submit(request);
+		this->refresh.emplace(Pending {request, this->worker->submit(request), Kind::Probe, true});
 		this->poll.start();
 	}
 
-	void collect() {
-		if (!this->refreshResult.valid()) return;
-		if (this->refreshResult.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-			try {
-				auto value = this->refreshResult.get();
-				this->refreshResult = {};
-				this->poll.stop();
-				if (value.sequence < this->applied) this->refreshAgain = true;
-				this->apply(std::move(value));
-				this->notify();
-				if (std::exchange(this->refreshAgain, false)) this->requestRefresh();
-			} catch (...) {
-				this->retire(E_UNEXPECTED);
+	bool stalled() const {
+		const auto stalled = [this](const std::optional<Pending>& job) {
+			return job && job->result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready
+			    && job->request->stalled(this->stallLimit);
+		};
+		return stalled(this->refresh) || stalled(this->pending);
+	}
+
+	void collectOne(std::optional<Pending>& slot) {
+		if (!slot || slot->result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+			return;
+		auto finished = std::move(*slot);
+		slot.reset();
+		try {
+			auto value = finished.result.get();
+			const auto success = value.result != -1;
+			if (!finished.queryWindows) value.windows = this->snapshot.windows;
+			if (value.sequence < this->applied) this->refreshAgain = true;
+			const auto available = this->apply(std::move(value));
+			if (finished.kind == Kind::Acquisition && success && available) {
+				++this->windowRevision;
+				this->recovery.reset();
+				const auto owner = this->worker;
+				if (this->context)
+					QTimer::singleShot(0, this->context, [this, owner] {
+						if (owner == this->worker && this->recovered
+						    && this->snapshot.availability == DesktopAvailability::Available)
+							this->recovered();
+					});
 			}
-		} else if (Clock::now() >= this->refreshDeadline) {
+			// Even a refused late command needs a fresh view of Explorer's
+			// actual state. Never dispatch the mutation a second time.
+			if (finished.kind == Kind::Command) this->refreshAgain = true;
+			this->notify();
+		} catch (...) {
+			this->retire(E_UNEXPECTED);
+		}
+	}
+
+	void collect() {
+		this->collectOne(this->refresh);
+		this->collectOne(this->pending);
+		if (this->stalled()) {
 			this->retire(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+			return;
+		}
+		if (!this->refresh && !this->pending) {
+			this->poll.stop();
+			if (std::exchange(this->refreshAgain, false)) this->requestRefresh();
 		}
 	}
 
@@ -846,7 +926,7 @@ bool loadNativeDesktopAccessor(
 	p.shutdown();
 	p.privateEnabled = true;
 	if (p.acquire()) return true;
-	p.recovery.disconnected();
+	if (!p.pending) p.recovery.disconnected();
 	return false;
 }
 
@@ -878,10 +958,19 @@ void initializeNativeDesktopQueries(QObject* context, std::function<void()> upda
 		c.recovered = {};
 		c.updated = {};
 	});
-	if (!c.worker && !c.recovery.active() && !c.acquire()) c.recovery.disconnected();
+	if (!c.worker && !c.recovery.active() && !c.acquire() && !c.pending) c.recovery.disconnected();
 }
 
 void requestNativeDesktopRefresh() { channel().requestRefresh(); }
+bool nativeDesktopCommandPending() {
+	const auto& c = channel();
+	return c.waiting || (c.pending && c.pending->kind == Channel::Kind::Command);
+}
+bool nativeDesktopRequestPending() {
+	const auto& c = channel();
+	return c.waiting || c.pending.has_value() || c.refresh.has_value();
+}
+quint64 nativeDesktopWindowSnapshotRevision() { return channel().windowRevision; }
 GUID nativeWindowDesktopId(HWND hwnd) { return channel().window(hwnd).id; }
 int nativeWindowOnCurrentDesktop(HWND hwnd) { return channel().window(hwnd).onCurrent; }
 std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop) {
@@ -923,10 +1012,12 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.privateEnabled = false;
 	p.refusedBuild = false;
 	p.applied = 0;
+	p.windowRevision = 0;
 	p.snapshot = {};
 	p.watchedWindows.clear();
 	p.factory = std::move(factory);
 	p.validator = {};
+	p.stallLimit = stuckBound;
 }
 
 void setNativeDesktopWindowValidatorForTest(std::function<bool(HWND)> validator) {
@@ -945,9 +1036,12 @@ void setNativeDesktopRecoveryAgeForTest(std::function<qint64()> age) {
 int nativeDesktopRecoveryPendingDelayForTest() { return channel().recovery.pendingDelay(); }
 
 int refreshNativeDesktopForTest() {
-	return channel().execute([] { return desktopCount(); }, true);
+	return channel().execute([] { return desktopCount(); }, true, false, Channel::Kind::Probe);
 }
 int nativeDesktopWorkerCountForTest() { return liveWorkers().load(); }
+void setNativeDesktopStuckBoundForTest(int milliseconds) {
+	channel().stallLimit = std::chrono::milliseconds(milliseconds);
+}
 #endif
 
 } // namespace qs::windows

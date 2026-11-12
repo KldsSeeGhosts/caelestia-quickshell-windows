@@ -176,6 +176,7 @@ private:
 	DWORD sessionId = 0;
 
 	bool applyingNativeSnapshot = false;
+	quint64 appliedWindowRevision = 0;
 	RegistryWatcher* watcher = nullptr;
 	QTimer cloakTimer;
 	QTimer creationTimer;

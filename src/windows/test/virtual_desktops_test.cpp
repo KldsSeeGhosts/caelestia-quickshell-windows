@@ -164,6 +164,7 @@ private slots:
 		QVERIFY(!desktops->isWindowOnCurrent(window));
 		auto blocked = std::make_shared<erm625::BlockingCall>();
 		erm625::Unblock unblock {blocked};
+		setNativeDesktopStuckBoundForTest(50);
 		old->publicApi.beforeQuery = [blocked] { (*blocked)(); };
 		requestNativeDesktopRefresh();
 		QElapsedTimer elapsed;

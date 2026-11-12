@@ -94,6 +94,9 @@ struct FakeManager: FakeCom<DesktopManager> {
 	int canMoves = 0;
 	int moves = 0;
 	HRESULT moveResult = S_OK;
+	HRESULT switchResult = S_OK;
+	bool publishSwitch = false;
+	bool publishCreation = false;
 	ApplicationView* expectedView = nullptr;
 	FakeDesktop* current = nullptr;
 	FakeDesktop* created = nullptr;
@@ -130,11 +133,13 @@ struct FakeManager: FakeCom<DesktopManager> {
 	HRESULT STDMETHODCALLTYPE GetAdjacentDesktop(Desktop*, int, Desktop**) override {
 		return E_NOTIMPL;
 	}
-	HRESULT STDMETHODCALLTYPE SwitchDesktop(Desktop*) override {
+	HRESULT STDMETHODCALLTYPE SwitchDesktop(Desktop* desktop) override {
 		if (this->beforeSwitch) this->beforeSwitch();
 		++this->switches;
 		if (this->faultOnSwitch) fault();
-		return S_OK;
+		if (SUCCEEDED(this->switchResult) && this->publishSwitch)
+			this->current = static_cast<FakeDesktop*>(desktop);
+		return this->switchResult;
 	}
 	HRESULT STDMETHODCALLTYPE SwitchDesktopAndMoveForegroundView(Desktop*) override {
 		return E_NOTIMPL;
@@ -146,6 +151,7 @@ struct FakeManager: FakeCom<DesktopManager> {
 		this->created->AddRef();
 		*out = this->created;
 		if (this->faultOnCreate) fault(); // Also test ownership of a partial output.
+		if (this->publishCreation) this->array.desktops.append(this->created);
 		return S_OK;
 	}
 };
@@ -208,6 +214,8 @@ struct Fixture {
 		this->publicApi.desktopId = this->one.id;
 	}
 	void clearFaults() {
+		this->manager.publishSwitch = this->manager.publishCreation = false;
+		this->manager.switchResult = this->manager.moveResult = S_OK;
 		this->manager.beforeEnumeration = this->manager.beforeSwitch = {};
 		this->manager.beforeCreate = this->manager.beforeMove = {};
 		this->manager.beforeRelease = this->manager.array.beforeRelease = {};

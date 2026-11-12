@@ -1,4 +1,6 @@
 #include <atomic>
+#include <chrono>
+#include <thread>
 
 #include <qtest.h>
 
@@ -427,6 +429,87 @@ private slots:
 		      "release"})
 			QTest::newRow(operation) << QString::fromLatin1(operation);
 	}
+	void slowRefreshKeepsTheApartmentAndAppliesItsSnapshot() {
+		auto fake = std::make_shared<Fixture>();
+		auto acquisitions = std::make_shared<std::atomic<int>>(0);
+		setNativeDesktopFactoryForTest(
+		    [fake, acquisitions](DesktopManager** m, ViewCollection** v, IVirtualDesktopManager** p) {
+			    ++*acquisitions;
+			    return fake->acquire(m, v, p);
+		    }
+		);
+		QObject context;
+		VirtualDesktops::Accessor accessor;
+		QVERIFY(loadNativeDesktopAccessor(accessor, &context, [] {}));
+		fake->manager.beforeEnumeration = [weak = std::weak_ptr<Fixture>(fake)] {
+			std::this_thread::sleep_for(std::chrono::milliseconds(300));
+			if (auto fake = weak.lock()) fake->manager.current = &fake->two;
+		};
+		requestNativeDesktopRefresh();
+		QTest::qWait(150);
+		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
+		QCOMPARE(accessor.getCurrentDesktopNumber(), 0);
+		QCOMPARE(nativeDesktopWorkerCountForTest(), 1);
+		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
+		QTRY_COMPARE_WITH_TIMEOUT(accessor.getCurrentDesktopNumber(), 1, 1000);
+		QCOMPARE(acquisitions->load(), 1);
+		setNativeDesktopFactoryForTest({});
+	}
+	void slowAcquisitionDoesNotStartRecoveryOrRunTwice() {
+		auto fake = std::make_shared<Fixture>();
+		auto acquisitions = std::make_shared<std::atomic<int>>(0);
+		setNativeDesktopFactoryForTest(
+		    [fake, acquisitions](DesktopManager** m, ViewCollection** v, IVirtualDesktopManager** p) {
+			    ++*acquisitions;
+			    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+			    return fake->acquire(m, v, p);
+		    }
+		);
+		QObject context;
+		auto recovered = std::make_shared<int>(0);
+		VirtualDesktops::Accessor accessor;
+		QElapsedTimer elapsed;
+		elapsed.start();
+		QVERIFY(!loadNativeDesktopAccessor(accessor, &context, [recovered] { ++*recovered; }));
+		QVERIFY(elapsed.elapsed() < 250);
+		initializeNativeDesktopQueries(&context, [] {});
+		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
+		QCOMPARE(nativeDesktopWorkerCountForTest(), 1);
+		QTRY_COMPARE_WITH_TIMEOUT(*recovered, 1, 1000);
+		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
+		QCOMPARE(accessor.getDesktopCount(), 2);
+		QCOMPARE(acquisitions->load(), 1);
+	}
+	void slowPublicMoveIsAcceptedAndAppliesItsLateResult() {
+		auto fake = std::make_shared<Fixture>();
+		setNativeDesktopFactoryForTest(
+		    [fake](DesktopManager** m, ViewCollection** v, IVirtualDesktopManager** p) {
+			    return fake->acquire(m, v, p);
+		    }
+		);
+		QObject context;
+		VirtualDesktops::Accessor accessor;
+		QVERIFY(loadNativeDesktopAccessor(accessor, &context, [] {}));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb2));
+		QTRY_VERIFY_WITH_TIMEOUT(IsEqualGUID(nativeWindowDesktopId(window), fake->one.id), 500);
+		fake->publicApi.beforeMove = [] {
+			std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		};
+		QElapsedTimer elapsed;
+		elapsed.start();
+		const auto moved = moveNativeDesktopOwnWindow(window, fake->two.id);
+		QVERIFY(moved.has_value() && *moved);
+		QVERIFY(elapsed.elapsed() < 250);
+		QVERIFY(nativeDesktopCommandPending());
+		const auto busy = moveNativeDesktopOwnWindow(window, fake->one.id);
+		QVERIFY(busy.has_value() && !*busy);
+		QCOMPARE(nativeDesktopLastError(), HRESULT_FROM_WIN32(ERROR_BUSY));
+		QTRY_VERIFY_WITH_TIMEOUT(IsEqualGUID(nativeWindowDesktopId(window), fake->two.id), 1000);
+		QVERIFY(!nativeDesktopCommandPending());
+		QCOMPARE(nativeDesktopWorkerCountForTest(), 1);
+		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
+	}
 	void blockedCallsAreBounded() {
 		QFETCH(QString, operation);
 		auto old = std::make_shared<Fixture>();
@@ -445,6 +528,7 @@ private slots:
 			if (first && operation == "activation") (*blocked)();
 			return (first ? old : fresh)->acquire(m, v, p);
 		});
+		setNativeDesktopStuckBoundForTest(50); // A genuine stall, with a fast test-only verdict.
 		struct Reset {
 			~Reset() { setNativeDesktopFactoryForTest({}); }
 		} reset;
@@ -552,6 +636,7 @@ private slots:
 			    return E_FAIL;
 		    }
 		);
+		setNativeDesktopStuckBoundForTest(50);
 		Unblock unblock {blocked};
 		QObject context;
 		VirtualDesktops::Accessor accessor;
@@ -580,6 +665,7 @@ private slots:
 		QObject context;
 		VirtualDesktops::Accessor accessor;
 		QVERIFY(loadNativeDesktopAccessor(accessor, &context, [] {}));
+		setNativeDesktopStuckBoundForTest(50);
 		old->manager.beforeEnumeration = [blocked] { (*blocked)(); };
 		requestNativeDesktopRefresh();
 		QTRY_COMPARE_WITH_TIMEOUT(WaitForSingleObject(blocked->entered, 0), DWORD(WAIT_OBJECT_0), 100);

@@ -274,9 +274,17 @@ void VirtualDesktops::applyNativeSnapshot() {
 	this->applyingNativeSnapshot = true;
 	if (this->nativeAccessor)
 		this->setAccessorLoaded(nativeDesktopAvailability() == DesktopAvailability::Available);
+	if (!nativeDesktopRequestPending()) {
+		if (this->pendingSwitch && !this->switchDeadline.isActive()) this->switchDeadline.start();
+		if (this->creationTarget != 0 && !this->creationTimer.isActive()) this->creationTimer.start();
+	}
 	this->refresh(true);
 	this->applyingNativeSnapshot = false;
-	emit this->windowDesktopsChanged();
+	const auto revision = nativeDesktopWindowSnapshotRevision();
+	if (revision != this->appliedWindowRevision) {
+		this->appliedWindowRevision = revision;
+		emit this->windowDesktopsChanged();
+	}
 	this->notifyCapability();
 }
 
@@ -588,6 +596,10 @@ void VirtualDesktops::initCommandObservation() {
 	this->creationTimer.setSingleShot(true);
 	this->creationTimer.setInterval(CREATION_TIMEOUT_MS);
 	QObject::connect(&this->creationTimer, &QTimer::timeout, this, [this] {
+		if (this->nativeAccessor && nativeDesktopRequestPending()) {
+			this->creationTimer.start();
+			return;
+		}
 		this->finishCreation(DesktopCommandOutcome::TimedOut, QStringLiteral("observation-timeout"));
 	});
 	QObject::connect(this, &VirtualDesktops::desktopsChanged, this,
@@ -595,6 +607,10 @@ void VirtualDesktops::initCommandObservation() {
 	this->switchDeadline.setSingleShot(true);
 	this->switchDeadline.setInterval(1500);
 	QObject::connect(&this->switchDeadline, &QTimer::timeout, this, [this] {
+		if (this->nativeAccessor && nativeDesktopRequestPending()) {
+			this->switchDeadline.start();
+			return;
+		}
 		this->finishSwitch(DesktopCommandOutcome::TimedOut, QStringLiteral("observation-timeout"));
 	});
 	QObject::connect(this, &AccessorState::accessorStateChanged, this, [this] {
@@ -655,6 +671,10 @@ void VirtualDesktops::observeSwitch() {
 
 bool VirtualDesktops::switchTo(qsizetype index) {
 	this->retryAccessor();
+	if (this->nativeAccessor && nativeDesktopCommandPending()) {
+		this->refuseCommand(QStringLiteral("switch"), QStringLiteral("provider-busy"));
+		return false;
+	}
 	if (!this->supports(DesktopOperation::Switch)) {
 		this->warnAccessorOnly("switch desktops");
 		this->refuseCommand(QStringLiteral("switch"),
@@ -682,7 +702,7 @@ bool VirtualDesktops::switchTo(qsizetype index) {
 
 	const auto id = ++this->nextRequest;
 	this->pendingSwitch = PendingSwitch {id, index, this->mDesktops[index].id};
-	this->switchDeadline.start();
+	if (!this->nativeAccessor || !nativeDesktopRequestPending()) this->switchDeadline.start();
 	this->publishCommand(DesktopRequestResult {id, QStringLiteral("switch"), DesktopCommandOutcome::Accepted, {}});
 	this->refresh();
 	return true;
@@ -690,6 +710,11 @@ bool VirtualDesktops::switchTo(qsizetype index) {
 
 void VirtualDesktops::ensureCount(qsizetype count, std::function<void(bool)> done) {
 	this->retryAccessor();
+	if (this->nativeAccessor && nativeDesktopCommandPending()) {
+		this->refuseCommand(QStringLiteral("create"), QStringLiteral("provider-busy"));
+		done(false);
+		return;
+	}
 	if (!this->supports(DesktopOperation::Create)) {
 		this->warnAccessorOnly("create desktops");
 		this->refuseCommand(QStringLiteral("create"),
@@ -745,12 +770,13 @@ void VirtualDesktops::createNext() {
 		return;
 	}
 
-	this->creationTimer.start();
+	if (!this->nativeAccessor || !nativeDesktopRequestPending()) this->creationTimer.start();
 	this->refresh();
 }
 
 void VirtualDesktops::observeCreation() {
 	if (this->creationTarget == 0) return;
+	if (this->nativeAccessor && nativeDesktopCommandPending()) return;
 	if (!this->accessorLoaded() || this->accessor.createDesktop == nullptr) {
 		this->warnAccessorOnly("create desktops");
 		this->creationTimer.stop();
