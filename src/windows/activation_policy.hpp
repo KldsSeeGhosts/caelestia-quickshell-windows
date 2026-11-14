@@ -71,6 +71,38 @@ enum class ForegroundHandoff {
 	return ForegroundHandoff::AllowTarget;
 }
 
+// A minimized window of a higher-integrity process cannot be restored by a
+// lower-integrity one: User Interface Privilege Isolation refuses ShowWindow
+// with ERROR_ACCESS_DENIED, and the window stays minimized whatever happens to
+// the foreground. The deferred User Account Control request of consent.exe is
+// such a window, and it opens the secure-desktop prompt only once it is
+// switched to. Explorer's taskbar button does that with SwitchToThisWindow, so
+// the shell's task list makes the same call for the same user action. A
+// request with no shell input event behind it keeps the clean path.
+// Measured on Windows 11 build 26300 against a waiting consent.exe window:
+// ShowWindowAsync(SW_RESTORE) failed with ERROR_ACCESS_DENIED,
+// SetForegroundWindow from a background process returned FALSE, and
+// SwitchToThisWindow opened the secure-desktop prompt.
+// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-switchtothiswindow
+enum class MinimizedActivation : quint8 {
+	// The restore was accepted, or failed for a reason the taskbar switch
+	// does not address. Continue with the single foreground request.
+	Request,
+	// The restore was refused by privilege isolation and the user asked for
+	// this window. Switch to it the way a taskbar button does.
+	TaskbarSwitch,
+};
+
+[[nodiscard]] constexpr MinimizedActivation minimizedActivation(
+    bool restoreAccepted,
+    DWORD restoreError,
+    ActivationSource source
+) {
+	if (restoreAccepted || restoreError != ERROR_ACCESS_DENIED) return MinimizedActivation::Request;
+	if (source == ActivationSource::Ipc) return MinimizedActivation::Request;
+	return MinimizedActivation::TaskbarSwitch;
+}
+
 // A panel that stops accepting keyboard focus gives the foreground back to
 // the application that had it before the panel took it. Windows' foreground
 // lock only permits that while the shell still owns the foreground, and the
