@@ -24,8 +24,10 @@
 #include <qtimer.h>
 #include <qtypes.h>
 
+#include "activation_policy.hpp"
 #include "desktopentry_backend.hpp"
 #include "fullscreen_geometry.hpp"
+#include "process_image_name.hpp"
 #include "startup.hpp"
 #include "redact.hpp"
 #include "system_surface.hpp"
@@ -276,10 +278,12 @@ void TrackedWindow::refreshIdentity() {
 		CloseHandle(process);
 	}
 
-	if (appId.isEmpty() && !exe.isEmpty()) {
-		appId = QFileInfo(exe).fileName().toLower();
-		if (appId.endsWith(".exe")) appId.chop(4);
-	}
+	if (appId.isEmpty() && !exe.isEmpty()) appId = appIdFromImageName(QFileInfo(exe).fileName());
+
+	// A window with no application id never reaches the task list, so the
+	// deferred User Account Control request of consent.exe (a SYSTEM process
+	// this one cannot open) had no row to activate and waited forever.
+	if (appId.isEmpty()) appId = appIdFromImageName(processImageNameFromSnapshot(pid));
 
 	WindowsDesktopEntryBackend::noteWindowExe(appId, exe);
 
@@ -410,7 +414,22 @@ bool TrackedWindow::activate() {
 		desktops->switchTo(desktop);
 	}
 
-	if (IsIconic(this->mHwnd)) ShowWindowAsync(this->mHwnd, SW_RESTORE);
+	auto source = activationSourceForCurrentState();
+
+	if (IsIconic(this->mHwnd)) {
+		SetLastError(ERROR_SUCCESS);
+		auto restored = ShowWindowAsync(this->mHwnd, SW_RESTORE) != FALSE;
+
+		// A minimized window of a higher-integrity process, such as a waiting
+		// User Account Control request, refuses the restore. The policy names
+		// the one case that may use the taskbar's own switch instead.
+		if (minimizedActivation(restored, GetLastError(), source)
+		    == MinimizedActivation::TaskbarSwitch)
+		{
+			SwitchToThisWindow(this->mHwnd, TRUE);
+			return true;
+		}
+	}
 
 	auto* target = GetLastActivePopup(this->mHwnd);
 	if (target == nullptr || !IsWindowVisible(target)) target = this->mHwnd;
@@ -420,7 +439,7 @@ bool TrackedWindow::activate() {
 	// foreground-lock right; a refusal is reported, not retried on a timer after
 	// the switch. Only a selector key the hook swallowed has no documented
 	// permission, so only that current dispatch may use the accepted escalation.
-	if (!requestForegroundWindow(target, activationSourceForCurrentState())) {
+	if (!requestForegroundWindow(target, source)) {
 		qCDebug(logTracker) << "The foreground lock refused activation for" << target;
 		return false;
 	}

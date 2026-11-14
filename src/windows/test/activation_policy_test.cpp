@@ -160,6 +160,38 @@ private slots:
 		QCOMPARE(mayForceForeground(static_cast<ActivationSource>(source)), mayForce);
 	}
 
+	// Only a restore refused by privilege isolation, on a request the user
+	// made through the shell, may use the taskbar switch.
+	void minimizedActivationRoute_data() {
+		QTest::addColumn<bool>("restoreAccepted");
+		QTest::addColumn<quint32>("restoreError");
+		QTest::addColumn<int>("source");
+		QTest::addColumn<bool>("taskbarSwitch");
+
+		auto denied = quint32(ERROR_ACCESS_DENIED);
+		QTest::newRow("restore accepted") << true << quint32(ERROR_SUCCESS) << int(ActivationSource::Click) << false;
+		QTest::newRow("accepted with stale error") << true << denied << int(ActivationSource::Click) << false;
+		QTest::newRow("denied, shell click") << false << denied << int(ActivationSource::Click) << true;
+		QTest::newRow("denied, wm_hotkey") << false << denied << int(ActivationSource::Hotkey) << true;
+		QTest::newRow("denied, hook key") << false << denied << int(ActivationSource::Hook) << true;
+		QTest::newRow("denied, ipc") << false << denied << int(ActivationSource::Ipc) << false;
+		QTest::newRow("other failure") << false << quint32(ERROR_INVALID_WINDOW_HANDLE) << int(ActivationSource::Click) << false;
+	}
+
+	void minimizedActivationRoute() {
+		QFETCH(bool, restoreAccepted);
+		QFETCH(quint32, restoreError);
+		QFETCH(int, source);
+		QFETCH(bool, taskbarSwitch);
+
+		auto route = qs::windows::minimizedActivation(
+		    restoreAccepted,
+		    restoreError,
+		    static_cast<ActivationSource>(source)
+		);
+		QCOMPARE(route == qs::windows::MinimizedActivation::TaskbarSwitch, taskbarSwitch);
+	}
+
 	// A panel gives the foreground back to the application it took it from,
 	// but only while the shell still owns it and the application is still
 	// there. Otherwise the close path's next-window handoff runs.
@@ -460,6 +492,23 @@ private slots:
 		    rawUtil.contains(QStringLiteral("the accepted limitation is tracked in")),
 		    "the hook escalation does not document its accepted limitation"
 		);
+
+		// The taskbar switch exists once, in the task list's activation, and
+		// only behind the policy decision.
+		auto switchUser = codeOnly(readSource(QStringLiteral("window_tracker.cpp")));
+		QCOMPARE(switchUser.count(QStringLiteral("SwitchToThisWindow(")), 1);
+		QVERIFY2(
+		    switchUser.contains(QStringLiteral("== MinimizedActivation::TaskbarSwitch")),
+		    "window_tracker.cpp does not gate the taskbar switch on the activation policy"
+		);
+		for (const auto& name: {QStringLiteral("util.cpp"), QStringLiteral("focus_grab.cpp"),
+		         QStringLiteral("panel_window.cpp"), QStringLiteral("window_manager.cpp")})
+		{
+			QVERIFY2(
+			    !codeOnly(readSource(name)).contains(QStringLiteral("SwitchToThisWindow(")),
+			    qPrintable(QStringLiteral("%1 uses the taskbar switch").arg(name))
+			);
+		}
 
 		// A virtual-desktop switch is not an activation timer: the request is
 		// part of the action that starts the switch.

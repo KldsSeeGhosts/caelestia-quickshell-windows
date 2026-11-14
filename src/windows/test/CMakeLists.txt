@@ -978,6 +978,15 @@ target_include_directories(super_drag_wait_test PRIVATE ${QS_WINDOWS_SRC})
 target_link_libraries(super_drag_wait_test PRIVATE Qt6::Core Qt6::Test)
 add_test(NAME super_drag_wait COMMAND super_drag_wait_test)
 
+# Application id for a window whose process cannot be opened, such as the
+# deferred User Account Control request of consent.exe. Reads the process
+# snapshot only.
+qs_add_test_executable(process_image_name_test process_image_name_test.cpp)
+target_compile_definitions(process_image_name_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(process_image_name_test PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(process_image_name_test PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME process_image_name COMMAND process_image_name_test)
+
 # WLAN interface routing: one explicit selection, privileged by connection
 # state, kept while it stays enumerated, and every notification filtered by its
 # GUID. Also the completed-refresh snapshot: the real Network state and networks
@@ -1169,7 +1178,7 @@ set(QS_TESTS_PORTABLE
 	transition_trace foreground_observer activation_policy fullscreen_app_state
 	panel_topmost power_profiles brightness_route display_identity
 	native_desktop_recovery pw_session_worker idle_request launcher_exit input_settle
-	super_drag_wait network_wifi_route runtime_paths lazyloader
+	super_drag_wait process_image_name network_wifi_route runtime_paths lazyloader
 	fullscreen_ownership display_transaction clipboard_capture clipboard_writer capture_dimensions
 	erm625_native_desktop_facade network_wifi_identity capture_affinity window_stack
 	fileview_transaction
