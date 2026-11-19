@@ -35,6 +35,7 @@ public:
 	explicit Toplevel(qs::windows::TrackedWindow* window, QObject* parent);
 
 	Q_INVOKABLE void activate();
+	Q_INVOKABLE void activateFromUserInput();
 
 	Q_INVOKABLE void close();
 

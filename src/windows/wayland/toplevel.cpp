@@ -8,6 +8,7 @@
 #include "../../core/qmlglobal.hpp"
 #include "../../core/qmlscreen.hpp"
 #include "../../core/util.hpp"
+#include "../activation_policy.hpp"
 #include "../window_tracker.hpp"
 
 using namespace qs::windows;
@@ -27,6 +28,11 @@ Toplevel::Toplevel(TrackedWindow* window, QObject* parent): QObject(parent), mWi
 }
 
 void Toplevel::activate() { this->mWindow->activate(); }
+
+void Toplevel::activateFromUserInput() {
+	auto scope = ActivationDispatchScope(ActivationSource::Click);
+	this->mWindow->activate();
+}
 void Toplevel::close() { this->mWindow->close(); }
 
 QString Toplevel::appId() const { return this->mWindow->appId(); }

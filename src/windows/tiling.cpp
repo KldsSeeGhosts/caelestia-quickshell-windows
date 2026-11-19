@@ -41,6 +41,7 @@
 #include "window_tracker.hpp"
 #endif
 #include "fullscreen_geometry.hpp"
+#include "system_surface.hpp"
 
 namespace qs::windows {
 
@@ -138,6 +139,14 @@ QString windowClass(HWND hwnd) {
 	return QString::fromWCharArray(buffer, length);
 }
 
+bool placementHidden(HWND hwnd) {
+	if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return true;
+
+	DWORD flags = 0;
+	return SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &flags, sizeof(flags)))
+	    && system_surface::cloakFromFlags(flags) == system_surface::Cloak::App;
+}
+
 bool dpiVirtualized(HWND hwnd) {
 	auto context = GetWindowDpiAwarenessContext(hwnd);
 	if (context == nullptr) return false;
@@ -171,11 +180,15 @@ private:
 	DPI_AWARENESS_CONTEXT previous = nullptr;
 };
 
-bool readFrame(HWND hwnd, QRect& raw, QRect& frame) {
+bool readFrame(HWND hwnd, QRect& raw, QRect& frame, DWORD* nativeError = nullptr) {
 	auto physical = PhysicalDpiScope(hwnd);
 
 	RECT rawRect {};
-	if (!GetWindowRect(hwnd, &rawRect)) return false;
+	if (!GetWindowRect(hwnd, &rawRect)) {
+		// Capture before restoring the thread's DPI context.
+		if (nativeError != nullptr) *nativeError = GetLastError();
+		return false;
+	}
 
 	RECT frameRect {};
 	auto hr = DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frameRect, sizeof(frameRect));
@@ -198,7 +211,8 @@ std::optional<DWORD> setFrame(HWND hwnd, const QRect& target) {
 
 	QRect raw;
 	QRect frame;
-	if (!readFrame(hwnd, raw, frame)) return GetLastError();
+	DWORD nativeError = 0;
+	if (!readFrame(hwnd, raw, frame, &nativeError)) return nativeError;
 
 	auto left = frame.left() - raw.left();
 	auto top = frame.top() - raw.top();
@@ -1182,7 +1196,13 @@ void TilingManager::manage(TrackedWindow* window) {
 	m.placement.window = reinterpret_cast<quintptr>(window->hwnd());
 	m.placement.lifetime = ++this->lifetimeCounter;
 	m.elevated = isMoreElevated(window->hwnd());
-	if (!this->starting) m.placeOn = focusedScreen();
+	if (!this->starting) {
+		m.placeOn = focusedScreen();
+		// A background command can briefly show a legacy console that looks
+		// like a normal task window. Don't give it a slot until it takes focus.
+		m.waitingForConsoleFocus = window->hwnd() != GetForegroundWindow()
+		    && windowClass(window->hwnd()) == QStringLiteral("ConsoleWindowClass");
+	}
 
 	if (m.elevated) {
 		qCDebug(logTiling) << "Window" << window->addressHex() << qs::windows::logId(window->appId())
@@ -1231,7 +1251,10 @@ void TilingManager::unmanage(TrackedWindow* window) {
 
 	QObject::disconnect(window, nullptr, this, nullptr);
 	if (iter->second.verifying || iter->second.snapping || iter->second.settleSince != 0) {
-		this->reportPlacement(iter->second, PlacementDisposition::Vanished, {}, ERROR_INVALID_WINDOW_HANDLE);
+		// The tracker also drops live windows when they hide or otherwise
+		// stop being eligible. That cancels placement rather than failing it.
+		if (IsWindow(window->hwnd())) this->supersedePlacement(iter->second);
+		else this->reportPlacement(iter->second, PlacementDisposition::Vanished, {}, ERROR_INVALID_WINDOW_HANDLE);
 	}
 	this->takeOut(iter->second);
 	if (iter->second.offscreen) forgetParked(window->hwnd());
@@ -1279,6 +1302,7 @@ TilingManager::State TilingManager::stateOf(const Managed& m) const {
 	if (m.elevated) return State::Out;
 	if (this->outsideScope(m)) return State::Out;
 	if (m.override == Override::Float) return State::Out;
+	if (m.waitingForConsoleFocus && m.override != Override::Tile) return State::Out;
 	// Exclusions are configuration, not a transient fullscreen style. They
 	// apply before fullscreen suspension, keeping the legacy explicit-tile override.
 	if (m.override != Override::Tile && this->scopeRules.matchesExcluded(this->factsOf(m))) {
@@ -1610,6 +1634,7 @@ void TilingManager::syncWindow(TrackedWindow* window) {
 			else if (m.elevated) reason = "elevated";
 			else if (this->outsideScope(m)) reason = "outside_scope";
 			else if (m.override == Override::Float) reason = "explicit_float";
+			else if (m.waitingForConsoleFocus && m.override != Override::Tile) reason = "waiting_for_console_focus";
 			else if (m.override != Override::Tile && this->scopeRules.matchesExcluded(this->factsOf(m))) reason = "excluded";
 			else reason = m.autoFloat ? "auto_float" : "float_rule";
 		}
@@ -1880,7 +1905,7 @@ QRect TilingManager::tileRect(
 
 void TilingManager::place(Managed& m, const QRect& tile) {
 	auto* hwnd = m.window->hwnd();
-	if (!this->placementAlive(m)) return;
+	if (!this->placementAvailable(m)) return;
 	// Re-evaluate just before placement: a fullscreen re-entry can revoke
 	// style-based exit evidence while a layout is waiting to settle.
 	if (this->stateOf(m) != State::Tiled) return;
@@ -1893,7 +1918,8 @@ void TilingManager::place(Managed& m, const QRect& tile) {
 	auto previous = std::exchange(m.observed, frame);
 	if (previous.isValid() && frame != previous) m.changedAt = now;
 
-	if (tile != m.target) {
+	if (tile != m.target || m.retryPlacementOnShow) {
+		m.retryPlacementOnShow = false;
 		this->supersedePlacement(m);
 		m.placement.layoutGeneration = ++this->layoutGeneration;
 		m.disposition = PlacementDisposition::Idle;
@@ -2021,7 +2047,7 @@ void TilingManager::stepSnaps() {
 
 	for (auto& [window, m]: this->managed) {
 		if (!m.snapping) continue;
-		if (!this->placementAlive(m)) continue;
+		if (!this->placementAvailable(m)) continue;
 
 		if (m.layout == nullptr || m.target.isNull() || window == this->dragging
 		    || this->stateOf(m) != State::Tiled)
@@ -2051,11 +2077,7 @@ void TilingManager::stepSnaps() {
 		    )
 		);
 		if (error) {
-			auto disposition = !IsWindow(window->hwnd()) ? PlacementDisposition::Vanished
-			                 : *error == ERROR_ACCESS_DENIED ? PlacementDisposition::Denied
-			                                               : PlacementDisposition::Failed;
-			this->reportPlacement(m, disposition,
-			                      currentFrame(window->hwnd()), *error);
+			this->reportPlacementError(m, currentFrame(window->hwnd()), *error);
 			continue;
 		}
 		active = true;
@@ -2065,16 +2087,13 @@ void TilingManager::stepSnaps() {
 }
 
 void TilingManager::send(Managed& m, const QRect& frame) {
-	if (!this->placementAlive(m)) return;
+	if (!this->placementAvailable(m)) return;
 	m.before = frame;
 	QS_TRANSITION_TRACE("placement_request", {{"window", transition_trace::handle(reinterpret_cast<quintptr>(m.window->hwnd()))},
 	    {"before", transition_trace::rect(frame)}, {"target", transition_trace::rect(m.target)}});
 	auto error = setFrame(m.window->hwnd(), m.target);
 	if (error) {
-		auto disposition = !IsWindow(m.window->hwnd()) ? PlacementDisposition::Vanished
-		                 : *error == ERROR_ACCESS_DENIED ? PlacementDisposition::Denied
-		                                               : PlacementDisposition::Failed;
-		this->reportPlacement(m, disposition, frame, *error);
+		this->reportPlacementError(m, frame, *error);
 		return;
 	}
 	m.verifying = true;
@@ -2166,13 +2185,36 @@ void TilingManager::supersedePlacement(Managed& m) {
 	this->unverified.remove(m.window);
 }
 
-bool TilingManager::placementAlive(Managed& m) {
-	if (IsWindow(m.window->hwnd())) return true;
-	if (m.verifying || m.snapping || m.settleSince != 0
+bool TilingManager::placementAlive(Managed& m, quint32 nativeError) {
+	if (m.disposition == PlacementDisposition::Vanished) return false;
+	if (nativeError != ERROR_INVALID_WINDOW_HANDLE && IsWindow(m.window->hwnd())) return true;
+	if (nativeError != 0 || m.verifying || m.snapping || m.settleSince != 0
 	    || (m.disposition == PlacementDisposition::Idle && m.target.isValid())) {
-		this->reportPlacement(m, PlacementDisposition::Vanished, {}, ERROR_INVALID_WINDOW_HANDLE);
+		this->reportPlacement(m, PlacementDisposition::Vanished, {},
+		                      nativeError != 0 ? nativeError : ERROR_INVALID_WINDOW_HANDLE);
 	}
 	return false;
+}
+
+bool TilingManager::placementAvailable(Managed& m, quint32 nativeError) {
+	if (!this->placementAlive(m, nativeError)) return false;
+	// WinEvents can still be in the tracker queue. Keep the slot, but do not
+	// move or diagnose a window Windows already hid, minimized or app-cloaked.
+	// A shell-cloaked window on another virtual desktop still owns its tile.
+	if (!placementHidden(m.window->hwnd())) return true;
+	// A close between the native checks can also look like a hide.
+	if (this->placementAlive(m, nativeError)) {
+		this->supersedePlacement(m);
+		m.retryPlacementOnShow = true;
+	}
+	return false;
+}
+
+void TilingManager::reportPlacementError(Managed& m, const QRect& frame, quint32 nativeError) {
+	if (!this->placementAvailable(m, nativeError)) return;
+	auto disposition = nativeError == ERROR_ACCESS_DENIED ? PlacementDisposition::Denied
+	                                                      : PlacementDisposition::Failed;
+	this->reportPlacement(m, disposition, frame, nativeError);
 }
 
 void TilingManager::armDeadline() {
@@ -2468,6 +2510,11 @@ void TilingManager::onActiveWindowChanged() {
 
 	auto& m = iter->second;
 	m.focusStamp = ++this->focusCounter;
+	if (m.waitingForConsoleFocus) {
+		m.waitingForConsoleFocus = false;
+		m.placeOn = focusedScreen();
+		this->markWindow(window);
+	}
 	if (m.layout == nullptr) return;
 
 	m.layout->lastFocused = window;
@@ -2503,15 +2550,15 @@ void TilingManager::verify() {
 		if (iter == this->managed.end() || window == this->dragging) continue;
 
 		auto& m = iter->second;
-		if (m.placement != iterPending.value() || !this->placementAlive(m)) continue;
+		if (m.placement != iterPending.value()) continue;
 		if (m.layout == nullptr || m.target.isNull()) continue;
-		if (this->stateOf(m) != State::Tiled) continue;
 
 		this->place(m, m.target);
 	}
 }
 
 void TilingManager::giveUp(Managed& m, const QRect& frame) {
+	if (!this->placementAvailable(m)) return;
 	m.verifying = false;
 
 	// A larger frame is judged by its origin, within the landing tolerance,
@@ -2567,16 +2614,14 @@ void TilingManager::onDeadline() {
 	auto now = tilingNow();
 
 	for (auto& [window, m]: this->managed) {
-		if (!m.verifying) continue;
-		if (!this->placementAlive(m)) continue;
+		if (!m.verifying || now < m.deadline) continue;
+		if (!this->placementAvailable(m)) continue;
 		if (m.layout == nullptr || m.target.isNull() || window == this->dragging
 		    || this->stateOf(m) != State::Tiled)
 		{
 			this->supersedePlacement(m);
 			continue;
 		}
-		if (now < m.deadline) continue;
-
 		auto* hwnd = window->hwnd();
 		auto frame = currentFrame(hwnd);
 
@@ -2608,7 +2653,7 @@ void TilingManager::onDeadline() {
 
 		// Telemetry only: a busy or hung app keeps its slot, and place()
 		// completes the placement if the queued move lands later.
-		this->reportPlacement(m, PlacementDisposition::Deadline, frame);
+		if (this->placementAvailable(m)) this->reportPlacement(m, PlacementDisposition::Deadline, frame);
 	}
 
 	this->armDeadline();

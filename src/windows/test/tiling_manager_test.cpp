@@ -466,6 +466,7 @@ private slots:
 		QSignalSpy reported(manager->telemetry(), &tiling::TilingTelemetry::placementReported);
 		enable();
 		manager->onRectChanged(old);
+		fakeWindow(old->hwnd()).exists = false; // Destruction, not a live eligibility change.
 		manager->unmanage(old);
 		WindowTracker::instance()->fixtures.removeAll(old);
 		auto* replacement = add(1);
@@ -603,6 +604,142 @@ private slots:
 		QCOMPARE(failed.count(), 1);
 		QCOMPARE(failed.first().at(1).toString(), QStringLiteral("target-vanished"));
 		QCOMPARE(manager->managed.at(window).disposition, tiling::PlacementDisposition::Vanished);
+	}
+
+	void backgroundConsoleDoesNotReflowLayout() {
+		auto* existing = add(1);
+		fakeWindow(existing->hwnd()).className = QStringLiteral("ConsoleWindowClass");
+		enable();
+		QVERIFY(manager->isTiled(existing)); // Enabling adopts existing windows.
+		auto& neighbour = fakeWindow(existing->hwnd());
+		auto original = neighbour.frame;
+		auto moves = neighbour.moves;
+
+		auto* console = add(2, QStringLiteral("conhost.exe"));
+		auto& native = fakeWindow(console->hwnd());
+		native.className = QStringLiteral("ConsoleWindowClass");
+		emit WindowTracker::instance()->windowAdded(console);
+		manager->sync();
+		QVERIFY(!manager->isTiled(console));
+		QCOMPARE(native.moves, 0);
+		close(console);
+		QCOMPARE(neighbour.frame, original);
+		QCOMPARE(neighbour.moves, moves);
+		QCOMPARE(manager->telemetry()->failedCount(), 0);
+	}
+
+	void consoleCanTileAfterFocusOrExplicitRequest_data() {
+		QTest::addColumn<bool>("explicitTile");
+		QTest::newRow("foreground") << false;
+		QTest::newRow("explicit-tile") << true;
+	}
+
+	void consoleCanTileAfterFocusOrExplicitRequest() {
+		QFETCH(bool, explicitTile);
+		enable();
+		auto* console = add(1, QStringLiteral("conhost.exe"));
+		fakeWindow(console->hwnd()).className = QStringLiteral("ConsoleWindowClass");
+		auto* tracker = WindowTracker::instance();
+		emit tracker->windowAdded(console);
+		QVERIFY(!manager->isTiled(console));
+
+		if (explicitTile) {
+			QVERIFY(manager->setFloating(console, false, false));
+		} else {
+			tracker->deliverForegroundEvent(console->hwnd());
+		}
+		manager->sync();
+		QVERIFY(manager->isTiled(console));
+		QCOMPARE(fakeWindow(console->hwnd()).moves, 1);
+
+		auto* terminal = add(2, QStringLiteral("WindowsTerminal.exe"));
+		fakeWindow(terminal->hwnd()).className = QStringLiteral("CASCADIA_HOSTING_WINDOW_CLASS");
+		emit tracker->windowAdded(terminal);
+		QVERIFY(manager->isTiled(terminal));
+	}
+
+	void nativeVisibilityChangeCancelsPendingPlacement_data() {
+		QTest::addColumn<QString>("change");
+		QTest::addColumn<bool>("deadline");
+		for (const auto* change: {"hidden", "minimized", "app-cloaked", "shell-cloaked", "untracked-live"})
+			QTest::newRow(change) << QString::fromLatin1(change) << true;
+		QTest::newRow("hidden-before-verdict") << QStringLiteral("hidden") << false;
+	}
+
+	void nativeVisibilityChangeCancelsPendingPlacement() {
+		QFETCH(QString, change);
+		QFETCH(bool, deadline);
+		auto* window = add(1);
+		auto& native = fakeWindow(window->hwnd());
+		native.ignoreMoves = true;
+		QSignalSpy reported(manager->telemetry(), &tiling::TilingTelemetry::placementReported);
+		QSignalSpy failed(manager->telemetry(), &tiling::TilingTelemetry::windowTilingFailed);
+		enable();
+
+		if (change == "hidden") native.visible = false;
+		if (change == "minimized") native.minimized = true;
+		if (change == "app-cloaked") native.cloak = FakeWindow::Cloak::App;
+		if (change == "shell-cloaked") native.cloak = FakeWindow::Cloak::Shell;
+		if (change == "untracked-live") {
+			// Eligibility can change while the HWND is still visible and alive.
+			emit WindowTracker::instance()->windowRemoved(window);
+			WindowTracker::instance()->fixtures.removeAll(window);
+		}
+
+		if (deadline) {
+			fakeDesktop.now += 2000;
+			manager->onDeadline();
+		} else {
+			manager->giveUp(manager->managed.at(window), QRect(-600, -400, 600, 400));
+		}
+		drain();
+		QCOMPARE(native.moves, 1);
+		QCOMPARE(reported.count(), 2);
+		auto outcome = qvariant_cast<tiling::PlacementOutcome>(reported.last().first());
+		if (change == "shell-cloaked") {
+			QCOMPARE(outcome.disposition, tiling::PlacementDisposition::Deadline);
+			QCOMPARE(failed.count(), 1);
+			QCOMPARE(failed.first().at(1).toString(), QStringLiteral("unresponsive"));
+			return;
+		}
+		QCOMPARE(outcome.disposition, tiling::PlacementDisposition::Superseded);
+		QCOMPARE(failed.count(), 0);
+		if (change == "untracked-live") return;
+
+		native.visible = true;
+		native.minimized = false;
+		native.cloak = FakeWindow::Cloak::None;
+		native.ignoreMoves = false;
+		recheck(window);
+		QCOMPARE(native.moves, 2); // Retry even though the slot did not change.
+		QCOMPARE(native.frame, manager->managed.at(window).target);
+	}
+
+	void nativeMoveErrorCanRaceWithWindowHideOrClose_data() {
+		QTest::addColumn<quint32>("error");
+		QTest::addColumn<bool>("hides");
+		QTest::newRow("hide-on-denial") << quint32(ERROR_ACCESS_DENIED) << true;
+		QTest::newRow("hide-on-failure") << quint32(ERROR_NOT_ENOUGH_MEMORY) << true;
+		QTest::newRow("invalid-handle") << quint32(ERROR_INVALID_WINDOW_HANDLE) << false;
+	}
+
+	void nativeMoveErrorCanRaceWithWindowHideOrClose() {
+		QFETCH(quint32, error);
+		QFETCH(bool, hides);
+		auto* window = add(1);
+		auto& native = fakeWindow(window->hwnd());
+		native.moveError = error;
+		native.hideOnMoveError = hides;
+		QSignalSpy failed(manager->telemetry(), &tiling::TilingTelemetry::windowTilingFailed);
+		enable();
+		drain();
+		QCOMPARE(native.moves, 1);
+		QVERIFY(manager->isTiled(window)); // Neither outcome should auto-float or restore.
+		QCOMPARE(failed.count(), hides ? 0 : 1);
+		if (!hides) {
+			QCOMPARE(failed.first().at(1).toString(), QStringLiteral("target-vanished"));
+			QCOMPARE(manager->managed.at(window).disposition, tiling::PlacementDisposition::Vanished);
+		}
 	}
 
 	void constrainedPlacementNeverLogsCompletion() {
