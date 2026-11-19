@@ -13,6 +13,8 @@
 #include <qscreen.h>
 #include <qt_windows.h>
 
+#include <dwmapi.h>
+
 #include "../accessor_state.hpp"
 #include "../desktop_index.hpp"
 #include "../focus_monitor.hpp"
@@ -85,9 +87,11 @@ struct FakeWindow {
 	bool hung = false;
 	bool ignoreMoves = false;
 	DWORD moveError = 0;
+	bool hideOnMoveError = false;
 	QSize minimumSize;
 	QSize maximumSize;
 	bool exists = true;
+	bool visible = true;
 	// Index into FakeDesktop::screens, or -1 for the fixture's primary screen.
 	int monitor = -1;
 	// DPI_AWARENESS_* of the window's own process: 0 unaware, 1 system aware,
@@ -221,11 +225,19 @@ inline BOOL GetWindowRect(HWND h, RECT* r) {
 	*r = toRECT(rect);
 	return TRUE;
 }
-inline HRESULT DwmGetWindowAttribute(HWND h, DWORD, void* r, DWORD size) {
-	if (size != sizeof(RECT)) qFatal("Unexpected native DWM query in fixture");
-	// The extended frame bounds stay in physical pixels, whatever the caller.
-	*static_cast<RECT*>(r) = toRECT(fakeWindow(h).frame);
-	return S_OK;
+inline HRESULT DwmGetWindowAttribute(HWND h, DWORD attribute, void* r, DWORD size) {
+	auto& window = fakeWindow(h);
+	if (attribute == DWMWA_EXTENDED_FRAME_BOUNDS && size == sizeof(RECT)) {
+		// The extended frame bounds stay in physical pixels, whatever the caller.
+		*static_cast<RECT*>(r) = toRECT(window.frame);
+		return S_OK;
+	}
+	if (attribute == DWMWA_CLOAKED && size == sizeof(DWORD)) {
+		*static_cast<DWORD*>(r) = window.cloak == FakeWindow::Cloak::App ? DWM_CLOAKED_APP
+		    : window.cloak == FakeWindow::Cloak::Shell ? DWM_CLOAKED_SHELL : 0;
+		return S_OK;
+	}
+	qFatal("Unexpected native DWM query in fixture");
 }
 inline HRESULT DwmSetWindowAttribute(HWND h, DWORD attribute, const void* value, DWORD size) {
 	if (attribute != 34 || size != sizeof(COLORREF)) qFatal("Unexpected native DWM write in fixture");
@@ -239,6 +251,7 @@ inline BOOL SetWindowPos(HWND h, HWND, int x, int y, int w, int height, UINT) {
 	window.moves++;
 	if (window.moveError != 0 || !window.exists) {
 		fakeDesktop.error = window.exists ? window.moveError : ERROR_INVALID_WINDOW_HANDLE;
+		if (window.hideOnMoveError) window.visible = false;
 		return FALSE;
 	}
 	if (!window.ignoreMoves) {
@@ -288,8 +301,7 @@ inline HWND GetWindow(HWND h, UINT) {
 	return nullptr;
 }
 inline BOOL IsWindowVisible(HWND h) {
-	fakeWindow(h);
-	return TRUE;
+	return IsWindow(h) && fakeWindow(h).visible;
 }
 inline LONG_PTR GetWindowLongPtrW(HWND h, int index) {
 	return index == GWL_STYLE ? fakeWindow(h).style : fakeWindow(h).exStyle;

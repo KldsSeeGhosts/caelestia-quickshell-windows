@@ -233,6 +233,7 @@ private:
 		Override override = Override::None;
 		bool elevated = false;
 		bool autoFloat = false;
+		bool waitingForConsoleFocus = false;
 		// The layout an automatic float left. A sibling closing there frees
 		// capacity and gives the window one fresh attempt.
 		GUID autoFloatDesktop {};
@@ -271,6 +272,9 @@ private:
 		bool overflowClamped = false;
 		qint64 lastCorrection = 0;
 		bool verifying = false;
+		// A native visibility change can interrupt placement before the
+		// tracker updates. A later show needs a new attempt even at the same tile.
+		bool retryPlacementOnShow = false;
 		qint64 deadline = 0;
 		bool parked = false;
 		QRect preTiling;
@@ -394,8 +398,10 @@ private:
 	void completePlacement(Managed& m, const QRect& frame);
 	void reportPlacement(Managed& m, tiling::PlacementDisposition disposition,
 	                     const QRect& frame = {}, quint32 nativeError = 0);
+	void reportPlacementError(Managed& m, const QRect& frame, quint32 nativeError);
 	void supersedePlacement(Managed& m);
-	bool placementAlive(Managed& m);
+	bool placementAlive(Managed& m, quint32 nativeError = 0);
+	bool placementAvailable(Managed& m, quint32 nativeError = 0);
 	void notifyTilingChanged(TrackedWindow* window);
 	void armDeadline();
 	void restoreFloating(Managed& m);
