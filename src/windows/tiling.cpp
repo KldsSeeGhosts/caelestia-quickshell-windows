@@ -607,7 +607,10 @@ void TilingManager::restoreBorderColour(Managed& m) {
 	if (!m.borderColour) return;
 	if (IsWindow(m.window->hwnd())) {
 		const COLORREF colour = DWMWA_COLOR_DEFAULT;
-		DwmSetWindowAttribute(m.window->hwnd(), DWMWA_BORDER_COLOR, &colour, sizeof(colour));
+		if (FAILED(DwmSetWindowAttribute(m.window->hwnd(), DWMWA_BORDER_COLOR, &colour, sizeof(colour)))) {
+			this->borderRetryNeeded = true;
+			return;
+		}
 	}
 	m.borderColour.reset();
 }
