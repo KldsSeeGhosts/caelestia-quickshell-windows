@@ -55,6 +55,10 @@ constexpr int SYNC_DELAY_MS = 30;
 constexpr int VERIFY_DELAY_MS = 150;
 constexpr int FULLSCREEN_STYLE_RECHECK_MS = 120;
 constexpr int FULLSCREEN_STYLE_GRACE_MS = 300;
+// A new Windows Terminal window must stay visibly eligible this long before
+// automatic tiling gives it a slot. Transient surfaces a command or hand-off
+// raises and drops inside the dwell never move neighboring tiles.
+constexpr int TERMINAL_ADMISSION_MS = 300;
 constexpr int DEADLINE_MS = 2000;
 constexpr int SNAPSHOT_MS = 2000;
 // A self-resizing window must hold still this long before it is judged, and
@@ -1040,7 +1044,13 @@ void TilingManager::persistLayout() {
 	QSet<TrackedWindow*> saved;
 	auto append = [&](const Managed& m) {
 		auto* window = m.window;
-		if (saved.contains(window) || m.identity.started == 0 || m.identity.pid == 0) return;
+		// A window still dwelling toward admission was never tiled; recording
+		// it now would only leave a stale floating entry behind.
+		if (saved.contains(window) || m.identity.started == 0 || m.identity.pid == 0
+		    || m.pendingTerminalAdmission)
+		{
+			return;
+		}
 		auto monitor =
 		    persistentMonitor(m.layout != nullptr ? m.layout->screen.data() : window->screen());
 		if (monitor.isEmpty()) return;
@@ -1198,10 +1208,16 @@ void TilingManager::manage(TrackedWindow* window) {
 	m.elevated = isMoreElevated(window->hwnd());
 	if (!this->starting) {
 		m.placeOn = focusedScreen();
+		auto className = windowClass(window->hwnd());
 		// A background command can briefly show a legacy console that looks
 		// like a normal task window. Don't give it a slot until it takes focus.
 		m.waitingForConsoleFocus = window->hwnd() != GetForegroundWindow()
-		    && windowClass(window->hwnd()) == QStringLiteral("ConsoleWindowClass");
+		    && className == QStringLiteral("ConsoleWindowClass");
+		// Windows Terminal raises a real top-level window for work that can
+		// be gone in well under a second. Automatic admission waits out a
+		// dwell of visible lifetime instead of tiling on arrival.
+		m.pendingTerminalAdmission =
+		    className == QStringLiteral("CASCADIA_HOSTING_WINDOW_CLASS");
 	}
 
 	if (m.elevated) {
@@ -1210,8 +1226,14 @@ void TilingManager::manage(TrackedWindow* window) {
 	}
 
 	auto mark = [this, window]() { this->markWindow(window); };
-	QObject::connect(window, &TrackedWindow::minimizedChanged, this, mark);
-	QObject::connect(window, &TrackedWindow::appCloakedChanged, this, mark);
+	auto visibilityChanged = [this, window]() {
+		// Do not let a hide and show between layout passes count as one dwell.
+		auto iter = this->managed.find(window);
+		if (iter != this->managed.end() && window->hidden()) iter->second.terminalAdmissionAt = 0;
+		this->markWindow(window);
+	};
+	QObject::connect(window, &TrackedWindow::minimizedChanged, this, visibilityChanged);
+	QObject::connect(window, &TrackedWindow::appCloakedChanged, this, visibilityChanged);
 	QObject::connect(window, &TrackedWindow::maximizedChanged, this, mark);
 	QObject::connect(window, &TrackedWindow::fullscreenChanged, this, mark);
 	QObject::connect(window, &TrackedWindow::styleChanged, this, mark);
@@ -1303,6 +1325,7 @@ TilingManager::State TilingManager::stateOf(const Managed& m) const {
 	if (this->outsideScope(m)) return State::Out;
 	if (m.override == Override::Float) return State::Out;
 	if (m.waitingForConsoleFocus && m.override != Override::Tile) return State::Out;
+	if (m.pendingTerminalAdmission && m.override != Override::Tile) return State::Out;
 	// Exclusions are configuration, not a transient fullscreen style. They
 	// apply before fullscreen suspension, keeping the legacy explicit-tile override.
 	if (m.override != Override::Tile && this->scopeRules.matchesExcluded(this->factsOf(m))) {
@@ -1612,12 +1635,39 @@ void TilingManager::syncWindow(TrackedWindow* window) {
 		QTimer::singleShot(FULLSCREEN_STYLE_GRACE_MS, this, recheck);
 	}
 
+	if (m.pendingTerminalAdmission) {
+		auto* hwnd = window->hwnd();
+		auto previous = m.terminalAdmissionAt;
+		auto now = tilingNow();
+		// Check native visibility in the same pass that can grant a slot.
+		// The tracker may not have processed the last hide or destroy yet.
+		if (!IsWindow(hwnd) || window->hidden() || placementHidden(hwnd)) {
+			m.terminalAdmissionAt = 0;
+		} else if (previous == 0) {
+			m.terminalAdmissionAt = now + TERMINAL_ADMISSION_MS;
+		} else if (now >= previous) {
+			auto current = persistenceIdentity(window);
+			// A recycled handle can be valid and visible. Reject a different
+			// owner or class even if the tracker still has the old window.
+			if (current.hwnd == m.identity.hwnd && current.pid == m.identity.pid
+			    && (m.identity.started == 0 || current.started == m.identity.started)
+			    && windowClass(hwnd) == QStringLiteral("CASCADIA_HOSTING_WINDOW_CLASS"))
+			{
+				m.pendingTerminalAdmission = false;
+			}
+			m.terminalAdmissionAt = 0;
+		}
+		if (m.terminalAdmissionAt != previous) this->armDeadline();
+	}
+
 	auto state = this->stateOf(m);
 	// Decide the monitor once, when the window is first looked at, even if it
 	// cannot be tiled yet. A window that is maximized or hidden at launch
 	// keeps the monitor Windows gave it when it later becomes tiled.
 	auto* placeOn = m.placeOn.data();
-	m.placeOn = nullptr;
+	// A deferred terminal keeps the screen that was focused when it arrived,
+	// not whichever screen happens to be focused when its dwell expires.
+	if (!m.pendingTerminalAdmission) m.placeOn = nullptr;
 	if (transition_trace::enabled() && m.traceState != static_cast<int>(state)) {
 		const char* names[] = {"Out", "Hidden", "Suspended", "Tiled"};
 		const char* reason = "eligible";
@@ -1635,6 +1685,7 @@ void TilingManager::syncWindow(TrackedWindow* window) {
 			else if (this->outsideScope(m)) reason = "outside_scope";
 			else if (m.override == Override::Float) reason = "explicit_float";
 			else if (m.waitingForConsoleFocus && m.override != Override::Tile) reason = "waiting_for_console_focus";
+			else if (m.pendingTerminalAdmission && m.override != Override::Tile) reason = "pending_terminal_admission";
 			else if (m.override != Override::Tile && this->scopeRules.matchesExcluded(this->factsOf(m))) reason = "excluded";
 			else reason = m.autoFloat ? "auto_float" : "float_rule";
 		}
@@ -2220,6 +2271,9 @@ void TilingManager::reportPlacementError(Managed& m, const QRect& frame, quint32
 void TilingManager::armDeadline() {
 	auto next = std::numeric_limits<qint64>::max();
 	for (auto& [window, m]: this->managed) {
+		if (m.pendingTerminalAdmission && m.terminalAdmissionAt != 0) {
+			next = qMin(next, m.terminalAdmissionAt);
+		}
 		if (!m.verifying) continue;
 		if (!this->placementAlive(m)) continue;
 		if (m.layout == nullptr || m.target.isNull() || window == this->dragging
@@ -2610,8 +2664,16 @@ void TilingManager::giveUp(Managed& m, const QRect& frame) {
 }
 
 void TilingManager::onDeadline() {
-	if (!this->dirtyLayouts.isEmpty() || !this->dirtyWindows.isEmpty()) this->sync();
 	auto now = tilingNow();
+	for (const auto& [window, m]: this->managed) {
+		if (m.pendingTerminalAdmission && m.terminalAdmissionAt != 0
+		    && now >= m.terminalAdmissionAt)
+		{
+			this->dirtyWindows.insert(window);
+		}
+	}
+	if (!this->dirtyLayouts.isEmpty() || !this->dirtyWindows.isEmpty()) this->sync();
+	now = tilingNow();
 
 	for (auto& [window, m]: this->managed) {
 		if (!m.verifying || now < m.deadline) continue;
@@ -3614,6 +3676,9 @@ bool TilingManager::setFloating(TrackedWindow* window, bool floating, bool toggl
 
 	m.override = floating ? Override::Float : Override::Tile;
 	if (!floating) m.autoFloat = false;
+	// A manual float or tile ends any automatic admission wait.
+	m.pendingTerminalAdmission = false;
+	m.terminalAdmissionAt = 0;
 
 	this->markWindow(window);
 	return true;
