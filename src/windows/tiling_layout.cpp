@@ -62,10 +62,17 @@ Edge dropSide(const QRect& target, const QPoint& cursor, bool precise) {
 	return dx < 0 ? Edge::Left : Edge::Right;
 }
 
+InsertBands insertBands(const QRect& box, int cap) {
+	return {
+	    qMax(1, qMin(box.width() / 4, cap)),
+	    qMax(1, qMin(box.height() / 4, cap)),
+	};
+}
+
 std::optional<Edge> insertSide(
     const QRect& box,
     const QPoint& cursor,
-    int cap,
+    InsertBands sizes,
     int hysteresis,
     const std::optional<Edge>* previous
 ) {
@@ -75,21 +82,20 @@ std::optional<Edge> insertSide(
 		int size;
 	};
 
-	auto across = qMax(1, qMin(box.width() / 5, cap));
-	auto down = qMax(1, qMin(box.height() / 5, cap));
 	const std::array<Band, 4> bands {{
-	    {.edge = Edge::Left, .depth = cursor.x() - box.left(), .size = across},
-	    {.edge = Edge::Right, .depth = rightOf(box) - 1 - cursor.x(), .size = across},
-	    {.edge = Edge::Top, .depth = cursor.y() - box.top(), .size = down},
-	    {.edge = Edge::Bottom, .depth = bottomOf(box) - 1 - cursor.y(), .size = down},
+	    {.edge = Edge::Left, .depth = cursor.x() - box.left(), .size = sizes.across},
+	    {.edge = Edge::Right, .depth = rightOf(box) - 1 - cursor.x(), .size = sizes.across},
+	    {.edge = Edge::Top, .depth = cursor.y() - box.top(), .size = sizes.down},
+	    {.edge = Edge::Bottom, .depth = bottomOf(box) - 1 - cursor.y(), .size = sizes.down},
 	}};
 
-	// The band the cursor is relatively deepest in, among those it is at least
-	// `inset` pixels inside of.
-	auto deepest = [&bands](int inset) -> std::optional<Edge> {
+	// The band the cursor is relatively deepest in, among those it is inside
+	// of. `margined` pulls each boundary in by that band's hysteresis margin.
+	auto deepest = [&bands, hysteresis](bool margined) -> std::optional<Edge> {
 		std::optional<Edge> best;
 		auto bestScore = 2.0;
 		for (const auto& band: bands) {
+			auto inset = margined ? bandInset(band.size, hysteresis) : 0;
 			if (band.depth >= band.size - inset) continue;
 			auto score = static_cast<double>(band.depth) / band.size;
 			if (score < bestScore) {
@@ -102,20 +108,23 @@ std::optional<Edge> insertSide(
 
 	if (previous != nullptr) {
 		if (!previous->has_value()) {
-			if (!deepest(hysteresis)) return std::nullopt;
+			return deepest(true);
 		} else {
 			const auto& kept = bands.at(static_cast<std::size_t>(**previous));
-			auto keep = kept.depth < kept.size + hysteresis;
+			auto inset = bandInset(kept.size, hysteresis);
+			auto keep = kept.depth < kept.size + inset;
 			for (const auto& band: bands) {
-				if (band.edge == kept.edge || band.depth + hysteresis >= band.size) continue;
-				auto score = static_cast<double>(band.depth + hysteresis) / band.size;
+				if (band.edge == kept.edge) continue;
+				auto margin = bandInset(band.size, hysteresis);
+				if (band.depth + margin >= band.size) continue;
+				auto score = static_cast<double>(band.depth + margin) / band.size;
 				if (score < static_cast<double>(kept.depth) / kept.size) keep = false;
 			}
 			if (keep) return kept.edge;
 		}
 	}
 
-	return deepest(0);
+	return deepest(false);
 }
 
 std::unique_ptr<LayoutEngine> LayoutEngine::create(Kind kind) {

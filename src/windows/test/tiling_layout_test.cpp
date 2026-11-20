@@ -78,6 +78,7 @@ private slots:
 	void staleLayoutLeavesCollapse();
 	void dwindleDropSplitsTheChosenSide_data();
 	void dwindleDropSplitsTheChosenSide();
+	void smallDropBandsLeaveSwapReachable();
 	void dwindleDropFollowsTheTargetAspect_data();
 	void dwindleDropFollowsTheTargetAspect();
 	void dwindleDropCollapsesTheSource();
@@ -295,6 +296,25 @@ void TestTilingLayout::dwindleDropSplitsTheChosenSide() {
 		QVERIFY(!touches(layout.box(A), layout.box(B)));
 		layout.compute(area);
 		QCOMPARE(layout.box(B), inserted);
+	}
+}
+
+void TestTilingLayout::smallDropBandsLeaveSwapReachable() {
+	const std::optional<Edge> swap;
+	for (const auto size: {QSize(19, 25), QSize(25, 19), QSize(11, 11)}) {
+		const QRect box(QPoint(-41, -29), size);
+		const auto bands = qs::windows::tiling::insertBands(box, 320);
+		const auto centre = box.center();
+		for (const auto edge: {Edge::Left, Edge::Right, Edge::Top, Edge::Bottom}) {
+			auto point = centre;
+			if (edge == Edge::Left) point.setX(box.left());
+			if (edge == Edge::Right) point.setX(box.right());
+			if (edge == Edge::Top) point.setY(box.top());
+			if (edge == Edge::Bottom) point.setY(box.bottom());
+			const auto split = qs::windows::tiling::insertSide(box, point, bands, 16, &swap);
+			QVERIFY(split == edge);
+			QVERIFY(!qs::windows::tiling::insertSide(box, centre, bands, 16, &split));
+		}
 	}
 }
 

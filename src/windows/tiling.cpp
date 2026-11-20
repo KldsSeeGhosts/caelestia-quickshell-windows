@@ -77,9 +77,8 @@ constexpr qint32 MAX_SNAPS = 2;
 constexpr qint32 MAX_CORRECTIONS = 2;
 constexpr qint64 CORRECTION_RESET_MS = 1500;
 constexpr int EDGE_TOLERANCE = 2;
-// A Super drop inserts within an edge band of 20% of the tile, at most this
-// many dp. A drop zone or target is kept until the cursor is this far past it.
-constexpr int DROP_BAND_DP = 120;
+// Maximum edge-band depth and jitter allowance, in target-monitor DIPs.
+constexpr int DROP_BAND_DP = 160;
 constexpr int DROP_HYSTERESIS_DP = 8;
 // Frame bits a fullscreen window normally drops. Regaining either one after
 // the suspension began confirms an exit even when the rectangle still covers
@@ -3092,27 +3091,28 @@ TilingManager::planDrop(const Managed& m, const QPoint& cursor, const DropPlan* 
 		plan.zone = inflate(box, h).intersected(physicalMonitor(screen));
 
 		if (layout->tree->kind() == tiling::Kind::Dwindle) {
-			auto cap = toPhysical(DROP_BAND_DP, dpr);
+			const auto bands = tiling::insertBands(box, toPhysical(DROP_BAND_DP, dpr));
 			const auto* kept = previous != nullptr && previous->target == target ? &previous->side : nullptr;
-			plan.side = tiling::insertSide(box, cursor, cap, h, kept);
+			plan.side = tiling::insertSide(box, cursor, bands, h, kept);
 
 			// The cursor can go anywhere in the zone insertSide keeps: the band, or
-			// the centre, widened by the hysteresis, short of the other bands.
-			auto across = qMax(1, qMin(box.width() / 5, cap));
-			auto down = qMax(1, qMin(box.height() / 5, cap));
+			// the centre, widened by the hysteresis, short of the other bands. The
+			// margins shrink on narrow tiles just as they do in the hit test.
+			auto hx = tiling::bandInset(bands.across, h);
+			auto hy = tiling::bandInset(bands.down, h);
 			auto left = box.left();
 			auto top = box.top();
 			auto right = left + box.width() - 1;
 			auto bottom = top + box.height() - 1;
-			auto x0 = left + across - h;
-			auto x1 = right - across + h;
-			auto y0 = top + down - h;
-			auto y1 = bottom - down + h;
+			auto x0 = left + bands.across - hx;
+			auto x1 = right - bands.across + hx;
+			auto y0 = top + bands.down - hy;
+			auto y1 = bottom - bands.down + hy;
 			QRect zone(QPoint(x0, y0), QPoint(x1, y1));
-			if (plan.side == Edge::Left) zone = QRect(QPoint(left - h, y0), QPoint(left + across + h - 1, y1));
-			if (plan.side == Edge::Right) zone = QRect(QPoint(right - across - h + 1, y0), QPoint(right + h, y1));
-			if (plan.side == Edge::Top) zone = QRect(QPoint(x0, top - h), QPoint(x1, top + down + h - 1));
-			if (plan.side == Edge::Bottom) zone = QRect(QPoint(x0, bottom - down - h + 1), QPoint(x1, bottom + h));
+			if (plan.side == Edge::Left) zone = QRect(QPoint(left - h, y0), QPoint(left + bands.across + hx - 1, y1));
+			if (plan.side == Edge::Right) zone = QRect(QPoint(right - bands.across - hx + 1, y0), QPoint(right + h, y1));
+			if (plan.side == Edge::Top) zone = QRect(QPoint(x0, top - h), QPoint(x1, top + bands.down + hy - 1));
+			if (plan.side == Edge::Bottom) zone = QRect(QPoint(x0, bottom - bands.down - hy + 1), QPoint(x1, bottom + h));
 			plan.zone &= zone;
 		}
 

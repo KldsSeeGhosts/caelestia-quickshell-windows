@@ -179,7 +179,7 @@ private slots:
 		const auto tileB = frame(b);
 		QVERIFY(boxA.right() < boxB.left());
 		QVERIFY(tileB.height() > tileB.width());
-		const auto band = qMin(tileB.width() / 5, 120);
+		const auto band = qMin(tileB.height() / 4, 160);
 		auto cursor = tileB.center();
 		// The upper half of a portrait tile, short of its top band.
 		if (spot == 1) cursor.setY(tileB.top() + band + 20);
@@ -291,9 +291,9 @@ private slots:
 		// Tiles are hit by their frames, so measure those.
 		const auto boxB = frame(b);
 		const auto boxC = frame(c);
-		// A | (B over C); the band is 20% of B's width, capped at 120 dp.
+		// A | (B over C); the band is 25% of B's width, capped at 160 dp.
 		QCOMPARE(box(b).bottom() + 1, box(c).top());
-		const auto band = qMin(boxB.width() / 5, 120);
+		const auto band = qMin(boxB.width() / 4, 160);
 		const auto y = boxB.center().y();
 
 		// A band is entered 8 dp past its boundary and left 8 dp past it.
@@ -319,7 +319,7 @@ private slots:
 		QCOMPARE(manager->drag.plan.target, b);
 		QSignalSpy zone(manager, &TilingManager::dragChanged);
 		for (int i = 0; i < 50; i++) {
-			moveTo(a, QPoint(boxB.left() + band + (i % 2 == 0 ? -3 : 3), boxB.top() + 100 + i));
+			moveTo(a, QPoint(boxB.left() + band + (i % 2 == 0 ? -3 : 3), y - 25 + i));
 		}
 		QVERIFY2(zone.count() <= 1, qPrintable(QString::number(zone.count())));
 		QCOMPARE(manager->drag.plan.mode, Mode::Swap);
@@ -478,7 +478,7 @@ private slots:
 		if (!dwindle) QVERIFY(plan.displaced.isNull());
 	}
 
-	// The edge band is 120 dp at the target's DPR: one physical pixel inside it
+	// The edge band is 160 dp at the target's DPR: one physical pixel inside it
 	// inserts, its boundary swaps.
 	void bandScalesWithTargetDpi_data() {
 		QTest::addColumn<qreal>("dpr");
@@ -500,13 +500,63 @@ private slots:
 		auto* c = add(3, 1);
 		enable();
 		const auto tile = frame(c);
-		const auto cap = static_cast<int>(std::lround(120 * dpr));
-		QVERIFY(tile.width() / 5 > cap && tile.height() / 5 > cap);
+		const auto cap = static_cast<int>(std::lround(160 * dpr));
+		QVERIFY(tile.width() / 4 > cap && tile.height() / 4 > cap);
 		begin(a, false);
 		moveTo(a, QPoint(tile.left() + cap - (inside ? 1 : 0), tile.center().y()));
 		QCOMPARE(manager->drag.plan.target, c);
 		QCOMPARE(manager->drag.plan.mode, inside ? Mode::Insert : Mode::Swap);
 		if (inside) QVERIFY(manager->drag.plan.side == Edge::Left);
+		const auto landing = manager->drag.plan.landing;
+		finish(a);
+		QCOMPARE(frame(a), landing);
+	}
+
+	void swapCatchesWiderSplit_data() {
+		QTest::addColumn<Edge>("edge");
+		QTest::addColumn<bool>("super");
+		QTest::addColumn<bool>("scaled");
+		for (const auto edge: {Edge::Left, Edge::Right, Edge::Top, Edge::Bottom}) {
+			for (const auto super: {false, true}) {
+				for (const auto scaled: {false, true}) {
+					const auto name = QByteArray::number(static_cast<int>(edge))
+					                + (super ? "-super-" : "-caption-") + (scaled ? "dpi-cap" : "quarter");
+					QTest::newRow(name.constData()) << edge << super << scaled;
+				}
+			}
+		}
+	}
+
+	void swapCatchesWiderSplit() {
+		QFETCH(Edge, edge);
+		QFETCH(bool, super);
+		QFETCH(bool, scaled);
+		const auto dpr = scaled ? 1.5 : 1.0;
+		addMonitor(scaled ? QRect(-3840, -203, 3840, 2160) : QRect(-520, 0, 520, 400), dpr,
+		           QStringLiteral("fixture-destination"));
+		auto* a = add(1);
+		auto* b = add(2, 1);
+		enable();
+		const auto tile = frame(b);
+		const bool horizontal = edge == Edge::Left || edge == Edge::Right;
+		const int length = horizontal ? tile.width() : tile.height();
+		const int band = qMin(length / 4, qRound(160 * dpr));
+		const int threshold = band - qRound(8 * dpr);
+		QVERIFY(threshold - 1 >= qMin(length / 5, qRound(120 * dpr))); // Outside even the old fresh-hit band.
+		auto atDepth = [&](int depth) {
+			auto point = tile.center();
+			if (horizontal) point.setX(edge == Edge::Left ? tile.left() + depth : tile.right() - depth);
+			else point.setY(edge == Edge::Top ? tile.top() + depth : tile.bottom() - depth);
+			return point;
+		};
+		begin(a, super);
+		moveTo(a, tile.center());
+		QCOMPARE(manager->drag.plan.mode, Mode::Swap);
+		moveTo(a, atDepth(threshold));
+		QCOMPARE(manager->drag.plan.mode, Mode::Swap);
+		moveTo(a, atDepth(threshold - 1));
+		QCOMPARE(manager->drag.plan.mode, Mode::Insert);
+		QVERIFY(manager->drag.plan.side == edge);
 		const auto landing = manager->drag.plan.landing;
 		finish(a);
 		QCOMPARE(frame(a), landing);
@@ -528,7 +578,7 @@ private slots:
 		auto* b = add(2);
 		enable();
 		const auto tile = frame(b);
-		QVERIFY(tile.width() / 5 >= 120 && tile.height() / 5 >= 120);
+		QVERIFY(tile.width() / 4 >= 160 && tile.height() / 4 >= 160);
 		const auto right = corner % 2 == 1;
 		const auto bottom = corner >= 2;
 		const QPoint cursor(
@@ -605,8 +655,8 @@ private slots:
 		auto* b = add(2);
 		enable();
 		begin(a, super);
-		// Just short of B's top band.
-		moveTo(a, QPoint(frame(b).center().x(), frame(b).top() + 125));
+		// Just short of B's top band, past the 8 dp entry margin.
+		moveTo(a, QPoint(frame(b).center().x(), frame(b).top() + qMin(frame(b).height() / 4, 160) + 12));
 		QCOMPARE(manager->drag.plan.mode, Mode::Swap);
 		QCOMPARE(manager->drag.plan.target, b);
 		const auto top = frame(b).top();
@@ -903,6 +953,29 @@ private slots:
 		finish(a);
 		QCOMPARE(box(a), boxA);
 		QCOMPARE(box(b), boxB);
+	}
+
+	// Motion inside the cached rectangle skips planning entirely. Its corners
+	// must agree with a fresh classification using the displayed drop as history.
+	void cachedDropZonesAgreeWithPlanner() {
+		auto* a = add(1);
+		auto* b = add(2);
+		enable();
+		const auto& source = manager->managed.at(a);
+		const QRect tile = frame(b);
+		const QPoint centre = tile.center();
+		for (const QPoint& point: {centre, QPoint(tile.left(), centre.y()), QPoint(tile.right(), centre.y()),
+		                          QPoint(centre.x(), tile.top()), QPoint(centre.x(), tile.bottom())}) {
+			const auto shown = manager->planDrop(source, point, nullptr);
+			QCOMPARE(shown.target, b);
+			QVERIFY(shown.zone.contains(point));
+			for (int x: {shown.zone.left(), shown.zone.center().x(), shown.zone.right()}) {
+				for (int y: {shown.zone.top(), shown.zone.center().y(), shown.zone.bottom()}) {
+					const auto fresh = manager->planDrop(source, QPoint(x, y), &shown);
+					QVERIFY(fresh.sameDrop(shown));
+				}
+			}
+		}
 	}
 
 	// Esc during a Super drag: the preview clears, later motion plans nothing
