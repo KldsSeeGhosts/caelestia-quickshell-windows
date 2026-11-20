@@ -77,9 +77,8 @@ constexpr qint32 MAX_SNAPS = 2;
 constexpr qint32 MAX_CORRECTIONS = 2;
 constexpr qint64 CORRECTION_RESET_MS = 1500;
 constexpr int EDGE_TOLERANCE = 2;
-// A Super drop inserts within an edge band of 20% of the tile, at most this
-// many dp. A drop zone or target is kept until the cursor is this far past it.
-constexpr int DROP_BAND_DP = 120;
+// Maximum edge-band depth and jitter allowance, in target-monitor DIPs.
+constexpr int DROP_BAND_DP = 160;
 constexpr int DROP_HYSTERESIS_DP = 8;
 // Frame bits a fullscreen window normally drops. Regaining either one after
 // the suspension began confirms an exit even when the rectangle still covers
@@ -607,7 +606,10 @@ void TilingManager::restoreBorderColour(Managed& m) {
 	if (!m.borderColour) return;
 	if (IsWindow(m.window->hwnd())) {
 		const COLORREF colour = DWMWA_COLOR_DEFAULT;
-		DwmSetWindowAttribute(m.window->hwnd(), DWMWA_BORDER_COLOR, &colour, sizeof(colour));
+		if (FAILED(DwmSetWindowAttribute(m.window->hwnd(), DWMWA_BORDER_COLOR, &colour, sizeof(colour)))) {
+			this->borderRetryNeeded = true;
+			return;
+		}
 	}
 	m.borderColour.reset();
 }
@@ -618,28 +620,37 @@ void TilingManager::restoreBorderColours() {
 
 void TilingManager::refreshBorderColours() {
 	if (!borderColoursSupported()) return;
-	for (auto& [window, m]: this->managed) {
-		if (!this->mEnabled || !this->mBorderColours || m.layout == nullptr
-		    || window->fullscreen() || this->fullscreenLike(m)
-		    || this->stateOf(m) == State::Out)
-		{
-			this->restoreBorderColour(m);
-			continue;
-		}
-		const auto& colour = window == this->tracker->activeWindow() ? this->mActiveBorderColour
-		                                                             : this->mInactiveBorderColour;
-		if (!colour.isValid()) {
-			this->restoreBorderColour(m);
-			continue;
-		}
-		auto native = RGB(colour.red(), colour.green(), colour.blue());
-		if (m.borderColour == native) continue;
-		if (SUCCEEDED(
-		        DwmSetWindowAttribute(window->hwnd(), DWMWA_BORDER_COLOR, &native, sizeof(native))
-		    ))
-		{
-			m.borderColour = native;
-		}
+	auto* active = this->tracker != nullptr ? this->tracker->activeWindow() : nullptr;
+	this->lastBorderFocused = active;
+	this->borderRetryNeeded = false;
+	for (auto& [window, m]: this->managed) this->refreshBorderColour(m, active);
+}
+
+void TilingManager::refreshBorderColour(Managed& m, TrackedWindow* active) {
+	auto* window = m.window;
+	if (!this->mEnabled || !this->mBorderColours || m.layout == nullptr
+	    || window->fullscreen() || this->fullscreenLike(m)
+	    || this->stateOf(m) == State::Out)
+	{
+		this->restoreBorderColour(m);
+		return;
+	}
+	const auto& colour = window == active ? this->mActiveBorderColour : this->mInactiveBorderColour;
+	if (!colour.isValid()) {
+		this->restoreBorderColour(m);
+		return;
+	}
+	auto native = RGB(colour.red(), colour.green(), colour.blue());
+	if (m.borderColour == native) return;
+	if (SUCCEEDED(
+	        DwmSetWindowAttribute(window->hwnd(), DWMWA_BORDER_COLOR, &native, sizeof(native))
+	    ))
+	{
+		m.borderColour = native;
+	} else {
+		// A failed inactive write can leave the old foreground border painted.
+		// Retry on the next normal update, even if focus moves to a third window.
+		this->borderRetryNeeded = true;
 	}
 }
 
@@ -1006,6 +1017,8 @@ void TilingManager::stop() {
 	this->dirtyWindows.clear();
 	this->dirtyLayouts.clear();
 	this->unverified.clear();
+	this->lastBorderFocused = nullptr;
+	this->borderRetryNeeded = false;
 	this->dragging = nullptr;
 	this->clearDrag();
 	this->edgeDragState = EdgeDrag();
@@ -1282,6 +1295,7 @@ void TilingManager::unmanage(TrackedWindow* window) {
 	this->takeOut(iter->second);
 	if (iter->second.offscreen) forgetParked(window->hwnd());
 	this->managed.erase(iter);
+	if (this->lastBorderFocused == window) this->lastBorderFocused = nullptr;
 
 	this->dirtyWindows.remove(window);
 	this->unverified.remove(window);
@@ -1882,7 +1896,8 @@ void TilingManager::apply(Layout* layout) {
 	if (work.isNull()) return;
 
 	auto* scroll = TilingManager::scrollingOf(layout);
-	auto in = toPhysical(this->mGapsIn, layout->screen->devicePixelRatio());
+	const auto gaps = this->tileGaps(*layout->tree, layout->screen);
+	auto in = gaps.inner;
 
 	for (auto id: layout->tree->ids()) {
 		auto* window = this->windowOf(id);
@@ -1896,7 +1911,7 @@ void TilingManager::apply(Layout* layout) {
 		if (parked) restore = clampInto(scroll->visibleBox(id).adjusted(in, in, -in, -in), work);
 		this->markOffscreen(m, parked, restore);
 
-		this->place(m, this->tileRect(layout, window));
+		this->place(m, tileRect(*layout->tree, id, gaps));
 	}
 }
 
@@ -1919,19 +1934,23 @@ qint32 TilingManager::outerGap(const tiling::LayoutEngine& tree) const {
 }
 
 QRect TilingManager::tileRect(const Layout* layout, TrackedWindow* window) const {
-	return this->tileRect(*layout->tree, layout->screen, idOf(window));
+	return tileRect(*layout->tree, idOf(window), this->tileGaps(*layout->tree, layout->screen));
+}
+
+TilingManager::TileGaps TilingManager::tileGaps(const tiling::LayoutEngine& tree, QScreen* screen) const {
+	const auto dpr = screen->devicePixelRatio();
+	// Scrolling already includes the outer gap in its computed boxes.
+	return {toPhysical(this->mGapsIn, dpr),
+	        tree.kind() == tiling::Kind::Scrolling ? 0 : toPhysical(this->outerGap(tree), dpr)};
 }
 
 QRect TilingManager::tileRect(
     const tiling::LayoutEngine& tree,
-    QScreen* screen,
-    tiling::LayoutEngine::Id id
-) const {
+    tiling::LayoutEngine::Id id,
+    TileGaps gaps
+) {
 	auto box = tree.box(id);
-	auto area = tree.area();
-	auto dpr = screen->devicePixelRatio();
-	auto in = toPhysical(this->mGapsIn, dpr);
-	auto out = toPhysical(this->outerGap(tree), dpr);
+	auto in = gaps.inner;
 
 	if (tree.kind() == tiling::Kind::Scrolling) {
 		return QRect(
@@ -1941,6 +1960,9 @@ QRect TilingManager::tileRect(
 		    qMax(1, box.height() - 2 * in)
 		);
 	}
+
+	auto area = tree.area();
+	auto out = gaps.outer;
 
 	auto left = box.left() == area.left() ? out : in;
 	auto top = box.top() == area.top() ? out : in;
@@ -2558,8 +2580,22 @@ void TilingManager::onScreensChanged() {
 }
 
 void TilingManager::onActiveWindowChanged() {
-	this->refreshBorderColours();
 	auto* window = this->tracker->activeWindow();
+	// Focus alone only changes which window is painted active. Repaint the
+	// window that was focused and the one that is now; every other border is
+	// already the inactive colour.
+	if (this->borderRetryNeeded) {
+		this->refreshBorderColours();
+	} else if (borderColoursSupported()) {
+		const auto refresh = [this, window](TrackedWindow* target) {
+			auto iter = this->managed.find(target);
+			if (iter != this->managed.end()) this->refreshBorderColour(iter->second, window);
+		};
+		if (this->lastBorderFocused && this->lastBorderFocused != window) refresh(this->lastBorderFocused);
+		if (window != nullptr) refresh(window);
+		this->lastBorderFocused = window;
+	}
+
 	auto iter = this->managed.find(window);
 	if (iter == this->managed.end()) return;
 
@@ -3029,12 +3065,13 @@ TilingManager::planDrop(const Managed& m, const QPoint& cursor, const DropPlan* 
 				continue;
 			}
 
+			const auto gaps = this->tileGaps(*candidate->tree, screen);
 			for (auto id: candidate->tree->ids()) {
 				if (id == self) continue;
 				auto* other = this->windowOf(id);
 				if (other == nullptr || this->stateOf(this->managed.at(other)) != State::Tiled) continue;
 
-				auto frame = this->tileRect(*candidate->tree, screen, id);
+				auto frame = tileRect(*candidate->tree, id, gaps);
 				if (!frame.contains(cursor)) continue;
 				layout = candidate.get();
 				target = other;
@@ -3054,27 +3091,28 @@ TilingManager::planDrop(const Managed& m, const QPoint& cursor, const DropPlan* 
 		plan.zone = inflate(box, h).intersected(physicalMonitor(screen));
 
 		if (layout->tree->kind() == tiling::Kind::Dwindle) {
-			auto cap = toPhysical(DROP_BAND_DP, dpr);
+			const auto bands = tiling::insertBands(box, toPhysical(DROP_BAND_DP, dpr));
 			const auto* kept = previous != nullptr && previous->target == target ? &previous->side : nullptr;
-			plan.side = tiling::insertSide(box, cursor, cap, h, kept);
+			plan.side = tiling::insertSide(box, cursor, bands, h, kept);
 
 			// The cursor can go anywhere in the zone insertSide keeps: the band, or
-			// the centre, widened by the hysteresis, short of the other bands.
-			auto across = qMax(1, qMin(box.width() / 5, cap));
-			auto down = qMax(1, qMin(box.height() / 5, cap));
+			// the centre, widened by the hysteresis, short of the other bands. The
+			// margins shrink on narrow tiles just as they do in the hit test.
+			auto hx = tiling::bandInset(bands.across, h);
+			auto hy = tiling::bandInset(bands.down, h);
 			auto left = box.left();
 			auto top = box.top();
 			auto right = left + box.width() - 1;
 			auto bottom = top + box.height() - 1;
-			auto x0 = left + across - h;
-			auto x1 = right - across + h;
-			auto y0 = top + down - h;
-			auto y1 = bottom - down + h;
+			auto x0 = left + bands.across - hx;
+			auto x1 = right - bands.across + hx;
+			auto y0 = top + bands.down - hy;
+			auto y1 = bottom - bands.down + hy;
 			QRect zone(QPoint(x0, y0), QPoint(x1, y1));
-			if (plan.side == Edge::Left) zone = QRect(QPoint(left - h, y0), QPoint(left + across + h - 1, y1));
-			if (plan.side == Edge::Right) zone = QRect(QPoint(right - across - h + 1, y0), QPoint(right + h, y1));
-			if (plan.side == Edge::Top) zone = QRect(QPoint(x0, top - h), QPoint(x1, top + down + h - 1));
-			if (plan.side == Edge::Bottom) zone = QRect(QPoint(x0, bottom - down - h + 1), QPoint(x1, bottom + h));
+			if (plan.side == Edge::Left) zone = QRect(QPoint(left - h, y0), QPoint(left + bands.across + hx - 1, y1));
+			if (plan.side == Edge::Right) zone = QRect(QPoint(right - bands.across - hx + 1, y0), QPoint(right + h, y1));
+			if (plan.side == Edge::Top) zone = QRect(QPoint(x0, top - h), QPoint(x1, top + bands.down + hy - 1));
+			if (plan.side == Edge::Bottom) zone = QRect(QPoint(x0, bottom - bands.down - hy + 1), QPoint(x1, bottom + h));
 			plan.zone &= zone;
 		}
 
@@ -3126,19 +3164,28 @@ void TilingManager::simulateDrop(const Managed& m, DropPlan& plan) const {
 		                                     : tiling::LayoutEngine::create(this->layoutKind());
 	}
 
+	// Only dwindle publishes a displaced ghost, so only its trees need the
+	// before/after frame comparison. Master and scrolling reflow; the landing
+	// frame below is all the preview draws for them.
+	auto& into = same ? *source : *destination;
+	const auto dwindle = into.kind() == tiling::Kind::Dwindle;
+
 	// Each other tiled window's frame now, to tell which ones the drop moves.
 	QHash<Id, QRect> before;
 	auto record = [this, self, &before](tiling::LayoutEngine& tree, QScreen* screen) {
 		this->computeTree(tree, screen);
+		const auto gaps = this->tileGaps(tree, screen);
 		for (auto id: tree.ids()) {
-			if (id != self) before.insert(id, this->tileRect(tree, screen, id));
+			if (id != self) before.insert(id, tileRect(tree, id, gaps));
 		}
 	};
-	record(*source->clone(), from->screen);
-	if (destination != nullptr && plan.layout != nullptr) record(*destination->clone(), plan.screen);
+	if (dwindle) {
+		record(*source->clone(), from->screen);
+		if (destination != nullptr && plan.layout != nullptr) record(*destination->clone(), plan.screen);
+	}
+	// The first insertion on an empty monitor still needs its configured tree and work area.
 	if (destination != nullptr && plan.layout == nullptr) this->computeTree(*destination, plan.screen);
 
-	auto& into = same ? *source : *destination;
 	if (plan.mode == DropMode::Swap) {
 		if (same) {
 			source->swap(self, targetId);
@@ -3164,7 +3211,9 @@ void TilingManager::simulateDrop(const Managed& m, DropPlan& plan) const {
 
 	this->computeTree(*source, from->screen);
 	if (destination != nullptr) this->computeTree(*destination, plan.screen);
-	plan.landing = this->tileRect(into, plan.screen, self);
+	const auto landingGaps = this->tileGaps(into, plan.screen);
+	plan.landing = tileRect(into, self, landingGaps);
+	if (!dwindle) return;
 
 	// The ghost: drawn only for dwindle swaps and inserts, when exactly one
 	// other tile moves and it stays on this screen, since a partial picture of
@@ -3173,11 +3222,12 @@ void TilingManager::simulateDrop(const Managed& m, DropPlan& plan) const {
 	QRect moved;
 	QScreen* movedOn = nullptr;
 	auto compare = [&](const tiling::LayoutEngine& tree, QScreen* screen) {
+		const auto gaps = &tree == &into ? landingGaps : this->tileGaps(tree, screen);
 		for (auto id: tree.ids()) {
 			auto* window = this->windowOf(id);
 			if (id == self || window == nullptr) continue;
 			if (this->stateOf(this->managed.at(window)) != State::Tiled) continue;
-			auto rect = this->tileRect(tree, screen, id);
+			auto rect = tileRect(tree, id, gaps);
 			if (before.value(id) == rect) continue;
 			moves++;
 			moved = rect;
@@ -3186,8 +3236,7 @@ void TilingManager::simulateDrop(const Managed& m, DropPlan& plan) const {
 	};
 	compare(*source, from->screen);
 	if (destination != nullptr) compare(*destination, plan.screen);
-	auto dwindle = into.kind() == tiling::Kind::Dwindle;
-	if (dwindle && moves == 1 && movedOn == plan.screen) plan.displaced = moved;
+	if (moves == 1 && movedOn == plan.screen) plan.displaced = moved;
 }
 
 void TilingManager::commitDrop(Managed& m, const DropPlan& plan) {

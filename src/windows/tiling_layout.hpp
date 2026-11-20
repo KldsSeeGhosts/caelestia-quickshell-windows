@@ -20,15 +20,26 @@ enum class Edge : quint8 { Left, Right, Top, Bottom };
 // only picks the side. `precise` (smart_split) picks the nearest of four edges.
 [[nodiscard]] Edge dropSide(const QRect& target, const QPoint& cursor, bool precise);
 
-// Where a Super drag over `box` drops: nullopt is the centre (a swap), an edge
-// inserts on that side. Each edge band is 20% of the box on its axis, at most
-// `cap` pixels, and a corner goes to the band the cursor is relatively deeper
-// in. `previous` is the zone the cursor was last in on the same box, or null;
-// it is kept while the cursor stays within `hysteresis` pixels of it.
+// The depth of each edge band of `box`: 25% of the box on its axis, at most
+// `cap` pixels. insertSide() and the cached plan zone both use these, so a
+// hit test and the zone a plan claims always agree.
+struct InsertBands {
+	int across;
+	int down;
+};
+[[nodiscard]] InsertBands insertBands(const QRect& box, int cap);
+
+// How far hysteresis reaches into a band `size` deep. Capped at half the band
+// so it neither swallows a small band whole nor holds an insert past the
+// centre of a tight tile.
+[[nodiscard]] inline int bandInset(int size, int hysteresis) { return qMin(hysteresis, size / 2); }
+
+// For both drag gestures, nullopt means swap; an edge means split on that side.
+// Corners use relative band depth. `previous` is the last zone on this tile.
 [[nodiscard]] std::optional<Edge> insertSide(
     const QRect& box,
     const QPoint& cursor,
-    int cap,
+    InsertBands sizes,
     int hysteresis,
     const std::optional<Edge>* previous
 );
