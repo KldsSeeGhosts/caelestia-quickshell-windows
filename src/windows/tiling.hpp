@@ -234,6 +234,15 @@ private:
 		bool elevated = false;
 		bool autoFloat = false;
 		bool waitingForConsoleFocus = false;
+		// A live Windows Terminal surface (CASCADIA_HOSTING_WINDOW_CLASS) can
+		// be a transient that dies well under a second old. Automatic tiling
+		// waits out a dwell of visible, unminimized, un-app-cloaked lifetime
+		// before giving it a slot; the explicit tile override skips the wait.
+		bool pendingTerminalAdmission = false;
+		// Monotonic deadline while the dwell is armed. A hide, minimize or
+		// app cloak disarms it to 0; the next eligible show re-arms the full
+		// dwell.
+		qint64 terminalAdmissionAt = 0;
 		// The layout an automatic float left. A sibling closing there frees
 		// capacity and gives the window one fresh attempt.
 		GUID autoFloatDesktop {};

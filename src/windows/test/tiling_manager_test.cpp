@@ -655,7 +655,323 @@ private slots:
 		auto* terminal = add(2, QStringLiteral("WindowsTerminal.exe"));
 		fakeWindow(terminal->hwnd()).className = QStringLiteral("CASCADIA_HOSTING_WINDOW_CLASS");
 		emit tracker->windowAdded(terminal);
+		// A live terminal dwells before automatic tiling admits it.
+		QVERIFY(!manager->isTiled(terminal));
+		fakeDesktop.now += 300;
+		manager->onDeadline();
+		manager->sync();
 		QVERIFY(manager->isTiled(terminal));
+	}
+
+	void terminalAdmissionDwellsBeforeTiling_data() {
+		QTest::addColumn<bool>("focused");
+		QTest::newRow("foreground") << true;
+		QTest::newRow("unfocused") << false;
+	}
+
+	void terminalAdmissionDwellsBeforeTiling() {
+		QFETCH(bool, focused);
+		auto* existing = add(1);
+		enable();
+		QVERIFY(manager->isTiled(existing));
+		const auto original = fakeWindow(existing->hwnd()).frame;
+		const auto moves = fakeWindow(existing->hwnd()).moves;
+
+		auto* terminal = add(2, QStringLiteral("WindowsTerminal.exe"));
+		auto& native = fakeWindow(terminal->hwnd());
+		native.className = QStringLiteral("CASCADIA_HOSTING_WINDOW_CLASS");
+		emit WindowTracker::instance()->windowAdded(terminal);
+		manager->sync();
+
+		// While pending the window stays out of the layout: no slot, no
+		// geometry write, no reflow and no placement failure.
+		auto& pending = manager->managed.at(terminal);
+		QVERIFY(pending.pendingTerminalAdmission);
+		QVERIFY(pending.terminalAdmissionAt > fakeDesktop.now);
+		QVERIFY(!manager->isTiled(terminal));
+		QCOMPARE(native.moves, 0);
+		QCOMPARE(fakeWindow(existing->hwnd()).frame, original);
+		QCOMPARE(fakeWindow(existing->hwnd()).moves, moves);
+		QCOMPARE(manager->telemetry()->failedCount(), 0);
+
+		if (focused) WindowTracker::instance()->deliverForegroundEvent(terminal->hwnd());
+		fakeDesktop.now += 299;
+		manager->onDeadline();
+		manager->sync();
+		// Focus is not part of the admission rule.
+		QVERIFY(!manager->isTiled(terminal));
+		QCOMPARE(native.moves, 0);
+
+		fakeDesktop.now += 1;
+		manager->onDeadline();
+		QVERIFY(manager->isTiled(terminal));
+		QCOMPARE(native.moves, 1);
+		QVERIFY(!manager->managed.at(terminal).pendingTerminalAdmission);
+
+		// Admission fires exactly once; the dwell cannot re-arm.
+		fakeDesktop.now += 1000;
+		manager->onDeadline();
+		manager->sync();
+		QCOMPARE(native.moves, 1);
+	}
+
+	void transientTerminalLeavesNeighboursUntouched() {
+		auto* existing = add(1);
+		enable();
+		const auto original = fakeWindow(existing->hwnd()).frame;
+		const auto moves = fakeWindow(existing->hwnd()).moves;
+
+		auto* terminal = add(2, QStringLiteral("WindowsTerminal.exe"));
+		fakeWindow(terminal->hwnd()).className = QStringLiteral("CASCADIA_HOSTING_WINDOW_CLASS");
+		emit WindowTracker::instance()->windowAdded(terminal);
+		manager->sync();
+
+		// The transient the dwell exists for dies well inside it.
+		fakeDesktop.now += 137;
+		close(terminal);
+		fakeDesktop.now += 500;
+		manager->onDeadline();
+		manager->sync();
+
+		QCOMPARE(fakeWindow(existing->hwnd()).frame, original);
+		QCOMPARE(fakeWindow(existing->hwnd()).moves, moves);
+		QCOMPARE(fakeWindow(terminal->hwnd()).moves, 0);
+		QCOMPARE(manager->telemetry()->failedCount(), 0);
+
+		// A new window on the recycled handle gets its own dwell, not the
+		// stale admission's outcome.
+		auto* reuse = add(2, QStringLiteral("WindowsTerminal.exe"));
+		fakeWindow(reuse->hwnd()).className = QStringLiteral("CASCADIA_HOSTING_WINDOW_CLASS");
+		emit WindowTracker::instance()->windowAdded(reuse);
+		manager->sync();
+		QVERIFY(manager->managed.at(reuse).pendingTerminalAdmission);
+		QVERIFY(!manager->isTiled(reuse));
+		QCOMPARE(fakeWindow(reuse->hwnd()).moves, 0);
+		QCOMPARE(fakeWindow(existing->hwnd()).moves, moves);
+	}
+
+	void terminalAdmissionRechecksNativeWindow_data() {
+		QTest::addColumn<QString>("change");
+		for (const auto* change: {"hidden", "destroyed", "new-owner", "reused-pid"})
+			QTest::newRow(change) << QString::fromLatin1(change);
+	}
+
+	void terminalAdmissionRechecksNativeWindow() {
+		QFETCH(QString, change);
+		auto* existing = add(1);
+		enable();
+		const auto original = fakeWindow(existing->hwnd()).frame;
+		const auto moves = fakeWindow(existing->hwnd()).moves;
+
+		auto* terminal = add(2, QStringLiteral("WindowsTerminal.exe"));
+		auto& native = fakeWindow(terminal->hwnd());
+		native.className = QStringLiteral("CASCADIA_HOSTING_WINDOW_CLASS");
+		emit WindowTracker::instance()->windowAdded(terminal);
+		QVERIFY(!manager->isTiled(terminal));
+
+		// WinEvents have not reached the tracker when the deadline fires.
+		if (change == "hidden") native.visible = false;
+		if (change == "destroyed") native.exists = false;
+		if (change == "new-owner") native.pid++;
+		if (change == "reused-pid") native.started++;
+		fakeDesktop.now += 300;
+		manager->onDeadline();
+
+		QVERIFY(!manager->isTiled(terminal));
+		QCOMPARE(manager->managed.at(terminal).terminalAdmissionAt, qint64(0));
+		QCOMPARE(native.moves, 0);
+		QCOMPARE(fakeWindow(existing->hwnd()).frame, original);
+		QCOMPARE(fakeWindow(existing->hwnd()).moves, moves);
+		QCOMPARE(manager->telemetry()->failedCount(), 0);
+	}
+
+	void terminalDwellRestartsOnCoalescedMinimizeAndRestore() {
+		enable();
+		auto* terminal = add(1, QStringLiteral("WindowsTerminal.exe"));
+		auto& native = fakeWindow(terminal->hwnd());
+		native.className = QStringLiteral("CASCADIA_HOSTING_WINDOW_CLASS");
+		emit WindowTracker::instance()->windowAdded(terminal);
+
+		fakeDesktop.now += 200;
+		native.minimized = true;
+		emit terminal->minimizedChanged();
+		native.minimized = false;
+		emit terminal->minimizedChanged();
+		manager->sync();
+
+		fakeDesktop.now += 100; // The original deadline must not admit it.
+		manager->onDeadline();
+		QVERIFY(!manager->isTiled(terminal));
+		QCOMPARE(native.moves, 0);
+
+		fakeDesktop.now += 200;
+		manager->onDeadline();
+		QVERIFY(manager->isTiled(terminal));
+		QCOMPARE(native.moves, 1);
+	}
+
+	void terminalDwellRestartsWhileHidden_data() {
+		QTest::addColumn<QString>("how");
+		QTest::newRow("minimized") << QStringLiteral("minimized");
+		QTest::newRow("app-cloaked") << QStringLiteral("app-cloaked");
+		QTest::newRow("untracked") << QStringLiteral("untracked");
+	}
+
+	void terminalDwellRestartsWhileHidden() {
+		QFETCH(QString, how);
+		enable();
+		auto* terminal = add(1, QStringLiteral("WindowsTerminal.exe"));
+		auto& native = fakeWindow(terminal->hwnd());
+		native.className = QStringLiteral("CASCADIA_HOSTING_WINDOW_CLASS");
+		emit WindowTracker::instance()->windowAdded(terminal);
+		manager->sync();
+		QVERIFY(manager->managed.at(terminal).pendingTerminalAdmission);
+
+		fakeDesktop.now += 200;
+		if (how == "minimized") {
+			native.minimized = true;
+			emit terminal->minimizedChanged();
+		} else if (how == "app-cloaked") {
+			native.cloak = FakeWindow::Cloak::App;
+			emit terminal->appCloakedChanged();
+		} else {
+			// A plain hide drops the window from the tracker entirely.
+			emit WindowTracker::instance()->windowRemoved(terminal);
+			WindowTracker::instance()->fixtures.removeAll(terminal);
+			native.visible = false;
+		}
+		manager->sync();
+		if (how != "untracked") QCOMPARE(manager->managed.at(terminal).terminalAdmissionAt, qint64(0));
+
+		// The armed deadline must not admit a window that is hidden at expiry.
+		fakeDesktop.now += 500;
+		manager->onDeadline();
+		manager->sync();
+		QVERIFY(!manager->isTiled(terminal));
+		QCOMPARE(native.moves, 0);
+
+		// Reshowing restarts the full dwell, not the remainder.
+		if (how == "minimized") {
+			native.minimized = false;
+			emit terminal->minimizedChanged();
+		} else if (how == "app-cloaked") {
+			native.cloak = FakeWindow::Cloak::None;
+			emit terminal->appCloakedChanged();
+		} else {
+			native.visible = true;
+			WindowTracker::instance()->fixtures.append(terminal);
+			emit WindowTracker::instance()->windowAdded(terminal);
+		}
+		manager->sync();
+		QVERIFY(!manager->isTiled(terminal));
+
+		fakeDesktop.now += 299;
+		manager->onDeadline();
+		manager->sync();
+		QVERIFY(!manager->isTiled(terminal));
+		QCOMPARE(native.moves, 0);
+
+		fakeDesktop.now += 1;
+		manager->onDeadline();
+		manager->sync();
+		QVERIFY(manager->isTiled(terminal));
+		QCOMPARE(native.moves, 1);
+	}
+
+	void explicitTileAdmitsTerminalImmediately() {
+		enable();
+		auto* terminal = add(1, QStringLiteral("WindowsTerminal.exe"));
+		fakeWindow(terminal->hwnd()).className = QStringLiteral("CASCADIA_HOSTING_WINDOW_CLASS");
+		emit WindowTracker::instance()->windowAdded(terminal);
+		manager->sync();
+		QVERIFY(!manager->isTiled(terminal));
+
+		QVERIFY(manager->setFloating(terminal, false, false));
+		manager->sync();
+		QVERIFY(manager->isTiled(terminal));
+		QCOMPARE(fakeWindow(terminal->hwnd()).moves, 1);
+		QVERIFY(!manager->managed.at(terminal).pendingTerminalAdmission);
+
+		// The invalidated dwell cannot fire afterwards.
+		fakeDesktop.now += 500;
+		manager->onDeadline();
+		manager->sync();
+		QCOMPARE(fakeWindow(terminal->hwnd()).moves, 1);
+	}
+
+	void adoptionAndNormalArrivalSkipTheTerminalDwell() {
+		auto* terminal = add(1, QStringLiteral("WindowsTerminal.exe"));
+		fakeWindow(terminal->hwnd()).className = QStringLiteral("CASCADIA_HOSTING_WINDOW_CLASS");
+		enable();
+		// Present before the tiler started: adoption is not a new arrival.
+		QVERIFY(manager->isTiled(terminal));
+		QVERIFY(!manager->managed.at(terminal).pendingTerminalAdmission);
+
+		// An ordinary window still tiles on first show.
+		auto* normal = add(2);
+		emit WindowTracker::instance()->windowAdded(normal);
+		QVERIFY(manager->isTiled(normal));
+	}
+
+	void pendingTerminalCannotBeAdmittedAfterRemovalOrStop_data() {
+		QTest::addColumn<QString>("how");
+		QTest::newRow("removed") << QStringLiteral("removed");
+		QTest::newRow("stopped") << QStringLiteral("stopped");
+	}
+
+	void pendingTerminalCannotBeAdmittedAfterRemovalOrStop() {
+		QFETCH(QString, how);
+		enable();
+		auto* terminal = add(1, QStringLiteral("WindowsTerminal.exe"));
+		auto& native = fakeWindow(terminal->hwnd());
+		native.className = QStringLiteral("CASCADIA_HOSTING_WINDOW_CLASS");
+		emit WindowTracker::instance()->windowAdded(terminal);
+		manager->sync();
+		QVERIFY(manager->managed.at(terminal).pendingTerminalAdmission);
+
+		if (how == "removed") {
+			// A tracker drop for a still-live window erases the pending
+			// admission with it.
+			emit WindowTracker::instance()->windowRemoved(terminal);
+			WindowTracker::instance()->fixtures.removeAll(terminal);
+			manager->sync();
+		} else {
+			manager->setEnabled(false);
+		}
+		QCOMPARE(manager->managed.count(terminal), std::size_t(0));
+
+		fakeDesktop.now += 500;
+		manager->onDeadline();
+		manager->sync();
+		QCOMPARE(native.moves, 0);
+		QVERIFY(!manager->isTiled(terminal));
+		QCOMPARE(manager->telemetry()->failedCount(), 0);
+	}
+
+	void terminalDwellKeepsTheArrivalMonitor() {
+		auto* left = addLeftMonitor();
+		auto* existing = add(1);
+		enable();
+		QVERIFY(manager->isTiled(existing));
+		auto* screenB = left->screen();
+		QVERIFY(fakeDesktop.focus.activeWindow(screenB));
+
+		auto* terminal = add(2, QStringLiteral("WindowsTerminal.exe"));
+		fakeWindow(terminal->hwnd()).className = QStringLiteral("CASCADIA_HOSTING_WINDOW_CLASS");
+		emit WindowTracker::instance()->windowAdded(terminal);
+		manager->sync();
+		QVERIFY(!manager->isTiled(terminal));
+
+		// Monitor focus moves back while the terminal is still dwelling; the
+		// arrival decision must not be recomputed from the later focus.
+		QVERIFY(fakeDesktop.focus.activeWindow(QGuiApplication::primaryScreen()));
+		fakeDesktop.now += 400;
+		manager->onDeadline();
+		manager->sync();
+
+		QVERIFY(manager->isTiled(terminal));
+		QCOMPARE(manager->managed.at(terminal).layout->screen.data(), screenB);
+		removeMonitor(left);
 	}
 
 	void nativeVisibilityChangeCancelsPendingPlacement_data() {
