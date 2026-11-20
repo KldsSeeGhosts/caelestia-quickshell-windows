@@ -308,6 +308,8 @@ DesktopHost::DesktopHost(QObject* parent): QObject(parent) {
 	gHost = this;
 	this->refreshTimer.setSingleShot(true);
 	QObject::connect(&this->refreshTimer, &QTimer::timeout, this, &DesktopHost::refresh);
+	this->wallpaperTimer.setSingleShot(true);
+	QObject::connect(&this->wallpaperTimer, &QTimer::timeout, this, &DesktopHost::wallpaperChanged);
 }
 
 DesktopHost::~DesktopHost() {
@@ -713,7 +715,7 @@ void DesktopHost::watchWallpaperKey() {
 		this->desktopKeyNotifier = new QWinEventNotifier(this->desktopKeyEvent, this);
 		QObject::connect(this->desktopKeyNotifier, &QWinEventNotifier::activated, this, [this]() {
 			this->watchWallpaperKey();
-			emit this->wallpaperChanged();
+			this->wallpaperTimer.start(SETTLE_MS);
 		});
 	}
 
@@ -768,6 +770,7 @@ LRESULT CALLBACK DesktopHost::listenerProc(HWND hwnd, UINT msg, WPARAM wparam, L
 			gHost->scheduleRefresh(SETTLE_MS);
 		} else if (msg == WM_SETTINGCHANGE && wparam == SPI_SETDESKWALLPAPER) {
 			gHost->scheduleRefresh(SETTLE_MS);
+			gHost->wallpaperTimer.start(SETTLE_MS);
 		}
 	}
 

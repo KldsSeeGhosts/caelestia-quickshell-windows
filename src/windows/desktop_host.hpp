@@ -214,6 +214,7 @@ private:
 	bool reconcilePending = false;
 	int spawnRetriesLeft = 4;
 	QTimer refreshTimer;
+	QTimer wallpaperTimer;
 	// Per foreign process: a lifecycle hook (create..reorder) and a parent
 	// change hook. They report a known owner's visibility and destruction
 	// edges; the desktop-wide hooks above report everything else.

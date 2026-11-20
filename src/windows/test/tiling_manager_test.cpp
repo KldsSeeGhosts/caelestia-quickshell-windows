@@ -1643,6 +1643,7 @@ private slots:
 
 		// With focus-follows-mouse off, crossing onto B does nothing; the
 		// foreground window on A keeps focus, so the next window opens on A.
+		fakeDesktop.cursor = QPoint(2000, 150);
 		QVERIFY(!fakeDesktop.focus.cursorEntered(screenB, false));
 		QCOMPARE(fakeDesktop.focus.screen(), screenA);
 		auto* viewer = add(2);
@@ -1655,8 +1656,10 @@ private slots:
 		QCOMPARE(view.layout->screen.data(), screenA);
 		QCOMPARE(fakeWindow(viewer->hwnd()).frame, QRect(20, 20, 1880, 1040));
 
-		// With focus-follows-mouse on, crossing onto B focuses it.
-		QVERIFY(fakeDesktop.focus.cursorEntered(screenB, true));
+		// The mouse hook's notification hasn't reached the GUI, so cached
+		// focus still points to A. Sample the pointer at window admission.
+		fakeDesktop.focusFollowsMouse = true;
+		QCOMPARE(fakeDesktop.focus.screen(), screenA);
 		auto* editor = add(3);
 		fakeWindow(editor->hwnd()).monitor = 0;
 		emit WindowTracker::instance()->windowAdded(editor);
@@ -1664,6 +1667,8 @@ private slots:
 		QCOMPARE(manager->managed.at(editor).layout->screen.data(), screenB);
 
 		// A click always moves focus, even with focus-follows-mouse off.
+		fakeDesktop.focusFollowsMouse = false;
+		QVERIFY(fakeDesktop.focus.activeWindow(screenB));
 		QVERIFY(fakeDesktop.focus.clicked(screenA));
 		auto* terminal = add(4);
 		fakeWindow(terminal->hwnd()).monitor = 0;

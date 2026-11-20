@@ -20,6 +20,7 @@ public:
 	Q_INVOKABLE static void sendKey(int keycode, bool down);
 	Q_INVOKABLE static void sendText(const QString& text);
 	Q_INVOKABLE static QVariantMap cursorPosition();
+	Q_INVOKABLE static QString cursorScreenForFocus();
 };
 
 } // namespace qs::windows::sys
