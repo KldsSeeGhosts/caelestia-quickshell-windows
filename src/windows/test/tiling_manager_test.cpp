@@ -1717,6 +1717,14 @@ private slots:
 		QCOMPARE(fakeWindow(reused->hwnd()).borderColour, COLORREF(RGB(32, 33, 34)));
 		QCOMPARE(fakeWindow(reused->hwnd()).borderWrites, 1);
 		QCOMPARE(fakeWindow(peer->hwnd()).borderColour, COLORREF(RGB(18, 52, 86)));
+
+		fakeWindow(peer->hwnd()).refuseNextBorder = true;
+		fakeDesktop.active = second->hwnd();
+		manager->onActiveWindowChanged();
+		QCOMPARE(fakeWindow(peer->hwnd()).borderColour, COLORREF(RGB(18, 52, 86)));
+		fakeDesktop.active = reused->hwnd();
+		manager->onActiveWindowChanged();
+		QCOMPARE(fakeWindow(peer->hwnd()).borderColour, COLORREF(RGB(32, 33, 34)));
 	}
 
 	// Windows opens a new window on the primary monitor. The tiler must move it

@@ -106,6 +106,7 @@ struct FakeWindow {
 	int placements = 0;
 	COLORREF borderColour = 0xffffffff;
 	int borderWrites = 0;
+	bool refuseNextBorder = false;
 };
 
 struct MonitorRects {
@@ -244,6 +245,10 @@ inline HRESULT DwmGetWindowAttribute(HWND h, DWORD attribute, void* r, DWORD siz
 inline HRESULT DwmSetWindowAttribute(HWND h, DWORD attribute, const void* value, DWORD size) {
 	if (attribute != 34 || size != sizeof(COLORREF)) qFatal("Unexpected native DWM write in fixture");
 	auto& window = fakeWindow(h);
+	if (window.refuseNextBorder) {
+		window.refuseNextBorder = false;
+		return E_FAIL;
+	}
 	window.borderColour = *static_cast<const COLORREF*>(value);
 	window.borderWrites++;
 	return S_OK;

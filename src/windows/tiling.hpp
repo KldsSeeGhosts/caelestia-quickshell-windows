@@ -401,7 +401,7 @@ private:
 	[[nodiscard]] qint32 outerGap(const Layout* layout) const;
 	[[nodiscard]] qint32 outerGap(const tiling::LayoutEngine& tree) const;
 	void refreshBorderColours();
-	void refreshBorderColour(TrackedWindow* window);
+	void refreshBorderColour(Managed& m, TrackedWindow* active);
 	void restoreBorderColour(Managed& m);
 	void restoreBorderColours();
 	void place(Managed& m, const QRect& tile);
@@ -502,10 +502,8 @@ private:
 	QSet<TrackedWindow*> dirtyWindows;
 	QSet<Layout*> dirtyLayouts;
 	QHash<TrackedWindow*, tiling::PlacementIdentity> unverified;
-	// The window the last border pass painted active, so a focus-only change
-	// repaints it and the new focus instead of every managed window. Cleared on
-	// unmanage and stop; sync clears it too whenever it repaints all borders.
-	TrackedWindow* lastBorderFocused = nullptr;
+	QPointer<TrackedWindow> lastBorderFocused;
+	bool borderRetryNeeded = false;
 	TrackedWindow* dragging = nullptr;
 	Drag drag;
 	// Bumped by every tree or geometry change, so drop plans never reuse frames

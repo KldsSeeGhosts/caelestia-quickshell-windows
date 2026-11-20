@@ -618,18 +618,14 @@ void TilingManager::restoreBorderColours() {
 
 void TilingManager::refreshBorderColours() {
 	if (!borderColoursSupported()) return;
-	for (auto& [window, m]: this->managed) {
-		this->refreshBorderColour(window);
-	}
-	this->lastBorderFocused = this->tracker != nullptr ? this->tracker->activeWindow() : nullptr;
+	auto* active = this->tracker != nullptr ? this->tracker->activeWindow() : nullptr;
+	this->lastBorderFocused = active;
+	this->borderRetryNeeded = false;
+	for (auto& [window, m]: this->managed) this->refreshBorderColour(m, active);
 }
 
-void TilingManager::refreshBorderColour(TrackedWindow* window) {
-	if (!borderColoursSupported()) return;
-	auto iter = this->managed.find(window);
-	if (iter == this->managed.end()) return;
-
-	auto& m = iter->second;
+void TilingManager::refreshBorderColour(Managed& m, TrackedWindow* active) {
+	auto* window = m.window;
 	if (!this->mEnabled || !this->mBorderColours || m.layout == nullptr
 	    || window->fullscreen() || this->fullscreenLike(m)
 	    || this->stateOf(m) == State::Out)
@@ -637,8 +633,7 @@ void TilingManager::refreshBorderColour(TrackedWindow* window) {
 		this->restoreBorderColour(m);
 		return;
 	}
-	const auto& colour = window == this->tracker->activeWindow() ? this->mActiveBorderColour
-	                                                             : this->mInactiveBorderColour;
+	const auto& colour = window == active ? this->mActiveBorderColour : this->mInactiveBorderColour;
 	if (!colour.isValid()) {
 		this->restoreBorderColour(m);
 		return;
@@ -650,6 +645,10 @@ void TilingManager::refreshBorderColour(TrackedWindow* window) {
 	    ))
 	{
 		m.borderColour = native;
+	} else {
+		// A failed inactive write can leave the old foreground border painted.
+		// Retry on the next normal update, even if focus moves to a third window.
+		this->borderRetryNeeded = true;
 	}
 }
 
@@ -1017,6 +1016,7 @@ void TilingManager::stop() {
 	this->dirtyLayouts.clear();
 	this->unverified.clear();
 	this->lastBorderFocused = nullptr;
+	this->borderRetryNeeded = false;
 	this->dragging = nullptr;
 	this->clearDrag();
 	this->edgeDragState = EdgeDrag();
@@ -2582,14 +2582,16 @@ void TilingManager::onActiveWindowChanged() {
 	// Focus alone only changes which window is painted active. Repaint the
 	// window that was focused and the one that is now; every other border is
 	// already the inactive colour.
-	if (this->lastBorderFocused != window) {
-		if (this->lastBorderFocused != nullptr) this->refreshBorderColour(this->lastBorderFocused);
-		if (window != nullptr) this->refreshBorderColour(window);
+	if (this->borderRetryNeeded) {
+		this->refreshBorderColours();
+	} else if (borderColoursSupported()) {
+		const auto refresh = [this, window](TrackedWindow* target) {
+			auto iter = this->managed.find(target);
+			if (iter != this->managed.end()) this->refreshBorderColour(iter->second, window);
+		};
+		if (this->lastBorderFocused && this->lastBorderFocused != window) refresh(this->lastBorderFocused);
+		if (window != nullptr) refresh(window);
 		this->lastBorderFocused = window;
-	} else if (window != nullptr) {
-		// Same focus, but a layout or state change between events may have
-		// altered this window's own eligibility.
-		this->refreshBorderColour(window);
 	}
 
 	auto iter = this->managed.find(window);
