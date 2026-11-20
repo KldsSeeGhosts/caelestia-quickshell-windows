@@ -1630,6 +1630,95 @@ private slots:
 		QCOMPARE(fakeWindow(a->hwnd()).borderWrites, writes);
 	}
 
+	// A foreground event repaints only the window losing focus and the one
+	// gaining it; the old code walked every managed window. Assert the cost
+	// stays at two windows regardless of how many apps the tiler manages.
+	void focusSwitchRepaintsOnlyOldAndNewBorder() {
+		manager->setActiveBorderColour(QColor("#123456"));
+		manager->setInactiveBorderColour(QColor("#202122"));
+
+		auto resetCounters = [&]() {
+			for (auto* w: windows) {
+				auto& native = fakeWindow(w->hwnd());
+				native.borderWrites = 0;
+				native.styleReads = 0;
+			}
+		};
+		auto switchCost = [&]() -> QPair<int, int> {
+			resetCounters();
+			manager->onActiveWindowChanged();
+			int writes = 0;
+			int touched = 0;
+			for (auto* w: windows) {
+				const auto& native = fakeWindow(w->hwnd());
+				writes += native.borderWrites;
+				if (native.borderWrites > 0 || native.styleReads > 0) touched++;
+			}
+			return qMakePair(writes, touched);
+		};
+
+		// A small layout first, then grow it to a busy one; the per-switch cost
+		// must not grow with the managed count.
+		for (int id = 1; id <= 4; ++id) add(id);
+		fakeDesktop.active = windows.at(0)->hwnd();
+		enable();
+		auto* first = windows.at(0);
+		auto* second = windows.at(1);
+		auto* peer = windows.at(2);
+		fakeDesktop.active = second->hwnd();
+		const QPair<int, int> few = switchCost();
+		QCOMPARE(fakeWindow(first->hwnd()).borderColour, COLORREF(RGB(32, 33, 34)));
+		QCOMPARE(fakeWindow(second->hwnd()).borderColour, COLORREF(RGB(18, 52, 86)));
+
+		for (int id = 5; id <= 16; ++id) manager->manage(add(id));
+		manager->sync();
+		QCOMPARE(manager->telemetry()->managedCount(), 16);
+		fakeDesktop.active = first->hwnd();
+		const QPair<int, int> many = switchCost();
+		QCOMPARE(fakeWindow(second->hwnd()).borderColour, COLORREF(RGB(32, 33, 34)));
+		QCOMPARE(fakeWindow(first->hwnd()).borderColour, COLORREF(RGB(18, 52, 86)));
+
+		// Each switch writes one border per side and only ever inspects the
+		// window losing focus and the one gaining it.
+		QVERIFY(few.first > 0);
+		QCOMPARE(many.first, few.first);
+		QCOMPARE(many.second, 2);
+		// An unaffected peer keeps its inactive colour and is untouched.
+		QCOMPARE(fakeWindow(peer->hwnd()).borderColour, COLORREF(RGB(32, 33, 34)));
+		QCOMPARE(fakeWindow(peer->hwnd()).borderWrites, 0);
+
+		// Focus moving to nothing (e.g. the desktop) still unpaints the old
+		// holder without touching peers.
+		resetCounters();
+		fakeDesktop.active = nullptr;
+		manager->onActiveWindowChanged();
+		QCOMPARE(fakeWindow(first->hwnd()).borderColour, COLORREF(RGB(32, 33, 34)));
+		QCOMPARE(fakeWindow(peer->hwnd()).borderWrites, 0);
+
+		// The pointer survives unmanage and hwnd reuse: closing the focused
+		// window and opening another at the same handle must not keep a
+		// dangling "last painted" pointer or skip repaints.
+		auto* stale = first;
+		fakeDesktop.active = stale->hwnd();
+		manager->onActiveWindowChanged();
+		manager->unmanage(stale);
+		WindowTracker::instance()->fixtures.removeAll(stale);
+		auto* reused = add(1);
+		manager->manage(reused);
+		manager->sync();
+		QCOMPARE(reused->hwnd(), stale->hwnd());
+		QVERIFY(manager->managed.at(reused).layout != nullptr);
+		// The reused handle is the foreground window, so it is painted active.
+		QCOMPARE(fakeWindow(reused->hwnd()).borderColour, COLORREF(RGB(18, 52, 86)));
+		// And focus still tracks it normally afterwards.
+		resetCounters();
+		fakeDesktop.active = peer->hwnd();
+		manager->onActiveWindowChanged();
+		QCOMPARE(fakeWindow(reused->hwnd()).borderColour, COLORREF(RGB(32, 33, 34)));
+		QCOMPARE(fakeWindow(reused->hwnd()).borderWrites, 1);
+		QCOMPARE(fakeWindow(peer->hwnd()).borderColour, COLORREF(RGB(18, 52, 86)));
+	}
+
 	// Windows opens a new window on the primary monitor. The tiler must move it
 	// to the monitor the Hyprland compatibility layer published as focusedmon,
 	// the same focusedMonitor the shell uses, when the window appears.
