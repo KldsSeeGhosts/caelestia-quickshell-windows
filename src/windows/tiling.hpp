@@ -395,8 +395,9 @@ private:
 	// Returns the work area, or a null rectangle when the monitor is gone.
 	QRect computeTree(tiling::LayoutEngine& tree, QScreen* screen) const;
 	[[nodiscard]] QRect tileRect(const Layout* layout, TrackedWindow* window) const;
-	[[nodiscard]] QRect
-	tileRect(const tiling::LayoutEngine& tree, QScreen* screen, tiling::LayoutEngine::Id id) const;
+	struct TileGaps { int inner; int outer; };
+	[[nodiscard]] TileGaps tileGaps(const tiling::LayoutEngine& tree, QScreen* screen) const;
+	[[nodiscard]] static QRect tileRect(const tiling::LayoutEngine& tree, tiling::LayoutEngine::Id id, TileGaps gaps);
 	[[nodiscard]] qint32 outerGap(const Layout* layout) const;
 	[[nodiscard]] qint32 outerGap(const tiling::LayoutEngine& tree) const;
 	void refreshBorderColours();

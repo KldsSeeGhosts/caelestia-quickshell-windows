@@ -101,6 +101,7 @@ struct FakeWindow {
 	qreal dpiScale = 1.0;
 	LONG_PTR style = WS_THICKFRAME;
 	LONG_PTR exStyle = 0;
+	int styleReads = 0;
 	int moves = 0;
 	int placements = 0;
 	COLORREF borderColour = 0xffffffff;
@@ -305,7 +306,9 @@ inline BOOL IsWindowVisible(HWND h) {
 	return IsWindow(h) && fakeWindow(h).visible;
 }
 inline LONG_PTR GetWindowLongPtrW(HWND h, int index) {
-	return index == GWL_STYLE ? fakeWindow(h).style : fakeWindow(h).exStyle;
+	auto& window = fakeWindow(h);
+	window.styleReads++;
+	return index == GWL_STYLE ? window.style : window.exStyle;
 }
 inline int GetClassNameW(HWND h, LPWSTR buffer, int size) {
 	auto name = fakeWindow(h).className.left(size - 1);

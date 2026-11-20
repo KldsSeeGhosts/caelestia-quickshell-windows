@@ -1543,6 +1543,35 @@ private slots:
 		QCOMPARE(fakeDesktop.rescues, 1); // Constructor used the fake rescue boundary.
 	}
 
+	void applyDoesNotRequeryGapOwnersForEachPeer_data() {
+		QTest::addColumn<QString>("kind");
+		for (const auto* name: {"master", "dwindle", "scrolling"})
+			QTest::newRow(name) << QString::fromLatin1(name);
+	}
+
+	void applyDoesNotRequeryGapOwnersForEachPeer() {
+		QFETCH(QString, kind);
+		manager->setLayout(kind);
+		for (int id = 1; id <= 4; ++id) add(id);
+		enable();
+		auto* layout = manager->managed.at(windows.first()).layout;
+		QVERIFY(layout != nullptr);
+		auto peakReads = [&]() {
+			for (auto* w: windows) fakeWindow(w->hwnd()).styleReads = 0;
+			manager->apply(layout);
+			int peak = 0;
+			for (auto* w: windows) peak = qMax(peak, fakeWindow(w->hwnd()).styleReads);
+			return peak;
+		};
+		const auto fourWindows = peakReads();
+		for (int id = 5; id <= 16; ++id) manager->manage(add(id));
+		manager->sync();
+		const auto sixteenWindows = peakReads();
+		qInfo() << "Peak native style reads per window for layouts of 4 and 16:" << fourWindows << sixteenWindows;
+		QVERIFY(fourWindows > 0);
+		QVERIFY(sixteenWindows <= fourWindows);
+	}
+
 	void singleWindowGapsAndBorderLifecycle() {
 		auto* a = add(1);
 		fakeDesktop.active = a->hwnd();
