@@ -116,4 +116,9 @@ QVariantMap Input::cursorPosition() {
 	return {};
 }
 
+QString Input::cursorScreenForFocus() {
+	auto* screen = qs::windows::cursorScreenForFocus();
+	return screen == nullptr ? QString() : screenName(screen);
+}
+
 } // namespace qs::windows::sys

@@ -7,6 +7,7 @@
 
 #include <qcoreapplication.h>
 #include <qprocess.h>
+#include <qsignalspy.h>
 #include <qtest.h>
 #include <qt_windows.h>
 
@@ -85,6 +86,28 @@ public:
 	QString desktopName;
 
 private slots:
+	void wallpaperBroadcastNotifiesReaders() {
+		registerClass();
+		auto* parent = create(nullptr, 0, 200);
+		QVERIFY(parent);
+		auto* host = qs::windows::DesktopHost::instance();
+		host->adoptHostForTesting(parent);
+		host->refreshForTesting();
+		auto* listener = FindWindowW(L"QuickshellDesktopListener", nullptr);
+		QVERIFY(listener);
+
+		QSignalSpy changed(host, &qs::windows::DesktopHost::wallpaperChanged);
+		// Simulate Windows' notifications on the private desktop without
+		// changing any wallpaper or sending a system-wide broadcast.
+		SendMessageW(listener, WM_SETTINGCHANGE, SPI_SETDESKWALLPAPER, 0);
+		SendMessageW(listener, WM_SETTINGCHANGE, SPI_SETDESKWALLPAPER, 0);
+		QCOMPARE(changed.count(), 0);
+		QTRY_COMPARE(changed.count(), 1);
+
+		host->setEnabled(false);
+		DestroyWindow(parent);
+	}
+
 	void shellRestackAfterStopPlay_data() {
 		QTest::addColumn<bool>("freshStart");
 		QTest::addColumn<bool>("stopHides");

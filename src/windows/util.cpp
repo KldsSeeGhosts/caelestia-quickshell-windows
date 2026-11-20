@@ -60,6 +60,12 @@ bool focusFollowsMouseEnabled() {
 	    && tracking != FALSE;
 }
 
+QScreen* cursorScreenForFocus() {
+	POINT cursor {};
+	if (!focusFollowsMouseEnabled() || !GetCursorPos(&cursor)) return nullptr;
+	return screenForMonitor(MonitorFromPoint(cursor, MONITOR_DEFAULTTONULL));
+}
+
 MonitorRects monitorRects(HMONITOR monitor) {
 	MonitorRects rects;
 	if (monitor == nullptr) return rects;

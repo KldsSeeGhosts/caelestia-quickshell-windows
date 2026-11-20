@@ -1207,7 +1207,8 @@ void TilingManager::manage(TrackedWindow* window) {
 	m.placement.lifetime = ++this->lifetimeCounter;
 	m.elevated = isMoreElevated(window->hwnd());
 	if (!this->starting) {
-		m.placeOn = focusedScreen();
+		m.placeOn = cursorScreenForFocus();
+		if (m.placeOn == nullptr) m.placeOn = focusedScreen();
 		auto className = windowClass(window->hwnd());
 		// A background command can briefly show a legacy console that looks
 		// like a normal task window. Don't give it a slot until it takes focus.
@@ -2566,7 +2567,8 @@ void TilingManager::onActiveWindowChanged() {
 	m.focusStamp = ++this->focusCounter;
 	if (m.waitingForConsoleFocus) {
 		m.waitingForConsoleFocus = false;
-		m.placeOn = focusedScreen();
+		m.placeOn = cursorScreenForFocus();
+		if (m.placeOn == nullptr) m.placeOn = focusedScreen();
 		this->markWindow(window);
 	}
 	if (m.layout == nullptr) return;

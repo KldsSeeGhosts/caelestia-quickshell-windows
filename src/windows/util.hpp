@@ -23,6 +23,9 @@ struct MonitorRects {
 [[nodiscard]] HMONITOR monitorForScreen(QScreen* screen);
 [[nodiscard]] QScreen* screenForMonitor(HMONITOR monitor);
 [[nodiscard]] QScreen* focusedScreen();
+// Sample the physical pointer at dispatch/placement time. The queued mouse
+// crossing may be late, or a foreground event may have superseded it.
+[[nodiscard]] QScreen* cursorScreenForFocus();
 // Latest-event-wins focused monitor, as Hyprland publishes it. Each returns
 // true when the focused screen changed. The cursor only moves focus while
 // focus-follows-mouse is enabled; a click and a foreground window always do.

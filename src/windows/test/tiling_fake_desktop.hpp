@@ -122,6 +122,7 @@ struct FakeDesktop {
 	// What the Hyprland compatibility layer last published as focusedmon.
 	FocusMonitor focus;
 	QPoint cursor;
+	bool focusFollowsMouse = false;
 	qint64 now = 10000;
 	bool mutexHeld = false;
 	bool mutexOpen = false;
@@ -398,6 +399,12 @@ inline QScreen* screenForMonitor(HMONITOR monitor) {
 	return fakeDesktop.screens.at(index - 1).data();
 }
 inline QString screenName(QScreen* screen) { return screen ? screen->name() : QString(); }
+inline QScreen* cursorScreenForFocus() {
+	if (!fakeDesktop.focusFollowsMouse) return nullptr;
+	POINT cursor {};
+	GetCursorPos(&cursor);
+	return screenForMonitor(MonitorFromPoint(cursor, MONITOR_DEFAULTTONULL));
+}
 inline QScreen* focusedScreen() {
 	auto* screen = fakeDesktop.focus.screen();
 	return screen != nullptr ? screen : QGuiApplication::primaryScreen();
