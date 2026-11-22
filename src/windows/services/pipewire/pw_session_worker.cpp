@@ -1,4 +1,6 @@
 #include "pw_session_worker.hpp"
+#include <algorithm>
+#include <utility>
 
 #include <audiopolicy.h>
 #include <mmdeviceapi.h>
@@ -156,8 +158,11 @@ private:
 } // namespace
 
 struct PwSessionWorker::Private {
+	static constexpr int RETRY_MS = 2000;
+	static constexpr int MAX_RETRIES = 5;
 	struct Endpoint {
 		int flow = 0;
+		int retries = 0;
 		ComPtr<IAudioSessionManager2> manager;
 		SessionNotificationClient* notify = nullptr;
 	};
@@ -188,18 +193,23 @@ void PwSessionWorker::start() {
 	}
 	this->d->comInitialized = true;
 	this->d->retry = new QTimer(this);
-	this->d->retry->setInterval(2000);
+	this->d->retry->setSingleShot(true);
+	this->d->retry->setInterval(Private::RETRY_MS);
 	connect(this->d->retry, &QTimer::timeout, this, [this] {
 		const auto ids = this->d->endpoints.keys();
 		for (const auto& id: ids) {
-			if (!this->d->endpoints[id].manager) this->attachEndpoint(id, this->d->endpoints[id].flow);
+			auto it = this->d->endpoints.find(id);
+			if (it == this->d->endpoints.end() || it->manager || it->retries >= Private::MAX_RETRIES)
+				continue;
+			++it->retries;
+			this->attemptEndpoint(id);
 		}
+		this->updateRetryTimer();
 	});
-	this->d->retry->start();
 }
 
 void PwSessionWorker::stop() {
-	if (this->d->retry) this->d->retry->stop();
+	delete std::exchange(this->d->retry, nullptr);
 	const auto ids = this->d->endpoints.keys();
 	for (const auto& id: ids) this->removeEndpoint(id);
 	this->d->enumerator.Reset();
@@ -213,7 +223,35 @@ void PwSessionWorker::attachEndpoint(const QString& id, int flow) {
 	if (!this->d->comInitialized) return;
 	auto& endpoint = this->d->endpoints[id];
 	endpoint.flow = flow;
+	endpoint.retries = 0;
 	if (endpoint.manager) return;
+	this->attemptEndpoint(id);
+	this->updateRetryTimer();
+}
+
+void PwSessionWorker::updateRetryTimer() {
+	if (!this->d->retry) return;
+	auto pending = std::ranges::any_of(this->d->endpoints, [](const Private::Endpoint& endpoint) {
+		return !endpoint.manager && endpoint.retries < Private::MAX_RETRIES;
+	});
+	if (!pending) this->d->retry->stop();
+	else if (!this->d->retry->isActive()) this->d->retry->start();
+}
+
+void PwSessionWorker::retryEndpoint(const QString& id, bool resetAttempts) {
+	auto it = this->d->endpoints.constFind(id);
+	if (it == this->d->endpoints.cend()) return;
+	auto flow = it->flow;
+	auto retries = resetAttempts ? 0 : it->retries;
+	this->removeEndpoint(id);
+	auto& endpoint = this->d->endpoints[id];
+	endpoint.flow = flow;
+	endpoint.retries = retries;
+	this->updateRetryTimer();
+}
+
+void PwSessionWorker::attemptEndpoint(const QString& id) {
+	auto& endpoint = this->d->endpoints[id];
 	auto fail = [this](const QString& operation, HRESULT hr) {
 		emit this->error(audioControlError(operation, hr));
 	};
@@ -247,7 +285,9 @@ void PwSessionWorker::attachEndpoint(const QString& id, int flow) {
 		    reinterpret_cast<void**>(endpoint.manager.GetAddressOf())
 		);
 	}
-	if (FAILED(hr)) {
+	if (FAILED(hr) || !endpoint.manager) {
+		endpoint.manager.Reset();
+		if (SUCCEEDED(hr)) hr = E_NOINTERFACE;
 		fail(QStringLiteral("Activate(IAudioSessionManager2)"), hr);
 		return;
 	}
@@ -273,9 +313,7 @@ void PwSessionWorker::scanEndpoint(const QString& id) {
 	if (SUCCEEDED(hr)) hr = sessions->GetCount(&count); // Arms new-session delivery.
 	if (FAILED(hr)) {
 		emit this->error(audioControlError(QStringLiteral("Enumerate audio sessions"), hr));
-		const auto flow = it->flow;
-		this->removeEndpoint(id);
-		this->d->endpoints[id].flow = flow;
+		this->retryEndpoint(id);
 		return;
 	}
 	for (int i = 0; i < count; ++i) {
@@ -297,6 +335,7 @@ void PwSessionWorker::removeEndpoint(const QString& id) {
 	for (const auto& key: keys) {
 		if (this->d->sessions[key].snapshot.endpointId == id) this->sessionDisconnected(key, false);
 	}
+	this->updateRetryTimer();
 }
 
 void PwSessionWorker::adoptSession(const QString& endpointId, IAudioSessionControl* control) {
@@ -351,9 +390,7 @@ void PwSessionWorker::adoptSession(const QString& endpointId, IAudioSessionContr
 		events->Release();
 		emit this->error(audioControlError(QStringLiteral("RegisterAudioSessionNotification"), hr));
 		// Retry this endpoint rather than silently retaining an unobservable list.
-		const auto flow = endpoint->flow;
-		this->removeEndpoint(endpointId);
-		this->d->endpoints[endpointId].flow = flow;
+		this->retryEndpoint(endpointId);
 		return;
 	}
 	entry.events = events;
@@ -426,12 +463,8 @@ void PwSessionWorker::sessionDisconnected(const QString& key, bool serviceStoppe
 	this->d->sessions.erase(it);
 	emit this->sessionRemoved(key);
 	if (serviceStopped) {
-		auto endpoint = this->d->endpoints.constFind(id);
-		if (endpoint == this->d->endpoints.cend()) return;
-		auto flow = endpoint->flow;
-		this->removeEndpoint(id);
-		this->d->endpoints[id].flow = flow;
 		this->d->enumerator.Reset();
+		this->retryEndpoint(id, true);
 	}
 }
 

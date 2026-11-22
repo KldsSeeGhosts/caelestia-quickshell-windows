@@ -158,14 +158,15 @@ bool titleChangeMakesShellSurface(const QString& title) {
 	return extraRules.matchesTitle(title);
 }
 
-QString windowTitle(HWND hwnd) {
-	auto length = GetWindowTextLengthW(hwnd);
+static QString readWindowTitle(HWND hwnd, int length) {
 	if (length <= 0) return {};
 
 	auto title = std::wstring(static_cast<size_t>(length) + 1, L'\0');
 	auto copied = GetWindowTextW(hwnd, title.data(), length + 1);
 	return QString::fromWCharArray(title.data(), copied);
 }
+
+QString windowTitle(HWND hwnd) { return readWindowTitle(hwnd, GetWindowTextLengthW(hwnd)); }
 
 bool isTaskListWindow(const Identity& identity) {
 	// WS_EX_APPWINDOW forces a taskbar button even on a tool or owned window.
@@ -249,13 +250,15 @@ Identity observe(HWND hwnd) {
 	identity.owned = GetWindow(hwnd, GW_OWNER) != nullptr;
 	identity.cloaked = isCloaked(hwnd);
 
-	identity.title = windowTitle(hwnd);
-	identity.hasTitle = GetWindowTextLengthW(hwnd) > 0;
+	auto titleLength = GetWindowTextLengthW(hwnd);
+	identity.title = readWindowTitle(hwnd, titleLength);
+	identity.hasTitle = titleLength > 0;
 
 	DWORD processId = 0;
 	GetWindowThreadProcessId(hwnd, &processId);
 	identity.processId = processId;
-	auto* process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+	auto* process = processId ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId)
+	                         : nullptr;
 
 	if (process != nullptr) {
 		wchar_t path[1024] {};

@@ -7,6 +7,7 @@
 #include <qhash.h>
 #include <qobject.h>
 #include <qqmlintegration.h>
+#include <qset.h>
 #include <qstringlist.h>
 #include <qtclasshelpermacros.h>
 #include <qtimer.h>
@@ -153,6 +154,7 @@ private:
 	void removeReconcileHook();
 	// Coalesces the events of one message-loop turn into one read-only pass.
 	void queueReconcile();
+	[[nodiscard]] bool relevantParentChange(HWND hwnd) const;
 
 	static LRESULT CALLBACK listenerProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 	static void CALLBACK eventProc(
@@ -219,6 +221,7 @@ private:
 	// change hook. They report a known owner's visibility and destruction
 	// edges; the desktop-wide hooks above report everything else.
 	QHash<DWORD, std::array<HWINEVENTHOOK, 2>> foreignHooks;
+	QSet<HWND> hostedChildren;
 #ifdef QS_TEST
 	bool adoptedForTesting = false;
 	bool eventRouteDisabledForTesting = false;

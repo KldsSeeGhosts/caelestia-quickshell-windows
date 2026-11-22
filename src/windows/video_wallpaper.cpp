@@ -17,6 +17,7 @@
 #include <mfmediaengine.h>
 #include <oleauto.h>
 
+#include <qevent.h>
 #include <qfileinfo.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
@@ -46,7 +47,7 @@ Q_LOGGING_CATEGORY(logVideo, "quickshell.windows.video", QtWarningMsg);
 
 constexpr UINT64 KEY_PRODUCER = 0;
 constexpr UINT64 KEY_CONSUMER = 1;
-constexpr int TICK_MS = 15;
+constexpr int TICK_MS = 16;
 constexpr int SOFTWARE_TICK_MS = 66;
 constexpr int MAX_WIDTH = 3840;
 constexpr int MAX_HEIGHT = 2160;
@@ -170,6 +171,7 @@ private:
 	bool mfReady = false;
 	bool loaded = false;
 	bool wantPlaying = false;
+	bool buffering = false;
 	bool warnedTransfer = false;
 	bool software = false;
 	winrt::com_ptr<ID3D11Device> device;
@@ -313,7 +315,7 @@ void VideoWorker::start() {
 	this->engine->SetAutoPlay(FALSE);
 
 	this->timer = new QTimer(this);
-	this->timer->setTimerType(Qt::PreciseTimer);
+	this->timer->setTimerType(Qt::CoarseTimer);
 	this->timer->setInterval(this->software ? SOFTWARE_TICK_MS : TICK_MS);
 	QObject::connect(this->timer, &QTimer::timeout, this, &VideoWorker::tick);
 
@@ -337,7 +339,18 @@ void VideoWorker::onEngineEvent(DWORD event) {
 		}
 		this->setPlaying(this->wantPlaying);
 		break;
+	case MF_MEDIA_ENGINE_EVENT_WAITING:
+	case MF_MEDIA_ENGINE_EVENT_STALLED:
+		this->buffering = true;
+		this->timer->stop();
+		break;
+	case MF_MEDIA_ENGINE_EVENT_PLAYING:
+	case MF_MEDIA_ENGINE_EVENT_CANPLAY:
+		this->buffering = false;
+		if (this->wantPlaying && this->frame && !this->timer->isActive()) this->timer->start();
+		break;
 	case MF_MEDIA_ENGINE_EVENT_ERROR: {
+		this->timer->stop();
 		winrt::com_ptr<IMFMediaError> error;
 		this->engine->GetError(error.put());
 		auto code = error ? error->GetErrorCode() : 0;
@@ -346,7 +359,8 @@ void VideoWorker::onEngineEvent(DWORD event) {
 		                   .arg(this->path)
 		                   .arg(code)
 		                   .arg(hresultText(extended));
-		qCWarning(logVideo).noquote() << message;
+		qCWarning(logVideo) << "Can't play" << qs::windows::logPath(this->path)
+		                   << "media error" << code << hresultText(extended);
 		emit this->failed(message);
 		break;
 	}
@@ -376,9 +390,9 @@ void VideoWorker::setPlaying(bool playing) {
 	this->wantPlaying = playing;
 	if (!this->engine || !this->loaded) return;
 
-	if (playing) {
-		this->engine->Play();
-		this->timer->start();
+	if (playing && this->frame) {
+		if (SUCCEEDED(this->engine->Play()) && !this->buffering && !this->timer->isActive())
+			this->timer->start();
 	} else {
 		this->engine->Pause();
 		this->timer->stop();
@@ -416,7 +430,7 @@ void VideoWorker::tick() {
 		this->slot->serial++;
 	}
 
-	emit this->frameReady();
+	if (!this->slot->wakePending.exchange(true)) emit this->frameReady();
 }
 
 void VideoWorker::fail(const QString& what, HRESULT hr) {
@@ -464,7 +478,10 @@ VideoSource::VideoSource(QString path)
 	QObject::connect(this->thread.get(), &QThread::finished, this->worker, &VideoWorker::shutdown);
 	QObject::connect(this->worker, &VideoWorker::ready, this, &VideoSource::onReady);
 	QObject::connect(this->worker, &VideoWorker::failed, this, &VideoSource::onFailed);
-	QObject::connect(this->worker, &VideoWorker::frameReady, this, &VideoSource::frameReady);
+	QObject::connect(this->worker, &VideoWorker::frameReady, this, [this] {
+		this->slot->wakePending.store(false);
+		emit this->frameReady();
+	});
 
 	this->thread->setObjectName(QStringLiteral("qs-video"));
 	this->thread->start();
@@ -626,9 +643,13 @@ private:
 
 VideoWallpaper::VideoWallpaper(QQuickItem* parent): QQuickItem(parent) {
 	this->setFlag(QQuickItem::ItemHasContents, true);
+	this->watchWindow(this->window());
 }
 
-VideoWallpaper::~VideoWallpaper() { this->detach(); }
+VideoWallpaper::~VideoWallpaper() {
+	if (this->watchedWindow) this->watchedWindow->removeEventFilter(this);
+	this->detach();
+}
 
 void VideoWallpaper::setSource(const QString& source) {
 	auto path = source.isEmpty() ? QString() : normalizedPath(source);
@@ -669,12 +690,51 @@ void VideoWallpaper::detach() {
 }
 
 void VideoWallpaper::updateWanted() {
-	if (this->mVideo) this->mVideo->setWanted(this, this->mPlaying && this->isVisible());
+	auto* window = this->watchedWindow.data();
+	if (this->mVideo) {
+		this->mVideo->setWanted(this, this->mPlaying && this->isVisible()
+		    && window && window->isVisible() && window->isExposed());
+	}
 }
 
 void VideoWallpaper::itemChange(ItemChange change, const ItemChangeData& value) {
-	if (change == ItemVisibleHasChanged) this->updateWanted();
 	QQuickItem::itemChange(change, value);
+	if (change == ItemSceneChange) {
+		this->watchWindow(value.window);
+	} else if (change == ItemVisibleHasChanged) {
+		this->updateWanted();
+	}
+}
+
+void VideoWallpaper::watchWindow(QQuickWindow* window) {
+	if (this->watchedWindow == window) return;
+	if (this->watchedWindow) this->watchedWindow->removeEventFilter(this);
+	this->watchedWindow = window;
+	if (window) window->installEventFilter(this);
+	this->updateWanted();
+}
+
+bool VideoWallpaper::eventFilter(QObject* watched, QEvent* event) {
+	if (watched == this->watchedWindow
+	    && (event->type() == QEvent::Expose || event->type() == QEvent::Show
+	        || event->type() == QEvent::Hide || event->type() == QEvent::WindowStateChange)
+	    && !this->wantedRefreshPending)
+	{
+		this->wantedRefreshPending = true;
+		QMetaObject::invokeMethod(this, [this] {
+			this->wantedRefreshPending = false;
+			this->updateWanted();
+		}, Qt::QueuedConnection);
+	}
+	return QQuickItem::eventFilter(watched, event);
+}
+
+void VideoWallpaper::queueSceneUpdate() {
+	if (this->sceneUpdatePending.exchange(true)) return;
+	QMetaObject::invokeMethod(this, [this] {
+		this->sceneUpdatePending.store(false);
+		if (this->mVideo && this->isVisible()) this->update();
+	}, Qt::QueuedConnection);
 }
 
 QSGNode* VideoWallpaper::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData* /*data*/) {
@@ -688,7 +748,7 @@ QSGNode* VideoWallpaper::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData* 
 
 	quint64 serial = 0;
 	auto frame = this->mVideo->latestFrame(&serial);
-	if (!node->sync(frame, serial)) this->update();
+	if (!node->sync(frame, serial)) this->queueSceneUpdate();
 
 	if (!node->hasTexture()) {
 		delete node;

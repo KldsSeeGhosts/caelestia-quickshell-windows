@@ -52,6 +52,7 @@
 #include "panel_effects.hpp"
 #include "panel_geometry.hpp"
 #include "panel_topmost.hpp"
+#include "supervisor_bridge.hpp"
 #include "redact.hpp"
 #include "startup.hpp"
 #include "system_surface.hpp"
@@ -362,6 +363,7 @@ public:
 
 	void removePanel(WinPanelWindow* panel) {
 		this->mPanels.removeOne(panel);
+		this->mTopmostRepairs.remove(panel);
 
 		// Forget monitors with no panel left: a replugged display can reuse the
 		// handle and must seed afresh instead of inheriting a stale lowering.
@@ -396,6 +398,7 @@ public:
 	void restoreTopmostPanels() {
 		// A topmost application can cover a panel without clearing its TOPMOST
 		// bit. Check actual overlapping application order as well as the style.
+		const auto now = GetTickCount64();
 		for (auto* panel: this->mPanels) {
 			auto* hwnd = panel->hwnd();
 			if (hwnd == nullptr || panel->bLayer != PanelLayer::Top || panel->isEmbedded()
@@ -403,11 +406,26 @@ public:
 			{
 				continue;
 			}
-			if (!panel->topmostExpected) continue;
+			if (!panel->topmostExpected) {
+				this->mTopmostRepairs.remove(panel);
+				continue;
+			}
+			auto& repair = this->mTopmostRepairs[panel];
+			if (repair.hwnd != hwnd) repair = {.hwnd = hwnd};
+			if (now < repair.nextAttempt) continue;
 			QList<HWND> ownAbove;
 			auto topmost = (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
 			if (panel_topmost::needsRestore(true, topmost, !onTopOfOthers(hwnd, ownAbove))) {
+				if (repair.stableSince && now - repair.stableSince >= 1000) repair.attempts = 0;
+				repair.stableSince = 0;
+				// Set this before SetWindowPos, which can reenter the native
+				// event handler. No timer keeps fighting an idle competitor.
+				repair.attempts = std::min(repair.attempts + 1, 8);
+				repair.nextAttempt = now + (repair.attempts <= 2
+					? 0 : (500ULL << (repair.attempts - 3)));
 				this->restack(hwnd, HWND_TOPMOST, true);
+			} else if (!repair.stableSince) {
+				repair.stableSince = now;
 			}
 		}
 	}
@@ -605,6 +623,13 @@ private:
 	RememberedForeground mExternalForeground;
 	QHash<HMONITOR, fullscreen_app::State> mFullscreenApps;
 	QHash<HMONITOR, HWND> mFullscreenWindows;
+	struct TopmostRepair {
+		HWND hwnd = nullptr;
+		ULONGLONG nextAttempt = 0;
+		ULONGLONG stableSince = 0;
+		int attempts = 0;
+	};
+	QHash<WinPanelWindow*, TopmostRepair> mTopmostRepairs;
 	bool mRepairPending = false;
 };
 
@@ -678,6 +703,32 @@ WinPanelWindow::WinPanelWindow(QObject* parent)
 	});
 
 	this->bcExclusionEdge.setBinding([this] { return this->bAnchors.value().exclusionEdge(); });
+
+	this->explorerRecoveryTimer.setSingleShot(true);
+	this->explorerRecoveryTimer.setInterval(4000);
+	QObject::connect(&this->explorerRecoveryTimer, &QTimer::timeout, this, [this] {
+		auto* taskbar = explorerTaskbarWindow();
+		DWORD pid = 0;
+		const auto thread = taskbar != nullptr ? GetWindowThreadProcessId(taskbar, &pid) : 0;
+		if (this->recoverExplorer(taskbar, pid, thread))
+			WinPanelStack::instance()->scheduleStackRepair();
+		else
+			this->scheduleUpdateDimensions();
+	});
+	QObject::connect(SupervisorBridge::instance(), &SupervisorBridge::explorerSettled, this,
+	    [this](quint64 pid, qint64 hwnd, int, bool) {
+		    const auto wasWaiting = this->explorerRecoveryTimer.isActive();
+		    this->explorerRecoveryTimer.stop();
+		    // The bridge emits each epoch once. The HWND check in recovery
+		    // also deduplicates a safety pass that already handled this tray.
+		    auto* taskbar = reinterpret_cast<HWND>(static_cast<qintptr>(hwnd));
+		    DWORD owner = 0;
+		    const auto thread = taskbar != nullptr ? GetWindowThreadProcessId(taskbar, &owner) : 0;
+		    if (owner == pid && this->recoverExplorer(taskbar, owner, thread))
+			    WinPanelStack::instance()->scheduleStackRepair();
+		    else if (wasWaiting)
+			    this->scheduleUpdateDimensions();
+	    });
 
 	auto* host = DesktopHost::instance();
 	auto queued = Qt::QueuedConnection;
@@ -1099,8 +1150,32 @@ void WinPanelWindow::onDesktopAccessorReady() {
 	if (this->window != nullptr && this->window->isVisible()) this->stickToAllDesktops();
 }
 
+bool WinPanelWindow::recoverExplorer(HWND taskbar, DWORD pid, DWORD thread) {
+	if (!thread || (taskbar == this->explorerTaskbar && pid == this->explorerTaskbarPid
+	               && thread == this->explorerTaskbarThread))
+		return false;
+	this->explorerTaskbar = taskbar;
+	this->explorerTaskbarPid = pid;
+	this->explorerTaskbarThread = thread;
+	this->pinnedToAllDesktops = false;
+	this->pinFailedHwnd = nullptr;
+	this->stuckHwnd = nullptr;
+	this->appBar.invalidate();
+	this->scheduleUpdateDimensions();
+	this->blur->syncPlacement();
+	QTimer::singleShot(0, this, &WinPanelWindow::onDesktopAccessorReady);
+	return true;
+}
+
 void WinPanelWindow::onWindowVisibleChanged() {
 	if (this->window->isVisible()) {
+		if (this->explorerTaskbar == nullptr) {
+			this->explorerTaskbar = explorerTaskbarWindow();
+			if (this->explorerTaskbar != nullptr)
+				this->explorerTaskbarThread = GetWindowThreadProcessId(
+				    this->explorerTaskbar, &this->explorerTaskbarPid
+				);
+		}
 		startup::watchWindow(this->window);
 		auto* stack = WinPanelStack::instance();
 		stack->addPanel(this);
@@ -1238,7 +1313,7 @@ void WinPanelWindow::updateDimensions(const MonitorRects& nativeRects) {
 		}
 	}
 
-	if (wantsAppBar) {
+	if (wantsAppBar && !this->explorerRecoveryTimer.isActive()) {
 		UINT abEdge = ABE_TOP;
 		switch (edge) {
 		case Qt::LeftEdge: abEdge = ABE_LEFT; break;
@@ -1268,7 +1343,7 @@ void WinPanelWindow::updateDimensions(const MonitorRects& nativeRects) {
 			default: break;
 			}
 		}
-	} else {
+	} else if (!wantsAppBar) {
 		this->appBar.remove();
 	}
 
@@ -1997,9 +2072,19 @@ bool WinPanelWindow::handleNativeMessage(MSG* msg, qintptr* result) {
 	}
 
 	if (msg->message == WinAppBar::taskbarCreatedMessage()) {
-		this->appBar.invalidate();
-		this->scheduleUpdateDimensions();
-		this->blur->syncPlacement();
+		auto* taskbar = explorerTaskbarWindow();
+		DWORD pid = 0;
+		auto thread = taskbar != nullptr ? GetWindowThreadProcessId(taskbar, &pid) : 0;
+		if (SupervisorBridge::instance()->isCoordinatingExplorer()) {
+			// Ignore the tray hook's rebroadcast for the same Explorer. A real
+			// replacement must wait for the supervisor's suppression pass.
+			if ((!thread || taskbar != this->explorerTaskbar || pid != this->explorerTaskbarPid
+			     || thread != this->explorerTaskbarThread) && !this->explorerRecoveryTimer.isActive())
+				this->explorerRecoveryTimer.start();
+		} else {
+			this->explorerRecoveryTimer.stop();
+			this->recoverExplorer(taskbar, pid, thread);
+		}
 		return false;
 	}
 

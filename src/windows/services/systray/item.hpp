@@ -151,7 +151,7 @@ private:
 	};
 
 	void allowForeground() const;
-	void send(UINT event) const;
+	void send(UINT event, const POINT* anchor = nullptr) const;
 	void sendActivate(bool doubleClick);
 	void sendSecondaryActivate();
 	void sendDisplay();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 
 #include <qabstractnativeeventfilter.h>
 #include <qhash.h>
@@ -140,7 +141,8 @@ private:
 	mutable quint64 nextUnresolvedId = 0;
 	quint64 nextSessionToken = 0;
 	QTimer settleTimer;
-	bool refreshPending = false;
+	struct DeviceNotifications;
+	std::unique_ptr<DeviceNotifications> deviceNotifications;
 };
 
 // The QML-facing name of an identity: the unique name, or the label while the

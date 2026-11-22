@@ -97,7 +97,9 @@ QImage hbitmapToImage(HBITMAP bitmap) {
 
 	if (ok == 0) return QImage();
 
-	return image.convertToFormat(QImage::Format_ARGB32);
+	constexpr auto targetFormat = QImage::Format_ARGB32;
+	if (image.format() == targetFormat) return image;
+	return std::move(image).convertToFormat(targetFormat);
 }
 
 QImage renderShellItemIcon(IShellItem* item, const QSize& size) {

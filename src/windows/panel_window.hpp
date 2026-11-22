@@ -20,6 +20,7 @@
 #include <qscreen.h>
 #include <qstring.h>
 #include <qtclasshelpermacros.h>
+#include <qtimer.h>
 #include <qtmetamacros.h>
 #include <qtypes.h>
 #include <qvariant.h>
@@ -209,6 +210,7 @@ private:
 	void takeFocusOnExpose();
 	void grabKeyboardFocus();
 	void stickToAllDesktops();
+	bool recoverExplorer(HWND taskbar, DWORD pid, DWORD thread);
 	[[nodiscard]] bool reservesSpace() const;
 	[[nodiscard]] bool wantsEmbedding() const;
 	[[nodiscard]] bool wantsAboveIcons() const;
@@ -274,6 +276,10 @@ private:
 	bool appBarDeferred = false;
 	bool pinnedToAllDesktops = false;
 	HWND pinFailedHwnd = nullptr;
+	HWND explorerTaskbar = nullptr;
+	DWORD explorerTaskbarPid = 0;
+	DWORD explorerTaskbarThread = 0;
+	QTimer explorerRecoveryTimer;
 	HWND stuckHwnd = nullptr;
 	qsizetype stuckDesktop = -1;
 

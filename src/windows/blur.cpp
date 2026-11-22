@@ -1,7 +1,7 @@
 #include "blur.hpp"
 #include <algorithm>
-#include <cmath>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -14,15 +14,14 @@
 #include <qjsondocument.h>
 #include <qjsonobject.h>
 #include <qjsonvalue.h>
-#include <qjsvalue.h>
 #include <qlist.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
 #include <qobject.h>
 #include <qpointer.h>
 #include <qqmlengine.h>
-#include <qquickitem.h>
 #include <qquickwindow.h>
+#include <qscopedvaluerollback.h>
 #include <qstandardpaths.h>
 #include <qstring.h>
 #include <qstringlist.h>
@@ -69,68 +68,32 @@ Q_LOGGING_CATEGORY(logBlur, "quickshell.windows.blur", QtInfoMsg);
 constexpr auto DEFAULT_FILE = "defaults/windows/layerrules.json";
 constexpr auto PERSONALIZE_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 constexpr auto BACKDROP_CLASS = L"QuickshellBlurBackdrop";
-constexpr DWORD WINDOWS_11_BUILD = 22000;
+// The SDK declares these as enum members, so use local aliases with the documented values.
+constexpr DWORD SYSTEM_BACKDROP_TYPE = 38; // DWMWA_SYSTEMBACKDROP_TYPE
+constexpr int BACKDROP_NONE = 1; // DWMSBT_NONE
+constexpr int BACKDROP_MICA = 2; // DWMSBT_MAINWINDOW
+constexpr int BACKDROP_ACRYLIC = 3; // DWMSBT_TRANSIENTWINDOW
+constexpr int BACKDROP_MICA_ALT = 4; // DWMSBT_TABBEDWINDOW
+constexpr qreal OPAQUE_ALPHA = 0.995; // Match the shape collector's cutoff.
 
 bool gManagerDestroyed = false; // NOLINT
+
+int systemBackdropType(BlurMode mode) {
+	switch (mode) {
+	case BlurMode::SystemAcrylic: return BACKDROP_ACRYLIC;
+	case BlurMode::SystemMica: return BACKDROP_MICA;
+	case BlurMode::SystemMicaAlt: return BACKDROP_MICA_ALT;
+	case BlurMode::Disabled:
+	case BlurMode::HostBackdrop: return BACKDROP_NONE;
+	}
+
+	return BACKDROP_NONE;
+}
 
 QString hresultString(const winrt::hresult_error& error) {
 	return QString("0x%1 %2")
 	    .arg(static_cast<quint32>(error.code().value), 8, 16, QChar('0'))
 	    .arg(QString::fromWCharArray(error.message().c_str()));
-}
-
-constexpr DWORD WCA_ACCENT_POLICY = 19;
-constexpr DWORD ACCENT_ENABLE_BLURBEHIND = 3;
-constexpr DWORD ACCENT_FLAG_GRADIENT_COLOR = 2;
-
-struct AccentPolicy {
-	DWORD accentState;
-	DWORD accentFlags;
-	DWORD gradientColor;
-	DWORD animationId;
-};
-
-struct WindowCompositionAttribData {
-	DWORD attribute;
-	PVOID data;
-	SIZE_T dataSize;
-};
-
-using SetWindowCompositionAttributeFn = BOOL(WINAPI*)(HWND, WindowCompositionAttribData*);
-
-SetWindowCompositionAttributeFn setWindowCompositionAttribute() {
-	static const auto function = []() -> SetWindowCompositionAttributeFn {
-		auto* user32 = GetModuleHandleW(L"user32.dll");
-		if (user32 == nullptr) return nullptr;
-
-		return reinterpret_cast<SetWindowCompositionAttributeFn>( // NOLINT
-		    GetProcAddress(user32, "SetWindowCompositionAttribute")
-		);
-	}();
-
-	return function;
-}
-
-QRect nearestRect(const QRectF& rect) {
-	auto left = static_cast<int>(std::lround(rect.left()));
-	auto top = static_cast<int>(std::lround(rect.top()));
-	auto right = static_cast<int>(std::lround(rect.right()));
-	auto bottom = static_cast<int>(std::lround(rect.bottom()));
-	return QRect(left, top, right - left, bottom - top);
-}
-
-void hideWindow(HWND hwnd) {
-	if (!IsWindowVisible(hwnd)) return;
-
-	SetWindowPos(
-	    hwnd,
-	    nullptr,
-	    0,
-	    0,
-	    0,
-	    0,
-	    SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER
-	);
 }
 
 } // namespace
@@ -143,16 +106,11 @@ public:
 
 	static std::unique_ptr<BackdropWindow> create(
 	    const wuc::Compositor& compositor,
-	    bool layered,
 	    bool tint,
 	    QString& error,
 	    bool& unsupported
 	);
 
-	static std::unique_ptr<BackdropWindow>
-	createAccent(bool layered, bool tint, QString& error, bool& unsupported);
-
-	[[nodiscard]] HWND hwnd() const { return this->mHwnd; }
 	void setPanel(HWND panel) { this->mPanel = panel; }
 
 	bool setShapes(const QList<BlurShape>& shapes);
@@ -163,51 +121,27 @@ public:
 private:
 	static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 	static bool registerClass();
-	static HWND createWindow(bool layered, BackdropWindow* owner, QString& error);
-	void updateRegion(const QList<BlurShape>& shapes);
+	static HWND createWindow(BackdropWindow* owner, QString& error);
+	void hideWindow();
 
-	HWND createPiece(QString& error, bool& unsupported);
-	bool setPieces(const QList<BlurShape>& shapes);
-	void showPieces();
-	void hidePieces();
-	[[nodiscard]] bool piecesInPlace(bool panelTopmost) const;
-
-	struct Slot {
+	struct VisualSlot {
 		wuc::ContainerVisual holder {nullptr};
 		wuc::SpriteVisual sprite {nullptr};
 		wuc::CompositionRoundedRectangleGeometry geometry {nullptr};
 	};
 
-	struct Piece {
-		HWND hwnd = nullptr;
-		QRect rect;
-		QRect shape;
-		int diameter = 0;
-		bool hasRegion = false;
-		RECT placed {};
-	};
-
 	HWND mHwnd = nullptr;
 	HWND mPanel = nullptr;
-	bool layered = false;
 	bool syncing = false;
 	bool shown = false;
 	RECT lastRect {};
-	QRegion region;
-	bool hasRegion = false;
-
-	bool accent = false;
-	bool accentTint = false;
-	std::vector<Piece> pieces;
-	size_t pieceCount = 0;
-	bool piecesMoved = false;
 
 	wuc::Compositor compositor {nullptr};
 	wucd::DesktopWindowTarget target {nullptr};
 	wuc::ContainerVisual root {nullptr};
 	wuc::CompositionBrush brush {nullptr};
 	wuc::CompositionBrush tint {nullptr};
-	std::vector<Slot> visuals;
+	std::vector<VisualSlot> visuals;
 	QList<BlurShape> applied;
 };
 
@@ -225,14 +159,14 @@ bool BackdropWindow::registerClass() {
 	return registered;
 }
 
-HWND BackdropWindow::createWindow(bool layered, BackdropWindow* owner, QString& error) {
+HWND BackdropWindow::createWindow(BackdropWindow* owner, QString& error) {
 	if (!registerClass()) {
 		error = QString("RegisterClassEx failed (%1)").arg(GetLastError());
 		return nullptr;
 	}
 
-	DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_NOREDIRECTIONBITMAP;
-	if (layered) exStyle |= WS_EX_LAYERED;
+	constexpr DWORD exStyle =
+	    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_NOREDIRECTIONBITMAP;
 
 	auto* hwnd = CreateWindowExW(
 	    exStyle,
@@ -258,14 +192,11 @@ HWND BackdropWindow::createWindow(bool layered, BackdropWindow* owner, QString& 
 
 	SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(owner));
 
-	if (layered) SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
-
 	return hwnd;
 }
 
 std::unique_ptr<BackdropWindow> BackdropWindow::create(
     const wuc::Compositor& compositor,
-    bool layered,
     bool tint,
     QString& error,
     bool& unsupported
@@ -273,15 +204,14 @@ std::unique_ptr<BackdropWindow> BackdropWindow::create(
 	unsupported = false;
 
 	auto backdrop = std::make_unique<BackdropWindow>();
-	backdrop->layered = layered;
-	backdrop->mHwnd = createWindow(layered, backdrop.get(), error);
+	backdrop->mHwnd = createWindow(backdrop.get(), error);
 	if (backdrop->mHwnd == nullptr) return nullptr;
 	auto* hwnd = backdrop->mHwnd;
 
 	BOOL enable = TRUE;
 	auto hr = DwmSetWindowAttribute(hwnd, DWMWA_USE_HOSTBACKDROPBRUSH, &enable, sizeof(enable));
 	if (FAILED(hr)) {
-		error = QString("DWMWA_USE_HOSTBACKDROPBRUSH was refused (0x%1), Windows 11 is required")
+		error = QString("DWMWA_USE_HOSTBACKDROPBRUSH was refused (0x%1)")
 		            .arg(static_cast<quint32>(hr), 8, 16, QChar('0'));
 		unsupported = true;
 		return nullptr;
@@ -323,62 +253,6 @@ std::unique_ptr<BackdropWindow> BackdropWindow::create(
 	return backdrop;
 }
 
-std::unique_ptr<BackdropWindow>
-BackdropWindow::createAccent(bool layered, bool tint, QString& error, bool& unsupported) {
-	auto backdrop = std::make_unique<BackdropWindow>();
-	backdrop->layered = layered;
-	backdrop->accent = true;
-	backdrop->accentTint = tint;
-
-	auto* hwnd = backdrop->createPiece(error, unsupported);
-	if (hwnd == nullptr) return nullptr;
-
-	backdrop->pieces.emplace_back().hwnd = hwnd;
-	return backdrop;
-}
-
-HWND BackdropWindow::createPiece(QString& error, bool& unsupported) {
-	unsupported = false;
-
-	auto* setAttribute = setWindowCompositionAttribute();
-	if (setAttribute == nullptr) {
-		error = "SetWindowCompositionAttribute is missing from user32";
-		unsupported = true;
-		return nullptr;
-	}
-
-	auto* hwnd = createWindow(this->layered, this, error);
-	if (hwnd == nullptr) return nullptr;
-
-	auto policy = AccentPolicy {
-	    .accentState = ACCENT_ENABLE_BLURBEHIND,
-	    .accentFlags = this->accentTint ? ACCENT_FLAG_GRADIENT_COLOR : 0,
-	    .gradientColor = this->accentTint ? 0x602020ffu : 0u,
-	    .animationId = 0,
-	};
-
-	auto data = WindowCompositionAttribData {
-	    .attribute = WCA_ACCENT_POLICY,
-	    .data = &policy,
-	    .dataSize = sizeof(policy),
-	};
-
-	if (!setAttribute(hwnd, &data)) {
-		error = QString("SetWindowCompositionAttribute refused the accent policy (%1)")
-		            .arg(GetLastError());
-		unsupported = true;
-		SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-		DestroyWindow(hwnd);
-		return nullptr;
-	}
-
-	BOOL enable = TRUE;
-	DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &enable, sizeof(enable));
-	DwmSetWindowAttribute(hwnd, DWMWA_EXCLUDED_FROM_PEEK, &enable, sizeof(enable));
-
-	return hwnd;
-}
-
 BackdropWindow::~BackdropWindow() {
 	try {
 		this->visuals.clear();
@@ -403,26 +277,21 @@ BackdropWindow::~BackdropWindow() {
 		DestroyWindow(this->mHwnd);
 		this->mHwnd = nullptr;
 	}
-
-	for (auto& piece: this->pieces) {
-		SetWindowLongPtrW(piece.hwnd, GWLP_USERDATA, 0);
-		DestroyWindow(piece.hwnd);
-	}
-
-	this->pieces.clear();
 }
 
 bool BackdropWindow::setShapes(const QList<BlurShape>& shapes) {
-	if (this->accent) return this->setPieces(shapes);
-
 	try {
 		auto children = this->root.Children();
+		// collectBlurShapes caps the list at MAX_SHAPES. Retain slots while the
+		// panel is shown so animations can reuse them as the count changes.
 		auto count = static_cast<size_t>(shapes.size());
+		auto previousCount = static_cast<size_t>(this->applied.size());
 
 		while (this->visuals.size() < count) {
-			Slot slot;
+			VisualSlot slot;
 			slot.holder = this->compositor.CreateContainerVisual();
 			slot.holder.Clip(this->compositor.CreateInsetClip());
+			slot.holder.IsVisible(false);
 
 			slot.sprite = this->compositor.CreateSpriteVisual();
 			slot.sprite.Brush(this->brush);
@@ -441,10 +310,7 @@ bool BackdropWindow::setShapes(const QList<BlurShape>& shapes) {
 			this->visuals.push_back(std::move(slot));
 		}
 
-		while (this->visuals.size() > count) {
-			children.Remove(this->visuals.back().holder);
-			this->visuals.pop_back();
-		}
+		for (auto i = count; i < previousCount; i++) this->visuals.at(i).holder.IsVisible(false);
 
 		for (size_t i = 0; i < count; i++) {
 			auto index = static_cast<qsizetype>(i);
@@ -467,6 +333,7 @@ bool BackdropWindow::setShapes(const QList<BlurShape>& shapes) {
 			slot.sprite.Size(size);
 			slot.geometry.Size(size);
 			slot.geometry.CornerRadius(float2(radius, radius));
+			if (i >= previousCount) slot.holder.IsVisible(true);
 		}
 	} catch (const winrt::hresult_error& e) {
 		qCWarning(logBlur) << "Updating the blur shapes failed:" << hresultString(e);
@@ -475,303 +342,16 @@ bool BackdropWindow::setShapes(const QList<BlurShape>& shapes) {
 	}
 
 	this->applied = shapes;
-	if (!this->layered) this->updateRegion(shapes);
+	if (shapes.isEmpty()) this->hideWindow();
 	return true;
-}
-
-void BackdropWindow::updateRegion(const QList<BlurShape>& shapes) {
-	QRegion next;
-	for (const auto& shape: shapes) next += shape.rect.intersected(shape.clip).toAlignedRect();
-
-	if (this->hasRegion && next == this->region) return;
-
-	auto* hrgn = CreateRectRgn(0, 0, 0, 0);
-	for (const auto& rect: next) {
-		auto* part = CreateRectRgn(rect.x(), rect.y(), rect.x() + rect.width(), rect.y() + rect.height());
-		CombineRgn(hrgn, hrgn, part, RGN_OR);
-		DeleteObject(part);
-	}
-
-	this->syncing = true;
-	if (SetWindowRgn(this->mHwnd, hrgn, FALSE) == 0) DeleteObject(hrgn);
-	this->syncing = false;
-
-	this->region = next;
-	this->hasRegion = true;
-}
-
-bool BackdropWindow::setPieces(const QList<BlurShape>& shapes) {
-	struct Part {
-		QRect rect;
-		QRect shape;
-		int diameter = 0;
-	};
-
-	struct Whole {
-		QRect visible;
-		QRect full;
-		QRect clip;
-		int radius = 0;
-	};
-
-	std::vector<Whole> wholes;
-	wholes.reserve(static_cast<size_t>(shapes.size()));
-
-	for (const auto& shape: shapes) {
-		auto rect = nearestRect(shape.rect);
-		auto clip = nearestRect(shape.clip);
-		auto visible = rect.intersected(clip);
-		if (visible.isEmpty()) continue;
-
-		wholes.push_back({
-		    .visible = visible,
-		    .full = rect,
-		    .clip = clip,
-		    .radius = static_cast<int>(std::lround(shape.radius)),
-		});
-	}
-
-	std::vector<Part> kept;
-
-	for (size_t i = 0; i < wholes.size(); i++) {
-		const auto& rect = wholes.at(i).visible;
-		auto inside = false;
-
-		for (size_t j = 0; j < wholes.size() && !inside; j++) {
-			const auto& other = wholes.at(j).visible;
-			inside = j != i && other.contains(rect) && (other != rect || j < i);
-		}
-
-		if (inside) continue;
-
-		const auto& whole = wholes.at(i);
-		auto add = [&](const QRect& band) {
-			auto part = band.intersected(whole.clip);
-			if (!part.isEmpty()) kept.push_back({.rect = part, .shape = QRect()});
-		};
-
-		auto full = whole.full;
-		auto radius = std::min(whole.radius, std::min(full.width(), full.height()) / 2);
-		if (radius < 2) {
-			add(full);
-			continue;
-		}
-
-		constexpr int STEPS = 3;
-		add(QRect(full.left(), full.top() + radius, full.width(), full.height() - 2 * radius));
-
-		for (auto step = 0; step < STEPS; step++) {
-			auto from = radius * step / STEPS;
-			auto to = radius * (step + 1) / STEPS;
-			if (to <= from) continue;
-
-			auto dy = static_cast<double>(radius - from);
-			auto inset = static_cast<int>(
-			    std::ceil(radius - std::sqrt(static_cast<double>(radius) * radius - dy * dy))
-			);
-			auto width = full.width() - 2 * inset;
-			if (width <= 0) continue;
-
-			add(QRect(full.left() + inset, full.top() + from, width, to - from));
-			add(QRect(full.left() + inset, full.bottom() + 1 - to, width, to - from));
-		}
-	}
-
-	while (this->pieces.size() < kept.size()) {
-		QString error;
-		auto unsupported = false;
-		auto* hwnd = this->createPiece(error, unsupported);
-
-		if (hwnd == nullptr) {
-			qCWarning(logBlur).noquote() << "Adding an accent blur window failed:" << error;
-			return false;
-		}
-
-		this->pieces.emplace_back().hwnd = hwnd;
-	}
-
-	this->syncing = true;
-
-	for (size_t i = 0; i < kept.size(); i++) {
-		auto& piece = this->pieces.at(i);
-		const auto& part = kept.at(i);
-
-		if (piece.rect != part.rect) {
-			piece.rect = part.rect;
-			this->piecesMoved = true;
-		}
-
-		if (piece.hasRegion && piece.shape == part.shape && piece.diameter == part.diameter) continue;
-
-		HRGN hrgn = nullptr;
-		if (part.diameter >= 2) {
-			hrgn = CreateRoundRectRgn(
-			    part.shape.left(),
-			    part.shape.top(),
-			    part.shape.left() + part.shape.width() + 1,
-			    part.shape.top() + part.shape.height() + 1,
-			    part.diameter,
-			    part.diameter
-			);
-		}
-
-		if (SetWindowRgn(piece.hwnd, hrgn, FALSE) == 0 && hrgn != nullptr) DeleteObject(hrgn);
-
-		piece.shape = part.shape;
-		piece.diameter = part.diameter;
-		piece.hasRegion = true;
-	}
-
-	for (auto i = kept.size(); i < this->pieces.size(); i++) hideWindow(this->pieces.at(i).hwnd);
-
-	this->syncing = false;
-
-	if (kept.size() != this->pieceCount) this->piecesMoved = true;
-	this->pieceCount = kept.size();
-	return true;
-}
-
-void BackdropWindow::showPieces() {
-	if (this->mPanel == nullptr) return;
-
-	RECT panel {};
-	if (!GetWindowRect(this->mPanel, &panel)) {
-		this->hide();
-		return;
-	}
-
-	auto panelTopmost = (GetWindowLongPtrW(this->mPanel, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
-	auto inPlace = this->shown && this->piecesInPlace(panelTopmost);
-
-	if (inPlace && !this->piecesMoved && EqualRect(&panel, &this->lastRect)) return;
-
-	struct Move {
-		HWND hwnd = nullptr;
-		HWND after = nullptr;
-		RECT rect {};
-		UINT flags = 0;
-	};
-
-	std::vector<Move> moves;
-	moves.reserve(this->pieceCount);
-
-	this->syncing = true;
-	constexpr UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER;
-
-	HWND above = this->mPanel;
-
-	for (size_t i = 0; i < this->pieceCount; i++) {
-		auto& piece = this->pieces.at(i);
-		auto* after = std::exchange(above, piece.hwnd);
-
-		auto rect = RECT {
-		    .left = panel.left + piece.rect.x(),
-		    .top = panel.top + piece.rect.y(),
-		    .right = panel.left + piece.rect.x() + piece.rect.width(),
-		    .bottom = panel.top + piece.rect.y() + piece.rect.height(),
-		};
-
-		if (inPlace && EqualRect(&rect, &piece.placed)) continue;
-
-		auto ownTopmost = (GetWindowLongPtrW(piece.hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
-
-		if (panelTopmost != ownTopmost) {
-			SetWindowPos(
-			    piece.hwnd,
-			    panelTopmost ? HWND_TOPMOST : HWND_NOTOPMOST,
-			    0,
-			    0,
-			    0,
-			    0,
-			    flags | SWP_NOMOVE | SWP_NOSIZE
-			);
-		}
-
-		moves.push_back({
-		    .hwnd = piece.hwnd,
-		    .after = after,
-		    .rect = rect,
-		    .flags = flags | SWP_SHOWWINDOW | (inPlace ? SWP_NOZORDER : 0),
-		});
-
-		piece.placed = rect;
-	}
-
-	if (!moves.empty()) {
-		auto* batch = BeginDeferWindowPos(static_cast<int>(moves.size()));
-
-		for (const auto& move: moves) {
-			if (batch == nullptr) break;
-
-			batch = DeferWindowPos(
-			    batch,
-			    move.hwnd,
-			    move.after,
-			    move.rect.left,
-			    move.rect.top,
-			    move.rect.right - move.rect.left,
-			    move.rect.bottom - move.rect.top,
-			    move.flags
-			);
-		}
-
-		if (batch == nullptr || !EndDeferWindowPos(batch)) {
-			for (const auto& move: moves) {
-				SetWindowPos(
-				    move.hwnd,
-				    move.after,
-				    move.rect.left,
-				    move.rect.top,
-				    move.rect.right - move.rect.left,
-				    move.rect.bottom - move.rect.top,
-				    move.flags
-				);
-			}
-		}
-	}
-
-	this->syncing = false;
-	this->lastRect = panel;
-	this->piecesMoved = false;
-	this->shown = true;
-}
-
-bool BackdropWindow::piecesInPlace(bool panelTopmost) const {
-	HWND above = this->mPanel;
-
-	for (size_t i = 0; i < this->pieceCount; i++) {
-		auto* hwnd = this->pieces.at(i).hwnd;
-		auto topmost = (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
-
-		if (!IsWindowVisible(hwnd) || topmost != panelTopmost
-		    || GetWindow(above, GW_HWNDNEXT) != hwnd)
-		{
-			return false;
-		}
-
-		above = hwnd;
-	}
-
-	return true;
-}
-
-void BackdropWindow::hidePieces() {
-	this->syncing = true;
-	for (const auto& piece: this->pieces) hideWindow(piece.hwnd);
-	this->syncing = false;
 }
 
 void BackdropWindow::show() {
-	if (this->accent) {
-		this->showPieces();
-		return;
-	}
-
 	if (this->mHwnd == nullptr || this->mPanel == nullptr) return;
 
 	RECT rect {};
 	if (!GetWindowRect(this->mPanel, &rect)) {
-		this->hide();
+		this->hideWindow();
 		return;
 	}
 
@@ -815,13 +395,20 @@ void BackdropWindow::show() {
 }
 
 void BackdropWindow::hide() {
-	this->shown = false;
+	this->hideWindow();
+	if (this->visuals.empty()) return;
 
-	if (this->accent) {
-		this->hidePieces();
-		return;
+	try {
+		this->root.Children().RemoveAll();
+		this->visuals.clear();
+		this->applied.clear();
+	} catch (const winrt::hresult_error& e) {
+		qCDebug(logBlur) << "Releasing hidden blur visuals:" << hresultString(e);
 	}
+}
 
+void BackdropWindow::hideWindow() {
+	this->shown = false;
 	if (this->mHwnd == nullptr || !IsWindowVisible(this->mHwnd)) return;
 
 	this->syncing = true;
@@ -879,11 +466,15 @@ BlurManager* BlurManager::instance() {
 BlurManager::BlurManager(QObject* parent): QObject(parent) {
 	auto env = qEnvironmentVariable("QS_WINDOWS_BLUR").trimmed().toLower();
 	this->envEnabled = !(env == "0" || env == "false" || env == "off" || env == "no");
-	this->envLayered = qEnvironmentVariableIntValue("QS_WINDOWS_BLUR_LAYERED") != 0;
 	this->mDebugTint = qEnvironmentVariableIntValue("QS_WINDOWS_BLUR_DEBUG") != 0;
+	this->mWindowsBuild = windowsBuild();
 
-	if (!this->envEnabled) qCInfo(logBlur) << "Blur behind panels is turned off by QS_WINDOWS_BLUR.";
-	else this->detectBackend();
+	if (this->mWindowsBuild < HOST_BACKDROP_MIN_BUILD) {
+		qCInfo(logBlur) << "Blur behind panels requires Windows 11. Current build:"
+		               << this->mWindowsBuild;
+	} else if (!this->envEnabled) {
+		qCInfo(logBlur) << "Blur behind panels is turned off by QS_WINDOWS_BLUR.";
+	}
 
 	this->reloadTimer.setSingleShot(true);
 	this->reloadTimer.setInterval(200);
@@ -898,45 +489,20 @@ BlurManager::BlurManager(QObject* parent): QObject(parent) {
 		QObject::connect(app, &QCoreApplication::aboutToQuit, this, &BlurManager::shutdown);
 	}
 
-	this->checkSystem();
-	this->watchRegistry();
+	if (this->mWindowsBuild >= HOST_BACKDROP_MIN_BUILD && this->envEnabled) {
+		this->checkSystem();
+		this->watchRegistry();
+	}
 }
 
 BlurManager::~BlurManager() {
 	gManagerDestroyed = true;
-
-	if (this->composition != nullptr) {
-		winrt::detach_abi(this->composition->compositor);
-		winrt::detach_abi(this->composition->controller);
-	}
+	this->shutdown();
 
 	delete this->registryNotifier;
 	this->registryNotifier = nullptr;
 	if (this->registryEvent != nullptr) CloseHandle(this->registryEvent);
 	if (this->personalizeKey != nullptr) RegCloseKey(this->personalizeKey);
-}
-
-void BlurManager::detectBackend() {
-	auto build = windowsBuild();
-
-	if (build == 0 || build >= WINDOWS_11_BUILD) {
-		this->mBackend = Backend::HostBackdrop;
-		qCInfo(logBlur).nospace() << "Blur behind panels uses the host backdrop brush (Windows build "
-		                          << build << ").";
-		return;
-	}
-
-	this->mBackend = Backend::Accent;
-
-	if (setWindowCompositionAttribute() == nullptr) {
-		this->markUnsupported(
-		    QString("SetWindowCompositionAttribute is missing (Windows build %1)").arg(build)
-		);
-		return;
-	}
-
-	qCInfo(logBlur).nospace() << "Blur behind panels uses SetWindowCompositionAttribute blur behind "
-	                          << "(Windows build " << build << ").";
 }
 
 void BlurManager::shutdown() {
@@ -947,8 +513,38 @@ void BlurManager::shutdown() {
 
 	if (this->composition != nullptr) {
 		this->closeCompositor();
-		winrt::detach_abi(this->composition->controller);
-		this->composition.reset();
+		auto state = std::move(this->composition);
+		if (state->controller == nullptr) return;
+
+		// We created this queue on the GUI thread. Windows requires its
+		// message loop to run until ShutdownQueueAsync completes.
+		std::optional<int> quitCode;
+		try {
+			using winrt::Windows::Foundation::AsyncStatus;
+			auto action = state->controller.ShutdownQueueAsync();
+			const auto deadline = GetTickCount64() + 250;
+			while (action.Status() == AsyncStatus::Started) {
+				auto now = GetTickCount64();
+				if (now >= deadline) {
+					qCDebug(logBlur) << "Dispatcher queue shutdown did not finish within its deadline";
+					break;
+				}
+				MSG msg {};
+				if (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+					if (msg.message == WM_QUIT) quitCode = static_cast<int>(msg.wParam);
+					else {
+						TranslateMessage(&msg);
+						DispatchMessageW(&msg);
+					}
+				} else {
+					MsgWaitForMultipleObjectsEx(0, nullptr, static_cast<DWORD>(deadline - now),
+					    QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+				}
+			}
+		} catch (const winrt::hresult_error& e) {
+			qCDebug(logBlur) << "Closing the dispatcher queue:" << hresultString(e);
+		}
+		if (quitCode) PostQuitMessage(*quitCode);
 	}
 }
 
@@ -965,7 +561,7 @@ void BlurManager::closeCompositor() {
 }
 
 BlurManager::Composition* BlurManager::ensureComposition() {
-	if (this->unsupported || this->mShutDown) return nullptr;
+	if (this->hostUnsupported || !this->available()) return nullptr;
 
 	if (this->composition == nullptr) this->composition = std::make_unique<Composition>();
 	auto* state = this->composition.get();
@@ -999,7 +595,7 @@ BlurManager::Composition* BlurManager::ensureComposition() {
 }
 
 bool BlurManager::deferComposition() {
-	if (this->unsupported || this->mShutDown || this->mBackend != Backend::HostBackdrop) return false;
+	if (this->hostUnsupported || !this->available()) return false;
 	if (startup::settled()) return false;
 	if (this->composition != nullptr && this->composition->compositor != nullptr) return false;
 
@@ -1016,12 +612,13 @@ bool BlurManager::deferComposition() {
 	return true;
 }
 
-void BlurManager::markUnsupported(const QString& reason) {
-	if (this->unsupported) return;
-	this->unsupported = true;
+void BlurManager::markHostUnsupported(const QString& reason) {
+	if (this->hostUnsupported) return;
+	auto wasAvailable = this->available();
+	this->hostUnsupported = true;
 
-	qCWarning(logBlur).noquote() << "Blur behind panels is unavailable:" << reason;
-	emit this->stateChanged();
+	qCWarning(logBlur).noquote() << "HostBackdrop is unavailable:" << reason;
+	if (wasAvailable != this->available()) emit this->stateChanged();
 	this->scheduleNotifyPanels();
 }
 
@@ -1056,11 +653,11 @@ void BlurManager::setExpressiveAnimations(bool expressive) {
 }
 
 bool BlurManager::available() const {
-	return !this->unsupported && !this->mShutDown && this->envEnabled && this->rules.enabled()
+	return this->mWindowsBuild >= HOST_BACKDROP_MIN_BUILD
+	    && (!this->hostUnsupported || this->mWindowsBuild >= SYSTEM_BACKDROP_MIN_BUILD)
+	    && !this->mShutDown && this->envEnabled && this->rules.enabled()
 	    && this->transparencyEffects && !this->highContrast && !this->energySaver;
 }
-
-bool BlurManager::layeredBackdrops() const { return this->envLayered || this->rules.layered(); }
 
 void BlurManager::scheduleNotifyPanels() {
 	if (this->notifyPending) return;
@@ -1081,6 +678,8 @@ void BlurManager::notifyPanels() {
 }
 
 void BlurManager::scheduleSystemCheck(bool recreate) {
+	if (this->mWindowsBuild < HOST_BACKDROP_MIN_BUILD || !this->envEnabled || this->mShutDown) return;
+
 	if (recreate) this->recreatePending = true;
 	if (this->systemCheckPending) return;
 	this->systemCheckPending = true;
@@ -1236,17 +835,12 @@ void BlurManager::loadFile() {
 			                          << "), blur behind panels is off.";
 		}
 
-		auto wasLayered = this->layeredBackdrops();
 		auto wasAvailable = this->available();
 
 		this->parsed = true;
 		this->mConfigPath = path;
 		this->loadedData = data;
 		this->parse(data, path);
-
-		if (this->layeredBackdrops() != wasLayered) {
-			for (auto* panel: QList(this->panels)) panel->recreate();
-		}
 
 		emit this->rulesChanged();
 		if (this->available() != wasAvailable) emit this->stateChanged();
@@ -1281,7 +875,7 @@ void BlurManager::updateWatches() {
 
 void BlurManager::parse(const QByteArray& data, const QString& path) {
 	QStringList warnings;
-	this->rules = LayerRules::parse(data, path, &warnings);
+	this->rules = LayerRules::parse(data, qs::windows::logPath(path), &warnings);
 
 	for (const auto& warning: warnings) qCWarning(logBlur).noquote() << warning;
 
@@ -1301,93 +895,77 @@ PanelBlur::PanelBlur(WinPanelWindow* panel): QObject(panel), panel(panel) {
 }
 
 PanelBlur::~PanelBlur() {
-	this->disconnectFrames();
-	this->backdrop.reset();
+	this->release();
 	if (auto* manager = BlurManager::instance()) manager->unregisterPanel(this);
 }
 
 void PanelBlur::adopt(PanelBlur* other) {
 	if (other == nullptr || other == this) return;
 
+	this->recreate();
 	other->disconnectFrames();
-	this->destroyBackdrop();
+	QObject::disconnect(std::exchange(other->colorConnection, {}));
 
+	// The backing window survives a reload. Transfer its live DWM state before
+	// the old panel releases its native state and disowns the window.
+	this->mode = std::exchange(other->mode, BlurMode::Disabled);
+	this->appliedSystemMode = std::exchange(other->appliedSystemMode, BlurMode::Disabled);
+	this->systemBackdropHwnd = std::exchange(other->systemBackdropHwnd, nullptr);
+	this->rejectedSystemHwnd = std::exchange(other->rejectedSystemHwnd, nullptr);
 	this->backdrop = std::move(other->backdrop);
 	this->shapes = std::move(other->shapes);
-	this->shapesForced = true;
-	this->active = this->backdrop != nullptr && other->active;
-	this->stale = other->stale;
-	this->panelWasShown = other->panelWasShown;
 	this->mask = other->mask;
 	this->hasMask = other->hasMask;
-
-	other->shapes.clear();
-	other->active = false;
 }
 
 void PanelBlur::attach() {
-	this->mWindow = this->panel->backingWindow();
-	if (this->backdrop != nullptr) this->backdrop->setPanel(this->panel->hwnd());
+	auto* window = this->panel->backingWindow();
+	if (this->mWindow != window) {
+		this->disconnectFrames();
+		QObject::disconnect(std::exchange(this->colorConnection, {}));
+		this->mWindow = window;
+	}
 
 	this->updateActive();
-	this->syncPlacement();
 }
 
 void PanelBlur::release() {
-	this->disconnectFrames();
-	this->destroyBackdrop();
-	this->active = false;
+	this->recreate();
 	this->mWindow = nullptr;
-	this->panelWasShown = false;
 }
 
 void PanelBlur::recreate() {
-	this->disconnectFrames();
-	this->destroyBackdrop();
-	this->active = false;
+	this->setMode(BlurMode::Disabled);
+	this->rejectedSystemHwnd = nullptr;
 }
 
 void PanelBlur::setSuspended(bool suspended) {
 	if (suspended == this->suspended) return;
 	this->suspended = suspended;
-
-	if (suspended) {
-		if (this->backdrop != nullptr) this->backdrop->hide();
-		return;
-	}
-
-	this->stale = true;
-	if (this->active && this->panelShown()) this->scheduleShapes();
+	this->syncPlacement();
 }
 
 void PanelBlur::destroyBackdrop() {
 	this->backdrop.reset();
 	this->shapes.clear();
 	this->shapesForced = true;
-	this->stale = true;
 }
 
 void PanelBlur::connectFrames() {
 	auto* window = this->mWindow.data();
-	if (window == nullptr) return;
-	if (this->frameConnection && this->framesWindow == window) return;
-
-	this->disconnectFrames();
+	if (window == nullptr || this->frameConnection) return;
 
 	this->frameConnection =
-	    QObject::connect(window, &QQuickWindow::afterAnimating, this, &PanelBlur::onFrame);
-	this->framesWindow = window;
+	    QObject::connect(window, &QQuickWindow::afterAnimating, this, &PanelBlur::updateShapes);
+	this->scheduleShapes();
 }
 
 void PanelBlur::disconnectFrames() {
-	if (this->frameConnection) QObject::disconnect(this->frameConnection);
-	this->frameConnection = {};
-	this->framesWindow = nullptr;
+	QObject::disconnect(std::exchange(this->frameConnection, {}));
 }
 
 void PanelBlur::updateActive() {
 	auto* manager = BlurManager::instance();
-	auto* hwnd = this->panel->hwnd();
 
 	if (manager != nullptr && !manager->shutDown()) {
 		if (auto* generation = EngineGeneration::findObjectGeneration(this->panel)) {
@@ -1399,60 +977,117 @@ void PanelBlur::updateActive() {
 		this->rule = LayerRule();
 	}
 
-	auto wanted = manager != nullptr && manager->enabled() && manager->available() && this->rule.blur
-	           && (!this->rule.ignoreAlpha.has_value() || *this->rule.ignoreAlpha < 1.0)
-	           && hwnd != nullptr && this->mWindow != nullptr
-	           && !this->panel->isEmbedded();
+	this->updateMode();
+}
 
-	if (!wanted) {
-		if (this->active) qCDebug(logBlur) << "Blur off for" << this->panel->ns();
-		this->active = false;
-		this->disconnectFrames();
-		this->destroyBackdrop();
-		return;
+void PanelBlur::updateMode() {
+	auto* manager = BlurManager::instance();
+	auto* hwnd = this->panel->hwnd();
+	auto next = chooseBlurMode({
+	    .windowsBuild = manager != nullptr ? manager->build() : 0u,
+	    .enabled = manager != nullptr && manager->enabled() && this->rule.blur && hwnd != nullptr
+	            && this->mWindow != nullptr && !this->panel->isEmbedded(),
+	    .forceDisabled = manager == nullptr || !manager->available(),
+	    .requested = this->rule.backdrop,
+	    .hasIgnoreAlpha = this->rule.ignoreAlpha.has_value(),
+	    .hasInputMask = this->hasMask,
+	});
+
+	if (systemBackdropType(next) != BACKDROP_NONE && hwnd == this->rejectedSystemHwnd) {
+		next = BlurMode::HostBackdrop;
+	}
+	if (next == BlurMode::HostBackdrop
+	    && (!manager->hostBackdropAvailable() || this->rule.ignoreAlpha.value_or(0) >= 1))
+	{
+		next = BlurMode::Disabled;
 	}
 
-	if (!this->active) qCDebug(logBlur) << "Blur on for" << this->panel->ns();
-	this->active = true;
+	this->setMode(next);
 	if (this->backdrop != nullptr) this->backdrop->setPanel(hwnd);
-	this->connectFrames();
-	this->scheduleShapes();
+	this->syncPlacement();
+	if (this->mode == BlurMode::HostBackdrop && this->frameConnection) this->scheduleShapes();
+}
+
+void PanelBlur::setMode(BlurMode mode) {
+	if (this->mode != mode) {
+		this->mode = mode;
+		qCDebug(logBlur) << "Blur mode for" << qs::windows::logId(this->panel->ns())
+		                 << blurModeName(mode);
+	}
+
+	if (mode != BlurMode::HostBackdrop) {
+		this->disconnectFrames();
+		this->destroyBackdrop();
+	}
+
+	if (systemBackdropType(mode) == BACKDROP_NONE) {
+		QObject::disconnect(std::exchange(this->colorConnection, {}));
+		this->clearSystemBackdrop();
+	} else if (!this->colorConnection) {
+		this->colorConnection =
+		    QObject::connect(this->mWindow.data(), &QQuickWindow::colorChanged, this, &PanelBlur::syncPlacement);
+	}
+}
+
+bool PanelBlur::applySystemBackdrop(HWND hwnd) {
+	if (this->systemBackdropHwnd == hwnd && this->appliedSystemMode == this->mode) return true;
+
+	// Extending the frame may deliver native placement messages synchronously.
+	const auto syncing = QScopedValueRollback(this->syncingSystemBackdrop, true);
+	HRESULT hr = S_OK;
+
+	if (this->systemBackdropHwnd != hwnd) {
+		this->clearSystemBackdrop();
+		constexpr MARGINS margins {-1, -1, -1, -1};
+		hr = DwmExtendFrameIntoClientArea(hwnd, &margins);
+		if (SUCCEEDED(hr)) this->systemBackdropHwnd = hwnd;
+	}
+
+	if (SUCCEEDED(hr)) {
+		const auto type = systemBackdropType(this->mode);
+		hr = DwmSetWindowAttribute(hwnd, SYSTEM_BACKDROP_TYPE, &type, sizeof(type));
+	}
+
+	if (SUCCEEDED(hr)) {
+		this->appliedSystemMode = this->mode;
+		return true;
+	}
+
+	this->clearSystemBackdrop();
+	qCDebug(logBlur) << "System backdrop for" << qs::windows::logId(this->panel->ns())
+	                 << "failed. Trying HostBackdrop. HRESULT:" << Qt::hex << hr;
+	return false;
+}
+
+void PanelBlur::clearSystemBackdrop() {
+	auto* hwnd = std::exchange(this->systemBackdropHwnd, nullptr);
+	this->appliedSystemMode = BlurMode::Disabled;
+	if (hwnd == nullptr || !IsWindow(hwnd)) return;
+
+	const auto syncing = QScopedValueRollback(this->syncingSystemBackdrop, true);
+	constexpr int type = BACKDROP_NONE;
+	constexpr MARGINS margins {};
+	DwmSetWindowAttribute(hwnd, SYSTEM_BACKDROP_TYPE, &type, sizeof(type));
+	DwmExtendFrameIntoClientArea(hwnd, &margins);
 }
 
 bool PanelBlur::ensureBackdrop() {
 	if (this->backdrop != nullptr) return true;
 
 	auto* manager = BlurManager::instance();
-	if (manager == nullptr) return false;
+	if (manager == nullptr || !manager->hostBackdropAvailable()) return false;
+	auto* composition = manager->ensureComposition();
+	if (composition == nullptr) return false;
 
 	QString error;
 	auto unsupported = false;
-
-	if (manager->backend() == BlurManager::Backend::Accent) {
-		if (!manager->available()) return false;
-
-		this->backdrop = BackdropWindow::createAccent(
-		    manager->layeredBackdrops(),
-		    manager->debugTint(),
-		    error,
-		    unsupported
-		);
-	} else {
-		auto* composition = manager->ensureComposition();
-		if (composition == nullptr) return false;
-
-		this->backdrop = BackdropWindow::create(
-		    composition->compositor,
-		    manager->layeredBackdrops(),
-		    manager->debugTint(),
-		    error,
-		    unsupported
-		);
-	}
+	this->backdrop =
+	    BackdropWindow::create(composition->compositor, manager->debugTint(), error, unsupported);
 
 	if (this->backdrop == nullptr) {
-		if (unsupported) manager->markUnsupported(error);
-		else qCWarning(logBlur).noquote() << "No blur for" << this->panel->ns() << ":" << error;
+		if (unsupported) manager->markHostUnsupported(error);
+		else qCWarning(logBlur).noquote() << "No blur for" << qs::windows::logId(this->panel->ns())
+		                                  << ":" << error;
 		return false;
 	}
 
@@ -1464,12 +1099,12 @@ bool PanelBlur::ensureBackdrop() {
 void PanelBlur::setInputMask(const QRegion& region, bool hasMask) {
 	if (hasMask == this->hasMask && region == this->mask) return;
 
+	auto changed = hasMask != this->hasMask;
 	this->mask = region;
 	this->hasMask = hasMask;
-	if (this->active) this->scheduleShapes();
+	if (changed) this->updateMode();
+	else if (this->frameConnection) this->scheduleShapes();
 }
-
-void PanelBlur::onFrame() { this->updateShapes(); }
 
 void PanelBlur::scheduleShapes() {
 	this->shapesForced = true;
@@ -1488,27 +1123,22 @@ bool PanelBlur::panelShown() const {
 	return hwnd != nullptr && IsWindowVisible(hwnd) && !IsIconic(hwnd);
 }
 
-PanelBlur::ShapeInputs PanelBlur::shapeInputs(bool shown) const {
+void PanelBlur::updateShapes() {
 	auto* window = this->mWindow.data();
-	if (window == nullptr) return {.shown = shown, .size = QSize(), .alpha = -1, .dpr = 0};
+	if (this->mode != BlurMode::HostBackdrop || this->suspended || window == nullptr) return;
 
-	return {
-	    .shown = shown,
+	if (!this->panelShown()) {
+		this->syncPlacement();
+		return;
+	}
+
+	auto inputs = ShapeInputs {
 	    .size = window->size(),
 	    .alpha = static_cast<qreal>(window->color().alphaF()),
 	    .dpr = window->devicePixelRatio(),
 	};
-}
-
-void PanelBlur::updateShapes() {
-	if (!this->active || this->suspended) return;
-
-	auto shown = this->panelShown();
-	auto inputs = this->shapeInputs(shown);
-	auto walks = shown && this->rule.ignoreAlpha.has_value();
-
 	if (!this->shapesForced && inputs == this->lastInputs
-	    && !(walks && itemTreeDirty(this->mWindow.data())))
+	    && !(this->rule.ignoreAlpha.has_value() && itemTreeDirty(window)))
 	{
 		this->syncPlacement();
 		return;
@@ -1518,7 +1148,7 @@ void PanelBlur::updateShapes() {
 	this->lastInputs = inputs;
 
 	QList<BlurShape> next;
-	if (shown) this->collectShapes(next);
+	this->collectShapes(next);
 
 	if (this->backdrop == nullptr) {
 		if (next.isEmpty()) return;
@@ -1527,8 +1157,7 @@ void PanelBlur::updateShapes() {
 		if (manager != nullptr && manager->deferComposition()) return;
 
 		if (!this->ensureBackdrop()) {
-			this->active = false;
-			this->disconnectFrames();
+			this->setMode(BlurMode::Disabled);
 			return;
 		}
 	}
@@ -1540,9 +1169,7 @@ void PanelBlur::updateShapes() {
 
 	if (!same) {
 		if (!this->backdrop->setShapes(next)) {
-			this->active = false;
-			this->disconnectFrames();
-			this->destroyBackdrop();
+			this->setMode(BlurMode::Disabled);
 			return;
 		}
 
@@ -1557,32 +1184,42 @@ void PanelBlur::updateShapes() {
 				                .arg(shape.radius));
 			}
 
-			qCDebug(logBlur).noquote() << "Blur shapes of" << this->panel->ns() << ":"
+			qCDebug(logBlur).noquote() << "Blur shapes of" << qs::windows::logId(this->panel->ns()) << ":"
 			                           << (list.isEmpty() ? "none" : list.join(", "));
 		}
 
 		this->shapes = std::move(next);
 	}
 
-	this->stale = false;
 	this->syncPlacement();
 }
 
 void PanelBlur::syncPlacement() {
-	auto shown = this->panelShown();
+	if (this->mode == BlurMode::Disabled || this->syncingSystemBackdrop) return;
 
-	if (shown && !this->panelWasShown) {
-		this->stale = true;
-		if (this->active) this->scheduleShapes();
+	auto shown = !this->suspended && this->panelShown();
+	if (this->mode == BlurMode::HostBackdrop) {
+		if (shown) {
+			this->connectFrames();
+			if (this->backdrop != nullptr && !this->shapes.isEmpty()) this->backdrop->show();
+		} else {
+			this->disconnectFrames();
+			if (this->backdrop != nullptr) this->backdrop->hide();
+			this->shapes.clear();
+		}
+		return;
 	}
 
-	this->panelWasShown = shown;
-	if (this->backdrop == nullptr) return;
-
-	if (!shown || !this->active || this->suspended || this->stale || this->shapes.isEmpty()) {
-		this->backdrop->hide();
+	// An opaque Qt clear color would cover the native material.
+	auto* window = this->mWindow.data();
+	if (!shown || window == nullptr || window->color().alphaF() >= OPAQUE_ALPHA) {
+		this->clearSystemBackdrop();
 	} else {
-		this->backdrop->show();
+		auto* hwnd = this->panel->hwnd();
+		if (!this->applySystemBackdrop(hwnd)) {
+			this->rejectedSystemHwnd = hwnd;
+			this->updateMode();
+		}
 	}
 }
 
@@ -1602,7 +1239,7 @@ void PanelBlur::collectShapes(QList<BlurShape>& shapes) {
 
 	if (result.truncated && !this->truncatedWarned) {
 		this->truncatedWarned = true;
-		qCWarning(logBlur) << "Item tree of" << this->panel->ns()
+		qCWarning(logBlur) << "Item tree of" << qs::windows::logId(this->panel->ns())
 		                   << "is too large to walk every frame, blur only covers part of it.";
 	}
 }

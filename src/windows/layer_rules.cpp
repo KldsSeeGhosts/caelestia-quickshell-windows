@@ -73,6 +73,20 @@ LayerRules LayerRules::parse(const QByteArray& data, const QString& path, QStrin
 			}
 		}
 
+		if (object.contains("backdrop")) {
+			auto value = object.value("backdrop");
+			auto material = BackdropMaterial::Auto;
+
+			if (value.isNull()) {
+				rule.backdrop.emplace();
+			} else if (value.isString() && parseBackdropMaterial(value.toString(), &material)) {
+				rule.backdrop.emplace(material);
+			} else {
+				warn(where + ": backdrop must be \"auto\", \"host\", \"acrylic\", \"mica\", "
+				             "\"mica-alt\" or null");
+			}
+		}
+
 		if (object.contains("animation")) {
 			auto value = object.value("animation");
 			auto style = value.isString() ? PanelAnimationStyle::parse(value.toString()) : std::nullopt;
@@ -82,9 +96,8 @@ LayerRules LayerRules::parse(const QByteArray& data, const QString& path, QStrin
 			} else if (style.has_value()) {
 				rule.animation = *style;
 			} else {
-				warn(QString("%1: animation must be \"slide\", \"slide top|bottom|left|right\", "
-				             "\"popin N%\", \"fade\", \"noAnim\" or null, not %2")
-				         .arg(where, value.toVariant().toString()));
+				warn(where + ": animation must be \"slide\", \"slide top|bottom|left|right\", "
+				             "\"popin N%\", \"fade\", \"noAnim\" or null");
 			}
 		}
 
@@ -97,9 +110,8 @@ LayerRules LayerRules::parse(const QByteArray& data, const QString& path, QStrin
 			} else if (effect.has_value()) {
 				rule.effect = *effect;
 			} else {
-				warn(QString("%1: expressive must be \"auto\", \"standard\", \"spring\", \"cascade\", "
-				             "\"reveal\", \"blur\", \"dissolve\" or null, not %2")
-				         .arg(where, value.toVariant().toString()));
+				warn(where + ": expressive must be \"auto\", \"standard\", \"spring\", \"cascade\", "
+				             "\"reveal\", \"blur\", \"dissolve\" or null");
 			}
 		}
 
@@ -118,6 +130,7 @@ LayerRule LayerRules::ruleFor(const QString& ns) const {
 		if (rule.ignoreAlpha.has_value()) result.ignoreAlpha = *rule.ignoreAlpha;
 		if (rule.animation.has_value()) result.animation = *rule.animation;
 		if (rule.effect.has_value()) result.effect = *rule.effect;
+		if (rule.backdrop.has_value()) result.backdrop = rule.backdrop->value_or(BackdropMaterial::Auto);
 	}
 
 	return result;
@@ -138,6 +151,12 @@ QVariantList LayerRules::info() const {
 
 		if (rule.animation.has_value()) map["animation"] = rule.animation->toString();
 		if (rule.effect.has_value()) map["expressive"] = panelEffectName(*rule.effect);
+
+		if (rule.backdrop.has_value()) {
+			map["backdrop"] = rule.backdrop->has_value()
+			                    ? QVariant(backdropMaterialName(**rule.backdrop).toString())
+			                    : QVariant::fromValue(nullptr);
+		}
 
 		list.append(map);
 	}

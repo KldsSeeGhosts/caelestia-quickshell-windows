@@ -4,6 +4,9 @@ qt_add_library(quickshell-windows STATIC
 	fullscreen_occluders.cpp
 	startup.cpp
 	appbar.cpp
+	supervisor_bridge.cpp
+	supervisor_bridge.hpp
+	supervisor_protocol.hpp
 	input_mask.cpp
 	panel_window.cpp
 	panel_animation.cpp

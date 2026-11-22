@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fcntl.h>
+#include <io.h>
 #include <limits>
 #include <utility>
 
@@ -189,10 +191,26 @@ std::shared_ptr<ClipboardListenerProvider> nativeListener() {
 	return provider;
 }
 
-QString readTextFile(const QString& path) {
-	QFile file(path);
-	if (!file.open(QIODevice::ReadOnly)) return {};
-	return QString::fromUtf8(file.readAll());
+using FileHandle = std::unique_ptr<void, decltype(&CloseHandle)>;
+
+FileHandle openHandoverFile(const QString& path) {
+	auto native = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath()).toStdWString();
+	auto handle = CreateFileW(native.c_str(), GENERIC_READ,
+	    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+	    nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+	return FileHandle(handle == INVALID_HANDLE_VALUE ? nullptr : handle, &CloseHandle);
+}
+
+std::optional<QByteArray> readHandoverFile(FileHandle handle) {
+	auto fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle.get()), _O_RDONLY | _O_BINARY);
+	if (fd < 0) return std::nullopt;
+	(void) handle.release(); // The file descriptor now owns the handle.
+	auto close = qScopeGuard([fd] { _close(fd); });
+	QFile file;
+	if (!file.open(fd, QIODevice::ReadOnly)) return std::nullopt;
+	auto bytes = file.readAll();
+	if (file.error() != QFileDevice::NoError) return std::nullopt;
+	return bytes;
 }
 
 void removeEntryFiles(const ClipboardEntry& entry) {
@@ -446,11 +464,10 @@ public:
 	    , pool(pool) {}
 
 	bool copyImageFile(const QString& path, Done done) {
-		QFile file(path);
-		auto readable = file.open(QIODevice::ReadOnly);
-		auto bytes = readable ? file.readAll() : QByteArray();
-		readable = readable && file.error() == QFileDevice::NoError;
-		if (!readable) {
+		// Keep an open handle before returning. The caller may unlink its
+		// temporary file immediately, but reading and decoding can happen later.
+		auto handle = openHandoverFile(path);
+		if (!handle) {
 			QTimer::singleShot(0, this, [done = std::move(done)]() {
 				done(false, QStringLiteral("read-failed"));
 			});
@@ -458,14 +475,16 @@ public:
 		}
 
 		this->pool->start(QRunnable::create(
-		    [self = QPointer(this), bytes = std::move(bytes), done = std::move(done)]() {
-			    auto image = QImage::fromData(bytes);
+		    [self = QPointer(this), handle = std::move(handle), done = std::move(done)]() mutable {
+			    auto bytes = readHandoverFile(std::move(handle));
+			    auto image = bytes ? QImage::fromData(*bytes) : QImage();
 			    QMetaObject::invokeMethod(
 			        QCoreApplication::instance(),
-			        [self, image = std::move(image), done]() {
+			        [self, image = std::move(image), readable = bytes.has_value(), done]() {
 				        if (!self) return;
 				        if (image.isNull()) {
-					        done(false, QStringLiteral("decode-failed"));
+					        done(false, readable ? QStringLiteral("decode-failed")
+					                             : QStringLiteral("read-failed"));
 					        return;
 				        }
 				        self->writeData(CF_DIB, self->provider->imageData(image), done);
@@ -475,6 +494,21 @@ public:
 		    }
 		));
 		return true;
+	}
+
+	void copyTextFile(const QString& path, Done done) {
+		auto handle = openHandoverFile(path);
+		if (!handle) return;
+		this->pool->start(QRunnable::create(
+		    [self = QPointer(this), handle = std::move(handle), done = std::move(done)]() mutable {
+			    auto bytes = readHandoverFile(std::move(handle));
+			    if (!bytes || bytes->isEmpty()) return;
+			    QMetaObject::invokeMethod(QCoreApplication::instance(),
+			        [self, text = QString::fromUtf8(*bytes), done = std::move(done)] {
+				        if (self) self->writeData(CF_UNICODETEXT, self->provider->textData(text), done);
+			        }, Qt::QueuedConnection);
+		    }
+		));
 	}
 
 	void copyText(const QString& text, Done done) {
@@ -803,10 +837,9 @@ void Clipboard::copy(qint64 id) {
 	};
 	if (entry.isImage) {
 		this->writer->copyImageFile(entry.imagePath, done);
-	} else {
-		auto text = entry.textPath.isEmpty() ? entry.text : readTextFile(entry.textPath);
-		if (!text.isEmpty()) this->writer->copyText(text, done);
-	}
+	} else if (!entry.textPath.isEmpty()) {
+		this->writer->copyTextFile(entry.textPath, done);
+	} else if (!entry.text.isEmpty()) this->writer->copyText(entry.text, done);
 }
 
 bool Clipboard::copyImageFile(const QString& path) {

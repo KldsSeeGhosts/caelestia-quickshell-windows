@@ -21,9 +21,7 @@ public:
 };
 } // namespace
 
-namespace qs::log {
-void initLogCategoryLevel(const char*, QtMsgType) {}
-} // namespace qs::log
+// qs::log::initLogCategoryLevel comes from portable_common_stubs.cpp.
 
 namespace qs::io {
 // Exercise QSaveFile's actual failed-commit path, without filesystem races or ACLs.

@@ -63,14 +63,8 @@ public:
 	[[nodiscard]] QString configPath() const { return this->mConfigPath; }
 	[[nodiscard]] QVariantList rulesInfo() const;
 
-	enum class Backend : quint8 {
-		HostBackdrop,
-		Accent,
-	};
-
-	[[nodiscard]] Backend backend() const { return this->mBackend; }
-
-	[[nodiscard]] bool layeredBackdrops() const;
+	[[nodiscard]] DWORD build() const { return this->mWindowsBuild; }
+	[[nodiscard]] bool hostBackdropAvailable() const { return !this->hostUnsupported; }
 	[[nodiscard]] bool debugTint() const { return this->mDebugTint; }
 
 	void scheduleSystemCheck(bool recreate = false);
@@ -80,7 +74,7 @@ public:
 	struct Composition;
 	[[nodiscard]] Composition* ensureComposition();
 	[[nodiscard]] bool deferComposition();
-	void markUnsupported(const QString& reason);
+	void markHostUnsupported(const QString& reason);
 
 	void registerPanel(PanelBlur* panel);
 	void unregisterPanel(PanelBlur* panel);
@@ -93,7 +87,6 @@ signals:
 private:
 	explicit BlurManager(QObject* parent);
 
-	void detectBackend();
 	void loadFile();
 	void parse(const QByteArray& data, const QString& path);
 	void updateWatches();
@@ -118,17 +111,16 @@ private:
 	bool parsed = false;
 	LayerRules rules;
 	bool envEnabled = true;
-	bool envLayered = false;
 	bool mDebugTint = false;
 	bool mEnabled = true;
 	bool mPanelAnimations = true;
 	bool mExpressiveAnimations = false;
-	Backend mBackend = Backend::HostBackdrop;
+	DWORD mWindowsBuild = 0;
 
 	bool transparencyEffects = true;
 	bool highContrast = false;
 	bool energySaver = false;
-	bool unsupported = false;
+	bool hostUnsupported = false;
 	bool systemCheckPending = false;
 	bool recreatePending = false;
 	bool notifyPending = false;
@@ -167,13 +159,8 @@ public:
 
 	void updateActive();
 
-private slots:
-	void onFrame();
-	void updateShapes();
-
 private:
 	struct ShapeInputs {
-		bool shown = false;
 		QSize size;
 		qreal alpha = -1;
 		qreal dpr = 0;
@@ -184,7 +171,11 @@ private:
 	void connectFrames();
 	void disconnectFrames();
 	void scheduleShapes();
-	[[nodiscard]] ShapeInputs shapeInputs(bool shown) const;
+	void updateShapes();
+	void updateMode();
+	void setMode(BlurMode mode);
+	[[nodiscard]] bool applySystemBackdrop(HWND hwnd);
+	void clearSystemBackdrop();
 	void collectShapes(QList<BlurShape>& shapes);
 	bool ensureBackdrop();
 	void destroyBackdrop();
@@ -193,16 +184,18 @@ private:
 	WinPanelWindow* panel;
 	QPointer<QQuickWindow> mWindow;
 	QMetaObject::Connection frameConnection;
-	QPointer<QQuickWindow> framesWindow;
+	QMetaObject::Connection colorConnection;
 	std::unique_ptr<BackdropWindow> backdrop;
 	LayerRule rule;
-	bool active = false;
+	BlurMode mode = BlurMode::Disabled;
+	BlurMode appliedSystemMode = BlurMode::Disabled;
+	HWND systemBackdropHwnd = nullptr;
+	HWND rejectedSystemHwnd = nullptr;
+	bool syncingSystemBackdrop = false;
 	bool suspended = false;
 	bool shapesPending = false;
 	bool shapesForced = true;
 	ShapeInputs lastInputs;
-	bool stale = true;
-	bool panelWasShown = false;
 	QRegion mask;
 	bool hasMask = false;
 	QList<BlurShape> shapes;

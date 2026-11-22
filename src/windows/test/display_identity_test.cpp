@@ -44,9 +44,7 @@ bool settled() { return true; }
 void afterFirstFrame(QObject*, std::function<void()> callback) { callback(); }
 } // namespace qs::windows::startup
 
-namespace qs::log {
-void initLogCategoryLevel(const char*, QtMsgType) {}
-} // namespace qs::log
+// qs::log::initLogCategoryLevel comes from portable_common_stubs.cpp.
 
 namespace {
 

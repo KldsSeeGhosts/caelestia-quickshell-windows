@@ -33,6 +33,7 @@
 #include <qvectornd.h>
 #include <rhi/qshader.h>
 
+#include "../blur_policy.hpp"
 #include "layer_rules.hpp"
 #include "panel_animation.hpp"
 #include "panel_effects.hpp"
@@ -192,6 +193,9 @@ private slots:
 	void maskBypass();
 	void overlayFollowsRoot();
 	void ruleMerging();
+	void blurPolicy();
+	void backdropNames();
+	void backdropRules();
 	void iiRules();
 	void springCurve();
 	void springOvershootLimits();
@@ -672,6 +676,144 @@ void TestPanelAnimation::ruleMerging() {
 	auto empty = LayerRules::parse(QByteArray(), "empty.json");
 	QVERIFY(!empty.valid());
 	QCOMPARE(empty.ruleFor("anything").animation, style(Kind::None));
+}
+
+void TestPanelAnimation::blurPolicy() {
+	using qs::windows::BackdropMaterial;
+	using qs::windows::BlurMode;
+	using qs::windows::chooseBlurMode;
+
+	QCOMPARE(chooseBlurMode({.windowsBuild = 22621}), BlurMode::Disabled);
+	QCOMPARE(chooseBlurMode({.windowsBuild = 19045, .enabled = true}), BlurMode::Disabled);
+	QCOMPARE(
+	    chooseBlurMode({.windowsBuild = 22621, .enabled = true, .forceDisabled = true}),
+	    BlurMode::Disabled
+	);
+
+	struct MaterialCase {
+		BackdropMaterial requested;
+		BlurMode modernMode;
+	};
+
+	constexpr MaterialCase materials[] = {
+	    {BackdropMaterial::Auto, BlurMode::SystemAcrylic},
+	    {BackdropMaterial::Host, BlurMode::HostBackdrop},
+	    {BackdropMaterial::Acrylic, BlurMode::SystemAcrylic},
+	    {BackdropMaterial::Mica, BlurMode::SystemMica},
+	    {BackdropMaterial::MicaAlt, BlurMode::SystemMicaAlt},
+	};
+
+	for (const auto& test: materials) {
+		QCOMPARE(
+		    chooseBlurMode({.windowsBuild = 22000, .enabled = true, .requested = test.requested}),
+		    BlurMode::HostBackdrop
+		);
+		QCOMPARE(
+		    chooseBlurMode({.windowsBuild = 22621, .enabled = true, .requested = test.requested}),
+		    test.modernMode
+		);
+	}
+
+	QCOMPARE(
+	    chooseBlurMode({.windowsBuild = 22621, .enabled = true, .hasIgnoreAlpha = true}),
+	    BlurMode::HostBackdrop
+	);
+	QCOMPARE(
+	    chooseBlurMode({.windowsBuild = 26100, .enabled = true, .hasInputMask = true}),
+	    BlurMode::HostBackdrop
+	);
+	QCOMPARE(
+	    chooseBlurMode({
+	        .windowsBuild = 22621,
+	        .enabled = true,
+	        .requested = BackdropMaterial::Acrylic,
+	        .hasIgnoreAlpha = true,
+	        .hasInputMask = true,
+	    }),
+	    BlurMode::SystemAcrylic
+	);
+}
+
+void TestPanelAnimation::backdropNames() {
+	using qs::windows::BackdropMaterial;
+	using qs::windows::BlurMode;
+	using qs::windows::backdropMaterialName;
+	using qs::windows::blurModeName;
+	using qs::windows::parseBackdropMaterial;
+
+	struct NameCase {
+		BackdropMaterial material;
+		QStringView text;
+	};
+
+	constexpr NameCase names[] = {
+	    {BackdropMaterial::Auto, u"auto"},
+	    {BackdropMaterial::Host, u"host"},
+	    {BackdropMaterial::Acrylic, u"acrylic"},
+	    {BackdropMaterial::Mica, u"mica"},
+	    {BackdropMaterial::MicaAlt, u"mica-alt"},
+	};
+
+	for (const auto& test: names) {
+		auto parsed = BackdropMaterial::Auto;
+		QCOMPARE(backdropMaterialName(test.material), test.text);
+		QVERIFY(parseBackdropMaterial(backdropMaterialName(test.material), &parsed));
+		QCOMPARE(parsed, test.material);
+	}
+
+	auto parsed = BackdropMaterial::Host;
+	QVERIFY(!parseBackdropMaterial(u"unknown", &parsed));
+	QCOMPARE(parsed, BackdropMaterial::Host);
+	QCOMPARE(blurModeName(BlurMode::Disabled), QStringView(u"disabled"));
+	QCOMPARE(blurModeName(BlurMode::SystemAcrylic), QStringView(u"system-acrylic"));
+	QCOMPARE(blurModeName(BlurMode::SystemMica), QStringView(u"system-mica"));
+	QCOMPARE(blurModeName(BlurMode::SystemMicaAlt), QStringView(u"system-mica-alt"));
+	QCOMPARE(blurModeName(BlurMode::HostBackdrop), QStringView(u"host-backdrop"));
+}
+
+void TestPanelAnimation::backdropRules() {
+	using qs::windows::BackdropMaterial;
+
+	auto data = QByteArray(R"({
+		"layered": true,
+		"rules": [
+			{"namespace": ".*", "blur": true, "backdrop": "mica"},
+			{"namespace": "auto", "backdrop": "auto"},
+			{"namespace": "host", "backdrop": "host"},
+			{"namespace": "acrylic", "backdrop": "acrylic"},
+			{"namespace": "tabbed", "backdrop": "mica-alt"},
+			{"namespace": "reset", "backdrop": null},
+			{"namespace": "private-pattern", "backdrop": "private-value"}
+		]
+	})");
+
+	auto warnings = QStringList();
+	auto rules = LayerRules::parse(data, "test.json", &warnings);
+	QVERIFY(rules.valid());
+	QVERIFY(rules.layered());
+	QCOMPARE(rules.size(), qsizetype(7));
+	QCOMPARE(warnings.size(), qsizetype(1));
+	QVERIFY(warnings.first().contains("rule 6: backdrop"));
+	QVERIFY(!warnings.first().contains("private-pattern"));
+	QVERIFY(!warnings.first().contains("private-value"));
+
+	QCOMPARE(LayerRules().ruleFor("anything").backdrop, BackdropMaterial::Auto);
+	QCOMPARE(rules.ruleFor("anything").backdrop, BackdropMaterial::Mica);
+	QCOMPARE(rules.ruleFor("auto").backdrop, BackdropMaterial::Auto);
+	QCOMPARE(rules.ruleFor("host").backdrop, BackdropMaterial::Host);
+	QCOMPARE(rules.ruleFor("acrylic").backdrop, BackdropMaterial::Acrylic);
+	QCOMPARE(rules.ruleFor("tabbed").backdrop, BackdropMaterial::MicaAlt);
+	QCOMPARE(rules.ruleFor("reset").backdrop, BackdropMaterial::Auto);
+	QVERIFY(rules.ruleFor("reset").blur);
+	QCOMPARE(rules.ruleFor("private-pattern").backdrop, BackdropMaterial::Mica);
+
+	auto info = rules.info();
+	QCOMPARE(info.at(0).toMap().value("backdrop").toString(), QString("mica"));
+	QCOMPARE(info.at(1).toMap().value("backdrop").toString(), QString("auto"));
+	QCOMPARE(info.at(4).toMap().value("backdrop").toString(), QString("mica-alt"));
+	auto reset = info.at(5).toMap().value("backdrop");
+	QVERIFY(reset.isValid() && reset.isNull());
+	QVERIFY(!info.at(6).toMap().contains("backdrop"));
 }
 
 void TestPanelAnimation::iiRules() {

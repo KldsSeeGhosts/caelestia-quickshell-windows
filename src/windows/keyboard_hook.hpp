@@ -322,6 +322,8 @@ public:
 	// Called on the hook thread for an Esc press; returning true consumes the
 	// press and its release. Super drags use it to cancel.
 	static void setEscapeFilter(bool (*filter)());
+	// Called on the hook thread for the first Super down, after tracking it.
+	static void setSuperPressedCallback(void (*callback)());
 
 	static constexpr ULONG_PTR INJECTION_MARKER = 0x5153484B;
 	static constexpr uint8_t MASK_KEY = 0xE8;

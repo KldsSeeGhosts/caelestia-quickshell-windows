@@ -11,6 +11,7 @@
 #include <qlist.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
+#include <qsavefile.h>
 #include <qstring.h>
 #include "../../redact.hpp"
 #include <qurl.h>
@@ -41,6 +42,10 @@ void pruneCache(const QString& dir, const QString& retainedFileName) {
 
 CachedArt cacheImageBytes(const QByteArray& bytes, const QString& cacheDirectory) {
 	if (!artworkSizeAllowed(static_cast<uint64_t>(bytes.size())) || cacheDirectory.isEmpty()) return {};
+	auto hash = QCryptographicHash::hash(bytes, QCryptographicHash::Sha1).toHex();
+	auto path = QDir(cacheDirectory).filePath(hash + ".png");
+	if (QFileInfo::exists(path)) return {QUrl::fromLocalFile(path).toString(), hash};
+
 	QBuffer buffer;
 	buffer.setData(bytes);
 	buffer.open(QIODevice::ReadOnly);
@@ -62,10 +67,8 @@ CachedArt cacheImageBytes(const QByteArray& bytes, const QString& cacheDirectory
 		return {};
 	}
 
-	auto hash = QCryptographicHash::hash(bytes, QCryptographicHash::Sha1).toHex();
-	auto path = QDir(cacheDirectory).filePath(hash + ".png");
-	if (QFileInfo::exists(path)) return {QUrl::fromLocalFile(path).toString(), hash};
-	if (!image.save(path, "PNG")) {
+	QSaveFile file(path);
+	if (!file.open(QIODevice::WriteOnly) || !image.save(&file, "PNG") || !file.commit()) {
 		qCWarning(logMprisArt) << "Could not save thumbnail to" << qs::windows::logPath(path);
 		return {};
 	}

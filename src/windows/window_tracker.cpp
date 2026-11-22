@@ -126,7 +126,7 @@ void CALLBACK queueEvent(
 	}
 }
 
-void eventThreadMain() {
+void eventThreadMain(HANDLE stop) {
 	MSG msg {};
 	PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 
@@ -158,9 +158,19 @@ void eventThreadMain() {
 		qCWarning(logTracker) << "Only" << hooks.size() << "of 8 window event hooks installed.";
 	}
 
-	while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-		TranslateMessage(&msg);
-		DispatchMessageW(&msg);
+	for (;;) {
+		auto status = MsgWaitForMultipleObjectsEx(1, &stop, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+		// Unlike PostThreadMessage(WM_QUIT), the stop event also works before
+		// the thread has created its message queue or while the queue is full.
+		if (status != WAIT_OBJECT_0 + 1) break;
+		while (WaitForSingleObject(stop, 0) == WAIT_TIMEOUT
+		       && PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
+		{
+			if (msg.message == WM_QUIT) break;
+			TranslateMessage(&msg);
+			DispatchMessageW(&msg);
+		}
+		if (msg.message == WM_QUIT) break;
 	}
 
 	for (auto* handle: hooks) UnhookWinEvent(handle);
@@ -315,18 +325,19 @@ void TrackedWindow::refreshState() {
 	auto* screen = this->tracker->screenFor(monitor);
 	auto rects = monitorRects(monitor);
 
-	RECT raw {};
-	GetWindowRect(this->mHwnd, &raw);
-
 	RECT frame {};
-	if (FAILED(DwmGetWindowAttribute(this->mHwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame)))) {
-		frame = raw;
-	}
+	auto trace = transition_trace::enabled();
+	RECT raw {};
+	auto hasFrame = SUCCEEDED(DwmGetWindowAttribute(
+	    this->mHwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame)
+	));
+	if (!hasFrame || trace) GetWindowRect(this->mHwnd, &raw);
+	if (!hasFrame) frame = raw;
 
 	auto detection = fullscreen_geometry::detect(
 	    minimized,
 	    maximized,
-	    toQRect(raw),
+	    toQRect(frame),
 	    rects.monitor,
 	    reinterpret_cast<quintptr>(monitor), // NOLINT(performance-no-int-to-ptr)
 	    this->fullscreenLatch
@@ -344,7 +355,7 @@ void TrackedWindow::refreshState() {
 	auto style = GetWindowLongPtrW(this->mHwnd, GWL_STYLE);
 	auto exStyle = GetWindowLongPtrW(this->mHwnd, GWL_EXSTYLE);
 	auto styleChanged = this->styleSnapshot.update(style, exStyle);
-	if (transition_trace::enabled()) {
+	if (trace) {
 		auto id = transition_trace::handle(reinterpret_cast<quintptr>(this->mHwnd));
 		auto frameRect = toQRect(frame);
 		if (!this->traceObserved || style != this->traceStyle || exStyle != this->traceExStyle) {
@@ -593,6 +604,19 @@ WindowTracker::WindowTracker() {
 }
 
 WindowTracker::~WindowTracker() {
+	auto window = gEventTarget.exchange(nullptr);
+	if (this->eventThread.joinable()) {
+		SetEvent(this->eventThreadStop);
+		this->eventThread.join();
+	}
+	if (this->eventThreadStop != nullptr) CloseHandle(this->eventThreadStop);
+	if (window != nullptr) DestroyWindow(window);
+	{
+		auto lock = std::lock_guard(gEventMutex);
+		gEvents.clear();
+		gTracked.clear();
+	}
+	gEventWakePending.store(false);
 	for (auto* window: this->findChildren<TrackedWindow*>(Qt::FindDirectChildrenOnly)) {
 		window->releaseFullscreenOwnership();
 	}
@@ -626,8 +650,20 @@ void WindowTracker::startEventThread() {
 		return;
 	}
 
-	gEventTarget.store(window);
-	std::thread(&eventThreadMain).detach();
+	this->eventThreadStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if (this->eventThreadStop != nullptr) {
+		gEventTarget.store(window);
+		try {
+			this->eventThread = std::thread(&eventThreadMain, this->eventThreadStop);
+			return;
+		} catch (...) {
+			gEventTarget.store(nullptr);
+			CloseHandle(this->eventThreadStop);
+			this->eventThreadStop = nullptr;
+		}
+	}
+	DestroyWindow(window);
+	qCWarning(logTracker) << "Failed to start the window event thread, windows won't be tracked live.";
 }
 
 void WindowTracker::drainEvents() {

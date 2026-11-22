@@ -47,6 +47,9 @@ public:
 	void sessionStateChanged(const QString& key, int state);
 	void sessionDisconnected(const QString& key, bool serviceStopped);
 	void scanEndpoint(const QString& id);
+	void attemptEndpoint(const QString& id);
+	void retryEndpoint(const QString& id, bool resetAttempts = false);
+	void updateRetryTimer();
 	void adoptSession(const QString& id, IAudioSessionControl* control);
 
 signals:

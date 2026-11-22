@@ -145,16 +145,17 @@ void SystemTrayItem::allowForeground() const {
 	if (pid != 0) AllowSetForegroundWindow(pid);
 }
 
-void SystemTrayItem::send(UINT event) const {
+void SystemTrayItem::send(UINT event, const POINT* anchor) const {
 	if (this->callbackMessage == 0 || !this->ownerAlive()) return;
 
 	WPARAM wParam = 0;
 	LPARAM lParam = 0;
 
 	if (this->version >= NOTIFYICON_VERSION_4) {
-		POINT cursor {};
-		GetCursorPos(&cursor);
-		wParam = MAKEWPARAM(static_cast<WORD>(cursor.x), static_cast<WORD>(cursor.y));
+		POINT point {};
+		if (anchor) point = *anchor;
+		else GetCursorPos(&point);
+		wParam = MAKEWPARAM(static_cast<WORD>(point.x), static_cast<WORD>(point.y));
 		lParam = MAKELPARAM(static_cast<WORD>(event), static_cast<WORD>(this->uid));
 	} else {
 		wParam = this->uid;
@@ -190,9 +191,8 @@ void SystemTrayItem::secondaryActivate() {
 void SystemTrayItem::scroll(qint32 /*delta*/, bool /*horizontal*/) const {}
 
 void SystemTrayItem::display(QObject* parentWindow, qint32 relativeX, qint32 relativeY) {
-	// The owner opens its menu at the cursor, so the cursor is the placement.
-	// Without it the menu opens under the pointer, which is on the icon, and
-	// the bar covers its left edge.
+	// Version 4 carries the screen anchor in its callback. Legacy owners
+	// receive no coordinates and may place their menu at the cursor.
 	this->displayAt.reset();
 
 	// QML hands over the window wrapper; its content item knows the native window.
@@ -235,11 +235,13 @@ void SystemTrayItem::sendSecondaryActivate() {
 }
 
 void SystemTrayItem::sendDisplay() {
-	if (this->displayAt) SetCursorPos(this->displayAt->x, this->displayAt->y);
+	auto* anchor = this->displayAt ? &*this->displayAt : nullptr;
+	if (anchor && this->version < NOTIFYICON_VERSION_4 && this->ownerAlive())
+		SetCursorPos(anchor->x, anchor->y);
 	this->allowForeground();
-	this->send(WM_RBUTTONDOWN);
-	this->send(WM_RBUTTONUP);
-	if (this->version >= NOTIFYICON_VERSION) this->send(WM_CONTEXTMENU);
+	this->send(WM_RBUTTONDOWN, anchor);
+	this->send(WM_RBUTTONUP, anchor);
+	if (this->version >= NOTIFYICON_VERSION) this->send(WM_CONTEXTMENU, anchor);
 }
 
 void SystemTrayItem::hold(Pending action) {

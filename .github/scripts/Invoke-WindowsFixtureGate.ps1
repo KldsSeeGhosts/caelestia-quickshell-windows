@@ -5,7 +5,7 @@ param(
     [Parameter(Mandatory)][string]$ToolRoot,
     [Parameter(Mandatory)][string]$BuildRoot,
     [Parameter(Mandatory)][string]$Results,
-    [ValidateRange(1, 16)][int]$Jobs = 2,
+    [ValidateRange(1, 16)][int]$Jobs = [Math]::Min([Environment]::ProcessorCount, 8),
     [string]$CompilerLauncher = $env:QS_FIXTURE_COMPILER_LAUNCHER
 )
 $ErrorActionPreference = 'Stop'
@@ -54,7 +54,11 @@ New-Item -ItemType Directory -Force -Path $temporaryRoot | Out-Null
 $env:TEMP = $temporaryRoot
 $env:TMP = $temporaryRoot
 # The parent recorder removes this raw file after producing allowlisted XML.
+# Portable fixtures are process-isolated fakes and run in parallel. The
+# hosted-native tier owns private desktops and window state, so it stays
+# sequential.
 $tier = if ($Phase -eq 'HostedNative') { 'hosted-native' } else { 'portable' }
-ctest --test-dir $BuildRoot -L "^$tier$" --no-tests=error --output-on-failure `
+$parallel = if ($Phase -eq 'HostedNative') { 1 } else { $Jobs }
+ctest --test-dir $BuildRoot -L "^$tier$" --parallel $parallel --no-tests=error --output-on-failure `
     --output-junit "$Results/$tier.raw.xml"
 exit $LASTEXITCODE

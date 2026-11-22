@@ -46,7 +46,7 @@ void notify(
 } // namespace wifi_fixture
 
 QThreadPool* BackgroundThreadPool::instance() { qFatal("Unexpected WLAN worker in fixture"); }
-void qs::log::initLogCategoryLevel(const char*, QtMsgType) {}
+// qs::log::initLogCategoryLevel comes from portable_common_stubs.cpp.
 void qs::windows::startup::afterFirstFrame(QObject*, std::function<void()>) {
 	qFatal("Unexpected observation startup in fixture");
 }
