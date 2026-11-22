@@ -15,9 +15,7 @@ QThreadPool* BackgroundThreadPool::instance() {
 	qFatal("Clipboard fixture attempted production cache pruning");
 }
 
-namespace qs::log {
-void initLogCategoryLevel(const char*, QtMsgType) {}
-} // namespace qs::log
+// qs::log::initLogCategoryLevel comes from portable_common_stubs.cpp.
 
 namespace qs::windows::services {
 ServiceMessageWindow* ServiceMessageWindow::instance() {

@@ -6,14 +6,8 @@
 
 using namespace qs::service::upower;
 
-namespace qs::log {
-// Test stub for the logging-category hook referenced by powerprofiles.cpp. No
-// logging runtime is linked into this fixture.
-void initLogCategoryLevel(const char* name, QtMsgType defaultLevel) {
-	Q_UNUSED(name);
-	Q_UNUSED(defaultLevel);
-}
-} // namespace qs::log
+// The logging-category hook referenced by powerprofiles.cpp is provided by
+// portable_common_stubs.cpp; no logging runtime is linked into this fixture.
 
 namespace {
 // Documented overlay GUID fixtures. Every powrprof call in this test targets a

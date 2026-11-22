@@ -1,0 +1,68 @@
+// Domain runner for the consolidated portable fixture executables, generated
+// from portable_runner.cpp.in by qs_add_portable_runner(). Each suite keeps
+// its own QTest entry point, renamed to run_<suite> so several suites can
+// share one process image:
+//   <exe> --suite <name> [qtest args]  run only that fixture suite
+//   <exe>                            run every suite in order
+//   <exe> --list                     print the suite names
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+@QS_RUNNER_DECLS@
+
+namespace {
+struct QsSuite {
+	const char* name;
+	int (*run)(int, char**);
+};
+
+constexpr QsSuite kSuites[] = {
+@QS_RUNNER_ROWS@
+};
+
+// Several fixtures re-launch their own binary through
+// QCoreApplication::applicationFilePath() with private flags. In a shared
+// image that child lands here, so the runner marks each dispatched suite in
+// the environment; an inherited marker routes the child straight into the
+// owning fixture's entry point exactly as its standalone main would.
+constexpr const char* kSuiteEnv = "QS_PORTABLE_SUITE";
+
+const QsSuite* find(const char* name) {
+	for (const auto& suite: kSuites) {
+		if (std::strcmp(name, suite.name) == 0) return &suite;
+	}
+	return nullptr;
+}
+} // namespace
+
+int main(int argc, char** argv) {
+	if (const char* forced = std::getenv(kSuiteEnv); forced && *forced != '\0') {
+		if (const auto* suite = find(forced)) return suite->run(argc, argv);
+	}
+
+	if (argc == 2 && std::strcmp(argv[1], "--list") == 0) {
+		for (const auto& suite: kSuites) std::puts(suite.name);
+		return 0;
+	}
+
+	if (argc >= 3 && std::strcmp(argv[1], "--suite") == 0) {
+		if (const auto* suite = find(argv[2])) {
+			// QTest expects argv[0] to be the program name; the suite name
+			// takes that slot so remaining arguments select functions or
+			// output options exactly as on a standalone fixture binary.
+			::_putenv_s(kSuiteEnv, argv[2]);
+			return suite->run(argc - 2, argv + 2);
+		}
+		std::fprintf(stderr, "unknown portable suite '%s'\n", argv[2]);
+		return 2;
+	}
+
+	auto failures = 0;
+	for (const auto& suite: kSuites) {
+		std::fprintf(stderr, "qs portable suite: %s\n", suite.name);
+		::_putenv_s(kSuiteEnv, suite.name);
+		failures += suite.run(argc, argv) == 0 ? 0 : 1;
+	}
+	return failures;
+}

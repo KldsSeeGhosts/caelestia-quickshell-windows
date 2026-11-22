@@ -160,7 +160,7 @@ jobs:
           python -B .github/scripts/candidate_contract.py --receipt "$env:RESULTS/candidate-result.json" run `
             --stage portable --junit "$env:RESULTS/portable.raw.xml" --echo -- `
             powershell.exe -NoProfile -NonInteractive -File .github/scripts/Invoke-WindowsFixtureGate.ps1 `
-            -Phase Portable -ContractRoot toolchain-contract -ToolRoot $env:TOOL_ROOT -BuildRoot $env:BUILD_ROOT -Results $env:RESULTS
+            -Phase Portable -ContractRoot toolchain-contract -ToolRoot $env:TOOL_ROOT -BuildRoot $env:BUILD_ROOT -Results $env:RESULTS -Jobs $env:BUILD_JOBS
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run hosted-native fixtures

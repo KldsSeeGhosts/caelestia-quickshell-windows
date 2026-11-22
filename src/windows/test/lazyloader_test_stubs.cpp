@@ -18,9 +18,7 @@ QQmlListProperty<QObject> ReloadPropagator::data() { return {}; }
 void PostReloadHook::componentComplete() {}
 void PostReloadHook::postReload() {}
 
-namespace qs::log {
-void initLogCategoryLevel(const char*, QtMsgType) {}
-}
+// qs::log::initLogCategoryLevel comes from portable_common_stubs.cpp.
 namespace qs::windows {
 float animationIntervalMs() { return 16.0f; }
 }
