@@ -27,6 +27,7 @@ struct TrayIconMessage {
 	QUuid guid;
 
 	bool seeded = false;
+	bool fromObserver = false;
 	QString exePath;
 };
 
@@ -40,6 +41,7 @@ public:
 	    bool brief,
 	    std::function<void(TrayHookState)> stateChanged = {}
 	);
+	static void setBrief(bool brief);
 	static void stop();
 	[[nodiscard]] static bool running();
 	[[nodiscard]] static QVariantMap capability();
@@ -63,7 +65,6 @@ public:
 	static void announceTo(std::vector<HWND> owners);
 };
 
-void seedFromExplorer(TrayIconSink sink, std::function<void(bool ok)> done);
 [[nodiscard]] QImage imageFromIcon(HICON icon);
 
 } // namespace qs::windows::services::systray

@@ -16,6 +16,7 @@
 
 #include "system_surface.hpp"
 #include "appbar_call.hpp"
+#include "supervisor_bridge.hpp"
 #include "util.hpp"
 #include "transition_trace.hpp"
 
@@ -170,9 +171,12 @@ bool WinAppBar::ensureRegistered(HWND hwnd) {
 	// Record before sending, so a crash during registration is recoverable.
 	// The channel removes a NEW that succeeds after the caller times out.
 	rememberRegistration(hwnd);
+	auto* supervisor = SupervisorBridge::instance();
+	supervisor->reportAppBar(u"register", hwnd, 0, data.rc);
 	auto registered = boundedAppBarMessage(ABM_NEW, data);
 	if (!registered) {
 		forgetRegistration(hwnd);
+		supervisor->reportAppBar(u"remove", hwnd, 0, data.rc);
 		return false;
 	}
 	if (!*registered) {
@@ -180,6 +184,7 @@ bool WinAppBar::ensureRegistered(HWND hwnd) {
 		data = appBarData(hwnd);
 		if (!boundedAppBarMessage(ABM_NEW, data).value_or(0)) {
 			forgetRegistration(hwnd);
+			supervisor->reportAppBar(u"remove", hwnd, 0, data.rc);
 			QS_TRANSITION_TRACE("appbar_register", {{"window", transition_trace::handle(reinterpret_cast<quintptr>(hwnd))}, {"success", false}});
 			qCWarning(logAppBar) << "Failed to register AppBar for window" << hwnd;
 			return false;
@@ -237,6 +242,7 @@ QRect WinAppBar::reserve(HWND hwnd, UINT edge, const QRect& monitor, qint32 size
 		traceWorkArea(hwnd, "after_position");
 		this->mEdge = edge;
 		this->mReserved = toQRect(data.rc);
+		SupervisorBridge::instance()->reportAppBar(u"update", hwnd, static_cast<int>(edge), data.rc);
 		qCDebug(logAppBar) << "Reserved" << this->mReserved << "on edge" << edge << "for" << hwnd;
 	}
 
@@ -255,11 +261,16 @@ void WinAppBar::remove() {
 	if (!this->mRegistered) return;
 
 	auto data = appBarData(this->mHwnd);
+	data.uEdge = this->mEdge;
+	data.rc = toRECT(this->mReserved);
 	traceWorkArea(this->mHwnd, "before_remove");
 	auto result = boundedAppBarMessage(ABM_REMOVE, data);
 	QS_TRANSITION_TRACE("appbar_remove", {{"window", transition_trace::handle(reinterpret_cast<quintptr>(this->mHwnd))}, {"success", result.value_or(0) != 0}});
 	traceWorkArea(this->mHwnd, "after_remove");
-	if (result) forgetRegistration(this->mHwnd);
+	if (result) {
+		forgetRegistration(this->mHwnd);
+		SupervisorBridge::instance()->reportAppBar(u"remove", this->mHwnd, static_cast<int>(data.uEdge), data.rc);
+	}
 	this->invalidate();
 }
 

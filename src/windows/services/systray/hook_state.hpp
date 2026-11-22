@@ -8,6 +8,7 @@ enum class TrayHookState {
 	Disabled,
 	Starting,
 	Running,
+	RunningBrief,
 	Elevated,
 	WindowCreationFailed,
 	Stopped,
@@ -15,7 +16,8 @@ enum class TrayHookState {
 
 inline QVariantMap trayHookCapability(TrayHookState state) {
 	switch (state) {
-	case TrayHookState::Running: return {{"availability", "available"}, {"reason", ""}};
+	case TrayHookState::Running:
+	case TrayHookState::RunningBrief: return {{"availability", "available"}, {"reason", ""}};
 	case TrayHookState::Disabled: return {{"availability", "disabled"}, {"reason", "hook-disabled"}};
 	case TrayHookState::Starting:
 		return {{"availability", "unavailable"}, {"reason", "hook-starting"}};

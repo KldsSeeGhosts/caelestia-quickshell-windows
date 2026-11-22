@@ -24,6 +24,7 @@
 #include "desktopentry_backend.hpp"
 #include "panel_window.hpp"
 #include "redact.hpp"
+#include "supervisor_bridge.hpp"
 #include "util.hpp"
 
 #include <dwmapi.h>
@@ -179,6 +180,10 @@ class WindowsPlugin: public QsEnginePlugin {
 		const auto offscreen = QGuiApplication::platformName() == "offscreen";
 		qs::windows::optOutOfProcessPowerThrottling();
 		if (!offscreen) {
+			auto* supervisor = qs::windows::SupervisorBridge::instance();
+			QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit,
+			                 supervisor, &qs::windows::SupervisorBridge::stop);
+			supervisor->start();
 			qs::windows::WinAppBar::removeStale();
 			qs::windows::installAnimationTiming();
 		}

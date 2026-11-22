@@ -1,6 +1,7 @@
 #pragma once
 
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include <qt_windows.h>
@@ -17,6 +18,7 @@
 
 #include "hook.hpp"
 #include "item.hpp"
+#include "seed.hpp"
 
 namespace qs::windows::services::systray {
 
@@ -28,12 +30,17 @@ public:
 	~TrayHost() override;
 
 	[[nodiscard]] const QList<SystemTrayItem*>& items() const { return this->mItems; }
-	[[nodiscard]] QVariantMap hookCapability() const { return trayHookCapability(this->hookState); }
+	[[nodiscard]] QVariantMap hookCapability() const;
+
+public slots:
+	void onExplorerRestarted();
 
 #ifdef QS_TEST
+public:
 	static TrayHost* createForTest();
 	void applyForTest(const TrayIconMessage& message) { this->apply(message); }
 	[[nodiscard]] int ownerWaitCountForTest() const { return this->ownerWatches.size(); }
+	[[nodiscard]] bool pollActiveForTest() const { return this->pollTimer.isActive(); }
 #endif
 
 signals:
@@ -53,8 +60,11 @@ private:
 	void onOwnerExited(quint64 token);
 	static void CALLBACK ownerExited(PVOID context, BOOLEAN timedOut);
 	void rememberDeletion(HWND hwnd, UINT uid, const QUuid& guid);
+	void stopWorkers();
+	void beginSnapshot();
 	void startSnapshot();
 	void scheduleSnapshot(int delayMs);
+	void onObserverState(ComObserverState state);
 	void onSnapshotDone(bool ok);
 	void recoverCallbacks();
 	void requestTitle(const QString& exePath);
@@ -95,6 +105,13 @@ private:
 
 	QList<SystemTrayItem*> mItems;
 	TrayHookState hookState = TrayHookState::Disabled;
+	enum class Transport { Disabled, ComHybrid, Brief, Mirror };
+	Transport configuredTransport = Transport::Disabled;
+	Transport transport = Transport::Disabled;
+	ComObserverState observerState = ComObserverState::Inactive;
+	bool transportsStarted = false;
+	bool stopping = false;
+	bool fallbackLogged = false;
 	QList<Deletion> deletions;
 	QHash<SystemTrayItem*, OwnerWatch> ownerWatches;
 	struct UnwatchedOwner {
@@ -109,6 +126,7 @@ private:
 	bool watchesLost = false;
 
 	TrayIconSink sink;
+	TrayNotifyObserver observer;
 	QTimer snapshotTimer;
 	bool snapshotRunning = false;
 	bool snapshotAgain = false;
@@ -117,11 +135,12 @@ private:
 	int snapshotReported = 0;
 
 	QTimer pollTimer;
+	std::size_t briefRetries = 0;
 	QTimer recoverTimer;
 
 	QHash<QString, QString> titles;
 	QList<QString> titleQueue;
-	bool titlesReading = false;
+	std::jthread titlesWorker;
 };
 
 } // namespace qs::windows::services::systray

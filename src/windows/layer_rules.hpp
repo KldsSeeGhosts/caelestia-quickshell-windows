@@ -10,6 +10,7 @@
 #include <qtypes.h>
 #include <qvariant.h>
 
+#include "blur_policy.hpp"
 #include "panel_animation.hpp"
 
 namespace qs::windows {
@@ -19,6 +20,7 @@ struct LayerRule {
 	std::optional<qreal> ignoreAlpha;
 	PanelAnimationStyle animation;
 	PanelEffect effect = PanelEffect::Auto;
+	BackdropMaterial backdrop = BackdropMaterial::Auto;
 };
 
 class LayerRules {
@@ -42,6 +44,7 @@ private:
 		std::optional<std::optional<qreal>> ignoreAlpha;
 		std::optional<PanelAnimationStyle> animation;
 		std::optional<PanelEffect> effect;
+		std::optional<std::optional<BackdropMaterial>> backdrop;
 	};
 
 	QList<Rule> rules;

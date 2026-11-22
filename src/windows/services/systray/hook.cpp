@@ -47,6 +47,7 @@ constexpr DWORD NOTIFYICON_SIGNATURE = 0x34753423;
 
 constexpr UINT_PTR ANNOUNCE_TIMER = 1;
 constexpr UINT_PTR DEADLINE_TIMER = 2;
+constexpr UINT MODE_CHANGE_MESSAGE = WM_APP + 1;
 constexpr ULONGLONG PROPS_SYNC_MS = 1000;
 constexpr UINT ANNOUNCE_DELAY_MS = 1500;
 constexpr UINT FORWARD_TIMEOUT_MS = 4000;
@@ -112,15 +113,21 @@ bool processIsElevated() {
 
 class HookWindow {
 public:
-	explicit HookWindow(TrayIconSink sink, std::function<void()> missed)
+	HookWindow(
+	    TrayIconSink sink,
+	    std::function<void()> missed,
+	    const std::function<void(TrayHookState)>& stateChanged
+	)
 	    : sink(std::move(sink))
-	    , missed(std::move(missed)) {}
+	    , missed(std::move(missed))
+	    , stateChanged(stateChanged) {}
 	~HookWindow() = default;
 	Q_DISABLE_COPY_MOVE(HookWindow);
 
 	bool create();
 	void probeTitle();
 	void announce();
+	void publishRunning();
 	static bool registerClass(const wchar_t* name, WNDPROC proc);
 	static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -145,6 +152,7 @@ private:
 
 	TrayIconSink sink;
 	std::function<void()> missed;
+	const std::function<void(TrayHookState)>& stateChanged;
 	TrayReorderWatch reorder;
 	const wchar_t* trayClass = TRAY_CLASS;
 	const wchar_t* notifyClass = NOTIFY_CLASS;
@@ -414,6 +422,12 @@ LRESULT CALLBACK HookWindow::wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 LRESULT HookWindow::handle(UINT msg, WPARAM wParam, LPARAM lParam) {
 	switch (msg) {
 	case WM_COPYDATA: return this->onCopyData(wParam, lParam);
+	case MODE_CHANGE_MESSAGE:
+		gFrontUntil.store(0);
+		KillTimer(this->hwnd, DEADLINE_TIMER);
+		this->repair();
+		this->publishRunning();
+		return 0;
 	case WM_TIMER:
 		if (wParam == ANNOUNCE_TIMER) {
 			KillTimer(this->hwnd, ANNOUNCE_TIMER);
@@ -643,9 +657,13 @@ void HookWindow::stepBack(HWND first) {
 	auto* target = this->explorerWindow();
 	if (target == nullptr) return;
 
+	// Windows can leave two topmost windows in place even when a relative
+	// SetWindowPos succeeds. Leave the topmost group when Explorer is in it.
+	auto* insertAfter =
+	    (GetWindowLongPtrW(target, GWL_EXSTYLE) & WS_EX_TOPMOST) ? HWND_NOTOPMOST : target;
 	SetWindowPos(
 	    this->hwnd,
-	    target,
+	    insertAfter,
 	    0,
 	    0,
 	    0,
@@ -790,6 +808,10 @@ void publishState(TrayHookState state, const std::function<void(TrayHookState)>&
 	if (changed) changed(state);
 }
 
+void HookWindow::publishRunning() {
+	publishState(gBrief.load() ? TrayHookState::RunningBrief : TrayHookState::Running, this->stateChanged);
+}
+
 void runHook(
     TrayIconSink sink,
     std::function<void()> missed,
@@ -800,13 +822,15 @@ void runHook(
 
 	stayInFront(briefFrontMs());
 
-	HookWindow window(std::move(sink), std::move(missed));
+	auto briefOnCreate = gBrief.load();
+	HookWindow window(std::move(sink), std::move(missed), stateChanged);
 	if (!window.create()) {
 		publishState(TrayHookState::WindowCreationFailed, stateChanged);
 		return;
 	}
 
 	gHwnd.store(window.hwnd);
+	if (briefOnCreate != gBrief.load()) PostMessageW(window.hwnd, MODE_CHANGE_MESSAGE, 0, 0);
 
 	if (gStopping.load()) {
 		DestroyWindow(window.hwnd);
@@ -815,7 +839,7 @@ void runHook(
 		return;
 	}
 
-	publishState(TrayHookState::Running, stateChanged);
+	window.publishRunning();
 
 #ifdef QS_TRAY_HOOK_TEST
 	// A fixture taskbar is not Explorer: never probe it or broadcast to the
@@ -877,8 +901,20 @@ void TrayHook::stop() {
 	auto* hwnd = gHwnd.load();
 	if (hwnd != nullptr) PostMessageW(hwnd, WM_CLOSE, 0, 0);
 
-	if (WaitForSingleObject(gThread.native_handle(), 1000) == WAIT_OBJECT_0) gThread.join();
-	else gThread.detach();
+	gThread.join();
+	{
+		auto announceLock = std::lock_guard(gAnnounceMutex);
+		gAnnounceQueue.clear();
+	}
+}
+
+void TrayHook::setBrief(bool brief) {
+	auto lock = std::lock_guard(gMutex);
+	if (!gThread.joinable() || gBrief.exchange(brief) == brief) return;
+
+	// If the window hasn't been published, creation already reads gBrief.
+	auto* hwnd = gHwnd.load();
+	if (hwnd != nullptr) PostMessageW(hwnd, MODE_CHANGE_MESSAGE, 0, 0);
 }
 
 void TrayHook::announceTo(std::vector<HWND> owners) {
@@ -894,7 +930,10 @@ void TrayHook::announceTo(std::vector<HWND> owners) {
 	if (hwnd != nullptr) PostMessageW(hwnd, announceMessage(), 0, 0);
 }
 
-bool TrayHook::running() { return gState.load() == TrayHookState::Running; }
+bool TrayHook::running() {
+	auto state = gState.load();
+	return state == TrayHookState::Running || state == TrayHookState::RunningBrief;
+}
 
 QVariantMap TrayHook::capability() { return trayHookCapability(gState.load()); }
 

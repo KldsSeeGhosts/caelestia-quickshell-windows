@@ -52,6 +52,7 @@
 #include "panel_effects.hpp"
 #include "panel_geometry.hpp"
 #include "panel_topmost.hpp"
+#include "supervisor_bridge.hpp"
 #include "redact.hpp"
 #include "startup.hpp"
 #include "system_surface.hpp"
@@ -703,6 +704,32 @@ WinPanelWindow::WinPanelWindow(QObject* parent)
 
 	this->bcExclusionEdge.setBinding([this] { return this->bAnchors.value().exclusionEdge(); });
 
+	this->explorerRecoveryTimer.setSingleShot(true);
+	this->explorerRecoveryTimer.setInterval(4000);
+	QObject::connect(&this->explorerRecoveryTimer, &QTimer::timeout, this, [this] {
+		auto* taskbar = explorerTaskbarWindow();
+		DWORD pid = 0;
+		const auto thread = taskbar != nullptr ? GetWindowThreadProcessId(taskbar, &pid) : 0;
+		if (this->recoverExplorer(taskbar, pid, thread))
+			WinPanelStack::instance()->scheduleStackRepair();
+		else
+			this->scheduleUpdateDimensions();
+	});
+	QObject::connect(SupervisorBridge::instance(), &SupervisorBridge::explorerSettled, this,
+	    [this](quint64 pid, qint64 hwnd, int, bool) {
+		    const auto wasWaiting = this->explorerRecoveryTimer.isActive();
+		    this->explorerRecoveryTimer.stop();
+		    // The bridge emits each epoch once. The HWND check in recovery
+		    // also deduplicates a safety pass that already handled this tray.
+		    auto* taskbar = reinterpret_cast<HWND>(static_cast<qintptr>(hwnd));
+		    DWORD owner = 0;
+		    const auto thread = taskbar != nullptr ? GetWindowThreadProcessId(taskbar, &owner) : 0;
+		    if (owner == pid && this->recoverExplorer(taskbar, owner, thread))
+			    WinPanelStack::instance()->scheduleStackRepair();
+		    else if (wasWaiting)
+			    this->scheduleUpdateDimensions();
+	    });
+
 	auto* host = DesktopHost::instance();
 	auto queued = Qt::QueuedConnection;
 	QObject::connect(
@@ -1123,6 +1150,23 @@ void WinPanelWindow::onDesktopAccessorReady() {
 	if (this->window != nullptr && this->window->isVisible()) this->stickToAllDesktops();
 }
 
+bool WinPanelWindow::recoverExplorer(HWND taskbar, DWORD pid, DWORD thread) {
+	if (!thread || (taskbar == this->explorerTaskbar && pid == this->explorerTaskbarPid
+	               && thread == this->explorerTaskbarThread))
+		return false;
+	this->explorerTaskbar = taskbar;
+	this->explorerTaskbarPid = pid;
+	this->explorerTaskbarThread = thread;
+	this->pinnedToAllDesktops = false;
+	this->pinFailedHwnd = nullptr;
+	this->stuckHwnd = nullptr;
+	this->appBar.invalidate();
+	this->scheduleUpdateDimensions();
+	this->blur->syncPlacement();
+	QTimer::singleShot(0, this, &WinPanelWindow::onDesktopAccessorReady);
+	return true;
+}
+
 void WinPanelWindow::onWindowVisibleChanged() {
 	if (this->window->isVisible()) {
 		if (this->explorerTaskbar == nullptr) {
@@ -1269,7 +1313,7 @@ void WinPanelWindow::updateDimensions(const MonitorRects& nativeRects) {
 		}
 	}
 
-	if (wantsAppBar) {
+	if (wantsAppBar && !this->explorerRecoveryTimer.isActive()) {
 		UINT abEdge = ABE_TOP;
 		switch (edge) {
 		case Qt::LeftEdge: abEdge = ABE_LEFT; break;
@@ -1299,7 +1343,7 @@ void WinPanelWindow::updateDimensions(const MonitorRects& nativeRects) {
 			default: break;
 			}
 		}
-	} else {
+	} else if (!wantsAppBar) {
 		this->appBar.remove();
 	}
 
@@ -2031,19 +2075,16 @@ bool WinPanelWindow::handleNativeMessage(MSG* msg, qintptr* result) {
 		auto* taskbar = explorerTaskbarWindow();
 		DWORD pid = 0;
 		auto thread = taskbar != nullptr ? GetWindowThreadProcessId(taskbar, &pid) : 0;
-		if (!thread || (taskbar == this->explorerTaskbar && pid == this->explorerTaskbarPid
-		               && thread == this->explorerTaskbarThread))
-			return false;
-		this->explorerTaskbar = taskbar;
-		this->explorerTaskbarPid = pid;
-		this->explorerTaskbarThread = thread;
-		this->pinnedToAllDesktops = false;
-		this->pinFailedHwnd = nullptr;
-		this->stuckHwnd = nullptr;
-		this->appBar.invalidate();
-		this->scheduleUpdateDimensions();
-		this->blur->syncPlacement();
-		QTimer::singleShot(0, this, &WinPanelWindow::onDesktopAccessorReady);
+		if (SupervisorBridge::instance()->isCoordinatingExplorer()) {
+			// Ignore the tray hook's rebroadcast for the same Explorer. A real
+			// replacement must wait for the supervisor's suppression pass.
+			if ((!thread || taskbar != this->explorerTaskbar || pid != this->explorerTaskbarPid
+			     || thread != this->explorerTaskbarThread) && !this->explorerRecoveryTimer.isActive())
+				this->explorerRecoveryTimer.start();
+		} else {
+			this->explorerRecoveryTimer.stop();
+			this->recoverExplorer(taskbar, pid, thread);
+		}
 		return false;
 	}
 

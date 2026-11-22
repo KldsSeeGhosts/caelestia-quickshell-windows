@@ -2,6 +2,7 @@
 #include <cstring>
 #include <vector>
 
+#include <qscopeguard.h>
 #include <qtest.h>
 #include <qt_windows.h>
 
@@ -306,6 +307,35 @@ private slots:
 
 		TrayHook::stop();
 		DestroyWindow(taskbar);
+	}
+
+	void briefHookPromotesAfterHandback() {
+		TrayHook::registerTestTrayClass();
+		auto* taskbar = createFixtureTaskbar();
+		QVERIFY(taskbar != nullptr);
+
+		TrayHook::setTestTaskbar(taskbar);
+		TrayHook::setTestBriefFrontMs(100);
+		TrayHook::setTestElevated(false);
+		std::atomic<TrayHookState> state = TrayHookState::Disabled;
+		const auto cleanup = qScopeGuard([&] {
+			TrayHook::stop();
+			DestroyWindow(taskbar);
+		});
+		TrayHook::start([](TrayIconMessage) {}, []() {}, true, [&](TrayHookState next) {
+			state.store(next);
+		});
+
+		QTRY_COMPARE(state.load(), TrayHookState::RunningBrief);
+		auto* mirror = TrayHook::testMirror();
+		QVERIFY(mirror != nullptr);
+		QTRY_VERIFY(aboveInZOrder(taskbar, mirror));
+
+		TrayHook::setBrief(false);
+		QTRY_COMPARE(state.load(), TrayHookState::Running);
+		QTRY_VERIFY(aboveInZOrder(mirror, taskbar));
+		QCOMPARE(TrayHook::testMirror(), mirror);
+		QVERIFY(TrayHook::running());
 	}
 };
 

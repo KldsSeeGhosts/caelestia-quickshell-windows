@@ -378,6 +378,8 @@ target_link_libraries(qs_suite_log_scrub PRIVATE Qt6::Core Qt6::Test)
 # backend suite without a live desktop.
 get_filename_component(QS_BACKEND_SRC "${QS_WINDOWS_SRC}/../.." ABSOLUTE)
 qs_add_portable_suite(log_redaction_guard log_redaction_guard_test.cpp)
+qs_add_portable_suite(supervisor_protocol supervisor_protocol_test.cpp)
+target_link_libraries(qs_suite_supervisor_protocol PRIVATE Qt6::Test)
 target_compile_definitions(qs_suite_log_redaction_guard PRIVATE
 	NOMINMAX WIN32_LEAN_AND_MEAN
 	QS_WINDOWS_SRC="${QS_WINDOWS_SRC}"
@@ -622,6 +624,7 @@ qs_add_test_executable(tray_host_test
 	tray_host_test.cpp
 	${QS_WINDOWS_SRC}/services/systray/host.cpp
 	${QS_WINDOWS_SRC}/services/systray/item.cpp
+	${QS_WINDOWS_SRC}/supervisor_bridge.cpp
 	${QS_WINDOWS_SRC}/../core/imageprovider.cpp
 )
 add_dependencies(tray_host_test tray_owner_helper)
@@ -634,6 +637,16 @@ target_link_libraries(tray_host_test PRIVATE
 )
 add_test(NAME tray_host COMMAND tray_host_test)
 set_tests_properties(tray_host PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+qs_add_test_executable(tray_notify_test
+	tray_notify_test.cpp
+	${QS_WINDOWS_SRC}/services/systray/seed.cpp
+)
+target_compile_definitions(tray_notify_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(tray_notify_test PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(tray_notify_test PRIVATE Qt6::Gui Qt6::Test user32 ole32)
+add_test(NAME tray_notify COMMAND tray_notify_test)
+set_tests_properties(tray_notify PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 # Production manager/window-callback routing with fake platform registration
 # and shell services. Never installs a hook or injects desktop input.
@@ -890,6 +903,7 @@ set(QS_PANEL_REEMBED_TEST_SOURCES
 	${QS_WINDOWS_SRC}/panel_window.cpp
 	${QS_WINDOWS_SRC}/panel_window.hpp
 	${QS_WINDOWS_SRC}/appbar.cpp
+	${QS_WINDOWS_SRC}/supervisor_bridge.cpp
 	${QS_WINDOWS_SRC}/appbar.hpp
 	${QS_WINDOWS_SRC}/blur.cpp
 	${QS_WINDOWS_SRC}/blur.hpp
@@ -1185,6 +1199,7 @@ target_link_libraries(qs_tiling_fakes PRIVATE Qt6::Gui Qt6::GuiPrivate Qt6::Qml)
 # startup::afterFirstFrame or windowsBuild) lives in a different runner.
 qs_add_portable_runner(portable_core SUITES
 	crash_relaunch_policy crash_retention redaction log_scrub log_redaction_guard
+	supervisor_protocol
 	transition_trace activation_policy fullscreen_app_state panel_topmost
 	dispatcher erm625_native_desktop_facade lazyloader runtime_paths
 )
@@ -1269,6 +1284,7 @@ set_tests_properties(clipboard_capture clipboard_writer PROPERTIES ENVIRONMENT
 set(QS_TESTS_PORTABLE
 	wallpaper_target screen_identity hyprland_monitor panel_animation
 	screenshot_jobs fs_utils ipc_limits redaction log_scrub log_redaction_guard
+	supervisor_protocol
 	crash_relaunch_policy crash_retention
 	tiling_layout dispatcher virtual_desktops hotkeys_routing hotkeys_routing_taskbar_filter
 	keyboard_hook keyboard_hook_taskbar_filter
@@ -1283,14 +1299,14 @@ set(QS_TESTS_PORTABLE
 	fileview_transaction
 )
 set(QS_TESTS_NATIVE
-	appbar_call tray_hook tray_host keyboard_layout native_lifetime
+	appbar_call tray_hook tray_host tray_notify keyboard_layout native_lifetime
 	notification_mirror_consent desktop_underlay capture_native daemon_handshake
 )
 # Additional hosted selection, not a replacement runtime tier. These fixtures
 # supply their own windows/services and need neither Explorer nor D3D hardware.
 # capture_native requires DWM composition for display-affinity round trips.
 set(QS_TESTS_HOSTED_NATIVE
-	appbar_call tray_hook tray_host keyboard_layout native_lifetime
+	appbar_call tray_hook tray_host tray_notify keyboard_layout native_lifetime
 	notification_mirror_consent desktop_underlay daemon_handshake
 )
 set(QS_TESTS_DESKTOP system_surface desktop_zorder panel_hidden_reembed)
