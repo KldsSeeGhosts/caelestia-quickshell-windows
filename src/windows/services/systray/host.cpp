@@ -174,6 +174,8 @@ TrayHost::~TrayHost() {
 TrayHost::TrayHost() {
 	this->waitState = new WaitState;
 	this->waitState->host = this;
+	this->ownerSweepTimer.setInterval(10000);
+	QObject::connect(&this->ownerSweepTimer, &QTimer::timeout, this, &TrayHost::sweepUnwatchedOwners);
 
 	this->snapshotTimer.setSingleShot(true);
 	QObject::connect(&this->snapshotTimer, &QTimer::timeout, this, &TrayHost::startSnapshot);
@@ -338,26 +340,33 @@ void TrayHost::remove(SystemTrayItem* item) {
 }
 
 void TrayHost::watchOwner(SystemTrayItem* item) {
+	auto* hwnd = item->ownerWindow();
 	DWORD pid = 0;
-	GetWindowThreadProcessId(item->ownerWindow(), &pid);
+	auto thread = GetWindowThreadProcessId(hwnd, &pid);
 
 	auto existing = this->ownerWatches.find(item);
 	if (existing != this->ownerWatches.end()) {
 		// Same process still running: the wait already covers this icon.
 		if (existing->pid == pid && WaitForSingleObject(existing->process, 0) == WAIT_TIMEOUT) return;
-		this->unwatchOwner(item);
 	}
+	auto fallback = this->unwatchedOwners.constFind(item);
+	if (fallback != this->unwatchedOwners.cend() && fallback->hwnd == hwnd
+	    && fallback->pid == pid && fallback->thread == thread)
+		return;
+	this->unwatchOwner(item);
 
-	if (pid == 0) return;
+	auto sweep = [this, item, hwnd, pid, thread] {
+		this->unwatchedOwners.insert(item, {hwnd, pid, thread});
+		if (!this->ownerSweepTimer.isActive()) this->ownerSweepTimer.start();
+	};
 
-	auto process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+	auto process = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : nullptr;
 	if (process == nullptr) {
-		// The icon keeps working, but it is not pruned when its owner exits:
-		// SYNCHRONIZE is refused for an elevated or protected process. Say so at
-		// warning level, or the degradation is invisible in the default log.
-		qCWarning(logTrayHost) << "Can't wait on the owner process of"
-		                       << qs::windows::logId(item->bindableId().value())
-		                       << "for its exit:" << GetLastError();
+		// Elevated or protected owners may deny SYNCHRONIZE. Their HWND
+		// and owning thread still tell us when the icon can no longer work.
+		if (pid) qCDebug(logTrayHost) << "Polling the tray owner window, process wait unavailable:"
+		                             << GetLastError();
+		sweep();
 		return;
 	}
 
@@ -379,6 +388,7 @@ void TrayHost::watchOwner(SystemTrayItem* item) {
 		                      << GetLastError();
 		CloseHandle(process);
 		delete context;
+		sweep();
 		return;
 	}
 
@@ -386,6 +396,8 @@ void TrayHost::watchOwner(SystemTrayItem* item) {
 }
 
 void TrayHost::unwatchOwner(SystemTrayItem* item) {
+	if (this->unwatchedOwners.remove(item) && this->unwatchedOwners.isEmpty())
+		this->ownerSweepTimer.stop();
 	auto it = this->ownerWatches.find(item);
 	if (it == this->ownerWatches.end()) return;
 
@@ -407,6 +419,19 @@ void TrayHost::unwatchOwner(SystemTrayItem* item) {
 
 	delete watch.context;
 	if (watch.process != nullptr) CloseHandle(watch.process);
+}
+
+void TrayHost::sweepUnwatchedOwners() {
+	QList<SystemTrayItem*> expired;
+	for (const auto& [item, owner]: this->unwatchedOwners.asKeyValueRange()) {
+		DWORD pid = 0;
+		auto thread = GetWindowThreadProcessId(owner.hwnd, &pid);
+		if (!thread || thread != owner.thread || pid != owner.pid) expired.append(item);
+	}
+	for (auto* item: expired) {
+		this->rememberDeletion(item->ownerWindow(), item->iconId(), item->iconGuid());
+		this->remove(item);
+	}
 }
 
 void CALLBACK TrayHost::ownerExited(PVOID context, BOOLEAN /*timedOut*/) {

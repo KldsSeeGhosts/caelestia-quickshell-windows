@@ -362,6 +362,7 @@ public:
 
 	void removePanel(WinPanelWindow* panel) {
 		this->mPanels.removeOne(panel);
+		this->mTopmostRepairs.remove(panel);
 
 		// Forget monitors with no panel left: a replugged display can reuse the
 		// handle and must seed afresh instead of inheriting a stale lowering.
@@ -396,6 +397,7 @@ public:
 	void restoreTopmostPanels() {
 		// A topmost application can cover a panel without clearing its TOPMOST
 		// bit. Check actual overlapping application order as well as the style.
+		const auto now = GetTickCount64();
 		for (auto* panel: this->mPanels) {
 			auto* hwnd = panel->hwnd();
 			if (hwnd == nullptr || panel->bLayer != PanelLayer::Top || panel->isEmbedded()
@@ -403,11 +405,26 @@ public:
 			{
 				continue;
 			}
-			if (!panel->topmostExpected) continue;
+			if (!panel->topmostExpected) {
+				this->mTopmostRepairs.remove(panel);
+				continue;
+			}
+			auto& repair = this->mTopmostRepairs[panel];
+			if (repair.hwnd != hwnd) repair = {.hwnd = hwnd};
+			if (now < repair.nextAttempt) continue;
 			QList<HWND> ownAbove;
 			auto topmost = (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
 			if (panel_topmost::needsRestore(true, topmost, !onTopOfOthers(hwnd, ownAbove))) {
+				if (repair.stableSince && now - repair.stableSince >= 1000) repair.attempts = 0;
+				repair.stableSince = 0;
+				// Set this before SetWindowPos, which can reenter the native
+				// event handler. No timer keeps fighting an idle competitor.
+				repair.attempts = std::min(repair.attempts + 1, 8);
+				repair.nextAttempt = now + (repair.attempts <= 2
+					? 0 : (500ULL << (repair.attempts - 3)));
 				this->restack(hwnd, HWND_TOPMOST, true);
+			} else if (!repair.stableSince) {
+				repair.stableSince = now;
 			}
 		}
 	}
@@ -605,6 +622,13 @@ private:
 	RememberedForeground mExternalForeground;
 	QHash<HMONITOR, fullscreen_app::State> mFullscreenApps;
 	QHash<HMONITOR, HWND> mFullscreenWindows;
+	struct TopmostRepair {
+		HWND hwnd = nullptr;
+		ULONGLONG nextAttempt = 0;
+		ULONGLONG stableSince = 0;
+		int attempts = 0;
+	};
+	QHash<WinPanelWindow*, TopmostRepair> mTopmostRepairs;
 	bool mRepairPending = false;
 };
 
@@ -1101,6 +1125,13 @@ void WinPanelWindow::onDesktopAccessorReady() {
 
 void WinPanelWindow::onWindowVisibleChanged() {
 	if (this->window->isVisible()) {
+		if (this->explorerTaskbar == nullptr) {
+			this->explorerTaskbar = explorerTaskbarWindow();
+			if (this->explorerTaskbar != nullptr)
+				this->explorerTaskbarThread = GetWindowThreadProcessId(
+				    this->explorerTaskbar, &this->explorerTaskbarPid
+				);
+		}
 		startup::watchWindow(this->window);
 		auto* stack = WinPanelStack::instance();
 		stack->addPanel(this);
@@ -1997,9 +2028,22 @@ bool WinPanelWindow::handleNativeMessage(MSG* msg, qintptr* result) {
 	}
 
 	if (msg->message == WinAppBar::taskbarCreatedMessage()) {
+		auto* taskbar = explorerTaskbarWindow();
+		DWORD pid = 0;
+		auto thread = taskbar != nullptr ? GetWindowThreadProcessId(taskbar, &pid) : 0;
+		if (!thread || (taskbar == this->explorerTaskbar && pid == this->explorerTaskbarPid
+		               && thread == this->explorerTaskbarThread))
+			return false;
+		this->explorerTaskbar = taskbar;
+		this->explorerTaskbarPid = pid;
+		this->explorerTaskbarThread = thread;
+		this->pinnedToAllDesktops = false;
+		this->pinFailedHwnd = nullptr;
+		this->stuckHwnd = nullptr;
 		this->appBar.invalidate();
 		this->scheduleUpdateDimensions();
 		this->blur->syncPlacement();
+		QTimer::singleShot(0, this, &WinPanelWindow::onDesktopAccessorReady);
 		return false;
 	}
 

@@ -8,6 +8,7 @@
 
 #include <qlogging.h>
 #include <qloggingcategory.h>
+#include <qmetaobject.h>
 #include <qnamespace.h>
 #include <qobject.h>
 #include <qqmlinfo.h>
@@ -172,7 +173,7 @@ void ScreencopyView::setCaptureSource(QObject* captureSource) {
 		if (this->completed) this->createContext();
 	}
 
-	if (!this->mHandle && hadContext) this->update();
+	if (hadContext) this->update();
 	emit this->captureSourceChanged();
 }
 
@@ -340,10 +341,19 @@ void ScreencopyView::itemChange(ItemChange change, const ItemChangeData& value) 
 	}
 }
 
+void ScreencopyView::queueSceneUpdate() {
+	if (this->sceneUpdatePending.exchange(true)) return;
+	QMetaObject::invokeMethod(this, [this] {
+		this->sceneUpdatePending.store(false);
+		if (!this->mHandle || !this->mHasFrame) this->setFlag(QQuickItem::ItemHasContents, false);
+		else if (this->isVisible()) this->update();
+	}, Qt::QueuedConnection);
+}
+
 QSGNode* ScreencopyView::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData* /*unused*/) {
 	if (!this->mHandle || !this->mHasFrame) {
 		delete oldNode;
-		this->setFlag(QQuickItem::ItemHasContents, false);
+		this->queueSceneUpdate();
 		return nullptr;
 	}
 
@@ -353,7 +363,7 @@ QSGNode* ScreencopyView::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData* 
 	quint64 serial = 0;
 	auto frame = this->mHandle->latestFrame(&serial);
 
-	if (!node->sync(frame, serial)) this->update();
+	if (!node->sync(frame, serial)) this->queueSceneUpdate();
 
 	if (!node->hasTexture()) {
 		delete node;

@@ -6,7 +6,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cwchar>
+#include <memory>
 #include <thread>
+#include <utility>
 
 #include <qcoreapplication.h>
 #include <qlogging.h>
@@ -39,6 +41,7 @@ constexpr UINT WM_SD_END = WM_APP + 4;
 constexpr UINT WM_SD_TARGET_EVENT = WM_APP + 5;
 constexpr UINT WM_SD_PLACED = WM_APP + 6;
 constexpr UINT WM_SD_CANCEL = WM_APP + 7;
+constexpr UINT WM_SD_PROBE = WM_APP + 8;
 
 constexpr UINT WM_SD_STARTED = WM_APP + 1;
 constexpr UINT WM_SD_TILED_RESIZE = WM_APP + 2;
@@ -57,7 +60,9 @@ constexpr UINT GUI_TIMEOUT_MS = 250;
 // waited for. It reports failure; the target's own state and the placement's
 // answer decide completion.
 constexpr DWORD SETTLE_TIMEOUT_MS = 3000;
-constexpr DWORD ELEVATION_CACHE_MS = 2000;
+constexpr DWORD PROBE_INTERVAL_MS = 50;
+constexpr DWORD PROBE_REFRESH_MS = 750;
+constexpr DWORD PLACEMENT_STOP_TIMEOUT_MS = 250;
 
 constexpr UINT POS_FLAGS = SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE;
 
@@ -76,13 +81,15 @@ std::atomic<bool> gTargetEventPending = false; // NOLINT
 // (keyboard hook thread); the button's release then ends nothing.
 std::atomic<bool> gDragLive = false;  // NOLINT
 std::atomic<bool> gCancelled = false; // NOLINT
+std::atomic<uint64_t> gProbePoint = 0; // NOLINT
+std::atomic<bool> gProbePending = false; // NOLINT
+std::atomic<HWND> gApprovedTarget = nullptr; // NOLINT
+std::atomic<DWORD> gApprovedPid = 0; // NOLINT
 
 struct HookState {
 	bool active = false;
 	bool resize = false;
-	DWORD elevationPid = 0;
-	DWORD elevationTime = 0;
-	bool elevated = false;
+	DWORD lastProbe = 0;
 };
 
 HookState gHook; // NOLINT
@@ -137,7 +144,9 @@ bool isShellWindow(HWND hwnd) {
 
 bool coversMonitor(HWND hwnd) {
 	RECT rect {};
-	if (!GetWindowRect(hwnd, &rect)) return false;
+	if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &rect, sizeof(rect)))
+	    && !GetWindowRect(hwnd, &rect))
+		return false;
 
 	MONITORINFO info {};
 	info.cbSize = sizeof(info);
@@ -148,53 +157,68 @@ bool coversMonitor(HWND hwnd) {
 	    && rect.bottom >= monitor.bottom;
 }
 
-bool isElevatedCached(HWND hwnd) {
-	DWORD pid = 0;
-	GetWindowThreadProcessId(hwnd, &pid);
-	auto now = GetTickCount();
-
-	if (pid != 0 && pid == gHook.elevationPid && now - gHook.elevationTime < ELEVATION_CACHE_MS) {
-		return gHook.elevated;
-	}
-
-	gHook.elevated = isMoreElevated(hwnd);
-	gHook.elevationPid = pid;
-	gHook.elevationTime = now;
-	return gHook.elevated;
+HWND windowAt(POINT point) {
+	auto* hit = WindowFromPhysicalPoint(point);
+	return hit != nullptr ? GetAncestor(hit, GA_ROOT) : nullptr;
 }
 
-HWND dragTarget(POINT point) {
-	auto* hit = WindowFromPhysicalPoint(point);
-	if (hit == nullptr) return nullptr;
-
-	auto* hwnd = GetAncestor(hit, GA_ROOT);
-	if (hwnd == nullptr || isOwnProcessWindow(hwnd)) return nullptr;
-	if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return nullptr;
+bool isDragTarget(HWND hwnd, bool resize = false) {
+	if (hwnd == nullptr || isOwnProcessWindow(hwnd)) return false;
+	if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
 
 	auto style = GetWindowLongPtrW(hwnd, GWL_STYLE);
 	auto exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-	if ((style & WS_CHILD) != 0) return nullptr;
+	if ((style & WS_CHILD) != 0) return false;
 
 	auto caption = (style & WS_CAPTION) == WS_CAPTION;
-	if (!caption && (style & WS_THICKFRAME) == 0) return nullptr;
-	if ((exStyle & WS_EX_TOOLWINDOW) != 0 && (exStyle & WS_EX_APPWINDOW) == 0) return nullptr;
+	if (!caption && (style & WS_THICKFRAME) == 0) return false;
+	if ((exStyle & WS_EX_TOOLWINDOW) != 0 && (exStyle & WS_EX_APPWINDOW) == 0) return false;
 
 	auto maximized = IsZoomed(hwnd) != FALSE;
-	if (isShellWindow(hwnd)) return nullptr;
+	if ((resize && (maximized || (style & WS_THICKFRAME) == 0)) || isShellWindow(hwnd)) return false;
 
 	DWORD cloaked = 0;
 	DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
-	if (cloaked != 0) return nullptr;
+	if (cloaked != 0) return false;
 
-	if (!maximized && coversMonitor(hwnd)) return nullptr;
-	if (isElevatedCached(hwnd)) return nullptr;
+	if (!maximized && coversMonitor(hwnd)) return false;
+	return !isMoreElevated(hwnd);
+}
 
-	return hwnd;
+void probeDragTarget(HWND hwnd) {
+	// The worker checks the same hovered window only occasionally. A click
+	// is revalidated again before the first placement.
+	thread_local HWND lastProbed = nullptr;
+	thread_local DWORD lastProbeTime = 0;
+	auto now = GetTickCount();
+	if (hwnd == lastProbed && now - lastProbeTime < PROBE_REFRESH_MS) return;
+	lastProbed = hwnd;
+	lastProbeTime = now;
+	DWORD pid = 0;
+	if (hwnd != nullptr) GetWindowThreadProcessId(hwnd, &pid);
+	if (pid == 0 || !isDragTarget(hwnd)) {
+		gApprovedTarget.store(nullptr);
+		return;
+	}
+	if (hwnd != gApprovedTarget.load() || pid != gApprovedPid.load()) gApprovedTarget.store(nullptr);
+	gApprovedPid.store(pid);
+	gApprovedTarget.store(hwnd);
 }
 
 bool postWorker(UINT message, WPARAM wParam, LPARAM lParam) {
 	auto id = gWorkerId.load();
 	return id != 0 && PostThreadMessageW(id, message, wParam, lParam) != FALSE;
+}
+
+void scheduleProbe(POINT point) {
+	gProbePoint.store(pack(point));
+	if (!gProbePending.exchange(true) && !postWorker(WM_SD_PROBE, 0, 0))
+		gProbePending.store(false);
+}
+
+void probeOnSuperPress() {
+	POINT point {};
+	if (gEnabled.load() && superAlone() && GetPhysicalCursorPos(&point)) scheduleProbe(point);
 }
 
 enum class DragPhase : uint8_t {
@@ -272,9 +296,9 @@ void installTargetEvents(HWND hwnd) {
 // A hung target blocks SetWindowPos until it responds, so only this thread
 // ever waits on a target. The drag worker keeps handling input and its
 // deadline, and hands over one request at a time; newer targets coalesce in
-// the worker. The thread is never joined: a call blocked on a hung window
-// cannot be cancelled, and shutdown must not wait for it. It owns no state
-// with a destructor and is reclaimed with the process.
+// the worker. Shutdown wakes and joins the idle thread. A synchronous USER32
+// call cannot be cancelled; if the target hangs, the thread keeps its own
+// state until Windows releases the call.
 struct PlacementRequest {
 	HWND hwnd = nullptr;
 	RECT rect {};
@@ -295,21 +319,30 @@ struct PlacementAnswer {
 	RECT rect {};
 };
 
-SRWLOCK gPlacementLock = SRWLOCK_INIT; // NOLINT
-PlacementRequest gPlacementRequest;    // NOLINT
-PlacementAnswer gPlacementAnswer;      // NOLINT
-HANDLE gPlacementEvent = nullptr;      // NOLINT
+struct PlacementState {
+	~PlacementState() {
+		if (this->thread != nullptr) CloseHandle(this->thread);
+		if (this->event != nullptr) CloseHandle(this->event);
+	}
+	SRWLOCK lock = SRWLOCK_INIT;
+	PlacementRequest request;
+	PlacementAnswer answer;
+	std::atomic<bool> stop = false;
+	HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	HANDLE thread = nullptr;
+};
+std::shared_ptr<PlacementState> gPlacement; // NOLINT
 
-DWORD WINAPI placementMain(LPVOID /*param*/) {
+void placementMain(const std::shared_ptr<PlacementState>& state) {
 	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
 	for (;;) {
-		WaitForSingleObject(gPlacementEvent, INFINITE);
+		if (WaitForSingleObject(state->event, INFINITE) != WAIT_OBJECT_0 || state->stop.load()) return;
 
-		AcquireSRWLockExclusive(&gPlacementLock);
-		auto request = gPlacementRequest;
-		gPlacementRequest.queued = false;
-		ReleaseSRWLockExclusive(&gPlacementLock);
+		AcquireSRWLockExclusive(&state->lock);
+		auto request = state->request;
+		state->request.queued = false;
+		ReleaseSRWLockExclusive(&state->lock);
 		if (!request.queued) continue;
 
 		const auto& rect = request.rect;
@@ -335,53 +368,71 @@ DWORD WINAPI placementMain(LPVOID /*param*/) {
 		if (answer.ok) answer.ok = GetWindowRect(request.hwnd, &answer.rect) != FALSE;
 		if (!answer.ok) answer.error = GetLastError();
 
-		AcquireSRWLockExclusive(&gPlacementLock);
-		gPlacementAnswer = answer;
-		ReleaseSRWLockExclusive(&gPlacementLock);
+		if (state->stop.load()) return;
+		AcquireSRWLockExclusive(&state->lock);
+		state->answer = answer;
+		ReleaseSRWLockExclusive(&state->lock);
 		postWorker(WM_SD_PLACED, 0, 0);
 	}
 }
 
 bool startPlacementThread() {
-	static const auto started = [] {
-		gPlacementEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-		if (gPlacementEvent == nullptr) return false;
+	auto state = std::make_shared<PlacementState>();
+	if (state->event == nullptr) return false;
+	auto context = std::make_unique<std::shared_ptr<PlacementState>>(state);
+	auto* raw = context.release();
+	state->thread = CreateThread(nullptr, 0, [](LPVOID parameter) -> DWORD {
+		auto owned = std::unique_ptr<std::shared_ptr<PlacementState>>(
+		    static_cast<std::shared_ptr<PlacementState>*>(parameter)
+		);
+		placementMain(*owned);
+		return 0;
+	}, raw, 0, nullptr);
+	if (state->thread == nullptr) {
+		delete raw;
+		return false;
+	}
+	gPlacement = std::move(state);
+	return true;
+}
 
-		auto* thread = CreateThread(nullptr, 0, &placementMain, nullptr, 0, nullptr);
-		if (thread == nullptr) return false;
-
-		CloseHandle(thread);
-		return true;
-	}();
-
-	return started;
+void stopPlacementThread() {
+	auto state = std::exchange(gPlacement, {});
+	if (!state) return;
+	state->stop.store(true);
+	SetEvent(state->event);
+	if (WaitForSingleObject(state->thread, PLACEMENT_STOP_TIMEOUT_MS) != WAIT_OBJECT_0)
+		qCWarning(logSuperDrag) << "Window placement did not stop within its deadline";
 }
 
 void queuePlacement(HWND hwnd, const RECT& rect, UINT flags, uint32_t seq) {
-	AcquireSRWLockExclusive(&gPlacementLock);
-	gPlacementRequest =
+	auto& state = *gPlacement;
+	AcquireSRWLockExclusive(&state.lock);
+	state.request =
 	    PlacementRequest {.hwnd = hwnd, .rect = rect, .flags = flags, .seq = seq, .queued = true};
-	ReleaseSRWLockExclusive(&gPlacementLock);
-	SetEvent(gPlacementEvent);
+	ReleaseSRWLockExclusive(&state.lock);
+	SetEvent(state.event);
 }
 
 void queuePlacement(HWND hwnd, const WINDOWPLACEMENT& placement, uint32_t seq) {
-	AcquireSRWLockExclusive(&gPlacementLock);
-	gPlacementRequest = PlacementRequest {
+	auto& state = *gPlacement;
+	AcquireSRWLockExclusive(&state.lock);
+	state.request = PlacementRequest {
 	    .hwnd = hwnd,
 	    .placement = placement,
 	    .seq = seq,
 	    .queued = true,
 	    .restorePlacement = true,
 	};
-	ReleaseSRWLockExclusive(&gPlacementLock);
-	SetEvent(gPlacementEvent);
+	ReleaseSRWLockExclusive(&state.lock);
+	SetEvent(state.event);
 }
 
 PlacementAnswer placementAnswer() {
-	AcquireSRWLockShared(&gPlacementLock);
-	auto answer = gPlacementAnswer;
-	ReleaseSRWLockShared(&gPlacementLock);
+	auto& state = *gPlacement;
+	AcquireSRWLockShared(&state.lock);
+	auto answer = state.answer;
+	ReleaseSRWLockShared(&state.lock);
 	return answer;
 }
 
@@ -458,6 +509,7 @@ bool restoreGeometry(Drag& drag) {
 }
 
 void beginDrag(Drag& drag, HWND hwnd, bool resize, POINT point) {
+	if (!isDragTarget(hwnd, resize)) return;
 	hotkeys::KeyboardHook::sendKey(hotkeys::KeyboardHook::MASK_KEY);
 
 	drag = Drag();
@@ -531,9 +583,7 @@ void beginDrag(Drag& drag, HWND hwnd, bool resize, POINT point) {
 
 	if (!drag.tiled) {
 		constexpr UINT raiseFlags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
-		auto topmost = (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
-		SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, raiseFlags);
-		if (!topmost) SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, raiseFlags);
+		SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, raiseFlags);
 	}
 
 	if (drag.tiled) {
@@ -893,9 +943,12 @@ SuperDragManager::SuperDragManager(QObject* parent): QObject(parent) {
 
 SuperDragManager::~SuperDragManager() {
 	gEnabled.store(false);
+	hotkeys::KeyboardHook::setSuperPressedCallback(nullptr);
+	hotkeys::KeyboardHook::setEscapeFilter(nullptr);
 	gGuiWindow.store(nullptr);
 	if (this->mEnabled) hotkeys::KeyboardHook::release();
 	this->stopWorker();
+	stopPlacementThread();
 
 	if (this->messageWindow != nullptr) {
 		DestroyWindow(this->messageWindow);
@@ -917,6 +970,7 @@ void SuperDragManager::setEnabled(bool enabled) {
 	auto* tracker = InputMaskTracker::instance();
 
 	hotkeys::KeyboardHook::setEscapeFilter(enabled ? &SuperDragManager::onEscape : nullptr);
+	hotkeys::KeyboardHook::setSuperPressedCallback(enabled ? &probeOnSuperPress : nullptr);
 
 	if (enabled) {
 		tracker->acquireHook();
@@ -945,7 +999,12 @@ bool SuperDragManager::startWorker() {
 
 	gWorkerId.store(0);
 	gWorkerStop.store(false);
-	this->worker = std::thread(&SuperDragManager::workerMain);
+	try {
+		this->worker = std::thread(&SuperDragManager::workerMain);
+	} catch (...) {
+		stopPlacementThread();
+		return false;
+	}
 
 	this->workerRunning = true;
 	return true;
@@ -960,6 +1019,8 @@ void SuperDragManager::stopWorker() {
 
 	this->worker.join();
 	this->workerRunning = false;
+	gApprovedTarget.store(nullptr);
+	gProbePending.store(false);
 }
 
 void SuperDragManager::workerMain() {
@@ -969,6 +1030,8 @@ void SuperDragManager::workerMain() {
 	prioritizeInputThread(THREAD_PRIORITY_HIGHEST);
 	gWorkerId.store(GetCurrentThreadId());
 	if (gWorkerStop.load()) return;
+	POINT cursor {};
+	if (GetCursorPos(&cursor)) probeDragTarget(windowAt(cursor));
 
 	auto drag = Drag();
 
@@ -1008,6 +1071,10 @@ void SuperDragManager::workerMain() {
 				break;
 			case WM_SD_TARGET_EVENT: gTargetEventPending.store(false); break;
 			case WM_SD_PLACED: placementAnswered(drag); break;
+			case WM_SD_PROBE:
+				gProbePending.store(false);
+				probeDragTarget(windowAt(unpack(gProbePoint.load())));
+				break;
 			default: DispatchMessageW(&msg); break;
 			}
 			pumpDrag(drag);
@@ -1037,12 +1104,30 @@ bool SuperDragManager::onMouseHook(WPARAM message, const MSLLHOOKSTRUCT* info) {
 		return message == (hook.resize ? WM_RBUTTONDOWN : WM_LBUTTONDOWN);
 	}
 
+	if (!gEnabled.load(std::memory_order_relaxed)) return false;
+	if (message == WM_MOUSEMOVE) {
+		if (info->time - hook.lastProbe >= PROBE_INTERVAL_MS && superAlone()) {
+			hook.lastProbe = info->time;
+			scheduleProbe(info->pt);
+		}
+		return false;
+	}
+
 	auto resize = message == WM_RBUTTONDOWN;
 	if (message != WM_LBUTTONDOWN && !resize) return false;
-	if (!gEnabled.load(std::memory_order_relaxed) || !superAlone()) return false;
+	if (!superAlone()) return false;
 
-	auto* hwnd = dragTarget(info->pt);
-	if (hwnd == nullptr) return false;
+	auto* hwnd = windowAt(info->pt);
+	DWORD pid = 0;
+	if (hwnd == nullptr || hwnd != gApprovedTarget.load() || !GetWindowThreadProcessId(hwnd, &pid)
+	    || pid != gApprovedPid.load() || hwnd != gApprovedTarget.load())
+	{
+		// Never swallow a click on an unverified window.
+		scheduleProbe(info->pt);
+		return false;
+	}
+	if (resize && (IsZoomed(hwnd) || !(GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_THICKFRAME)))
+		return false;
 
 	gCursor.store(pack(info->pt));
 

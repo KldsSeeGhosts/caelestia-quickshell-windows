@@ -6,6 +6,7 @@
 
 #include <qhash.h>
 #include <qobject.h>
+#include <qpointer.h>
 #include <qqmlintegration.h>
 #include <qquickitem.h>
 #include <qsize.h>
@@ -25,6 +26,7 @@ struct FrameSlot {
 	std::mutex mutex;
 	std::shared_ptr<capture::SharedFrame> frame;
 	quint64 serial = 0;
+	std::atomic<bool> wakePending = false;
 };
 
 class VideoSource: public QObject {
@@ -95,14 +97,20 @@ signals:
 protected:
 	QSGNode* updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData* data) override;
 	void itemChange(ItemChange change, const ItemChangeData& value) override;
+	bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
 	void attach();
 	void detach();
+	void watchWindow(QQuickWindow* window);
 	void updateWanted();
+	void queueSceneUpdate();
 
 	QString mSource;
 	bool mPlaying = true;
+	bool wantedRefreshPending = false;
+	std::atomic<bool> sceneUpdatePending = false;
+	QPointer<QQuickWindow> watchedWindow;
 	std::shared_ptr<VideoSource> mVideo;
 };
 

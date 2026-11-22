@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -904,11 +905,7 @@ BlurManager::BlurManager(QObject* parent): QObject(parent) {
 
 BlurManager::~BlurManager() {
 	gManagerDestroyed = true;
-
-	if (this->composition != nullptr) {
-		winrt::detach_abi(this->composition->compositor);
-		winrt::detach_abi(this->composition->controller);
-	}
+	this->shutdown();
 
 	delete this->registryNotifier;
 	this->registryNotifier = nullptr;
@@ -947,8 +944,38 @@ void BlurManager::shutdown() {
 
 	if (this->composition != nullptr) {
 		this->closeCompositor();
-		winrt::detach_abi(this->composition->controller);
-		this->composition.reset();
+		auto state = std::move(this->composition);
+		if (state->controller == nullptr) return;
+
+		// We created this queue on the GUI thread. Windows requires its
+		// message loop to run until ShutdownQueueAsync completes.
+		std::optional<int> quitCode;
+		try {
+			using winrt::Windows::Foundation::AsyncStatus;
+			auto action = state->controller.ShutdownQueueAsync();
+			const auto deadline = GetTickCount64() + 250;
+			while (action.Status() == AsyncStatus::Started) {
+				auto now = GetTickCount64();
+				if (now >= deadline) {
+					qCDebug(logBlur) << "Dispatcher queue shutdown did not finish within its deadline";
+					break;
+				}
+				MSG msg {};
+				if (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+					if (msg.message == WM_QUIT) quitCode = static_cast<int>(msg.wParam);
+					else {
+						TranslateMessage(&msg);
+						DispatchMessageW(&msg);
+					}
+				} else {
+					MsgWaitForMultipleObjectsEx(0, nullptr, static_cast<DWORD>(deadline - now),
+					    QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+				}
+			}
+		} catch (const winrt::hresult_error& e) {
+			qCDebug(logBlur) << "Closing the dispatcher queue:" << hresultString(e);
+		}
+		if (quitCode) PostQuitMessage(*quitCode);
 	}
 }
 

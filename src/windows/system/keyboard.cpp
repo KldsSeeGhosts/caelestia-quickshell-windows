@@ -87,7 +87,7 @@ bool isApplicationWindow(HWND hwnd) {
 // it must still be the recorded window (a recycled handle is rejected) and be
 // visible, not minimized and not cloaked, or a background app that minimized
 // or closed itself would receive the switch.
-bool isRetainedApplication(const TrackedWindow* retained) {
+bool isLiveRetainedApplication(const TrackedWindow* retained) {
 	if (retained == nullptr) return false;
 
 	auto* hwnd = retained->hwnd();
@@ -95,23 +95,21 @@ bool isRetainedApplication(const TrackedWindow* retained) {
 	if (!isLiveRetainedTarget(state, {retained->frameProcessId(), retained->frameThreadId()})) {
 		return false;
 	}
-	return isApplicationWindow(hwnd);
+	return true;
 }
 
 // The single target used for both observing and switching. WindowTracker keeps
 // the last application while shell UI (launcher, session, task switcher) owns
 // the foreground; using it here prevents the popout from reading or changing
 // the shell's own thread layout. Shell windows are never accepted.
-HWND intendedLayoutTarget() {
-	auto* foreground = GetForegroundWindow();
+HWND intendedLayoutTarget(HWND foreground, bool validateRetainedSurface) {
+	if (isApplicationWindow(foreground)) return foreground;
 	auto* retained = WindowTracker::instance()->activeWindow();
-
-	return resolveLayoutTarget(
-	    foreground,
-	    isApplicationWindow(foreground),
-	    retained != nullptr ? retained->hwnd() : nullptr,
-	    isRetainedApplication(retained)
-	);
+	if (!isLiveRetainedApplication(retained) || retained->hwnd() == foreground) return nullptr;
+	// The tracker has already classified the retained application. A layout
+	// write still revalidates it independently, but a poll needn't reopen it.
+	auto* hwnd = retained->hwnd();
+	return !validateRetainedSurface || isApplicationWindow(hwnd) ? hwnd : nullptr;
 }
 
 bool postLayoutRequest(HWND target, HKL hkl, DWORD& error) {
@@ -134,8 +132,7 @@ bool postLayoutRequest(HWND target, HKL hkl, DWORD& error) {
 // target. This is for hosted UWP input, where the frame (ApplicationFrameHost)
 // and the app's CoreWindow are on different threads, and for classic windows
 // whose focus is a child. Observation and switching both use this one result.
-LayoutInputTarget intendedInputTarget() {
-	auto* top = intendedLayoutTarget();
+LayoutInputTarget layoutInputTarget(HWND top) {
 	if (top == nullptr) return {};
 
 	static const LayoutInputQueries queries {
@@ -164,11 +161,8 @@ LayoutInputTarget intendedInputTarget() {
 	return resolveLayoutInput(top, queries);
 }
 
-HKL foregroundLayout() {
-	auto input = intendedInputTarget();
-	if (input.window == nullptr || input.threadId == 0) return nullptr;
-
-	return GetKeyboardLayout(input.threadId);
+LayoutInputTarget intendedInputTarget() {
+	return layoutInputTarget(intendedLayoutTarget(GetForegroundWindow(), true));
 }
 
 } // namespace
@@ -183,12 +177,17 @@ KeyboardLayoutWatcher::KeyboardLayoutWatcher(QObject* parent): QObject(parent) {
 	this->pollTimer.setInterval(LAYOUT_POLL_MS);
 	QObject::connect(&this->pollTimer, &QTimer::timeout, this, &KeyboardLayoutWatcher::check);
 
-	QObject::connect(
-	    WindowTracker::instance(),
-	    &WindowTracker::foregroundChanged,
-	    this,
-	    &KeyboardLayoutWatcher::check
-	);
+	auto* tracker = WindowTracker::instance();
+	auto invalidate = [this] { this->sampleValid = false; };
+	connect(tracker, &WindowTracker::foregroundChanged, this, [this, invalidate] {
+		invalidate();
+		this->check();
+	});
+	connect(tracker, &WindowTracker::activeWindowChanged, this, invalidate);
+	connect(tracker, &WindowTracker::foregroundNameChanged, this, invalidate);
+	connect(tracker, &WindowTracker::windowRemoved, this, [this](TrackedWindow* window) {
+		if (window->hwnd() == this->sampledTarget) this->sampleValid = false;
+	});
 
 	this->check();
 	// Compatibility fallback, not the intended end state. It is tracked in
@@ -219,7 +218,30 @@ void KeyboardLayoutWatcher::check() {
 		emit this->locksChanged();
 	}
 
-	auto* current = foregroundLayout();
+	auto* foreground = GetForegroundWindow();
+	auto thread = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+	auto* layout = thread ? GetKeyboardLayout(thread) : nullptr;
+	if (!this->sampleValid || foreground != this->sampledForeground
+	    || thread != this->sampledForegroundThread || layout != this->sampledForegroundLayout)
+	{
+		this->sampledForeground = foreground;
+		this->sampledForegroundThread = thread;
+		this->sampledForegroundLayout = layout;
+		this->sampledTarget = intendedLayoutTarget(foreground, false);
+		this->sampleValid = true;
+	}
+	auto* target = this->sampledTarget;
+	if (target != nullptr && target != foreground
+	    && (!IsWindowVisible(target) || IsIconic(target) || system_surface::isCloaked(target)))
+	{
+		this->sampleValid = false;
+		target = nullptr;
+	}
+	// A UWP frame can keep its own HKL while its hosted input thread
+	// switches. Keep sampling the input thread without reclassifying the app.
+	auto input = layoutInputTarget(target);
+	auto* current = input.threadId == 0 ? nullptr
+	             : input.threadId == thread ? layout : GetKeyboardLayout(input.threadId);
 	// A lost target (nullptr) is published too, so the popout does not keep
 	// showing the previous app's layout as active.
 	if (current == this->mCurrent) return;

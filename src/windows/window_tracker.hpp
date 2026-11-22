@@ -1,4 +1,5 @@
 #pragma once
+#include <thread>
 
 #include <vector>
 
@@ -264,6 +265,8 @@ private:
 
 	QHash<HMONITOR, QScreen*> screensByMonitor;
 	std::vector<WindowEvent> spareEvents;
+	HANDLE eventThreadStop = nullptr;
+	std::thread eventThread;
 };
 
 } // namespace qs::windows

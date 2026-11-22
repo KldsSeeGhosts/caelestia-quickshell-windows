@@ -445,10 +445,12 @@ void DesktopHost::updateReportedState() {
 	int foreign = 0;
 	int visible = 0;
 	int backgrounds = 0;
+	this->hostedChildren.clear();
 	for (auto* child = this->mParent == nullptr ? nullptr : GetWindow(this->mParent, GW_CHILD);
 	     child != nullptr;
 	     child = GetWindow(child, GW_HWNDNEXT))
 	{
+		this->hostedChildren.insert(child);
 		if (GetPropW(child, BACKGROUND_PROP) != nullptr) backgrounds++;
 		if (isOwnProcessWindow(child)) continue;
 		foreign++;
@@ -911,36 +913,36 @@ void CALLBACK DesktopHost::reconcileEventProc(
 		return;
 	}
 
-	// A parent change does not name the old parent, so a child that just left
-	// the host cannot be recognized by its current parent. Parent changes are
-	// rare and the reconcile only reads the host's few children, so every one
-	// asks for it.
-	if (idObject == OBJID_WINDOW && idChild == CHILDID_SELF) host->queueReconcile();
+	if (event == EVENT_OBJECT_PARENTCHANGE && idObject == OBJID_WINDOW && idChild == CHILDID_SELF
+	    && host->relevantParentChange(hwnd))
+		host->queueReconcile();
+}
+
+bool DesktopHost::relevantParentChange(HWND hwnd) const {
+	// WinEvent doesn't include the old parent. Remember direct children so a
+	// wallpaper leaving the host is detected as well as one entering it.
+	return hwnd == this->mParent || hwnd == this->mIconsHost || hwnd == this->mIconsView
+	    || this->hostedChildren.contains(hwnd) || GetAncestor(hwnd, GA_PARENT) == this->mParent;
 }
 
 void CALLBACK DesktopHost::foreignEventProc(
     HWINEVENTHOOK /*hook*/,
     DWORD event,
     HWND hwnd,
-    LONG /*idObject*/,
-    LONG /*idChild*/,
+    LONG idObject,
+    LONG idChild,
     DWORD /*thread*/,
     DWORD /*time*/
 ) {
 	auto* host = gHost;
 	if (host == nullptr || hwnd == nullptr || host->mParent == nullptr) return;
 
-	// Only what can change the host's child order matters: the host's own
-	// client reorder, or a child of the host. A destruction (the window is
-	// already gone) and a parent change (the window may just have left the
-	// host, so its new parent is not the host any more) always count.
-	if (event != EVENT_OBJECT_DESTROY && event != EVENT_OBJECT_PARENTCHANGE
-	    && hwnd != host->mParent && GetAncestor(hwnd, GA_PARENT) != host->mParent)
-	{
-		return;
+	if (event == EVENT_OBJECT_PARENTCHANGE || event == EVENT_OBJECT_DESTROY) {
+		if (idObject == OBJID_WINDOW && idChild == CHILDID_SELF && host->relevantParentChange(hwnd))
+			host->queueReconcile();
+	} else if (hwnd == host->mParent || GetAncestor(hwnd, GA_PARENT) == host->mParent) {
+		host->queueReconcile();
 	}
-
-	host->queueReconcile();
 }
 
 void CALLBACK DesktopHost::eventProc(

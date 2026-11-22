@@ -29,6 +29,7 @@ std::atomic<bool> gFailed = false;                           // NOLINT
 std::atomic<bool> gForegroundBlocked = false; // NOLINT
 std::atomic<bool> gSuppressLoneSuperTap = false; // NOLINT
 std::atomic<bool (*)()> gEscapeFilter = nullptr; // NOLINT
+std::atomic<void (*)()> gSuperPressed = nullptr; // NOLINT
 
 std::thread* gThread = nullptr; // NOLINT
 
@@ -82,14 +83,37 @@ bool gPhysicalSwallowed[256] = {};       // NOLINT
 // cannot slip between them.
 constexpr UINT WM_QS_ARM_OBSERVER = WM_APP + 0x40;
 constexpr DWORD HOOK_START_TIMEOUT_MS = 5000;
+constexpr DWORD HOOK_STOP_TIMEOUT_MS = 250;
+constexpr DWORD OBSERVER_TIMEOUT_MS = 250;
 
 struct InputObserverRequest {
+	enum class State { Pending, Armed, Cancelled };
+	~InputObserverRequest() { if (this->done != nullptr) CloseHandle(this->done); }
 	HWND target = nullptr;
 	UINT keyMessage = 0;
 	UINT resetMessage = 0;
 	HANDLE done = nullptr;
 	std::vector<uint8_t> keys;
+	std::atomic<State> state = State::Pending;
 };
+std::atomic<std::shared_ptr<InputObserverRequest>> gObserverRequest; // NOLINT
+HWINEVENTHOOK gForegroundHook = nullptr; // NOLINT
+std::atomic<HWND> gCheckedForeground = nullptr; // NOLINT
+
+bool foregroundIsBlocked() {
+	// Check that a foreground event was processed before consuming a new
+	// sequence. The UI thread can lag behind input, so unknown means blocked.
+	if (gThreadId.load() == 0) return gForegroundBlocked.load();
+	auto* foreground = GetForegroundWindow();
+	if (foreground == nullptr) return false;
+	if (gCheckedForeground.load() == foreground) {
+		auto blocked = gForegroundBlocked.load();
+		if (gCheckedForeground.load() == foreground) return blocked;
+	}
+	DWORD pid = 0;
+	GetWindowThreadProcessId(foreground, &pid);
+	return pid != GetCurrentProcessId();
+}
 
 // Signalled once the hook is installed (or failed), and once the thread has
 // stopped touching physical state.
@@ -346,11 +370,16 @@ void resetPhysicalState() {
 // Runs on the hook thread, where a key transition cannot interleave between
 // the snapshot and the subscription.
 void armObserver(InputObserverRequest& request) {
+	using State = InputObserverRequest::State;
+	if (request.state.load() != State::Pending) return;
 	reconcilePhysicalState();
 	request.keys = physicalKeys();
 	gInputObserverMessage.store(request.keyMessage, std::memory_order_relaxed);
 	gInputObserverResetMessage.store(request.resetMessage, std::memory_order_relaxed);
 	gInputObserver.store(request.target, std::memory_order_release);
+	auto pending = State::Pending;
+	if (!request.state.compare_exchange_strong(pending, State::Armed))
+		gInputObserver.store(nullptr, std::memory_order_release);
 	if (request.done != nullptr) SetEvent(request.done);
 }
 
@@ -417,6 +446,7 @@ LRESULT onWin(
     bool up,
     bool taskbarMaskedRelease = false
 ) {
+	auto blocked = foregroundIsBlocked();
 	auto index = info->vkCode == VK_LWIN ? 0 : 1;
 	auto& key = gWin[index];
 	auto& other = gWin[1 - index];
@@ -432,7 +462,7 @@ LRESULT onWin(
 		}
 		// Preserve the existing UIPI boundary. A sequence whose down passed
 		// through is never claimed retrospectively on its release.
-		if (gForegroundBlocked.load() || isDown(static_cast<int>(info->vkCode))) return 0;
+		if (blocked || isDown(static_cast<int>(info->vkCode))) return 0;
 		auto ownsSuper = !snapshot.masks.empty();
 		for (const auto& trigger: snapshot.triggers) {
 			ownsSuper |= trigger.combo.lone == ModSuper || (trigger.combo.mods & ModSuper) != 0;
@@ -453,6 +483,9 @@ LRESULT onWin(
 		}
 		key = {.down = true, .forwarded = false, .consumed = ownsSuper, .lastTime = info->time};
 		gWinDown.store(true);
+		if (!other.down) {
+			if (auto* callback = gSuperPressed.load(std::memory_order_acquire)) callback();
+		}
 		if (ownsSuper) {
 			if (!other.down) {
 				gHoldActive |= ModSuper;
@@ -473,7 +506,7 @@ LRESULT onWin(
 			gHoldActive &= ~ModSuper;
 			postAll(snapshot, HookTrigger::Hold, ModSuper, HookReleased);
 		}
-		if (gTapCandidate == ModSuper && !gSuppressLoneSuperTap.load() && !gForegroundBlocked.load()
+		if (gTapCandidate == ModSuper && !gSuppressLoneSuperTap.load() && !blocked
 		    && info->time - gTapStart <= snapshot.tapTimeoutMs)
 		{
 			postAll(snapshot, HookTrigger::Tap, ModSuper, HookTapped);
@@ -489,7 +522,7 @@ LRESULT onWin(
 	if (taskbarMaskedRelease && (forwarded || !consumed)) {
 		return injectMaskedRelease(info) ? 1 : 0;
 	}
-	if (forwarded && chordConsumed && !other.down && !gForegroundBlocked.load()) {
+	if (forwarded && chordConsumed && !other.down && !blocked) {
 		return injectMaskedRelease(info) ? 1 : 0;
 	}
 	if (forwarded) {
@@ -550,22 +583,31 @@ bool isHiddenFromUs(HWND hwnd) {
 	return hidden;
 }
 
+// This WinEvent hook is installed on the GUI thread. Token and process
+// queries must not delay the low-level keyboard hook's message pump.
+void checkForeground(HWND hwnd) {
+	gCheckedForeground.store(nullptr);
+	gForegroundBlocked.store(isHiddenFromUs(hwnd));
+	gCheckedForeground.store(hwnd);
+}
+
 void CALLBACK foregroundChanged(
     HWINEVENTHOOK /*hook*/,
     DWORD /*event*/,
-    HWND hwnd,
+	HWND /*hwnd*/,
     LONG idObject,
     LONG /*idChild*/,
     DWORD /*thread*/,
     DWORD /*time*/
 ) {
 	if (idObject != OBJID_WINDOW) return;
-	gForegroundBlocked.store(isHiddenFromUs(hwnd));
+	checkForeground(GetForegroundWindow());
 }
 
-LRESULT onModifier(const HookSnapshot& snapshot, const KBDLLHOOKSTRUCT* info, uint8_t bit, bool up) {
+LRESULT onModifier(
+    const HookSnapshot& snapshot, const KBDLLHOOKSTRUCT* info, uint8_t bit, bool up, bool blocked
+) {
 	auto vk = static_cast<int>(info->vkCode);
-	auto blocked = gForegroundBlocked.load();
 	auto otherDown = isDown(otherSide(info->vkCode));
 
 	if (!up) {
@@ -613,7 +655,8 @@ LRESULT onKey(
     const HookSnapshot& snapshot,
     const KBDLLHOOKSTRUCT* info,
     bool up,
-    TaskbarShortcutDecision taskbar = {}
+    TaskbarShortcutDecision taskbar,
+    bool blocked
 ) {
 	auto vk = static_cast<uint8_t>(info->vkCode);
 	auto& held = gHeld.at(vk);
@@ -646,7 +689,7 @@ LRESULT onKey(
 		held.active = false;
 	}
 
-	if (gForegroundBlocked.load()) return taskbar.swallow ? 1 : 0;
+	if (blocked) return taskbar.swallow ? 1 : 0;
 
 	auto mods = heldModifiers();
 
@@ -705,12 +748,13 @@ LRESULT CALLBACK hookProc(int code, WPARAM wParam, LPARAM lParam) {
 	auto up = (info->flags & LLKHF_UP) != 0;
 	auto snapshot = gSnapshot.load(std::memory_order_acquire);
 	auto& routing = snapshot != nullptr ? *snapshot : gNoRouting;
+	auto blocked = foregroundIsBlocked();
 	auto swallow = 0;
 	TaskbarShortcutDecision taskbar;
 	if (taskbarShortcutFilterEnabled()) {
 		auto mods = heldModifiers();
 		bool bound = false;
-		if (!gForegroundBlocked.load()) {
+		if (!blocked) {
 			for (const auto& trigger: routing.triggers) {
 				bound |= trigger.kind == HookTrigger::Combo && trigger.combo.vk == info->vkCode
 				      && trigger.combo.mods == mods;
@@ -768,8 +812,8 @@ LRESULT CALLBACK hookProc(int code, WPARAM wParam, LPARAM lParam) {
 
 		expireWin(info->time);
 		swallow = bit == ModSuper ? onWin(routing, info, up, taskbar.maskedRelease)
-		        : bit != 0        ? onModifier(routing, info, bit, up)
-		                          : onKey(routing, info, up, taskbar);
+		        : bit != 0        ? onModifier(routing, info, bit, up, blocked)
+		                          : onKey(routing, info, up, taskbar, blocked);
 	}
 	updateWinLeaseTimer();
 
@@ -827,16 +871,6 @@ void hookThreadMain() {
 		return;
 	}
 
-	auto* foregroundHook = SetWinEventHook(
-	    EVENT_SYSTEM_FOREGROUND,
-	    EVENT_SYSTEM_FOREGROUND,
-	    nullptr,
-	    &foregroundChanged,
-	    0,
-	    0,
-	    WINEVENT_OUTOFCONTEXT
-	);
-
 	// A secure desktop (lock screen, UAC, switch user) takes every hold away
 	// without a release. Reset on the switch instead of retaining stale keys.
 	auto* desktopHook = SetWinEventHook(
@@ -849,13 +883,12 @@ void hookThreadMain() {
 	    WINEVENT_OUTOFCONTEXT
 	);
 
-	gForegroundBlocked.store(isHiddenFromUs(GetForegroundWindow()));
 	seedPhysicalState();
 	signalReady();
 
 	while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
 		if (msg.message == WM_QS_ARM_OBSERVER) {
-			armObserver(*reinterpret_cast<InputObserverRequest*>(msg.wParam)); // NOLINT
+			if (auto request = gObserverRequest.exchange(nullptr)) armObserver(*request);
 			continue;
 		}
 		if (msg.message == WM_TIMER && gWinLeaseTimer != 0 && msg.wParam == gWinLeaseTimer) {
@@ -866,7 +899,6 @@ void hookThreadMain() {
 	}
 
 	if (desktopHook != nullptr) UnhookWinEvent(desktopHook);
-	if (foregroundHook != nullptr) UnhookWinEvent(foregroundHook);
 	resetPhysicalState();
 	UnhookWindowsHookEx(hook);
 
@@ -878,21 +910,42 @@ void hookThreadMain() {
 	if (auto exited = gExitEvent.load(); exited != nullptr) SetEvent(exited);
 }
 
+bool reapHookThread(DWORD timeout) {
+	if (gThread == nullptr) return true;
+	auto exited = gExitEvent.load();
+	if (WaitForSingleObject(exited, timeout) != WAIT_OBJECT_0) return false;
+	gThread->join();
+	delete gThread;
+	gThread = nullptr;
+	CloseHandle(gExitEvent.exchange(nullptr));
+	CloseHandle(gReadyEvent.exchange(nullptr));
+	return true;
+}
+
+void stopHookThread() {
+	if (gForegroundHook != nullptr) UnhookWinEvent(std::exchange(gForegroundHook, nullptr));
+	gCheckedForeground.store(nullptr);
+	gInputObserver.store(nullptr);
+	gObserverRequest.store(nullptr);
+	gTarget.store(nullptr);
+	if (gThread == nullptr) return;
+	gStopRequested.store(true);
+	auto threadId = gThreadId.load();
+	if (threadId != 0) PostThreadMessageW(threadId, WM_QUIT, 0, 0);
+	if (!reapHookThread(HOOK_STOP_TIMEOUT_MS))
+		qCWarning(logKeyboardHook) << "Keyboard hook did not stop within its deadline";
+}
+
 // Installs the thread unless it is already up. Routing target and message base
 // stay whatever the last start()/retain() set, so a hook kept alive by another
 // owner keeps answering the hotkey manager until it stops routing.
 bool startHookThread() {
-	if (gThread != nullptr && !gFailed.load()) {
+	if (gThread != nullptr && !gFailed.load() && !gStopRequested.load()) {
 		auto exited = gExitEvent.load();
 		if (exited == nullptr || WaitForSingleObject(exited, 0) != WAIT_OBJECT_0) return true;
 	}
 
-	if (gThread != nullptr) {
-		gThread->join();
-		delete gThread;
-		gThread = nullptr;
-		if (auto exited = gExitEvent.exchange(nullptr); exited != nullptr) CloseHandle(exited);
-	}
+	if (!reapHookThread(0)) return false;
 
 	auto ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 	auto exited = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -907,39 +960,28 @@ bool startHookThread() {
 	gThreadId.store(0);
 	gStopRequested.store(false);
 	gFailed.store(false);
-	gThread = new std::thread(&hookThreadMain);
+	if (gForegroundHook == nullptr) {
+		gForegroundHook = SetWinEventHook(
+		    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+		    nullptr, &foregroundChanged, 0, 0, WINEVENT_OUTOFCONTEXT
+		);
+		if (gForegroundHook == nullptr)
+			qCWarning(logKeyboardHook) << "Could not observe foreground integrity:" << GetLastError();
+	}
+	checkForeground(GetForegroundWindow());
+	try {
+		gThread = new std::thread(&hookThreadMain);
+	} catch (...) {
+		CloseHandle(gReadyEvent.exchange(nullptr));
+		CloseHandle(gExitEvent.exchange(nullptr));
+		stopHookThread();
+		return false;
+	}
 
 	auto answered = WaitForSingleObject(ready, HOOK_START_TIMEOUT_MS) == WAIT_OBJECT_0;
 	auto started = answered && !gFailed.load();
-	gReadyEvent.store(nullptr);
-	CloseHandle(ready);
-
-	if (!started) {
-		gStopRequested.store(true);
-		auto threadId = gThreadId.load();
-		if (threadId != 0) PostThreadMessageW(threadId, WM_QUIT, 0, 0);
-		gThread->join();
-		delete gThread;
-		gThread = nullptr;
-		gExitEvent.store(nullptr);
-		CloseHandle(exited);
-	}
-
+	if (!started) stopHookThread();
 	return started;
-}
-
-void stopHookThread() {
-	if (gThread == nullptr) return;
-
-	gStopRequested.store(true);
-	auto threadId = gThreadId.load();
-	if (threadId != 0) PostThreadMessageW(threadId, WM_QUIT, 0, 0);
-
-	gThread->join();
-	delete gThread;
-	gThread = nullptr;
-	gTarget.store(nullptr);
-	if (auto exited = gExitEvent.exchange(nullptr); exited != nullptr) CloseHandle(exited);
 }
 
 } // namespace
@@ -1002,8 +1044,8 @@ void KeyboardHook::release() {
 	stopHookThread();
 }
 
-bool KeyboardHook::isRunning() { return gThread != nullptr && !gFailed.load(); }
-bool KeyboardHook::foregroundBlocked() { return gForegroundBlocked.load(); }
+bool KeyboardHook::isRunning() { return gThread != nullptr && !gFailed.load() && !gStopRequested.load(); }
+bool KeyboardHook::foregroundBlocked() { return foregroundIsBlocked(); }
 bool KeyboardHook::superDown() {
 	return gWinDown.load() || isDown(VK_LWIN) || isDown(VK_RWIN);
 }
@@ -1015,6 +1057,10 @@ void KeyboardHook::setSnapshot(std::shared_ptr<const HookSnapshot> snapshot) {
 void KeyboardHook::noteSuperChord() { gSuppressLoneSuperTap.store(true); }
 void KeyboardHook::setEscapeFilter(bool (*filter)()) { gEscapeFilter.store(filter, std::memory_order_release); }
 
+void KeyboardHook::setSuperPressedCallback(void (*callback)()) {
+	gSuperPressed.store(callback, std::memory_order_release);
+}
+
 bool KeyboardHook::armInputObserver(
     HWND target,
     UINT message,
@@ -1023,39 +1069,29 @@ bool KeyboardHook::armInputObserver(
 ) {
 	auto threadId = gThreadId.load();
 	auto exited = gExitEvent.load();
-	if (gThread == nullptr || threadId == 0 || exited == nullptr) return false;
+	if (!isRunning() || threadId == 0 || exited == nullptr) return false;
 
-	auto done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-	if (done == nullptr) return false;
-
-	InputObserverRequest request {
-	    .target = target,
-	    .keyMessage = message,
-	    .resetMessage = resetMessage,
-	    .done = done,
-	    .keys = {},
-	};
-
-	if (!PostThreadMessageW(
-	        threadId,
-	        WM_QS_ARM_OBSERVER,
-	        reinterpret_cast<WPARAM>(&request), // NOLINT(performance-no-int-to-ptr)
-	        0
-	    ))
-	{
-		CloseHandle(done);
+	auto request = std::make_shared<InputObserverRequest>();
+	request->target = target;
+	request->keyMessage = message;
+	request->resetMessage = resetMessage;
+	request->done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if (!request->done) return false;
+	gObserverRequest.store(request);
+	if (!PostThreadMessageW(threadId, WM_QS_ARM_OBSERVER, 0, 0)) {
+		gObserverRequest.store(nullptr);
 		return false;
 	}
 
-	// The hook thread either answers or stops; it never leaves the request
-	// queued while exiting, so the stack request stays valid until this returns.
-	HANDLE handles[] = {done, exited};
-	auto wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
-	CloseHandle(done);
-
-	if (wait != WAIT_OBJECT_0) return false;
-
-	keys = std::move(request.keys);
+	HANDLE handles[] = {request->done, exited};
+	auto wait = WaitForMultipleObjects(2, handles, FALSE, OBSERVER_TIMEOUT_MS);
+	using State = InputObserverRequest::State;
+	if (wait != WAIT_OBJECT_0) {
+		if (request->state.exchange(State::Cancelled) == State::Armed) clearInputObserver();
+		gObserverRequest.store(nullptr);
+		return false;
+	}
+	keys = std::move(request->keys);
 	return true;
 }
 

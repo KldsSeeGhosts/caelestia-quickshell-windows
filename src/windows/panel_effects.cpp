@@ -235,7 +235,7 @@ void PanelEffects::unload() {
 
 	qCInfo(logEffects) << "Unloaded the expressive panel effects after" << this->keepAlive.interval()
 	                   << "ms without use and released the cached graphics of" << released
-	                   << "shown windows";
+	                   << "hidden windows";
 	emit this->unloaded();
 }
 
@@ -260,7 +260,7 @@ int PanelEffects::releaseHosts() {
 	auto released = 0;
 
 	for (const auto& host: std::exchange(this->hosts, {})) {
-		if (host == nullptr || !host->isVisible()) continue;
+		if (host == nullptr || host->isVisible() || host->isExposed()) continue;
 
 		host->releaseResources();
 		released++;

@@ -38,10 +38,14 @@ constexpr int CURSOR_INTERVAL_MS = 33;
 
 struct MaskedWindow {
 	HWND hwnd = nullptr;
+	RECT bounds {};
 	QRegion region;
 	qreal dpr = 1;
 
-	[[nodiscard]] bool operator==(const MaskedWindow& other) const = default;
+	[[nodiscard]] bool operator==(const MaskedWindow& other) const {
+		return this->hwnd == other.hwnd && EqualRect(&this->bounds, &other.bounds)
+		    && this->dpr == other.dpr && this->region == other.region;
+	}
 };
 
 using MaskList = std::vector<MaskedWindow>;
@@ -57,7 +61,23 @@ std::atomic<bool> cursorWatched = false;             // NOLINT
 std::atomic<DWORD> lastCursorWake = 0;               // NOLINT
 std::atomic<bool> monitorWatched = false;            // NOLINT
 CursorMonitorCache monitorCache;                   // NOLINT
-std::atomic<std::shared_ptr<const MaskList>> gMasks; // NOLINT
+// One reader, the mouse hook thread, and one publisher, the GUI thread.
+// The reader pins a snapshot and rechecks publication before dereferencing
+// it. The GUI thread owns reclamation and keeps at most one pinned old list.
+std::atomic<const MaskList*> gMasks = nullptr;      // NOLINT
+std::atomic<const MaskList*> gReadingMasks = nullptr; // NOLINT
+static_assert(decltype(gMasks)::is_always_lock_free);
+std::unique_ptr<const MaskList> gPublishedMasks;     // NOLINT
+std::unique_ptr<const MaskList> gRetiredMasks;       // NOLINT
+
+void publishMasks(std::unique_ptr<const MaskList> next) {
+	gMasks.store(next.get());
+	auto* pinned = gReadingMasks.load();
+	if (gRetiredMasks.get() != pinned) gRetiredMasks.reset();
+	if (gPublishedMasks && gPublishedMasks.get() == pinned)
+		gRetiredMasks = std::move(gPublishedMasks);
+	gPublishedMasks = std::move(next);
+}
 
 constexpr DWORD LATE_INPUT_MS = 100;
 constexpr int LATE_REPORT_INTERVAL_MS = 10000;
@@ -80,23 +100,24 @@ QPoint localPoint(POINT cursor, const RECT& rect, qreal dpr) {
 }
 
 bool masksNeedEvaluation(POINT cursor) {
-	auto masks = gMasks.load(std::memory_order_acquire);
+	auto* masks = gMasks.load();
 	if (masks == nullptr) return false;
+	gReadingMasks.store(masks);
+	struct Unpin {
+		~Unpin() { gReadingMasks.store(nullptr); }
+	} unpin;
+	// If a publish raced the pin, let the GUI evaluate rather than retry in
+	// the low-level hook.
+	if (gMasks.load() != masks) return true;
 
 	for (const auto& window: *masks) {
+		if (!PtInRect(&window.bounds, cursor)) continue;
 		if (!IsWindowVisible(window.hwnd)) continue;
 
 		auto transparent = (GetWindowLongPtrW(window.hwnd, GWL_EXSTYLE) & WS_EX_TRANSPARENT) != 0;
 
-		if (window.region.isEmpty()) {
-			if (!transparent) return true;
-			continue;
-		}
-
-		RECT rect {};
-		if (!GetWindowRect(window.hwnd, &rect) || !PtInRect(&rect, cursor)) continue;
-
-		if (window.region.contains(localPoint(cursor, rect, window.dpr)) == transparent) return true;
+		if (window.region.contains(localPoint(cursor, window.bounds, window.dpr)) == transparent)
+			return true;
 	}
 
 	return false;
@@ -284,7 +305,7 @@ InputMaskTracker::InputMaskTracker(QObject* parent): QObject(parent) {
 InputMaskTracker::~InputMaskTracker() {
 	lateReportOwner.store(nullptr, std::memory_order_release);
 	this->stopHook();
-	gMasks.store(nullptr, std::memory_order_release);
+	publishMasks(nullptr);
 
 	if (this->messageWindow != nullptr) {
 		DestroyWindow(this->messageWindow);
@@ -309,9 +330,8 @@ void InputMaskTracker::setMask(QWindow* window, const QRegion& region) {
 	if (!found) this->entries.push_back(Entry {.window = window, .region = region});
 	qCDebug(logInputMask) << "Mask for" << window << "set to" << region;
 
-	this->publish();
-	this->updateHookState();
 	this->refresh();
+	this->updateHookState();
 }
 
 void InputMaskTracker::remove(QWindow* window) {
@@ -342,16 +362,18 @@ void InputMaskTracker::publish() {
 	for (const auto& entry: this->entries) {
 		auto* window = entry.window.data();
 		auto* hwnd = hwndOf(window);
-		if (hwnd == nullptr) continue;
+		RECT bounds {};
+		if (hwnd == nullptr || !window->isVisible() || !GetWindowRect(hwnd, &bounds)) continue;
 
-		next.push_back({.hwnd = hwnd, .region = entry.region, .dpr = window->devicePixelRatio()});
+		next.push_back({
+		    .hwnd = hwnd, .bounds = bounds, .region = entry.region, .dpr = window->devicePixelRatio()
+		});
 	}
 
-	auto current = gMasks.load(std::memory_order_acquire);
+	auto* current = gPublishedMasks.get();
 	if (current == nullptr ? next.empty() : *current == next) return;
 
-	auto snapshot = next.empty() ? nullptr : std::make_shared<const MaskList>(std::move(next));
-	gMasks.store(std::move(snapshot), std::memory_order_release);
+	publishMasks(next.empty() ? nullptr : std::make_unique<const MaskList>(std::move(next)));
 }
 
 void InputMaskTracker::acquireButtonEvents() {

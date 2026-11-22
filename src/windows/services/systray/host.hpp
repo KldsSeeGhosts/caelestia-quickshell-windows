@@ -49,6 +49,7 @@ private:
 	void remove(SystemTrayItem* item);
 	void watchOwner(SystemTrayItem* item);
 	void unwatchOwner(SystemTrayItem* item);
+	void sweepUnwatchedOwners();
 	void onOwnerExited(quint64 token);
 	static void CALLBACK ownerExited(PVOID context, BOOLEAN timedOut);
 	void rememberDeletion(HWND hwnd, UINT uid, const QUuid& guid);
@@ -96,6 +97,13 @@ private:
 	TrayHookState hookState = TrayHookState::Disabled;
 	QList<Deletion> deletions;
 	QHash<SystemTrayItem*, OwnerWatch> ownerWatches;
+	struct UnwatchedOwner {
+		HWND hwnd;
+		DWORD pid;
+		DWORD thread;
+	};
+	QHash<SystemTrayItem*, UnwatchedOwner> unwatchedOwners;
+	QTimer ownerSweepTimer;
 	quint64 nextOwnerToken = 0;
 	WaitState* waitState = nullptr;
 	bool watchesLost = false;

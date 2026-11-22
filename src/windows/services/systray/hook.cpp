@@ -155,7 +155,13 @@ private:
 	UINT taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 	ULONGLONG readdGraceUntil = 0;
 	ULONGLONG propsSyncedAt = 0;
-	std::vector<std::wstring> mirrored;
+	struct PropertyName {
+		std::wstring text;
+		ATOM atom = 0;
+		const wchar_t* native() const { return this->atom ? MAKEINTATOM(this->atom) : this->text.c_str(); }
+		bool operator==(const PropertyName&) const = default;
+	};
+	std::vector<PropertyName> mirrored;
 	bool probing = false;
 	bool probeSeen = false;
 	bool testOwned = false;
@@ -305,14 +311,14 @@ bool HookWindow::create() {
 	    nullptr
 	);
 
-#ifdef QS_TRAY_HOOK_TEST
-	gTestMirror.store(this->hwnd);
-#endif
-
 	this->syncGeometry();
 	this->keepFirst(false);
 	this->watchTaskbar();
 	this->armDeadline();
+
+#ifdef QS_TRAY_HOOK_TEST
+	gTestMirror.store(this->hwnd);
+#endif
 
 	return true;
 }
@@ -653,35 +659,34 @@ void HookWindow::mirrorProps() {
 	if (target == nullptr) return;
 
 	struct Found {
-		std::vector<std::pair<std::wstring, HANDLE>> props;
+		std::vector<std::pair<PropertyName, HANDLE>> props;
 	} found;
 
 	EnumPropsExW(
 	    target,
 	    [](HWND /*hwnd*/, LPWSTR name, HANDLE value, ULONG_PTR param) -> BOOL {
 		    auto* found = reinterpret_cast<Found*>(param); // NOLINT(performance-no-int-to-ptr)
+		    // Explorer properties may hold private pointers or handles.
+		    // Mirror only small integer/atom sentinels.
+		    auto scalar = reinterpret_cast<ULONG_PTR>(value);
+		    if (scalar == 0 || scalar >= 0x10000) return TRUE;
 		    auto key = IS_INTRESOURCE(name)
-		                 ? L"#" + std::to_wstring(reinterpret_cast<ULONG_PTR>(name)) // NOLINT
-		                 : std::wstring(name);
+		                 ? PropertyName {L"", static_cast<ATOM>(reinterpret_cast<ULONG_PTR>(name))}
+		                 : PropertyName {name, 0};
 		    found->props.emplace_back(std::move(key), value);
 		    return TRUE;
 	    },
 	    reinterpret_cast<LPARAM>(&found)
 	);
 
-	auto nameOf = [](const std::wstring& key) {
-		return key.starts_with(L'#') ? MAKEINTATOM(std::stoul(key.substr(1))) : key.c_str();
-	};
-
-	std::vector<std::wstring> current;
+	std::vector<PropertyName> current;
 	for (const auto& [key, value]: found.props) {
-		if (key == TRAY_HOOK_PROP) continue;
-		SetPropW(this->hwnd, nameOf(key), value);
-		current.push_back(key);
+		if (key.text == TRAY_HOOK_PROP) continue;
+		if (SetPropW(this->hwnd, key.native(), value)) current.push_back(key);
 	}
 
 	for (const auto& key: this->mirrored) {
-		if (std::ranges::find(current, key) == current.end()) RemovePropW(this->hwnd, nameOf(key));
+		if (std::ranges::find(current, key) == current.end()) RemovePropW(this->hwnd, key.native());
 	}
 
 	this->mirrored = std::move(current);

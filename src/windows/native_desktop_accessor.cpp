@@ -388,6 +388,7 @@ struct Request {
 		if (this->finished) CloseHandle(this->finished);
 	}
 	std::function<int()> operation;
+	std::function<void()> completed;
 	QList<quintptr> windows;
 	std::promise<Snapshot> completion;
 	Clock::time_point submitted = Clock::now();
@@ -503,6 +504,7 @@ struct Worker {
 			}
 			request->completion.set_value(std::move(snapshot));
 			SetEvent(request->finished);
+			if (request->completed) request->completed();
 		}
 		// Release and even CoUninitialize may block. Both belong to this
 		// retired worker and count against the cap until they finish.
@@ -528,7 +530,8 @@ struct Channel {
 	QPointer<QObject> context;
 	std::function<void()> recovered;
 	std::function<void()> updated;
-	QTimer poll;
+	QTimer deadline;
+	std::atomic<bool> completionWake = false;
 	std::optional<Pending> refresh;
 	std::optional<Pending> pending;
 	std::chrono::milliseconds stallLimit = stuckBound;
@@ -553,17 +556,20 @@ struct Channel {
 	};
 
 	Channel() {
-		this->poll.setInterval(10);
-		QObject::connect(&this->poll, &QTimer::timeout, &this->poll, [this] { this->collect(); });
+		this->deadline.setSingleShot(true);
+		this->deadline.setTimerType(Qt::PreciseTimer);
+		QObject::connect(&this->deadline, &QTimer::timeout, &this->deadline, [this] {
+			this->collect();
+		});
 		if (auto* app = QCoreApplication::instance()) {
-			QObject::connect(app, &QCoreApplication::aboutToQuit, &this->poll, [this] {
+			QObject::connect(app, &QCoreApplication::aboutToQuit, &this->deadline, [this] {
 				this->shutdown();
 			});
 		}
 	}
 
 	void shutdown() {
-		this->poll.stop();
+		this->deadline.stop();
 		this->recovery.reset();
 		if (auto previous = std::exchange(this->worker, {})) previous->stop();
 		this->refresh.reset();
@@ -581,7 +587,7 @@ struct Channel {
 		if (auto previous = std::exchange(this->worker, {})) previous->stop();
 		this->refresh.reset();
 		this->pending.reset();
-		this->poll.stop();
+		this->deadline.stop();
 		this->snapshot.availability = DesktopAvailability::Disconnected;
 		this->snapshot.error = error;
 		// Keep the last desktop/window values as explicitly stale state.
@@ -638,6 +644,7 @@ struct Channel {
 		}
 		request->sequence = ++this->sequence;
 		request->operation = std::move(operation);
+		request->completed = [this] { this->wakeOnCompletion(); };
 		if (queryWindows) request->windows = this->watchedWindows.values();
 		auto result = owner->submit(request);
 		const auto guiDeadline = request->submitted + callBound;
@@ -672,7 +679,7 @@ struct Channel {
 			// The request is still owned by this generation, not failed.
 			// Keep its future so the GUI can apply the eventual result.
 			this->pending.emplace(Pending {request, std::move(result), kind, queryWindows});
-			this->poll.start();
+			this->armDeadline();
 			return kind == Kind::Command ? 0 : -1;
 		}
 		try {
@@ -769,9 +776,36 @@ struct Channel {
 		request->operation = [] {
 			return provider().privateEnabled ? (desktopCount() < 0 ? -1 : 0) : 0;
 		};
+		request->completed = [this] { this->wakeOnCompletion(); };
 		request->windows = this->watchedWindows.values();
 		this->refresh.emplace(Pending {request, this->worker->submit(request), Kind::Probe, true});
-		this->poll.start();
+		this->armDeadline();
+	}
+
+	void wakeOnCompletion() {
+		// Channel and its receiver live for the process. No owner QObject is
+		// dereferenced by a retired worker that completes after shutdown.
+		if (this->completionWake.exchange(true)) return;
+		if (!QMetaObject::invokeMethod(&this->deadline, [this] {
+			this->completionWake.store(false);
+			this->collect();
+		}, Qt::QueuedConnection)) this->completionWake.store(false);
+	}
+
+	void armDeadline() {
+		auto next = Clock::time_point::max();
+		for (auto* job: {&this->refresh, &this->pending}) {
+			if (!*job) continue;
+			const auto& request = (*job)->request;
+			const auto ticks = request->started.load();
+			const auto since = ticks ? Clock::time_point(Clock::duration(ticks)) : request->submitted;
+			next = std::min(next, since + this->stallLimit);
+		}
+		if (next == Clock::time_point::max()) this->deadline.stop();
+		else this->deadline.start(std::max(
+		    std::chrono::ceil<std::chrono::milliseconds>(next - Clock::now()),
+		    std::chrono::milliseconds(1)
+		));
 	}
 
 	bool stalled() const {
@@ -821,9 +855,9 @@ struct Channel {
 			return;
 		}
 		if (!this->refresh && !this->pending) {
-			this->poll.stop();
 			if (std::exchange(this->refreshAgain, false)) this->requestRefresh();
 		}
+		this->armDeadline();
 	}
 
 	WindowSnapshot window(HWND hwnd) {
@@ -952,7 +986,7 @@ void initializeNativeDesktopQueries(QObject* context, std::function<void()> upda
 	auto& c = channel();
 	c.context = context;
 	c.updated = std::move(updated);
-	QObject::connect(context, &QObject::destroyed, &c.poll, [&c] {
+	QObject::connect(context, &QObject::destroyed, &c.deadline, [&c] {
 		c.shutdown();
 		c.context = nullptr;
 		c.recovered = {};

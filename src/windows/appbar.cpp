@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include <dwmapi.h>
 #include <shellapi.h>
 
 #include <qlogging.h>
@@ -134,8 +135,12 @@ bool WinAppBar::windowCoversMonitor(HWND hwnd) {
 	auto rects = monitorRects(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST));
 	if (!rects.valid) return false;
 
-	RECT raw {};
-	if (!GetWindowRect(hwnd, &raw)) return false;
+	RECT frame {};
+	if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame)))
+	    && !GetWindowRect(hwnd, &frame))
+	{
+		return false;
+	}
 
 	// Taskbar ineligibility is not shell identity: a tool-window or
 	// no-activate fullscreen video still seeds the AppBar fullscreen state.
@@ -145,7 +150,7 @@ bool WinAppBar::windowCoversMonitor(HWND hwnd) {
 	auto identity = system_surface::observe(hwnd);
 	return system_surface::isFullscreenOccluder(
 	    identity,
-	    toQRect(raw),
+	    toQRect(frame),
 	    rects.monitor
 	);
 }
@@ -162,15 +167,19 @@ bool WinAppBar::ensureRegistered(HWND hwnd) {
 
 	auto data = appBarData(hwnd);
 	traceWorkArea(hwnd, "before_register");
-	// A timed-out NEW can still complete later. Keep the cleanup record even
-	// if this caller never observes success.
+	// Record before sending, so a crash during registration is recoverable.
+	// The channel removes a NEW that succeeds after the caller times out.
 	rememberRegistration(hwnd);
 	auto registered = boundedAppBarMessage(ABM_NEW, data);
-	if (!registered) return false;
+	if (!registered) {
+		forgetRegistration(hwnd);
+		return false;
+	}
 	if (!*registered) {
 		boundedAppBarMessage(ABM_REMOVE, data);
 		data = appBarData(hwnd);
 		if (!boundedAppBarMessage(ABM_NEW, data).value_or(0)) {
+			forgetRegistration(hwnd);
 			QS_TRANSITION_TRACE("appbar_register", {{"window", transition_trace::handle(reinterpret_cast<quintptr>(hwnd))}, {"success", false}});
 			qCWarning(logAppBar) << "Failed to register AppBar for window" << hwnd;
 			return false;
@@ -281,13 +290,17 @@ void WinAppBar::adopt(WinAppBar& other) {
 void WinAppBar::notifyActivate() {
 	if (!this->mRegistered) return;
 	auto data = appBarData(this->mHwnd);
-	boundedAppBarMessage(ABM_ACTIVATE, data);
+	auto* shell = explorerTaskbarWindow();
+	if (!appBarChannel().notify(shell, ABM_ACTIVATE, data, appBarOperation(shell)))
+		qCDebug(logAppBar) << "Could not enqueue AppBar activation";
 }
 
 void WinAppBar::notifyWindowPosChanged() {
 	if (!this->mRegistered) return;
 	auto data = appBarData(this->mHwnd);
-	boundedAppBarMessage(ABM_WINDOWPOSCHANGED, data);
+	auto* shell = explorerTaskbarWindow();
+	if (!appBarChannel().notify(shell, ABM_WINDOWPOSCHANGED, data, appBarOperation(shell)))
+		qCDebug(logAppBar) << "Could not enqueue AppBar position change";
 }
 
 } // namespace qs::windows

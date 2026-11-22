@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 
 #include <qobject.h>
 #include <qproperty.h>
@@ -76,6 +77,7 @@ private:
 	void syncSession();
 	void updateImplicitSize();
 	void watchWindow(QQuickWindow* window);
+	void queueSceneUpdate();
 
 	// clang-format off
 	Q_OBJECT_BINDABLE_PROPERTY(ScreencopyView, bool, bHasContent, &ScreencopyView::hasContentChanged);
@@ -91,6 +93,7 @@ private:
 	bool completed = false;
 	bool wantFrame = false;
 	bool mHasFrame = false;
+	std::atomic<bool> sceneUpdatePending = false;
 	qs::windows::capture::CaptureHandle* mHandle = nullptr;
 	QQuickWindow* watchedWindow = nullptr;
 };

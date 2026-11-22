@@ -55,6 +55,11 @@ private:
 	explicit KeyboardLayoutWatcher(QObject* parent);
 
 	HKL mCurrent = nullptr;
+	HWND sampledForeground = nullptr;
+	DWORD sampledForegroundThread = 0;
+	HKL sampledForegroundLayout = nullptr;
+	HWND sampledTarget = nullptr;
+	bool sampleValid = false;
 	std::vector<HKL> mLayouts;
 	bool mCapsLock = false;
 	bool mNumLock = false;

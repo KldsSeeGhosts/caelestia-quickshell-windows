@@ -274,6 +274,9 @@ private:
 	bool appBarDeferred = false;
 	bool pinnedToAllDesktops = false;
 	HWND pinFailedHwnd = nullptr;
+	HWND explorerTaskbar = nullptr;
+	DWORD explorerTaskbarPid = 0;
+	DWORD explorerTaskbarThread = 0;
 	HWND stuckHwnd = nullptr;
 	qsizetype stuckDesktop = -1;
 

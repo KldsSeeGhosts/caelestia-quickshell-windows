@@ -20,6 +20,7 @@
 #include <qset.h>
 #include <qstandardpaths.h>
 #include <qt_windows.h>
+#include <dbt.h>
 
 #include "redact.hpp"
 
@@ -245,9 +246,63 @@ QList<DisplayIdentity> queryIdentities() {
 
 } // namespace
 
+namespace {
+constexpr GUID MONITOR_INTERFACE {
+    0xe6f07b5f, 0xee97, 0x4a90, {0xb0, 0x76, 0x33, 0xf5, 0x7b, 0xf4, 0xea, 0xa7}
+};
+
+bool isMonitorDeviceChange(WPARAM event, LPARAM data) {
+	if (data == 0 || (event != DBT_DEVICEARRIVAL && event != DBT_DEVICEREMOVECOMPLETE)) return false;
+	auto* device = reinterpret_cast<const DEV_BROADCAST_HDR*>(data);
+	return device->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE
+	    && device->dbch_size >= sizeof(DEV_BROADCAST_DEVICEINTERFACE_W)
+	    && reinterpret_cast<const DEV_BROADCAST_DEVICEINTERFACE_W*>(device)->dbcc_classguid
+	           == MONITOR_INTERFACE;
+}
+} // namespace
+
+struct ScreenIdentityRegistry::DeviceNotifications {
+	explicit DeviceNotifications(ScreenIdentityRegistry* registry) {
+		constexpr auto windowClass = L"QuickshellMonitorDeviceNotifications";
+		WNDCLASSW wc {};
+		wc.lpfnWndProc = &DeviceNotifications::windowProc;
+		wc.hInstance = GetModuleHandleW(nullptr);
+		wc.lpszClassName = windowClass;
+		RegisterClassW(&wc);
+		this->window = CreateWindowExW(0, windowClass, L"", 0, 0, 0, 0, 0,
+		    HWND_MESSAGE, nullptr, wc.hInstance, registry);
+		if (!this->window) return;
+		DEV_BROADCAST_DEVICEINTERFACE_W filter {};
+		filter.dbcc_size = sizeof(filter);
+		filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+		filter.dbcc_classguid = MONITOR_INTERFACE;
+		this->notification = RegisterDeviceNotificationW(this->window, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+	}
+	~DeviceNotifications() {
+		if (this->notification) UnregisterDeviceNotification(this->notification);
+		if (this->window) DestroyWindow(this->window);
+	}
+
+	static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM event, LPARAM data) {
+		if (message == WM_NCCREATE) {
+			auto* create = reinterpret_cast<const CREATESTRUCTW*>(data);
+			SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+		} else if (message == WM_DEVICECHANGE && isMonitorDeviceChange(event, data)) {
+			auto* registry = reinterpret_cast<ScreenIdentityRegistry*>(
+			    GetWindowLongPtrW(hwnd, GWLP_USERDATA)
+			);
+			if (registry) registry->scheduleRefresh();
+		}
+		return DefWindowProcW(hwnd, message, event, data);
+	}
+
+	HWND window = nullptr;
+	HDEVNOTIFY notification = nullptr;
+};
+
 ScreenIdentityRegistry* ScreenIdentityRegistry::instance() {
 	static QPointer<ScreenIdentityRegistry> registry;
-	if (!registry)
+	if (!registry) {
 		registry = new ScreenIdentityRegistry(
 		    queryIdentities,
 		    deviceNameFor,
@@ -255,6 +310,8 @@ ScreenIdentityRegistry* ScreenIdentityRegistry::instance() {
 		    defaultReservationsPath(),
 		    defaultMonitorConfigDir()
 		);
+		registry->deviceNotifications = std::make_unique<DeviceNotifications>(registry.data());
+	}
 	return registry;
 }
 
@@ -320,21 +377,17 @@ void ScreenIdentityRegistry::watch(QScreen* screen) {
 }
 
 void ScreenIdentityRegistry::scheduleRefresh() {
-	// Run after Qt has consumed WM_DISPLAYCHANGE/WM_DPICHANGED. Requery once
-	// more after the driver settles, including identity-only topology changes.
+	// One sweep after Qt and the display driver settle. One topology change
+	// can send native messages to several windows and change several QScreens.
 	this->settleTimer.start();
-	if (this->refreshPending) return;
-	this->refreshPending = true;
-	QTimer::singleShot(0, this, [this]() {
-		this->refreshPending = false;
-		this->refresh();
-	});
 }
 
 bool ScreenIdentityRegistry::nativeEventFilter(const QByteArray&, void* message, qintptr*) {
 	auto* msg = static_cast<MSG*>(message);
-	if (msg->message == WM_DISPLAYCHANGE || msg->message == WM_DEVICECHANGE
-	    || msg->message == WM_DPICHANGED || msg->message == WM_SETTINGCHANGE)
+	if (msg->message == WM_DISPLAYCHANGE || msg->message == WM_DPICHANGED
+	    || (msg->message == WM_SETTINGCHANGE && msg->wParam == SPI_SETWORKAREA))
+		this->scheduleRefresh();
+	if (msg->message == WM_DEVICECHANGE && isMonitorDeviceChange(msg->wParam, msg->lParam))
 		this->scheduleRefresh();
 	return false;
 }
@@ -353,7 +406,8 @@ void ScreenIdentityRegistry::refresh() {
 	identities.reserve(screens.size());
 	for (auto* screen: screens) {
 		auto device = this->deviceName(screen);
-		DisplayIdentity identity {device, {}, {}};
+		DisplayIdentity identity;
+		identity.deviceName = device;
 		for (const auto& display: displays) {
 			if (device.isEmpty() || display.deviceName.compare(device, Qt::CaseInsensitive) != 0)
 				continue;

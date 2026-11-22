@@ -29,7 +29,7 @@ Foreground::Foreground(QObject* parent): QObject(parent) {
 	// Seed from the tracker: it may already hold the last application while one
 	// of the shell's panels owns the foreground.
 	if (auto* window = tracker->activeWindow(); window != nullptr) {
-		adopt(window->hwnd(), system_surface::observe(window->hwnd()));
+		adopt(window->hwnd(), {});
 	} else if (auto* hwnd = GetForegroundWindow(); hwnd != nullptr) {
 		onForegroundChanged(hwnd, GetTickCount(), tracker->eventSequence());
 	}
@@ -56,7 +56,7 @@ void Foreground::onForegroundChanged(HWND hwnd, quint32 time, quint64 sequence) 
 		case ForegroundAction::Keep:
 			if (this->mHwnd == nullptr) {
 				if (auto* window = WindowTracker::instance()->activeWindow(); window != nullptr) {
-					this->adopt(window->hwnd(), system_surface::observe(window->hwnd()));
+					this->adopt(window->hwnd(), {});
 				}
 			} else {
 				// A shell panel or overlay owns the foreground. Keep the last
@@ -87,7 +87,7 @@ void Foreground::onForegroundChanged(HWND hwnd, quint32 time, quint64 sequence) 
 void Foreground::onForegroundNameChanged(HWND hwnd) {
 	if (hwnd == nullptr || hwnd != this->mHwnd) return;
 
-	auto identity = system_surface::observe(hwnd);
+	auto identity = this->mTracked ? system_surface::Identity() : system_surface::observe(hwnd);
 	this->refreshTitle(identity);
 	this->refreshAppId(identity);
 }
@@ -96,9 +96,8 @@ void Foreground::onWindowAdded(TrackedWindow* window) {
 	if (window == nullptr || window->hwnd() != this->mHwnd) return;
 
 	this->bindTracked(window);
-	auto identity = system_surface::observe(window->hwnd());
-	this->refreshTitle(identity);
-	this->refreshAppId(identity);
+	this->refreshTitle({});
+	this->refreshAppId({});
 }
 
 void Foreground::onWindowRemoved(TrackedWindow* window) {
@@ -150,12 +149,12 @@ void Foreground::bindTracked(TrackedWindow* window) {
 	this->mTrackedTitleConnection =
 	    QObject::connect(window, &TrackedWindow::titleChanged, this, [this, window]() {
 		    if (window != this->mTracked) return;
-		    this->refreshTitle(system_surface::observe(window->hwnd()));
+		    this->refreshTitle({});
 	    });
 	this->mTrackedAppIdConnection =
 	    QObject::connect(window, &TrackedWindow::appIdChanged, this, [this, window]() {
 		    if (window != this->mTracked) return;
-		    this->refreshAppId(system_surface::observe(window->hwnd()));
+		    this->refreshAppId({});
 	    });
 }
 
