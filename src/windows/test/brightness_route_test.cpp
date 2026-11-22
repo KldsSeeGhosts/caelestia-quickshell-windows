@@ -4,6 +4,7 @@
 #include <utility>
 
 #include <qcoreapplication.h>
+#include <qelapsedtimer.h>
 #include <qhash.h>
 #include <qlist.h>
 #include <qmutex.h>
@@ -12,6 +13,7 @@
 #include <qsemaphore.h>
 #include <qsignalspy.h>
 #include <qtest.h>
+#include <qthread.h>
 
 #include "../startup.hpp"
 #include "../system/brightness_backend.hpp"
@@ -62,6 +64,35 @@ void resetStartupGate() {
 	qs::windows::startup::Fixture::gateSettled = true;
 	qs::windows::startup::Fixture::deferred.clear();
 }
+
+// QTest's QTRY_* re-polls a satisfied predicate in ~60 ms quanta. These waits
+// poll at 1 ms instead; each keeps its original timeout budget and the
+// QCOMPARE/verify immediately after keeps the assertion identical.
+bool waitUntil(const std::function<bool()>& predicate, int timeoutMs) {
+	QElapsedTimer elapsed;
+	elapsed.start();
+	for (;;) {
+		if (predicate()) return true;
+		if (elapsed.elapsed() >= timeoutMs) return predicate();
+		QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+		QThread::msleep(1);
+	}
+}
+
+// QTRY_* equivalents backed by waitUntil above. The QCOMPARE/QVERIFY inside
+// remains the assertion; the wait only bounds how long it can take.
+#define QS_WAIT_COMPARE_TIMEOUT(expr, expected, timeoutMs)                                   \
+	do {                                                                                    \
+		QVERIFY2(waitUntil([&] { return (expr) == (expected); }, timeoutMs), #expr);          \
+		QCOMPARE(expr, expected);                                                           \
+	} while (false)
+#define QS_WAIT_VERIFY_TIMEOUT(cond, timeoutMs)                                              \
+	do {                                                                                    \
+		QVERIFY2(waitUntil([&] { return (cond); }, timeoutMs), #cond);                        \
+		QVERIFY(cond);                                                                      \
+	} while (false)
+#define QS_WAIT_COMPARE(expr, expected) QS_WAIT_COMPARE_TIMEOUT(expr, expected, 5000)
+#define QS_WAIT_VERIFY(cond) QS_WAIT_VERIFY_TIMEOUT(cond, 5000)
 
 // Releases work the startup gate deferred, in the order it was queued.
 void runDeferredStartup() {
@@ -256,7 +287,7 @@ class BrightnessRouteTest: public QObject {
 		fake.observation = probeFor(method);
 		QSignalSpy queried(&brightness, &Brightness::queried);
 		brightness.query(SCREEN);
-		QTRY_COMPARE(queried.count(), 1);
+		QS_WAIT_COMPARE(queried.count(), 1);
 	}
 
 private slots:
@@ -286,23 +317,23 @@ private slots:
 		QSignalSpy queried(&brightness, &Brightness::queried);
 		QSignalSpy writes(&brightness, &Brightness::brightnessWriteResult);
 		brightness.query(SCREEN);
-		QTRY_COMPARE(queried.count(), 1);
+		QS_WAIT_COMPARE(queried.count(), 1);
 		QCOMPARE(brightness.methodFor(SCREEN), QStringLiteral("sdr-white"));
 		QCOMPARE(queried.at(0).at(3).toDouble(), 0.4);
 		brightness.setBrightness(SCREEN, false, 0.8);
-		QTRY_COMPARE(writes.count(), 1);
+		QS_WAIT_COMPARE(writes.count(), 1);
 		QCOMPARE(writes.at(0).at(1).toDouble(), 0.4);
 		QCOMPARE(writes.at(0).at(3).toString(), QStringLiteral("sdr-white"));
 		// Advanced color remains active in WCG when HDR is turned off.
 		fake.observation.monitor.targets[0].hdrActive = false;
 		brightness.query(SCREEN);
-		QTRY_COMPARE(queried.count(), 2);
+		QS_WAIT_COMPARE(queried.count(), 2);
 		QCOMPARE(brightness.methodFor(SCREEN), QStringLiteral("ddc"));
 		QCOMPARE(queried.at(1).at(3).toDouble(), 0.6);
 		fake.observation.monitor.targets[0].hdrActive = true;
 		fake.observation.monitor.targets[0].whiteLevel = 4650;
 		brightness.query(SCREEN);
-		QTRY_COMPARE(queried.count(), 3);
+		QS_WAIT_COMPARE(queried.count(), 3);
 		QCOMPARE(brightness.methodFor(SCREEN), QStringLiteral("sdr-white"));
 		QCOMPARE(queried.at(2).at(3).toDouble(), 0.73);
 	}
@@ -326,7 +357,7 @@ private slots:
 		QVERIFY(third > second);
 		QCOMPARE(finished.count(), 0); // Completion stays asynchronous.
 
-		QTRY_COMPARE(finished.count(), 3);
+		QS_WAIT_COMPARE(finished.count(), 3);
 		QCOMPARE(queried.count(), 3); // queryRequest still reports through queried().
 
 		QHash<qint64, QVariantList> byId;
@@ -353,7 +384,7 @@ private slots:
 		QSignalSpy recreatedFinished(&recreated, &Brightness::queryFinished);
 		const auto fourth = recreated.queryRequest(SCREEN);
 		QVERIFY(fourth > third);
-		QTRY_COMPARE(recreatedFinished.count(), 1);
+		QS_WAIT_COMPARE(recreatedFinished.count(), 1);
 		QCOMPARE(recreatedFinished.at(0).at(0).toLongLong(), fourth);
 	}
 
@@ -365,7 +396,7 @@ private slots:
 		QSignalSpy queried(&brightness, &Brightness::queried);
 
 		const auto id = brightness.queryRequest(SCREEN);
-		QTRY_COMPARE(finished.count(), 1);
+		QS_WAIT_COMPARE(finished.count(), 1);
 		QCOMPARE(queried.count(), 1);
 		QCOMPARE(finished.at(0), QVariantList({id, SCREEN, false, true, 1.0}));
 		QCOMPARE(queried.at(0), QVariantList({SCREEN, false, true, 1.0}));
@@ -387,7 +418,7 @@ private slots:
 
 		const auto id = brightness->queryRequest(SCREEN);
 		QVERIFY(id > 0);
-		QTRY_COMPARE(order.size(), 2);
+		QS_WAIT_COMPARE(order.size(), 2);
 		QCOMPARE(order, QStringList({QStringLiteral("finished"), QStringLiteral("queried")}));
 		QCOMPARE(finished.count(), 1);
 		QCOMPARE(finished.at(0).at(0).toLongLong(), id);
@@ -419,14 +450,14 @@ private slots:
 		QSignalSpy queried(&brightness, &Brightness::queried);
 
 		brightness.query(SCREEN);
-		QTRY_COMPARE(queried.count(), 1);
+		QS_WAIT_COMPARE(queried.count(), 1);
 		QCOMPARE(finished.count(), 0);
 		brightness.probe(SCREEN);
-		QTRY_COMPARE(queried.count(), 2);
+		QS_WAIT_COMPARE(queried.count(), 2);
 		QCOMPARE(finished.count(), 0);
 
 		const auto id = brightness.queryRequest(SCREEN);
-		QTRY_COMPARE(queried.count(), 3);
+		QS_WAIT_COMPARE(queried.count(), 3);
 		QCOMPARE(finished.count(), 1);
 		QCOMPARE(finished.at(0).at(0).toLongLong(), id);
 		QCOMPARE(brightness.methodFor(SCREEN), QStringLiteral("ddc"));
@@ -455,7 +486,7 @@ private slots:
 		qs::windows::startup::Fixture::gateSettled = true;
 		const auto dispatched = brightness.queryRequest(screenC);
 		runDeferredStartup();
-		QTRY_COMPARE(finished.count(), 3);
+		QS_WAIT_COMPARE(finished.count(), 3);
 		QCOMPARE(queried.count(), 3);
 
 		// The live request reached the backend first, so it completes first even
@@ -509,7 +540,7 @@ private slots:
 			// Failure also retains the last known successful slider value.
 			QSignalSpy queried(brightness.get(), &Brightness::queried);
 			brightness->query(SCREEN);
-			QTRY_COMPARE(queried.count(), 1);
+			QS_WAIT_COMPARE(queried.count(), 1);
 			QCOMPARE(queried.at(0).at(3).toDouble(), 0.25);
 		}
 		native.createOk = true;
@@ -741,7 +772,7 @@ private slots:
 		    Qt::DirectConnection
 		);
 		brightness->setBrightness(SCREEN, false, 0.4);
-		QTRY_VERIFY(guard.isNull());
+		QS_WAIT_VERIFY(guard.isNull());
 		QCOMPARE(finished, 1);
 		QCOMPARE(results, onResult ? 1 : 0);
 		if (!strict) QVERIFY(legacyPolicyHeld);
@@ -779,7 +810,7 @@ private slots:
 		} else {
 			brightness->setBrightness(SCREEN, false, 0.4);
 		}
-		QTRY_VERIFY(guard.isNull());
+		QS_WAIT_VERIFY(guard.isNull());
 		QCOMPARE(finished, 0);
 		QCOMPARE(queried, 0);
 		QVERIFY(fake.gammaWrites.isEmpty());
@@ -819,7 +850,7 @@ private slots:
 		QSignalSpy finished(&brightness, &Brightness::brightnessSetFinished);
 		QSignalSpy result(&brightness, &Brightness::brightnessWriteResult);
 		brightness.setBrightness(SCREEN, true, 0.4);
-		QTRY_COMPARE(fake.entered.available(), 1);
+		QS_WAIT_COMPARE(fake.entered.available(), 1);
 		// The policy guard must cover writes on any screen.
 		if (queued) brightness.setBrightness(SCREEN, true, 0.8);
 		QTest::ignoreMessage(
@@ -830,7 +861,7 @@ private slots:
 		QVERIFY(!brightness.strictRoutes());
 		QCOMPARE(changed.count(), 0);
 		fake.release.release(2);
-		QTRY_COMPARE(finished.count(), 1);
+		QS_WAIT_COMPARE(finished.count(), 1);
 		QCOMPARE(result.count(), 0);
 		QCOMPARE(fake.writtenValues(), queued ? QList<qreal>({0.4, 0.8}) : QList<qreal>({0.4}));
 		brightness.setStrictRoutes(true);
@@ -855,7 +886,7 @@ private slots:
 			QVERIFY(!brightness.strictRoutes());
 		});
 		brightness.setBrightness(SCREEN, false, 0.4);
-		QTRY_COMPARE(finished.count(), 1);
+		QS_WAIT_COMPARE(finished.count(), 1);
 		QVERIFY(tried);
 		QCOMPARE(
 		    fake.writtenMethods(),
@@ -919,7 +950,7 @@ private slots:
 		QSignalSpy finished(&brightness, &Brightness::brightnessSetFinished);
 		QSignalSpy changed(&brightness, &Brightness::routeChanged);
 		brightness.setBrightness(SCREEN, false, 0.4);
-		QTRY_COMPARE(result.count(), 1);
+		QS_WAIT_COMPARE(result.count(), 1);
 		QCOMPARE(
 		    result.at(0),
 		    QVariantList({SCREEN, 0.4, ok, route, ok ? QString() : QStringLiteral("fixture denied")})
@@ -971,7 +1002,7 @@ private slots:
 		QVERIFY(fake.writtenMethods().isEmpty());
 		QSignalSpy queried(&brightness, &Brightness::queried);
 		brightness.query(SCREEN);
-		QTRY_COMPARE(queried.count(), 1);
+		QS_WAIT_COMPARE(queried.count(), 1);
 		QCOMPARE(queried.at(0).at(1).toBool(), ok);
 		QCOMPARE(queried.at(0).at(3).toDouble(), ok ? 0.3 : 1.0);
 		QCOMPARE(fake.gammaWrites, QList<qreal>({0.3}));
@@ -998,7 +1029,7 @@ private slots:
 		QSignalSpy queried(&brightness, &Brightness::queried);
 		if (query) brightness.query(SCREEN);
 		else brightness.probe(SCREEN);
-		QTRY_COMPARE(queried.count(), 1);
+		QS_WAIT_COMPARE(queried.count(), 1);
 		QCOMPARE(fake.gammaWrites, strict ? QList<qreal>() : QList<qreal>({1.0}));
 		QCOMPARE(fake.dimmed, strict);
 	}
@@ -1015,7 +1046,7 @@ private slots:
 		QCOMPARE(fake.gammaWrites, QList<qreal>({0.25, 1.0}));
 		QSignalSpy queried(&brightness, &Brightness::queried);
 		brightness.query(SCREEN);
-		QTRY_COMPARE(queried.count(), 1);
+		QS_WAIT_COMPARE(queried.count(), 1);
 		QCOMPARE(queried.at(0).at(3).toDouble(), 1.0);
 	}
 
@@ -1045,7 +1076,7 @@ private slots:
 			// old route exactly as a disconnected screen is pruned.
 			QSignalSpy queried(brightness.get(), &Brightness::queried);
 			brightness->query(QStringLiteral("another-screen"));
-			QTRY_COMPARE(queried.count(), 1);
+			QS_WAIT_COMPARE(queried.count(), 1);
 		}
 		QVERIFY(brightness->methodFor(SCREEN).isEmpty());
 		if (hardware) {
@@ -1079,7 +1110,7 @@ private slots:
 		QSignalSpy finished(&brightness, &Brightness::brightnessSetFinished);
 		QSignalSpy changed(&brightness, &Brightness::routeChanged);
 		brightness.setBrightness(SCREEN, false, 0.4);
-		QTRY_COMPARE(finished.count(), 1);
+		QS_WAIT_COMPARE(finished.count(), 1);
 		QCOMPARE(finished.at(0).at(1).toBool(), true);
 		QCOMPARE(result.count(), 0);
 		QCOMPARE(
@@ -1105,7 +1136,7 @@ private slots:
 		Brightness brightness(fake);
 		QSignalSpy finished(&brightness, &Brightness::brightnessSetFinished);
 		brightness.setBrightness(SCREEN, false, 0.4);
-		QTRY_COMPARE(finished.count(), 1);
+		QS_WAIT_COMPARE(finished.count(), 1);
 		QCOMPARE(finished.at(0).at(1).toBool(), true);
 		QCOMPARE(fake.writtenMethods(), QList<BrightnessMethod>({BrightnessMethod::Ddc}));
 		QCOMPARE(fake.gammaWrites, QList<qreal>({0.4}));
@@ -1120,11 +1151,11 @@ private slots:
 		QSignalSpy finished(&brightness, &Brightness::brightnessSetFinished);
 		QSignalSpy result(&brightness, &Brightness::brightnessWriteResult);
 		brightness.setBrightness(SCREEN, true, 0.4);
-		QTRY_COMPARE(fake.entered.available(), 1);
+		QS_WAIT_COMPARE(fake.entered.available(), 1);
 		brightness.setBrightness(SCREEN, true, 0.6);
 		brightness.setBrightness(SCREEN, true, 0.8);
 		fake.release.release(2);
-		QTRY_COMPARE(finished.count(), 1);
+		QS_WAIT_COMPARE(finished.count(), 1);
 		QCOMPARE(fake.writtenValues(), QList<qreal>({0.4, 0.8}));
 		QCOMPARE(result.count(), 0);
 	}
@@ -1136,9 +1167,9 @@ private slots:
 		resolve(brightness, fake, BrightnessMethod::Ddc);
 		QSignalSpy result(&brightness, &Brightness::brightnessWriteResult);
 		brightness.setBrightness(SCREEN, true, -0.5);
-		QTRY_COMPARE(result.count(), 1);
+		QS_WAIT_COMPARE(result.count(), 1);
 		brightness.setBrightness(SCREEN, true, 1.5);
-		QTRY_COMPARE(result.count(), 2);
+		QS_WAIT_COMPARE(result.count(), 2);
 		QCOMPARE(fake.writtenValues(), QList<qreal>({0.0, 1.0}));
 		QCOMPARE(result.at(0).at(1).toDouble(), 0.0);
 		QCOMPARE(result.at(1).at(1).toDouble(), 1.0);
@@ -1162,7 +1193,7 @@ private slots:
 		QSignalSpy result(&brightness, &Brightness::brightnessWriteResult);
 		QSignalSpy finished(&brightness, &Brightness::brightnessSetFinished);
 		brightness.setBrightness(SCREEN, true, 0.4);
-		QTRY_COMPARE(fake.entered.available(), 1);
+		QS_WAIT_COMPARE(fake.entered.available(), 1);
 		brightness.setBrightness(SCREEN, true, 0.4); // Equal values still need separate results.
 		brightness.setBrightness(SCREEN, true, 0.8);
 		QCOMPARE(result.count(), 2);
@@ -1175,7 +1206,7 @@ private slots:
 		brightness.setStrictRoutes(false);
 		QVERIFY(brightness.strictRoutes());
 		fake.release.release();
-		QTRY_COMPARE(result.count(), 3);
+		QS_WAIT_COMPARE(result.count(), 3);
 		QCOMPARE(result.at(2).at(1).toDouble(), 0.4);
 		QCOMPARE(result.at(2).at(2).toBool(), ok);
 		QCOMPARE(finished.count(), 3);
@@ -1220,23 +1251,23 @@ private slots:
 		    }
 		);
 		brightness.setBrightness(SCREEN, true, 0.4);
-		QTRY_COMPARE(fake.entered.available(), 1);
+		QS_WAIT_COMPARE(fake.entered.available(), 1);
 		fake.release.release();
-		QTRY_COMPARE(result.count(), 2);
+		QS_WAIT_COMPARE(result.count(), 2);
 		QCOMPARE(result.at(0).at(1).toDouble(), 0.4);
 		QCOMPARE(result.at(0).at(2).toBool(), firstOk);
 		QCOMPARE(result.at(1).at(1).toDouble(), 0.9);
 		QCOMPARE(result.at(1).at(2).toBool(), false);
 		QVERIFY(result.at(1).at(4).toString().contains(QStringLiteral("in flight")));
-		QTRY_COMPARE(fake.entered.available(), 2);
+		QS_WAIT_COMPARE(fake.entered.available(), 2);
 		QCOMPARE(fake.writtenValues(), QList<qreal>({0.4, 0.8}));
 		fake.release.release();
-		QTRY_COMPARE(result.count(), 3);
+		QS_WAIT_COMPARE(result.count(), 3);
 		QCOMPARE(result.at(2).at(1).toDouble(), 0.8);
 		QCOMPARE(result.at(2).at(2).toBool(), true);
 		brightness.setBrightness(SCREEN, true, 0.2);
 		fake.release.release();
-		QTRY_COMPARE(result.count(), 4);
+		QS_WAIT_COMPARE(result.count(), 4);
 		QCOMPARE(result.at(3).at(1).toDouble(), 0.2);
 		QCOMPARE(result.at(3).at(2).toBool(), true);
 		QCOMPARE(finished.count(), 4);
@@ -1266,7 +1297,7 @@ private slots:
 		QCOMPARE(fake.gammaWrites, QList<qreal>({0.4, 0.8}));
 		QSignalSpy queried(&brightness, &Brightness::queried);
 		brightness.query(SCREEN);
-		QTRY_COMPARE(queried.count(), 1);
+		QS_WAIT_COMPARE(queried.count(), 1);
 		QCOMPARE(queried.at(0).at(3).toDouble(), 0.8);
 		QCOMPARE(result.count(), 2);
 	}
@@ -1300,10 +1331,10 @@ private slots:
 		QSignalSpy queried(&brightness, &Brightness::queried);
 		QSignalSpy finished(&brightness, &Brightness::brightnessSetFinished);
 		brightness.query(SCREEN);
-		QTRY_COMPARE(queried.count(), 1);
+		QS_WAIT_COMPARE(queried.count(), 1);
 		QCOMPARE(brightness.methodFor(SCREEN), QStringLiteral("software"));
 		brightness.setBrightness(SCREEN, false, 0.4);
-		QTRY_COMPARE(finished.count(), 1);
+		QS_WAIT_COMPARE(finished.count(), 1);
 		QVERIFY(fake.writtenMethods().isEmpty());
 	}
 
@@ -1324,10 +1355,10 @@ private slots:
 		QSignalSpy queried(&brightness, &Brightness::queried);
 		QSignalSpy result(&brightness, &Brightness::brightnessWriteResult);
 		brightness.query(SCREEN);
-		QTRY_COMPARE(queried.count(), 1);
+		QS_WAIT_COMPARE(queried.count(), 1);
 		QVERIFY(brightness.methodFor(SCREEN).isEmpty());
 		brightness.setBrightness(SCREEN, false, 0.4);
-		QTRY_COMPARE(result.count(), 1);
+		QS_WAIT_COMPARE(result.count(), 1);
 		QCOMPARE(result.at(0).at(2).toBool(), false);
 		QVERIFY(fake.writtenMethods().isEmpty());
 	}
@@ -1356,10 +1387,10 @@ private slots:
 		QSignalSpy queried(&brightness, &Brightness::queried);
 		QSignalSpy finished(&brightness, &Brightness::brightnessSetFinished);
 		brightness.query(SCREEN);
-		QTRY_COMPARE(queried.count(), 1);
+		QS_WAIT_COMPARE(queried.count(), 1);
 		QCOMPARE(brightness.methodFor(SCREEN), QStringLiteral("software"));
 		brightness.setBrightness(SCREEN, false, 0.4);
-		QTRY_COMPARE(finished.count(), 1);
+		QS_WAIT_COMPARE(finished.count(), 1);
 		QVERIFY(fake.writtenMethods().isEmpty());
 	}
 
@@ -1375,10 +1406,10 @@ private slots:
 		QSignalSpy queried(&brightness, &Brightness::queried);
 		QSignalSpy finished(&brightness, &Brightness::brightnessSetFinished);
 		brightness.query(SCREEN);
-		QTRY_COMPARE(queried.count(), 1);
+		QS_WAIT_COMPARE(queried.count(), 1);
 		QCOMPARE(brightness.methodFor(SCREEN), QStringLiteral("software"));
 		brightness.setBrightness(SCREEN, false, 0.4);
-		QTRY_COMPARE(finished.count(), 1);
+		QS_WAIT_COMPARE(finished.count(), 1);
 		QVERIFY(fake.writtenMethods().isEmpty());
 	}
 
@@ -1499,10 +1530,10 @@ private slots:
 		QSignalSpy queried(&brightness, &Brightness::queried);
 		QSignalSpy finished(&brightness, &Brightness::brightnessSetFinished);
 		brightness.query(SCREEN);
-		QTRY_COMPARE(queried.count(), 1);
+		QS_WAIT_COMPARE(queried.count(), 1);
 		QCOMPARE(brightness.methodFor(SCREEN), QStringLiteral("wmi"));
 		brightness.setBrightness(SCREEN, false, 0.4);
-		QTRY_COMPARE(finished.count(), 1);
+		QS_WAIT_COMPARE(finished.count(), 1);
 		QCOMPARE(fake.writtenMethods(), QList<BrightnessMethod>({BrightnessMethod::Wmi}));
 		QCOMPARE(brightness.methodFor(SCREEN), QStringLiteral("software"));
 	}

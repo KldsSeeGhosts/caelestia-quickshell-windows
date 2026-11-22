@@ -2,7 +2,10 @@
 #include <chrono>
 #include <thread>
 
+#include <qcoreapplication.h>
+#include <qelapsedtimer.h>
 #include <qtest.h>
+#include <qthread.h>
 
 #include "desktop_recovery.hpp"
 #include "erm625_desktop_fakes.hpp"
@@ -16,6 +19,33 @@ namespace qs::windows {
 DWORD testBuild = 26100;
 DWORD windowsBuild() { return testBuild; }
 } // namespace qs::windows
+
+namespace {
+
+// QTest's QTRY_* re-polls a satisfied predicate in ~60 ms quanta. These waits
+// poll at 1 ms instead; each keeps its original timeout budget and the
+// QCOMPARE/verify immediately after keeps the assertion identical.
+bool waitUntil(const std::function<bool()>& predicate, int timeoutMs) {
+	QElapsedTimer elapsed;
+	elapsed.start();
+	for (;;) {
+		if (predicate()) return true;
+		if (elapsed.elapsed() >= timeoutMs) return predicate();
+		QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+		QThread::msleep(1);
+	}
+}
+
+// The production recovery window is 30 s with a 250 ms first retry. Anchoring
+// the injected age 40 ms before the deadline leaves every retry a real
+// timer-driven attempt, just scheduled 40 ms out instead of 250+ ms.
+constexpr qint64 RECOVERY_TEST_AGE = 30000 - 40;
+
+void fastRecovery() {
+	setNativeDesktopRecoveryAgeForTest([] { return RECOVERY_TEST_AGE; });
+}
+
+} // namespace
 
 class NativeDesktopRecoveryTest: public QObject {
 	Q_OBJECT;
@@ -105,6 +135,7 @@ private slots:
 			    return fresh.acquire(m, v, p);
 		    }
 		);
+		fastRecovery();
 		struct Reset {
 			Fixture& old;
 			Fixture& fresh;
@@ -198,7 +229,8 @@ private slots:
 		QCOMPARE(accessor.getCurrentDesktopNumber(), 0);
 		QCOMPARE(acquisitions, 1); // Dispatch cannot bypass the active backoff.
 		online = true;
-		QTRY_COMPARE_WITH_TIMEOUT(recovered, 1, 1500);
+		QVERIFY(waitUntil([&] { return recovered == 1; }, 1500));
+		QCOMPARE(recovered, 1);
 		QCOMPARE(acquisitions, 2);
 		QVERIFY(retryNativeDesktopAccessor());
 		QCOMPARE(nativeDesktopLastError(), S_OK);
@@ -256,6 +288,7 @@ private slots:
 			    return (++acquisitions == 1 ? old : fresh).acquire(m, v, p);
 		    }
 		);
+		fastRecovery();
 		struct Reset {
 			Fixture& old;
 			Fixture& fresh;
@@ -274,7 +307,8 @@ private slots:
 		QCOMPARE(nativeDesktopLastError(), E_UNEXPECTED);
 		QCOMPARE(old.manager.array.refs, 1UL);
 		QCOMPARE(old.one.refs, 1UL);
-		QTRY_COMPARE_WITH_TIMEOUT(recovered, 1, 1500);
+		QVERIFY(waitUntil([&] { return recovered == 1; }, 1500));
+		QCOMPARE(recovered, 1);
 		QCOMPARE(acquisitions, 2);
 		QVERIFY(retryNativeDesktopAccessor());
 	}
@@ -291,6 +325,7 @@ private slots:
 			    return fresh.acquire(m, v, p);
 		    }
 		);
+		fastRecovery();
 		struct Reset {
 			~Reset() { setNativeDesktopFactoryForTest({}); }
 		} reset;
@@ -302,7 +337,8 @@ private slots:
 		QCOMPARE(partial.manager.refs, 1UL);
 		QCOMPARE(partial.views.refs, 1UL);
 		QCOMPARE(partial.publicApi.refs, 1UL);
-		QTRY_COMPARE_WITH_TIMEOUT(recovered, 1, 2000);
+		QVERIFY(waitUntil([&] { return recovered == 1; }, 2000));
+		QCOMPARE(recovered, 1);
 		QCOMPARE(acquisitions, 3);
 		QCOMPARE(partial.manager.refs, 1UL);
 		QCOMPARE(partial.views.refs, 1UL);
@@ -372,6 +408,7 @@ private slots:
 			    return S_OK;
 		    }
 		);
+		fastRecovery();
 		// Reset even if an assertion below exits early; the factory captures locals.
 		struct Reset {
 			~Reset() { setNativeDesktopFactoryForTest({}); }
@@ -399,12 +436,14 @@ private slots:
 		QCOMPARE(one.refs, 1UL);
 		QCOMPARE(two.refs, 1UL);
 		QCOMPARE(accessor.goToDesktopNumber(1), -1);
-		QTRY_VERIFY_WITH_TIMEOUT(acquisitions >= 2, 1500); // First retry while Explorer is absent.
+		// First retry while Explorer is absent.
+		QVERIFY(waitUntil([&] { return acquisitions >= 2; }, 1500));
 		manager.result = S_OK;
 		online = true;
 		manager.array.desktops = {&three, &two, &one};
 		manager.current = &two;
-		QTRY_COMPARE_WITH_TIMEOUT(recovered, 1, 2000);
+		QVERIFY(waitUntil([&] { return recovered == 1; }, 2000));
+		QCOMPARE(recovered, 1);
 		QVERIFY(retryNativeDesktopAccessor());
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
 		QCOMPARE(accessor.getDesktopCount(), 3);
@@ -414,7 +453,8 @@ private slots:
 		QCOMPARE(manager.switches, 1);
 		invalidateNativeDesktopAccessor(); // TaskbarCreated takes the same path.
 		QVERIFY(IsEqualGUID(accessor.getDesktopIdByNumber(0), three.id));
-		QTRY_COMPARE_WITH_TIMEOUT(recovered, 2, 1500);
+		QVERIFY(waitUntil([&] { return recovered == 2; }, 1500));
+		QCOMPARE(recovered, 2);
 	}
 	void blockedCallsAreBounded_data() {
 		QTest::addColumn<QString>("operation");
@@ -442,16 +482,17 @@ private slots:
 		VirtualDesktops::Accessor accessor;
 		QVERIFY(loadNativeDesktopAccessor(accessor, &context, [] {}));
 		fake->manager.beforeEnumeration = [weak = std::weak_ptr<Fixture>(fake)] {
-			std::this_thread::sleep_for(std::chrono::milliseconds(300));
+			std::this_thread::sleep_for(std::chrono::milliseconds(150));
 			if (auto fake = weak.lock()) fake->manager.current = &fake->two;
 		};
 		requestNativeDesktopRefresh();
-		QTest::qWait(150);
+		QTest::qWait(60);
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
 		QCOMPARE(accessor.getCurrentDesktopNumber(), 0);
 		QCOMPARE(nativeDesktopWorkerCountForTest(), 1);
 		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
-		QTRY_COMPARE_WITH_TIMEOUT(accessor.getCurrentDesktopNumber(), 1, 1000);
+		QVERIFY(waitUntil([&] { return accessor.getCurrentDesktopNumber() == 1; }, 1000));
+		QCOMPARE(accessor.getCurrentDesktopNumber(), 1);
 		QCOMPARE(acquisitions->load(), 1);
 		setNativeDesktopFactoryForTest({});
 	}
@@ -461,7 +502,7 @@ private slots:
 		setNativeDesktopFactoryForTest(
 		    [fake, acquisitions](DesktopManager** m, ViewCollection** v, IVirtualDesktopManager** p) {
 			    ++*acquisitions;
-			    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+			    std::this_thread::sleep_for(std::chrono::milliseconds(150));
 			    return fake->acquire(m, v, p);
 		    }
 		);
@@ -475,7 +516,8 @@ private slots:
 		initializeNativeDesktopQueries(&context, [] {});
 		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
 		QCOMPARE(nativeDesktopWorkerCountForTest(), 1);
-		QTRY_COMPARE_WITH_TIMEOUT(*recovered, 1, 1000);
+		QVERIFY(waitUntil([&] { return *recovered == 1; }, 1000));
+		QCOMPARE(*recovered, 1);
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
 		QCOMPARE(accessor.getDesktopCount(), 2);
 		QCOMPARE(acquisitions->load(), 1);
@@ -492,9 +534,12 @@ private slots:
 		QVERIFY(loadNativeDesktopAccessor(accessor, &context, [] {}));
 		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
 		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb2));
-		QTRY_VERIFY_WITH_TIMEOUT(IsEqualGUID(nativeWindowDesktopId(window), fake->one.id), 500);
+		QVERIFY(waitUntil(
+		    [&] { return IsEqualGUID(nativeWindowDesktopId(window), fake->one.id); },
+		    500
+		));
 		fake->publicApi.beforeMove = [] {
-			std::this_thread::sleep_for(std::chrono::milliseconds(300));
+			std::this_thread::sleep_for(std::chrono::milliseconds(150));
 		};
 		QElapsedTimer elapsed;
 		elapsed.start();
@@ -505,7 +550,10 @@ private slots:
 		const auto busy = moveNativeDesktopOwnWindow(window, fake->one.id);
 		QVERIFY(busy.has_value() && !*busy);
 		QCOMPARE(nativeDesktopLastError(), HRESULT_FROM_WIN32(ERROR_BUSY));
-		QTRY_VERIFY_WITH_TIMEOUT(IsEqualGUID(nativeWindowDesktopId(window), fake->two.id), 1000);
+		QVERIFY(waitUntil(
+		    [&] { return IsEqualGUID(nativeWindowDesktopId(window), fake->two.id); },
+		    1000
+		));
 		QVERIFY(!nativeDesktopCommandPending());
 		QCOMPARE(nativeDesktopWorkerCountForTest(), 1);
 		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
@@ -528,7 +576,8 @@ private slots:
 			if (first && operation == "activation") (*blocked)();
 			return (first ? old : fresh)->acquire(m, v, p);
 		});
-		setNativeDesktopStuckBoundForTest(50); // A genuine stall, with a fast test-only verdict.
+		setNativeDesktopStuckBoundForTest(30); // A genuine stall, with a fast test-only verdict.
+		fastRecovery();
 		struct Reset {
 			~Reset() { setNativeDesktopFactoryForTest({}); }
 		} reset;
@@ -559,19 +608,17 @@ private slots:
 		if (operation == "enumeration" || operation == "release") {
 			requestNativeDesktopRefresh();
 			QVERIFY(elapsed.elapsed() < 50);
-			QTRY_COMPARE_WITH_TIMEOUT(
-			    nativeDesktopAvailability(),
-			    DesktopAvailability::Disconnected,
+			QVERIFY(waitUntil(
+			    [] { return nativeDesktopAvailability() == DesktopAvailability::Disconnected; },
 			    250
-			);
+			));
 		} else if (operation == "window-query") {
 			QVERIFY(IsEqualGUID(nativeWindowDesktopId(window), GUID {}));
 			QVERIFY(elapsed.elapsed() < 50);
-			QTRY_COMPARE_WITH_TIMEOUT(
-			    nativeDesktopAvailability(),
-			    DesktopAvailability::Disconnected,
+			QVERIFY(waitUntil(
+			    [] { return nativeDesktopAvailability() == DesktopAvailability::Disconnected; },
 			    250
-			);
+			));
 		} else if (operation == "switch") QCOMPARE(accessor.goToDesktopNumber(1), -1);
 		else if (operation == "create") QCOMPARE(accessor.createDesktop(), -1);
 		else if (operation == "move") QCOMPARE(accessor.moveWindowToDesktopNumber(window, 1), -1);
@@ -594,11 +641,15 @@ private slots:
 		}
 		QVERIFY(elapsed.elapsed() < 50);
 		// The replacement succeeds while the previous apartment stays blocked.
-		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopAvailability(), DesktopAvailability::Available, 1500);
+		QVERIFY(waitUntil(
+		    [] { return nativeDesktopAvailability() == DesktopAvailability::Available; },
+		    1500
+		));
 		QCOMPARE(acquisitions.load(), 2);
 		QVERIFY(IsEqualGUID(accessor.getDesktopIdByNumber(0), fresh->one.id));
 		blocked->release();
-		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 1, 500);
+		QVERIFY(waitUntil([] { return nativeDesktopWorkerCountForTest() == 1; }, 500));
+		QCOMPARE(nativeDesktopWorkerCountForTest(), 1);
 		QCoreApplication::processEvents();
 		// A late acquisition/refresh/command must not overwrite this generation.
 		QVERIFY(IsEqualGUID(accessor.getDesktopIdByNumber(0), fresh->one.id));
@@ -622,9 +673,10 @@ private slots:
 		elapsed.start();
 		shutdownNativeDesktopAccessor();
 		QVERIFY(elapsed.elapsed() < 50);
-		QTRY_COMPARE_WITH_TIMEOUT(WaitForSingleObject(blocked->entered, 0), DWORD(WAIT_OBJECT_0), 200);
+		QCOMPARE(WaitForSingleObject(blocked->entered, 200), DWORD(WAIT_OBJECT_0));
 		blocked->release();
-		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 0, 500);
+		QVERIFY(waitUntil([] { return nativeDesktopWorkerCountForTest() == 0; }, 500));
+		QCOMPARE(nativeDesktopWorkerCountForTest(), 0);
 	}
 	void retiredApartmentsHaveAGlobalCap() {
 		auto blocked = std::make_shared<BlockingCall>();
@@ -636,7 +688,7 @@ private slots:
 			    return E_FAIL;
 		    }
 		);
-		setNativeDesktopStuckBoundForTest(50);
+		setNativeDesktopStuckBoundForTest(30);
 		Unblock unblock {blocked};
 		QObject context;
 		VirtualDesktops::Accessor accessor;
@@ -651,7 +703,8 @@ private slots:
 		QCOMPARE(nativeDesktopLastError(), HRESULT_FROM_WIN32(ERROR_BUSY));
 		blocked->release();
 		shutdownNativeDesktopAccessor();
-		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 0, 1000);
+		QVERIFY(waitUntil([] { return nativeDesktopWorkerCountForTest() == 0; }, 1000));
+		QCOMPARE(nativeDesktopWorkerCountForTest(), 0);
 	}
 	void queuedCommandExpiresWithoutDispatch() {
 		auto old = std::make_shared<Fixture>();
@@ -665,17 +718,18 @@ private slots:
 		QObject context;
 		VirtualDesktops::Accessor accessor;
 		QVERIFY(loadNativeDesktopAccessor(accessor, &context, [] {}));
-		setNativeDesktopStuckBoundForTest(50);
+		setNativeDesktopStuckBoundForTest(30);
 		old->manager.beforeEnumeration = [blocked] { (*blocked)(); };
 		requestNativeDesktopRefresh();
-		QTRY_COMPARE_WITH_TIMEOUT(WaitForSingleObject(blocked->entered, 0), DWORD(WAIT_OBJECT_0), 100);
+		QCOMPARE(WaitForSingleObject(blocked->entered, 100), DWORD(WAIT_OBJECT_0));
 		QElapsedTimer elapsed;
 		elapsed.start();
 		QCOMPARE(accessor.goToDesktopNumber(1), -1);
 		QVERIFY(elapsed.elapsed() < 250);
 		blocked->release();
 		shutdownNativeDesktopAccessor();
-		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 0, 500);
+		QVERIFY(waitUntil([] { return nativeDesktopWorkerCountForTest() == 0; }, 500));
+		QCOMPARE(nativeDesktopWorkerCountForTest(), 0);
 		QCOMPARE(old->manager.switches, 0);
 	}
 	void publicQueriesRemainAvailableOnUnknownBuild() {
@@ -693,7 +747,10 @@ private slots:
 		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
 		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb2));
 		QVERIFY(IsEqualGUID(nativeWindowDesktopId(window), GUID {}));
-		QTRY_VERIFY_WITH_TIMEOUT(IsEqualGUID(nativeWindowDesktopId(window), fake->one.id), 250);
+		QVERIFY(waitUntil(
+		    [&] { return IsEqualGUID(nativeWindowDesktopId(window), fake->one.id); },
+		    250
+		));
 		QCOMPARE(nativeWindowOnCurrentDesktop(window), 1);
 		QCOMPARE(fake->manager.enumerations, 0);
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::UnsupportedBuild);
@@ -707,19 +764,27 @@ private slots:
 			    return fake->acquire(m, v, p);
 		    }
 		);
+		fastRecovery();
 		QObject context;
 		VirtualDesktops::Accessor accessor;
 		QVERIFY(!loadNativeDesktopAccessor(accessor, &context, [] {}));
 		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
 		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb2));
 		QVERIFY(IsEqualGUID(nativeWindowDesktopId(window), GUID {}));
-		QTRY_VERIFY_WITH_TIMEOUT(IsEqualGUID(nativeWindowDesktopId(window), fake->one.id), 200);
+		QVERIFY(waitUntil(
+		    [&] { return IsEqualGUID(nativeWindowDesktopId(window), fake->one.id); },
+		    200
+		));
 		QCOMPARE(nativeWindowOnCurrentDesktop(window), 1);
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::MissingProvider);
 		const auto moved = moveNativeDesktopOwnWindow(window, fake->two.id);
 		QVERIFY(moved.has_value() && *moved);
 		fake->manager.result = S_OK;
-		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopAvailability(), DesktopAvailability::Available, 1500);
+		QVERIFY(waitUntil(
+		    [] { return nativeDesktopAvailability() == DesktopAvailability::Available; },
+		    1500
+		));
+		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
 	}
 	void boundedBackoffAndDispatchRetry() {
 		qint64 age = 0;
@@ -814,6 +879,7 @@ private slots:
 			    return S_OK;
 		    }
 		);
+		fastRecovery();
 		struct Reset {
 			~Reset() { setNativeDesktopFactoryForTest({}); }
 		} reset;
@@ -822,7 +888,8 @@ private slots:
 		VirtualDesktops::Accessor accessor;
 		QVERIFY(!loadNativeDesktopAccessor(accessor, &context, [&] { ++recovered; }));
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::PermissionDenied);
-		QTRY_COMPARE_WITH_TIMEOUT(recovered, 1, 3000);
+		QVERIFY(waitUntil([&] { return recovered == 1; }, 3000));
+		QCOMPARE(recovered, 1);
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
 		QCOMPARE(accessor.getDesktopCount(), 1);
 	}
@@ -853,15 +920,18 @@ private slots:
 		} reset;
 		QObject context;
 		int recovered = 0;
+		// Anchor the injected clock just inside the deadline so the first
+		// retry fires 40 ms out instead of 250 ms; the timer is still real.
+		qint64 age = RECOVERY_TEST_AGE;
+		setNativeDesktopRecoveryAgeForTest([&] { return age; });
 		VirtualDesktops::Accessor accessor;
 		QVERIFY(!loadNativeDesktopAccessor(accessor, &context, [&] { ++recovered; }));
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Disconnected);
-		qint64 age = 0;
-		setNativeDesktopRecoveryAgeForTest([&] { return age; });
 		// The real timer still delivers the retry. Advancing only its elapsed
 		// clock to the exact deadline must prevent another retry being scheduled.
 		age = 30000;
-		QTRY_VERIFY_WITH_TIMEOUT(acquisitions >= 2, 1000);
+		QVERIFY(waitUntil([&] { return acquisitions >= 2; }, 1000));
+		QCOMPARE(acquisitions, 2);
 		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
 		const auto exhausted = acquisitions;
 		QTest::qWait(500);
@@ -870,7 +940,8 @@ private slots:
 		age = 0; // A new recovery window starts when Explorer returns.
 		invalidateNativeDesktopAccessor();
 		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), 250);
-		QTRY_COMPARE_WITH_TIMEOUT(recovered, 1, 2000);
+		QVERIFY(waitUntil([&] { return recovered == 1; }, 2000));
+		QCOMPARE(recovered, 1);
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
 	}
 };

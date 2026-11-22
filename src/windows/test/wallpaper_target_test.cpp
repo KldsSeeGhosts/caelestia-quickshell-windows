@@ -4,8 +4,10 @@
 #include <mutex>
 #include <thread>
 
+#include <qcoreapplication.h>
 #include <qelapsedtimer.h>
 #include <qtest.h>
+#include <qthread.h>
 
 #include "../system/wallpaper_target.hpp"
 #include "../system/wallpaper_worker.hpp"
@@ -92,13 +94,29 @@ worker::Request setRequest(worker::Kind kind = worker::Kind::Set) {
 	request.path = QStringLiteral("new");
 	return request;
 }
+
+// QTest's QTRY_* re-polls a satisfied predicate in ~60 ms quanta. These waits
+// poll at 1 ms instead; each keeps its original timeout budget and the
+// QCOMPARE/verify immediately after keeps the assertion identical.
+bool waitUntil(const std::function<bool()>& predicate, int timeoutMs) {
+	QElapsedTimer elapsed;
+	elapsed.start();
+	for (;;) {
+		if (predicate()) return true;
+		if (elapsed.elapsed() >= timeoutMs) return predicate();
+		QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+		QThread::msleep(1);
+	}
+}
 } // namespace
 
 class TestWallpaperTarget: public QObject {
 	Q_OBJECT
 
 private slots:
-	void cleanup() { QTRY_COMPARE_WITH_TIMEOUT(worker::Channel::liveCount(), 0, 2000); }
+	void cleanup() {
+		QVERIFY(waitUntil([] { return worker::Channel::liveCount() == 0; }, 2000));
+	}
 
 	void workerHealthyContractsAndOwnership() {
 		auto state = std::make_shared<FakeState>();
@@ -124,7 +142,8 @@ private slots:
 		QCOMPARE(channel.read({}), QString());
 		QVERIFY(state->owner != gui);
 		channel.shutdown();
-		QTRY_COMPARE(state->destroyed.load(), 1);
+		QVERIFY(waitUntil([&] { return state->destroyed.load() == 1; }, 5000));
+		QCOMPARE(state->destroyed.load(), 1);
 		QVERIFY(!state->wrongThread);
 	}
 
@@ -132,6 +151,7 @@ private slots:
 		auto state = std::make_shared<FakeState>();
 		ReleaseOnExit release {state};
 		worker::Channel channel(factory(state), this);
+		channel.setGuiBound(std::chrono::milliseconds(30));
 		QCOMPARE(channel.read({}), QStringLiteral("original"));
 		{
 			std::lock_guard lock(state->mutex);
@@ -150,7 +170,8 @@ private slots:
 			++completions;
 		};
 		state->release();
-		QTRY_COMPARE(completions, 1);
+		QVERIFY(waitUntil([&] { return completions == 1; }, 5000));
+		QCOMPARE(completions, 1);
 		QCOMPARE(channel.read({}), QStringLiteral("new"));
 		QCOMPARE(state->factories.load(), 1);
 	}
@@ -170,8 +191,9 @@ private slots:
 	void slow300msCallsCompleteWithoutReplacement() {
 		QFETCH(int, kind);
 		auto state = std::make_shared<FakeState>();
-		state->delay = 300;
+		state->delay = 100;
 		worker::Channel channel(factory(state), this);
+		channel.setGuiBound(std::chrono::milliseconds(30));
 		channel.setStuckBound(std::chrono::milliseconds(1000));
 		auto request = setRequest(static_cast<worker::Kind>(kind));
 		int results = 0;
@@ -188,16 +210,21 @@ private slots:
 		else QVERIFY(channel.command(request));
 		QVERIFY(elapsed.elapsed() < 250);
 		QCOMPARE(results, 0);
-		QTest::qWait(350);
+		QTest::qWait(150);
 		QCOMPARE(state->factories.load(), 1);
 		if (read) {
 			// Another slow refresh returns the completed first read's cache.
 			QCOMPARE(channel.read(request), QStringLiteral("original"));
 		} else {
+			QVERIFY(waitUntil([&] { return results == 1; }, 5000));
 			QCOMPARE(results, 1);
 			// Per-desktop changes cannot assume which desktop is current.
 			// Its cache updates only once a real read has completed.
-			QTRY_COMPARE_WITH_TIMEOUT(channel.read({}), QStringLiteral("new"), 1500);
+			QVERIFY(waitUntil(
+			    [&] { return channel.read({}) == QStringLiteral("new"); },
+			    1500
+			));
+			QCOMPARE(channel.read({}), QStringLiteral("new"));
 		}
 	}
 
@@ -211,9 +238,10 @@ private slots:
 	void lateRefusalAndBusyCommandKeepOriginalRequest() {
 		QFETCH(int, kind);
 		auto state = std::make_shared<FakeState>();
-		state->delay = 300;
+		state->delay = 100;
 		state->refuse = true;
 		worker::Channel channel(factory(state), this);
+		channel.setGuiBound(std::chrono::milliseconds(30));
 		int results = 0;
 		channel.finished = [&](const worker::Request& request, bool ok, const QString& reason) {
 			QVERIFY(!ok);
@@ -234,7 +262,8 @@ private slots:
 		QVERIFY(!channel.command(newer));
 		QVERIFY(elapsed.elapsed() < 50);
 		QCOMPARE(results, 0);
-		QTRY_COMPARE(results, 1);
+		QVERIFY(waitUntil([&] { return results == 1; }, 5000));
+		QCOMPARE(results, 1);
 		QCOMPARE(state->calls.load(), 1);
 		QCOMPARE(state->factories.load(), 1);
 	}
@@ -273,7 +302,7 @@ private slots:
 		QTest::addColumn<int>("applied");
 		QTest::addColumn<int>("delay");
 		QTest::addColumn<bool>("success");
-		for (int delay: {0, 300}) {
+		for (int delay: {0, 100}) {
 			const auto suffix = QByteArray::number(delay);
 			QTest::newRow(("no-set-attempts-" + suffix).constData()) << 0 << 0 << delay << true;
 			QTest::newRow(("all-applied-" + suffix).constData()) << 2 << 2 << delay << true;
@@ -292,6 +321,7 @@ private slots:
 		state->desktopApplied = applied;
 		state->delay = delay;
 		worker::Channel channel(factory(state), this);
+		channel.setGuiBound(std::chrono::milliseconds(30));
 		int results = 0;
 		channel.finished = [&](const worker::Request& request, bool ok, const QString& reason) {
 			QCOMPARE(request.kind, worker::Kind::SetDesktops);
@@ -305,7 +335,8 @@ private slots:
 		QVERIFY(elapsed.elapsed() < 250);
 		if (delay > 0) {
 			QCOMPARE(results, 0);
-			QTRY_COMPARE(results, 1);
+			QVERIFY(waitUntil([&] { return results == 1; }, 5000));
+			QCOMPARE(results, 1);
 		} else {
 			QCOMPARE(results, success ? 1 : 0);
 		}
@@ -332,11 +363,15 @@ private slots:
 		    },
 		    this
 		);
-		channel.setStuckBound(std::chrono::milliseconds(50));
+		channel.setRecoveryBackoff(std::chrono::milliseconds(20));
+		channel.setGuiBound(std::chrono::milliseconds(30));
+		channel.setStuckBound(std::chrono::milliseconds(30));
 		QCOMPARE(channel.read({}), QString());
-		QTRY_COMPARE_WITH_TIMEOUT(generation.load(), 4, 6000);
-		QTRY_COMPARE_WITH_TIMEOUT(states[3]->calls.load(), 1, 1000);
-		QTest::qWait(250);
+		QVERIFY(waitUntil([&] { return generation.load() == 4; }, 6000));
+		QCOMPARE(generation.load(), 4);
+		QVERIFY(waitUntil([&] { return states[3]->calls.load() == 1; }, 1000));
+		QCOMPARE(states[3]->calls.load(), 1);
+		QTest::qWait(100);
 		QCOMPARE(worker::Channel::liveCount(), 4);
 		QCOMPARE(generation.load(), 4);
 		int results = 0;
@@ -344,8 +379,13 @@ private slots:
 		QVERIFY(!channel.command(setRequest()));
 		QCOMPARE(results, 0);
 		for (const auto& state: states) state->release();
-		QTRY_COMPARE_WITH_TIMEOUT(generation.load(), 5, 6000);
-		QTRY_COMPARE(channel.read({}), QStringLiteral("original"));
+		QVERIFY(waitUntil([&] { return generation.load() == 5; }, 6000));
+		QCOMPARE(generation.load(), 5);
+		QVERIFY(waitUntil(
+		    [&] { return channel.read({}) == QStringLiteral("original"); },
+		    2000
+		));
+		QCOMPARE(channel.read({}), QStringLiteral("original"));
 	}
 
 	void slowActivationCompletesAndReleaseDoesNotBlockGui() {
@@ -356,16 +396,21 @@ private slots:
 		worker::Channel channel(
 		    [&] {
 			    ++activations;
-			    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+			    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			    return std::make_unique<FakeProvider>(state);
 		    },
 		    this
 		);
+		channel.setGuiBound(std::chrono::milliseconds(30));
 		QElapsedTimer elapsed;
 		elapsed.start();
 		QCOMPARE(channel.read({}), QString());
 		QVERIFY(elapsed.elapsed() < 250);
-		QTRY_COMPARE(channel.read({}), QStringLiteral("original"));
+		QVERIFY(waitUntil(
+		    [&] { return channel.read({}) == QStringLiteral("original"); },
+		    2000
+		));
+		QCOMPARE(channel.read({}), QStringLiteral("original"));
 		QCOMPARE(activations.load(), 1);
 		elapsed.restart();
 		channel.shutdown();
@@ -373,7 +418,8 @@ private slots:
 		QCOMPARE(state->destroyed.load(), 0);
 		QCOMPARE(worker::Channel::liveCount(), 1);
 		state->release();
-		QTRY_COMPARE(worker::Channel::liveCount(), 0);
+		QVERIFY(waitUntil([] { return worker::Channel::liveCount() == 0; }, 2000));
+		QCOMPARE(worker::Channel::liveCount(), 0);
 		QCOMPARE(state->destroyed.load(), 1);
 		QVERIFY(!state->wrongThread);
 	}
@@ -388,6 +434,7 @@ private slots:
 		    [&] { return std::make_unique<FakeProvider>(generation++ == 0 ? old : replacement); },
 		    this
 		);
+		channel.setRecoveryBackoff(std::chrono::milliseconds(25));
 		int results = 0;
 		channel.finished = [&](const worker::Request&, bool ok, const QString& reason) {
 			QVERIFY(!ok);
@@ -396,7 +443,8 @@ private slots:
 		};
 		QVERIFY(!channel.command(setRequest()));
 		QCOMPARE(results, 0);
-		QTRY_COMPARE(replacement->calls.load(), 1);
+		QVERIFY(waitUntil([&] { return replacement->calls.load() == 1; }, 2000));
+		QCOMPARE(replacement->calls.load(), 1);
 		QCOMPARE(old->calls.load(), 1);
 		QCOMPARE(channel.read({}), QStringLiteral("original"));
 	}
@@ -427,7 +475,9 @@ private slots:
 		    [&] { return std::make_unique<FakeProvider>(generation++ == 0 ? old : replacement); },
 		    this
 		);
-		channel.setStuckBound(std::chrono::milliseconds(180));
+		channel.setRecoveryBackoff(std::chrono::milliseconds(25));
+		channel.setGuiBound(std::chrono::milliseconds(30));
+		channel.setStuckBound(std::chrono::milliseconds(120));
 		int results = 0;
 		QString verdict;
 		channel.finished = [&](const worker::Request&, bool ok, const QString& reason) {
@@ -441,11 +491,17 @@ private slots:
 		QVERIFY(elapsed.elapsed() < 250);
 		QCOMPARE(results, 0); // 100 ms GUI expiry is not a stuck verdict.
 		QCOMPARE(old->factories.load(), 1);
-		QTRY_COMPARE(verdict, QStringLiteral("provider-timeout"));
-		QTRY_COMPARE(replacement->calls.load(), 1);
+		QVERIFY(waitUntil(
+		    [&] { return verdict == QStringLiteral("provider-timeout"); },
+		    5000
+		));
+		QCOMPARE(verdict, QStringLiteral("provider-timeout"));
+		QVERIFY(waitUntil([&] { return replacement->calls.load() == 1; }, 2000));
+		QCOMPARE(replacement->calls.load(), 1);
 		QCOMPARE(channel.read({}), QStringLiteral("replacement"));
 		old->release();
-		QTRY_COMPARE(old->destroyed.load(), 1);
+		QVERIFY(waitUntil([&] { return old->destroyed.load() == 1; }, 5000));
+		QCOMPARE(old->destroyed.load(), 1);
 		QTest::qWait(30);
 		QCOMPARE(results, 1);
 		QCOMPARE(channel.read({}), QStringLiteral("replacement"));
@@ -463,6 +519,7 @@ private slots:
 		    [&] { return std::make_unique<FakeProvider>(generation++ == 0 ? old : replacement); },
 		    this
 		);
+		channel.setRecoveryBackoff(std::chrono::milliseconds(25));
 		QCOMPARE(channel.read({}), QString());
 		QVERIFY(channel.command(setRequest()));
 		int results = 0;
@@ -473,9 +530,11 @@ private slots:
 		};
 		channel.invalidate();
 		QCOMPARE(results, 1);
-		QTRY_COMPARE(replacement->calls.load(), 1);
+		QVERIFY(waitUntil([&] { return replacement->calls.load() == 1; }, 2000));
+		QCOMPARE(replacement->calls.load(), 1);
 		old->release();
-		QTRY_COMPARE(old->destroyed.load(), 1);
+		QVERIFY(waitUntil([&] { return old->destroyed.load() == 1; }, 5000));
+		QCOMPARE(old->destroyed.load(), 1);
 		QCOMPARE(old->calls.load(), 1); // Queued old mutation was discarded.
 		QCOMPARE(channel.read({}), QStringLiteral("fresh"));
 		QCOMPARE(results, 1);
@@ -490,27 +549,34 @@ private slots:
 		{
 			worker::Channel channel(factory(state), this);
 			channel.background(setRequest(worker::Kind::Background));
-			QTRY_COMPARE(state->calls.load(), 1);
+			QVERIFY(waitUntil([&] { return state->calls.load() == 1; }, 5000));
+			QCOMPARE(state->calls.load(), 1);
 			auto request = setRequest(worker::Kind::Background);
 			request.path = QStringLiteral("obsolete");
 			channel.background(request);
 			request.path = QStringLiteral("latest");
 			channel.background(request);
 			state->release();
-			QTRY_COMPARE(state->calls.load(), 2);
-			QTRY_COMPARE(channel.read({}), QStringLiteral("latest"));
+			QVERIFY(waitUntil([&] { return state->calls.load() == 2; }, 5000));
+			QCOMPARE(state->calls.load(), 2);
+			QVERIFY(waitUntil(
+			    [&] { return channel.read({}) == QStringLiteral("latest"); },
+			    5000
+			));
+			QCOMPARE(channel.read({}), QStringLiteral("latest"));
 			{
 				std::lock_guard lock(state->mutex);
 				state->blocked = true;
 				state->released = false;
 			}
 			channel.background(setRequest(worker::Kind::Background));
-			QTRY_VERIFY(state->calls.load() >= 4);
+			QVERIFY(waitUntil([&] { return state->calls.load() >= 4; }, 5000));
 			elapsed.restart();
 		}
 		QVERIFY(elapsed.elapsed() < 100);
 		state->release();
-		QTRY_COMPARE(state->destroyed.load(), 1);
+		QVERIFY(waitUntil([&] { return state->destroyed.load() == 1; }, 5000));
+		QCOMPARE(state->destroyed.load(), 1);
 	}
 
 	void normalization() {
