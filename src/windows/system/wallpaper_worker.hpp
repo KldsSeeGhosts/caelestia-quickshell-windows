@@ -66,6 +66,12 @@ public:
 
 #ifdef QS_TEST
 	void setStuckBound(std::chrono::milliseconds bound);
+	// Reconnect backoff between generations and the resubmit delay while a
+	// worker cannot be acquired. Production keeps its 250 ms schedule.
+	void setRecoveryBackoff(std::chrono::milliseconds delay);
+	// How long a synchronous read/command waits for the worker before
+	// returning early. Production waits the full 100 ms bound.
+	void setGuiBound(std::chrono::milliseconds bound);
 	static int liveCount();
 #endif
 

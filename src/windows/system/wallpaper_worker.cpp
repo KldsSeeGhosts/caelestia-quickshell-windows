@@ -116,7 +116,10 @@ struct Channel::Impl {
 	std::optional<Request> latestBackground;
 	QHash<QString, QString> cache;
 	std::chrono::milliseconds stallLimit = stuckBound;
+	std::chrono::milliseconds resubmitDelay {250};
+	std::chrono::milliseconds guiWait {guiBound};
 	Clock::time_point retryAt {};
+	int backoffBase = 250;
 	int backoff = 250;
 	bool stopped = false;
 	bool waiting = false;
@@ -203,7 +206,7 @@ struct Channel::Impl {
 				this->cache.clear();
 				this->cache.insert({}, request.path);
 			} else if (request.kind == Kind::SetScreen) this->cache.insert(request.target, request.path);
-			this->backoff = 250;
+			this->backoff = this->backoffBase;
 			this->recovering = false;
 		}
 		if (report)
@@ -240,8 +243,8 @@ struct Channel::Impl {
 		}
 		if (this->pending.empty() && this->recovering && Clock::now() >= this->retryAt) {
 			if (!this->submit(Request {})) {
-				this->retryAt = Clock::now() + std::chrono::milliseconds(250);
-				this->poll.setInterval(250);
+				this->retryAt = Clock::now() + this->resubmitDelay;
+				this->poll.setInterval(this->resubmitDelay);
 			}
 		}
 		if (this->pending.empty() && !this->recovering) this->poll.stop();
@@ -250,7 +253,7 @@ struct Channel::Impl {
 		if (!job) return;
 		this->waiting = true;
 		const auto generation = this->worker;
-		const auto deadline = job->submitted + guiBound;
+		const auto deadline = job->submitted + this->guiWait;
 		while (generation == this->worker && !job->ready()) {
 			const auto remaining = deadline - Clock::now();
 			if (remaining <= Clock::duration::zero()) break;
@@ -329,6 +332,11 @@ void Channel::shutdown() { this->impl->stop(); }
 
 #ifdef QS_TEST
 void Channel::setStuckBound(std::chrono::milliseconds bound) { this->impl->stallLimit = bound; }
+void Channel::setRecoveryBackoff(std::chrono::milliseconds delay) {
+	this->impl->backoffBase = this->impl->backoff = static_cast<int>(delay.count());
+	this->impl->resubmitDelay = delay;
+}
+void Channel::setGuiBound(std::chrono::milliseconds bound) { this->impl->guiWait = bound; }
 int Channel::liveCount() { return liveWorkers().load(); }
 #endif
 } // namespace qs::windows::sys::wallpaper_worker

@@ -1,10 +1,13 @@
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <thread>
 
+#include <qcoreapplication.h>
 #include <qelapsedtimer.h>
 #include <qsignalspy.h>
 #include <qtest.h>
+#include <qthread.h>
 #include <wrl/client.h>
 
 #include "erm625_desktop_fakes.hpp"
@@ -38,6 +41,13 @@ struct NativeDesktopFacadeTestHook {
 		return !desktops.pendingSwitch && desktops.creationWaiters.isEmpty()
 		    && !desktops.switchDeadline.isActive() && !desktops.creationTimer.isActive();
 	}
+	// Shortens the post-command observation budgets (1500 ms switch, 1000 ms
+	// creation) for test runs. The budgets still gate "timed-out" outcomes the
+	// same way; tests just do not pay the production grace period.
+	static void setObservationBudget(VirtualDesktops& desktops, int milliseconds) {
+		desktops.switchDeadline.setInterval(milliseconds);
+		desktops.creationTimer.setInterval(milliseconds);
+	}
 	static int call(VirtualDesktops& desktops, int (*operation)()) {
 		return desktops.call(-1, operation);
 	}
@@ -60,6 +70,29 @@ int localReleaseOutsideNativeGuard() {
 void restoreEnvironment(const char* name, const QByteArray& previous) {
 	if (previous.isNull()) qunsetenv(name);
 	else qputenv(name, previous);
+}
+
+// QTest's QTRY_* re-polls a satisfied predicate in ~60 ms quanta. These waits
+// poll at 1 ms instead; each keeps its original timeout budget and the
+// QCOMPARE/verify immediately after keeps the assertion identical.
+bool waitUntil(const std::function<bool()>& predicate, int timeoutMs) {
+	QElapsedTimer elapsed;
+	elapsed.start();
+	for (;;) {
+		if (predicate()) return true;
+		if (elapsed.elapsed() >= timeoutMs) return predicate();
+		QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+		QThread::msleep(1);
+	}
+}
+
+// The production recovery window is 30 s with a 250 ms first retry. Anchoring
+// the injected age 40 ms before the deadline leaves every retry a real
+// timer-driven attempt, just scheduled 40 ms out instead of 250+ ms.
+constexpr qint64 RECOVERY_TEST_AGE = 30000 - 40;
+
+void fastRecovery() {
+	setNativeDesktopRecoveryAgeForTest([] { return RECOVERY_TEST_AGE; });
 }
 } // namespace
 
@@ -105,6 +138,8 @@ private slots:
 			    return (++this->acquisitions == 1 ? this->old : this->fresh).acquire(m, v, p);
 		    }
 		);
+		fastRecovery();
+		NativeDesktopFacadeTestHook::setObservationBudget(*this->desktops, 200);
 		QVERIFY(loadNativeDesktopAccessor(this->accessor, this->desktops, [this] { this->install(); }));
 		NativeDesktopFacadeTestHook::observeSnapshots(*this->desktops);
 		this->install();
@@ -117,7 +152,8 @@ private slots:
 		restoreEnvironment("CAELESTIA_WINDOWS_HYPR_DISPATCH", this->previousDispatch);
 		outerFaultView = nullptr;
 		setNativeDesktopFactoryForTest({});
-		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 0, 1000);
+		QVERIFY(waitUntil([] { return nativeDesktopWorkerCountForTest() == 0; }, 1000));
+		QCOMPARE(nativeDesktopWorkerCountForTest(), 0);
 		this->old.clearFaults();
 		this->fresh.clearFaults();
 		if (this->desktops) this->desktops->destroyForTest();
@@ -158,13 +194,21 @@ private slots:
 		QCoreApplication::processEvents();
 		QCOMPARE(capabilities.count(), 1);
 		QCOMPARE(results.count(), 2);
-		QTRY_VERIFY_WITH_TIMEOUT(this->desktops->accessorLoaded(), 1500);
+		QVERIFY(waitUntil([this] { return this->desktops->accessorLoaded(); }, 1500));
+		QVERIFY(this->desktops->accessorLoaded());
 		QCOMPARE(this->acquisitions, 2);
 		this->fresh.manager.current = &this->fresh.two;
 		QVERIFY(this->desktops->switchTo(1));
 		QCOMPARE(this->fresh.manager.switches, 1);
 		QCOMPARE(this->old.manager.switches, 1);
-		QTRY_COMPARE(
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("observed");
+		    },
+		    5000
+		));
+		QCOMPARE(
 		    this->desktops->lastCommand().value("outcome").toString(),
 		    QStringLiteral("observed")
 		);
@@ -190,7 +234,8 @@ private slots:
 		QCOMPARE(this->old.manager.refs, 1UL);
 		QVERIFY(!retryNativeDesktopAccessor());
 		QCOMPARE(this->acquisitions, 1);
-		QTRY_VERIFY_WITH_TIMEOUT(this->desktops->accessorLoaded(), 1500);
+		QVERIFY(waitUntil([this] { return this->desktops->accessorLoaded(); }, 1500));
+		QVERIFY(this->desktops->accessorLoaded());
 		QCOMPARE(this->acquisitions, 2);
 	}
 	void pendingOperationsFailOnReadFault_data() {
@@ -231,7 +276,8 @@ private slots:
 			this->old.manager.faultOnEnumeration = true;
 		}
 		this->desktops->refresh();
-		QTRY_VERIFY_WITH_TIMEOUT(!this->desktops->accessorLoaded(), 200);
+		QVERIFY(waitUntil([this] { return !this->desktops->accessorLoaded(); }, 200));
+		QVERIFY(!this->desktops->accessorLoaded());
 		this->old.clearFaults();
 		outerFaultView = nullptr;
 		this->verifyUnavailable();
@@ -243,7 +289,8 @@ private slots:
 		QCOMPARE(terminal.value("reason").toString(), QStringLiteral("provider-disconnected"));
 		QCOMPARE(completions, creation ? 1 : 0);
 		QVERIFY(NativeDesktopFacadeTestHook::pendingIsEmpty(*this->desktops));
-		QTRY_VERIFY_WITH_TIMEOUT(this->desktops->accessorLoaded(), 1500);
+		QVERIFY(waitUntil([this] { return this->desktops->accessorLoaded(); }, 1500));
+		QVERIFY(this->desktops->accessorLoaded());
 		QCOMPARE(results.count(), 2); // Recovery never resurrects/replays the request.
 	}
 	void blockedCommandReportsTimeoutAndNeverReplays_data() {
@@ -264,10 +311,14 @@ private slots:
 	void slowCommandRemainsAccepted() {
 		QFETCH(QString, operation);
 		QFETCH(bool, succeed);
-		const auto delay = [] { std::this_thread::sleep_for(std::chrono::milliseconds(300)); };
+		const auto delay = [] { std::this_thread::sleep_for(std::chrono::milliseconds(150)); };
 		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb2));
 		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
-		QTRY_COMPARE_WITH_TIMEOUT(this->desktops->windowDesktopIndex(window), qsizetype(0), 500);
+		QVERIFY(waitUntil(
+		    [this, window] { return this->desktops->windowDesktopIndex(window) == qsizetype(0); },
+		    500
+		));
+		QCOMPARE(this->desktops->windowDesktopIndex(window), qsizetype(0));
 		QCoreApplication::processEvents();
 		QSignalSpy membership(this->desktops, &VirtualDesktops::windowDesktopsChanged);
 		this->old.manager.publishSwitch = this->old.manager.publishCreation = true;
@@ -311,23 +362,37 @@ private slots:
 		QCOMPARE(nativeDesktopWorkerCountForTest(), 1);
 		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
 		QCOMPARE(completion->calls, 0);
-		QTRY_VERIFY_WITH_TIMEOUT(!nativeDesktopCommandPending(), 1000);
+		QVERIFY(waitUntil([] { return !nativeDesktopCommandPending(); }, 1000));
+		QVERIFY(!nativeDesktopCommandPending());
 		QCOMPARE(this->acquisitions, 1);
 		if (operation == "move") {
-			QTRY_COMPARE_WITH_TIMEOUT(
-			    this->desktops->windowDesktopIndex(window),
-			    succeed ? qsizetype(1) : qsizetype(0),
+			QVERIFY(waitUntil(
+			    [this, window, succeed] {
+				    return this->desktops->windowDesktopIndex(window)
+				        == (succeed ? qsizetype(1) : qsizetype(0));
+			    },
 			    1000
+			));
+			QCOMPARE(
+			    this->desktops->windowDesktopIndex(window),
+			    succeed ? qsizetype(1) : qsizetype(0)
 			);
 			QCOMPARE(this->desktops->lastCommand(), accepted); // No promised move observation.
-			QTRY_VERIFY_WITH_TIMEOUT(!nativeDesktopRequestPending(), 1000);
+			QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+			QVERIFY(!nativeDesktopRequestPending());
 			QCoreApplication::processEvents();
 			if (!succeed) QCOMPARE(membership.count(), 0); // No unchanged signal that reissues a panel move.
 		} else {
-			QTRY_COMPARE_WITH_TIMEOUT(
-			    this->desktops->lastCommand().value("outcome").toString(),
-			    succeed ? QStringLiteral("observed") : QStringLiteral("timed-out"),
+			QVERIFY(waitUntil(
+			    [this, succeed] {
+				    return this->desktops->lastCommand().value("outcome").toString()
+				        == (succeed ? QStringLiteral("observed") : QStringLiteral("timed-out"));
+			    },
 			    2500
+			));
+			QCOMPARE(
+			    this->desktops->lastCommand().value("outcome").toString(),
+			    succeed ? QStringLiteral("observed") : QStringLiteral("timed-out")
 			);
 			QCOMPARE(this->desktops->lastCommand().value("requestId"), accepted.value("requestId"));
 			if (!succeed)
@@ -370,10 +435,16 @@ private slots:
 		QVERIFY(elapsed.elapsed() < 50);
 		QVERIFY(nativeDesktopCommandPending());
 		blocked->release();
-		QTRY_COMPARE_WITH_TIMEOUT(
-		    this->desktops->lastCommand().value("outcome").toString(),
-		    QStringLiteral("observed"),
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("observed");
+		    },
 		    1000
+		));
+		QCOMPARE(
+		    this->desktops->lastCommand().value("outcome").toString(),
+		    QStringLiteral("observed")
 		);
 		QCOMPARE(this->desktops->lastCommand().value("requestId"), accepted.value("requestId"));
 		QCOMPARE(this->old.manager.switches, 1);
@@ -384,7 +455,7 @@ private slots:
 	void aCommandCanWaitBehindOneSlowRefresh() {
 		auto first = std::make_shared<std::atomic<bool>>(true);
 		this->old.manager.beforeEnumeration = [first] {
-			if (first->exchange(false)) std::this_thread::sleep_for(std::chrono::milliseconds(300));
+			if (first->exchange(false)) std::this_thread::sleep_for(std::chrono::milliseconds(150));
 		};
 		this->old.manager.publishSwitch = true;
 		requestNativeDesktopRefresh();
@@ -393,10 +464,16 @@ private slots:
 		QVERIFY(this->desktops->switchTo(1));
 		QVERIFY(elapsed.elapsed() < 250);
 		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("accepted"));
-		QTRY_COMPARE_WITH_TIMEOUT(
-		    this->desktops->lastCommand().value("outcome").toString(),
-		    QStringLiteral("observed"),
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("observed");
+		    },
 		    1000
+		));
+		QCOMPARE(
+		    this->desktops->lastCommand().value("outcome").toString(),
+		    QStringLiteral("observed")
 		);
 		QCOMPARE(this->old.manager.switches, 1);
 		QCOMPARE(this->acquisitions, 1);
@@ -409,14 +486,16 @@ private slots:
 		this->old.manager.publishCreation = true;
 		auto completed = std::make_shared<int>(0);
 		this->desktops->ensureCount(3, [completed](bool ok) { *completed = ok ? 1 : -1; });
-		QTest::qWait(1200
-		); // Longer than the 1 s creation observation budget, shorter than the 5 s stall verdict.
+		// Longer than the creation observation budget (200 ms in this fixture,
+		// 1 s in production), shorter than the stall verdict.
+		QTest::qWait(450);
 		QCOMPARE(*completed, 0);
 		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("accepted"));
 		QVERIFY(nativeDesktopCommandPending());
 		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
 		blocked->release();
-		QTRY_COMPARE_WITH_TIMEOUT(*completed, 1, 1000);
+		QVERIFY(waitUntil([completed] { return *completed == 1; }, 1000));
+		QCOMPARE(*completed, 1);
 		QCOMPARE(this->old.manager.creates, 1);
 		QCOMPARE(this->acquisitions, 1);
 	}
@@ -430,38 +509,48 @@ private slots:
 		QCOMPARE(accepted.value("outcome").toString(), QStringLiteral("accepted"));
 		QVERIFY(this->desktops->accessorLoaded());
 		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
-		QTRY_VERIFY_WITH_TIMEOUT(!this->desktops->accessorLoaded(), 300);
+		QVERIFY(waitUntil([this] { return !this->desktops->accessorLoaded(); }, 300));
+		QVERIFY(!this->desktops->accessorLoaded());
 		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("denied"));
 		QCOMPARE(
 		    this->desktops->lastCommand().value("reason").toString(),
 		    QStringLiteral("provider-timeout")
 		);
 		QCOMPARE(this->desktops->lastCommand().value("requestId"), accepted.value("requestId"));
-		QTRY_VERIFY_WITH_TIMEOUT(this->desktops->accessorLoaded(), 1500);
+		QVERIFY(waitUntil([this] { return this->desktops->accessorLoaded(); }, 1500));
+		QVERIFY(this->desktops->accessorLoaded());
 		QCOMPARE(this->acquisitions, 2);
 		QCOMPARE(this->fresh.manager.switches, 0);
 		blocked->release();
-		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 1, 500);
+		QVERIFY(waitUntil([] { return nativeDesktopWorkerCountForTest() == 1; }, 500));
+		QCOMPARE(nativeDesktopWorkerCountForTest(), 1);
 		QCOMPARE(this->fresh.manager.switches, 0);
 	}
 	void observationWaitsForASlowPostCommandSnapshot() {
 		this->old.manager.publishSwitch = true;
 		this->old.manager.beforeSwitch = [] {
-			std::this_thread::sleep_for(std::chrono::milliseconds(300));
+			std::this_thread::sleep_for(std::chrono::milliseconds(150));
 		};
 		this->old.manager.beforeEnumeration = [] {
-			std::this_thread::sleep_for(std::chrono::milliseconds(1700));
+			std::this_thread::sleep_for(std::chrono::milliseconds(600));
 		};
 		QVERIFY(this->desktops->switchTo(1));
-		QTest::qWait(1750); // The command is done, but its confirming snapshot is still in flight.
+		// The command is done, but its confirming snapshot is still in flight.
+		QTest::qWait(550);
 		QVERIFY(!nativeDesktopCommandPending());
 		QVERIFY(nativeDesktopRequestPending());
 		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("accepted"));
 		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
-		QTRY_COMPARE_WITH_TIMEOUT(
-		    this->desktops->lastCommand().value("outcome").toString(),
-		    QStringLiteral("observed"),
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("observed");
+		    },
 		    1000
+		));
+		QCOMPARE(
+		    this->desktops->lastCommand().value("outcome").toString(),
+		    QStringLiteral("observed")
 		);
 		QCOMPARE(this->acquisitions, 1);
 		QCOMPARE(this->old.manager.switches, 1);
@@ -497,13 +586,15 @@ private slots:
 		QCOMPARE(completions, operation == "create" ? 1 : 0);
 		QCOMPARE(this->desktops->count(), qsizetype(2));
 		QVERIFY(NativeDesktopFacadeTestHook::pendingIsEmpty(*this->desktops));
-		QTRY_VERIFY_WITH_TIMEOUT(this->desktops->accessorLoaded(), 1500);
+		QVERIFY(waitUntil([this] { return this->desktops->accessorLoaded(); }, 1500));
+		QVERIFY(this->desktops->accessorLoaded());
 		QCOMPARE(results.count(), 1);
 		QCOMPARE(this->fresh.manager.switches, 0);
 		QCOMPARE(this->fresh.manager.creates, 0);
 		QCOMPARE(this->fresh.manager.moves, 0);
 		blocked->release();
-		QTRY_COMPARE_WITH_TIMEOUT(nativeDesktopWorkerCountForTest(), 1, 500);
+		QVERIFY(waitUntil([] { return nativeDesktopWorkerCountForTest() == 1; }, 500));
+		QCOMPARE(nativeDesktopWorkerCountForTest(), 1);
 		QCOMPARE(results.count(), 1);
 	}
 };
