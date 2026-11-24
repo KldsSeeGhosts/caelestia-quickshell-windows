@@ -293,7 +293,12 @@ private:
 
 		auto image = QImage();
 		if (!job.cancelled || !job.cancelled()) image = loadShellIcon(job.parsingName, job.size);
-		job.done(std::move(image));
+		{
+			// Synchronize completion delivery with stop() so a timed-out worker
+			// that outlives aboutToQuit can never post through a destroyed app.
+			QMutexLocker deliveryLock(&this->deliveryMutex);
+			if (this->deliveriesAllowed && job.done) job.done(std::move(image));
+		}
 
 		QMutexLocker locker(&this->mutex);
 		if (this->queue.isEmpty() || this->stopping) {
@@ -316,7 +321,13 @@ private:
 			for (auto i = 0; i < this->started; i++) running.append(this->workers.at(i));
 		}
 
-		for (auto& job: pending) job.done(QImage());
+		for (auto& job: pending) {
+			if (job.done) job.done(QImage());
+		}
+		{
+			QMutexLocker deliveryLock(&this->deliveryMutex);
+			this->deliveriesAllowed = false;
+		}
 		for (auto& worker: running) worker.thread->quit();
 
 		auto deadline = QDeadlineTimer(ICON_THREAD_STOP_MS);
@@ -332,10 +343,12 @@ private:
 	}
 
 	QMutex mutex;
+	QMutex deliveryMutex;
 	QList<IconJob> queue;
 	std::array<Worker, ICON_THREAD_COUNT> workers {};
 	int started = 0;
 	bool stopping = false;
+	bool deliveriesAllowed = true;
 };
 
 } // namespace

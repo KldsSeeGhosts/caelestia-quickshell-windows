@@ -69,6 +69,8 @@ struct HookRun {
 	TrayIconSink sink;
 	std::function<void()> missed;
 	std::function<void(TrayHookState)> stateChanged;
+	std::mutex announceMutex;
+	std::vector<HWND> announceQueue;
 	std::atomic<bool> stopping = false;
 	std::atomic<bool> brief = false;
 	std::atomic<ULONGLONG> frontUntil = 0;
@@ -206,9 +208,6 @@ ULONGLONG briefFrontMs() {
 	return BRIEF_FRONT_MS;
 #endif
 }
-
-std::mutex gAnnounceMutex;        // NOLINT
-std::vector<HWND> gAnnounceQueue; // NOLINT
 
 DWORD explorerProcessId() {
 	auto* taskbar = explorerTaskbarWindow();
@@ -370,6 +369,8 @@ void HookWindow::probeTitle() {
 }
 
 void HookWindow::announce() {
+	if (this->run->stopping.load()) return;
+
 	this->readdGraceUntil = GetTickCount64() + READD_GRACE_MS;
 	stayInFront(this->run, briefFrontMs());
 	this->keepFirst(false);
@@ -396,10 +397,12 @@ void HookWindow::announce() {
 }
 
 void HookWindow::announceQueued() {
+	if (this->run->stopping.load()) return;
+
 	std::vector<HWND> owners;
 	{
-		auto lock = std::lock_guard(gAnnounceMutex);
-		owners.swap(gAnnounceQueue);
+		auto lock = std::lock_guard(this->run->announceMutex);
+		owners.swap(this->run->announceQueue);
 	}
 
 	std::ranges::sort(owners);
@@ -643,7 +646,7 @@ HWND HookWindow::discoverExplorer() {
 }
 
 void HookWindow::keepFirst(bool report) {
-	if (trayHookYielding()) return;
+	if (this->run->stopping.load() || trayHookYielding()) return;
 	auto* first = FindWindowW(this->trayClass, nullptr);
 
 	if (!wantFront(this->run)) {
@@ -881,6 +884,13 @@ void runHook(std::shared_ptr<HookRun> run) {
 	if (gTestTaskbar.load() == nullptr) {
 #endif
 		window.probeTitle();
+		if (run->stopping.load()) {
+			if (window.hwnd != nullptr) DestroyWindow(window.hwnd);
+			publishWindow(run, nullptr);
+			publishState(run, TrayHookState::Stopped);
+			run->callbacks->deactivate();
+			return;
+		}
 		window.announce();
 		PostMessageW(window.hwnd, announceMessage(), 0, 0);
 #ifdef QS_TRAY_HOOK_TEST
@@ -964,10 +974,6 @@ void TrayHook::stop() {
 		qCWarning(logTrayHook) << "Tray hook thread exceeded its shutdown deadline; detached";
 	}
 	gRun.reset();
-	{
-		auto announceLock = std::lock_guard(gAnnounceMutex);
-		gAnnounceQueue.clear();
-	}
 }
 
 void TrayHook::setBrief(bool brief) {
@@ -982,13 +988,21 @@ void TrayHook::setBrief(bool brief) {
 void TrayHook::announceTo(std::vector<HWND> owners) {
 	if (owners.empty() || !TrayHook::running()) return;
 
+	std::shared_ptr<HookRun> run;
+	HWND hwnd = nullptr;
 	{
-		auto lock = std::lock_guard(gAnnounceMutex);
-		if (gAnnounceQueue.size() > 1024) gAnnounceQueue.clear();
-		gAnnounceQueue.insert(gAnnounceQueue.end(), owners.begin(), owners.end());
+		auto lock = std::lock_guard(gMutex);
+		if (!gThread.joinable() || gRun == nullptr || gRun->stopping.load()) return;
+		run = gRun;
+		hwnd = gHwnd.load();
 	}
 
-	auto* hwnd = gHwnd.load();
+	{
+		auto lock = std::lock_guard(run->announceMutex);
+		if (run->announceQueue.size() > 1024) run->announceQueue.clear();
+		run->announceQueue.insert(run->announceQueue.end(), owners.begin(), owners.end());
+	}
+
 	if (hwnd != nullptr) PostMessageW(hwnd, announceMessage(), 0, 0);
 }
 
