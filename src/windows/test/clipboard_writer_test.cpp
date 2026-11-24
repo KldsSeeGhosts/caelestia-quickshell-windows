@@ -54,6 +54,8 @@ namespace {
 
 constexpr int WAIT_MS = 5000;
 
+QByteArray pngSignature() { return QByteArray::fromHex("89504e470d0a1a0a"); }
+
 class FakeReader final: public ClipboardReadProvider {
 public:
 	int reads = 0;
@@ -146,6 +148,9 @@ private slots:
 	void listenerFailure();
 	void outcomes_data();
 	void outcomes();
+	void imageWritesPngAndDib();
+	void nonPngInputIsEncoded();
+	void partialFormatFailureKeepsOwnership();
 	void overlappingOperations();
 	void retrySuccess();
 	void destructionDuringRetry();
@@ -325,7 +330,7 @@ void TestClipboardWriter::outcomes() {
 	QCoreApplication::processEvents();
 	QCOMPARE(finished.size(), 1);
 	QVERIFY(f.provider->owned.isEmpty());
-	QCOMPARE(f.provider->transfers, fault == "success" ? 1 : 0);
+	QCOMPARE(f.provider->transfers, fault == "success" ? 2 : 0);
 	QCOMPARE(
 	    f.provider->opens,
 	    fault == "clipboard-busy"                                                ? 5
@@ -335,10 +340,74 @@ void TestClipboardWriter::outcomes() {
 	if (fault == "success") {
 		QCOMPARE(f.provider->image.size(), QSize(2, 3));
 		QCOMPARE(f.provider->image.pixelColor(0, 0), QColor(Qt::red));
+		QCOMPARE(f.provider->setFormats, QVector<quint32>({f.provider->pngFormat(), CF_DIB}));
 	}
 	QCOMPARE(f.listener->starts, 0);
 	QCOMPARE(f.reader->reads, 0);
 	QVERIFY(!QFile::exists(f.cache()));
+}
+
+void TestClipboardWriter::imageWritesPngAndDib() {
+	Fixture f;
+	auto path = f.path(QStringLiteral("image.png"));
+	QImage image(7, 5, QImage::Format_ARGB32);
+	image.fill(Qt::transparent);
+	image.setPixelColor(1, 1, QColor(12, 34, 56, 200));
+	QVERIFY(image.save(path));
+	QFile file(path);
+	QVERIFY(file.open(QIODevice::ReadOnly));
+	const auto original = file.readAll();
+
+	QSignalSpy finished(f.writer.get(), &ClipboardWriter::writeFinished);
+	f.writer->copyImageFile(path);
+	QTRY_COMPARE_WITH_TIMEOUT(finished.size(), 1, WAIT_MS);
+	QVERIFY(finished.front()[1].toBool());
+	QCOMPARE(f.provider->setFormats.size(), 2);
+	QCOMPARE(f.provider->setFormats[0], f.provider->pngFormat());
+	QCOMPARE(f.provider->setFormats[1], quint32(CF_DIB));
+	QCOMPARE(f.provider->pngBytes, original);
+	QVERIFY(f.provider->pngBytes.startsWith(pngSignature()));
+	QCOMPARE(f.provider->image.size(), QSize(7, 5));
+	QCOMPARE(f.provider->transfers, 2);
+	QCOMPARE(f.provider->frees, 0);
+}
+
+void TestClipboardWriter::nonPngInputIsEncoded() {
+	Fixture f;
+	auto path = f.path(QStringLiteral("image.bmp"));
+	QImage image(4, 4, QImage::Format_RGB32);
+	image.fill(Qt::blue);
+	QVERIFY(image.save(path, "BMP"));
+	QFile file(path);
+	QVERIFY(file.open(QIODevice::ReadOnly));
+	const auto original = file.readAll();
+	QVERIFY(!original.startsWith(pngSignature()));
+
+	QSignalSpy finished(f.writer.get(), &ClipboardWriter::writeFinished);
+	f.writer->copyImageFile(path);
+	QTRY_COMPARE_WITH_TIMEOUT(finished.size(), 1, WAIT_MS);
+	QVERIFY(finished.front()[1].toBool());
+	QVERIFY(f.provider->pngBytes.startsWith(pngSignature()));
+	QVERIFY(f.provider->pngBytes != original);
+	QCOMPARE(f.provider->transfers, 2);
+}
+
+void TestClipboardWriter::partialFormatFailureKeepsOwnership() {
+	Fixture f;
+	auto path = f.path(QStringLiteral("image.png"));
+	QImage image(2, 2, QImage::Format_RGB32);
+	image.fill(Qt::red);
+	QVERIFY(image.save(path));
+
+	f.provider->failSetFormat = f.provider->pngFormat();
+	QSignalSpy finished(f.writer.get(), &ClipboardWriter::writeFinished);
+	f.writer->copyImageFile(path);
+	QTRY_COMPARE_WITH_TIMEOUT(finished.size(), 1, WAIT_MS);
+	QVERIFY(!finished.front()[1].toBool());
+	QCOMPARE(finished.front()[2].toString(), QStringLiteral("set-failed"));
+	QCOMPARE(f.provider->setFormats.size(), 2);
+	QCOMPARE(f.provider->transfers, 1);
+	QCOMPARE(f.provider->frees, 1);
 }
 
 void TestClipboardWriter::overlappingOperations() {
@@ -415,7 +484,7 @@ void TestClipboardWriter::legacyWrites() {
 	image.fill(Qt::green);
 	QVERIFY(image.save(path));
 	QVERIFY(f.clipboard->copyImageFile(path));
-	QTRY_COMPARE_WITH_TIMEOUT(f.provider->transfers, 2, WAIT_MS);
+	QTRY_COMPARE_WITH_TIMEOUT(f.provider->transfers, 3, WAIT_MS);
 	QCOMPARE(f.listener->starts, 0);
 	QCOMPARE(f.reader->reads, 0);
 	QCOMPARE(f.provider->sequences, 0);

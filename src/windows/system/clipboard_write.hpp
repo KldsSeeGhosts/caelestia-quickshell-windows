@@ -6,6 +6,7 @@
 #include <qstring.h>
 #include <qtypes.h>
 
+class QByteArray;
 class QImage;
 
 namespace qs::windows::sys {
@@ -16,6 +17,8 @@ class ClipboardWriteProvider {
 public:
 	virtual ~ClipboardWriteProvider() = default;
 	virtual void* imageData(const QImage& image) = 0;
+	virtual void* binaryData(const QByteArray& bytes) = 0;
+	virtual quint32 pngFormat() = 0;
 	virtual void* textData(const QString& text) = 0;
 	virtual void freeData(void* data) = 0;
 	virtual bool open() = 0;

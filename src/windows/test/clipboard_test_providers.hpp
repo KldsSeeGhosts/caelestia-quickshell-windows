@@ -2,9 +2,11 @@
 
 #include <utility>
 
+#include <qbytearray.h>
 #include <qimage.h>
 #include <qpointer.h>
 #include <qset.h>
+#include <qvector.h>
 
 #include "../system/clipboard_write.hpp"
 
@@ -37,6 +39,7 @@ public:
 	bool allowOpen = true;
 	bool allowEmpty = true;
 	bool allowSet = true;
+	quint32 failSetFormat = 0;
 	int failedOpens = 0;
 	int opens = 0;
 	int empties = 0;
@@ -46,7 +49,9 @@ public:
 	int transfers = 0;
 	int sequences = 0;
 	QImage image;
+	QByteArray pngBytes;
 	QString text;
+	QVector<quint32> setFormats;
 	QSet<void*> owned;
 
 	~FakeClipboardWrite() override {
@@ -56,6 +61,11 @@ public:
 		this->image = image;
 		return this->data();
 	}
+	void* binaryData(const QByteArray& bytes) override {
+		this->pngBytes = bytes;
+		return this->data();
+	}
+	quint32 pngFormat() override { return 0xe000; }
 	void* textData(const QString& text) override {
 		this->text = text;
 		return this->data();
@@ -73,9 +83,10 @@ public:
 		++this->empties;
 		return this->allowEmpty;
 	}
-	bool set(quint32, void* data) override {
+	bool set(quint32 format, void* data) override {
 		++this->sets;
-		if (!this->allowSet) return false;
+		this->setFormats.append(format);
+		if (!this->allowSet || format == this->failSetFormat) return false;
 		// Model the OS taking ownership. No Win32 clipboard calls exist here.
 		if (!this->owned.remove(data)) qFatal("Clipboard fixture transferred unknown data");
 		delete static_cast<int*>(data);
