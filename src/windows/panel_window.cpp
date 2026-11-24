@@ -43,6 +43,7 @@
 #include "../window/proxywindow.hpp"
 #include "appbar.hpp"
 #include "blur.hpp"
+#include "desktop_embedding.hpp"
 #include "desktop_host.hpp"
 #include "foreground_policy.hpp"
 #include "fullscreen_app_state.hpp"
@@ -261,7 +262,10 @@ public:
 			    VirtualDesktops::instance(),
 			    &VirtualDesktops::currentChanged,
 			    VirtualDesktops::instance(),
-			    [] { stack->followCurrentDesktop(); }
+			    [] {
+				    stack->followCurrentDesktop();
+				    DesktopHost::instance()->refreshAfterDesktopSwitch();
+			    }
 			);
 			QObject::connect(
 			    VirtualDesktops::instance(),
@@ -1666,16 +1670,16 @@ void WinPanelWindow::reconcileEmbedding() {
 	auto* hwnd = this->hwnd();
 	if (hwnd == nullptr || this->window == nullptr) return;
 
-	auto* parentBefore = this->mEmbedParent;
-	this->updateEmbedding();
-	if (this->mEmbedParent == nullptr) return;
-
-	// A changed parent was already placed by embedInto(). An unchanged one
-	// still has to re-place its group: the foreign wallpaper child appeared,
-	// left, or changed visibility.
-	if (this->mEmbedParent == parentBefore) this->placeEmbedded();
-
-	this->resetEmbeddedPresent();
+	reconcileEmbeddedPanel(
+	    this->mEmbedParent,
+	    [this] {
+		    this->updateEmbedding();
+		    return this->mEmbedParent;
+	    },
+	    [this] { this->placeEmbedded(); },
+	    [this] { return this->window != nullptr && this->window->isVisible(); },
+	    [this] { this->resetEmbeddedPresent(); }
+	);
 }
 
 void WinPanelWindow::resetEmbeddedPresent() {
