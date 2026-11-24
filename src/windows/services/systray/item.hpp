@@ -159,6 +159,7 @@ private:
 	void replayPending();
 	void setTip(const QString& tip);
 	void updateIconSource();
+	void requestFallbackIcon();
 
 	HWND hwnd;
 	UINT uid;
@@ -168,6 +169,9 @@ private:
 	QString exePath;
 	QString tip;
 	TrayIconImage image;
+	bool imageIsFallback = false;
+	quint64 iconRevision = 0;
+	std::optional<quint64> requestedIconRevision;
 	ULONGLONG lastActivate = 0;
 	Pending pending = Pending::None;
 	ULONGLONG pendingAt = 0;

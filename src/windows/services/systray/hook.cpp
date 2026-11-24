@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -24,6 +25,8 @@
 
 #include "../../../core/logcat.hpp"
 #include "../../util.hpp"
+#include "../../window_responsiveness.hpp"
+#include "worker_stop.hpp"
 
 namespace qs::windows::services::systray {
 
@@ -183,6 +186,12 @@ std::atomic<TrayHookState> gState = TrayHookState::Disabled; // NOLINT
 std::atomic<bool> gBrief = false;         // NOLINT
 std::atomic<ULONGLONG> gFrontUntil = 0;   // NOLINT
 
+struct HookRun {
+	TrayIconSink sink;
+	std::function<void()> missed;
+	std::function<void(TrayHookState)> stateChanged;
+};
+
 void stayInFront(ULONGLONG ms) {
 	auto until = GetTickCount64() + ms;
 	auto current = gFrontUntil.load();
@@ -332,6 +341,12 @@ bool HookWindow::create() {
 }
 
 void HookWindow::probeTitle() {
+	auto* taskbar = this->explorerWindow();
+	if (taskbar != nullptr && !windowResponding(taskbar)) {
+		qCDebug(logTrayHook) << "Skipped the Shell_NotifyIcon probe: Explorer's taskbar is unresponsive";
+		return;
+	}
+
 	SetWindowTextW(this->hwnd, HOOK_TITLE);
 
 	NOTIFYICONDATAW nid {};
@@ -546,7 +561,7 @@ LRESULT HookWindow::onCopyData(WPARAM wParam, LPARAM lParam) {
 		}
 	}
 
-	this->sink(std::move(message));
+	if (!gStopping.load()) this->sink(std::move(message));
 	return answer;
 }
 
@@ -812,20 +827,16 @@ void HookWindow::publishRunning() {
 	publishState(gBrief.load() ? TrayHookState::RunningBrief : TrayHookState::Running, this->stateChanged);
 }
 
-void runHook(
-    TrayIconSink sink,
-    std::function<void()> missed,
-    std::function<void(TrayHookState)> stateChanged
-) {
+void runHook(std::shared_ptr<HookRun> run) {
 	SetThreadDescription(GetCurrentThread(), L"qs tray hook");
 	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
 	stayInFront(briefFrontMs());
 
 	auto briefOnCreate = gBrief.load();
-	HookWindow window(std::move(sink), std::move(missed), stateChanged);
+	HookWindow window(std::move(run->sink), std::move(run->missed), run->stateChanged);
 	if (!window.create()) {
-		publishState(TrayHookState::WindowCreationFailed, stateChanged);
+		publishState(TrayHookState::WindowCreationFailed, run->stateChanged);
 		return;
 	}
 
@@ -835,7 +846,7 @@ void runHook(
 	if (gStopping.load()) {
 		DestroyWindow(window.hwnd);
 		gHwnd.store(nullptr);
-		publishState(TrayHookState::Stopped, stateChanged);
+		publishState(TrayHookState::Stopped, run->stateChanged);
 		return;
 	}
 
@@ -860,7 +871,7 @@ void runHook(
 	}
 
 	gHwnd.store(nullptr);
-	publishState(TrayHookState::Stopped, stateChanged);
+	publishState(TrayHookState::Stopped, run->stateChanged);
 }
 
 } // namespace
@@ -887,8 +898,12 @@ void TrayHook::start(
 	// A new start begins with no front deadline; the previous run's remaining
 	// time must not leak into it.
 	gFrontUntil.store(0);
-	gThread =
-	    std::thread(runHook, std::move(sink), std::move(missedTraffic), std::move(stateChanged));
+	auto run = std::make_shared<HookRun>(HookRun {
+	    .sink = std::move(sink),
+	    .missed = std::move(missedTraffic),
+	    .stateChanged = std::move(stateChanged),
+	});
+	gThread = std::thread(runHook, std::move(run));
 }
 
 void TrayHook::stop() {
@@ -901,7 +916,9 @@ void TrayHook::stop() {
 	auto* hwnd = gHwnd.load();
 	if (hwnd != nullptr) PostMessageW(hwnd, WM_CLOSE, 0, 0);
 
-	gThread.join();
+	if (stopWorker(gThread) == WorkerStopResult::Detached) {
+		qCWarning(logTrayHook) << "Tray hook thread exceeded its shutdown deadline; detached";
+	}
 	{
 		auto announceLock = std::lock_guard(gAnnounceMutex);
 		gAnnounceQueue.clear();

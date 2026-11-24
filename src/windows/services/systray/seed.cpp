@@ -1,14 +1,20 @@
 #include "seed.hpp"
+#include <atomic>
 #include <future>
 #include <utility>
 
 #include <objbase.h>
+#include <qloggingcategory.h>
 #include <shellapi.h>
 #include <unknwn.h>
+
+#include "worker_stop.hpp"
 
 namespace qs::windows::services::systray {
 
 namespace {
+
+Q_LOGGING_CATEGORY(logTrayNotify, "quickshell.windows.systray", QtWarningMsg);
 
 constexpr UINT RESYNC_MESSAGE = WM_APP + 1;
 
@@ -173,28 +179,44 @@ bool transientFailure(HRESULT result) {
 
 } // namespace
 
+struct TrayNotifyObserver::State {
+	explicit State(std::shared_ptr<TrayNotifyBackend> backend): backend(std::move(backend)) {}
+
+	std::shared_ptr<TrayNotifyBackend> backend;
+	std::atomic<DWORD> threadId = 0;
+	std::atomic<bool> stopping = false;
+	std::atomic<bool> retryable = false;
+	std::atomic<ComObserverState> mState = ComObserverState::Inactive;
+};
+
 TrayNotifyObserver::TrayNotifyObserver(std::unique_ptr<TrayNotifyBackend> backend)
-    : backend(backend ? std::move(backend) : std::make_unique<ExplorerTrayNotifyBackend>()) {}
+    : backend(
+          backend ? std::shared_ptr<TrayNotifyBackend>(std::move(backend))
+                  : std::make_shared<ExplorerTrayNotifyBackend>()
+      )
+    , workerState(std::make_shared<State>(this->backend)) {}
 
 TrayNotifyObserver::~TrayNotifyObserver() { this->stop(); }
 
 void TrayNotifyObserver::start(TrayIconSink sink, std::function<void(ComObserverState)> onState) {
 	if (this->worker.joinable()) return;
 
-	this->stopping.store(false);
-	this->mState.store(ComObserverState::Connecting);
+	auto state = std::make_shared<State>(this->backend);
+	state->mState.store(ComObserverState::Connecting);
+	this->workerState = state;
+
 	std::promise<DWORD> ready;
 	auto queueId = ready.get_future();
-	this->worker = std::thread([this, ready = std::move(ready), sink = std::move(sink), onState = std::move(onState)]() mutable {
+	this->worker = std::thread([state, ready = std::move(ready), sink = std::move(sink), onState = std::move(onState)]() mutable {
 		SetThreadDescription(GetCurrentThread(), L"qs tray notify");
 
 		MSG msg {};
 		PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 		ready.set_value(GetCurrentThreadId());
 
-		auto publish = [&](ComObserverState state) {
-			this->mState.store(state);
-			if (onState && !this->stopping.load()) onState(state);
+		auto publish = [&](ComObserverState next) {
+			state->mState.store(next);
+			if (onState && !state->stopping.load()) onState(next);
 		};
 
 		const auto initialized =
@@ -206,11 +228,11 @@ void TrayNotifyObserver::start(TrayIconSink sink, std::function<void(ComObserver
 		auto disconnect = [&] {
 			if (!connected) return;
 			connected = false;
-			this->backend->unregisterCallback();
+			state->backend->unregisterCallback();
 		};
 
 		auto connect = [&] {
-			this->retryable.store(false);
+			state->retryable.store(false);
 			publish(ComObserverState::Connecting);
 			if (!initialized) {
 				publish(ComObserverState::Unavailable);
@@ -220,27 +242,27 @@ void TrayNotifyObserver::start(TrayIconSink sink, std::function<void(ComObserver
 			connected = true;
 			registering = true;
 			receivedInitialCallback = false;
-			auto registration = this->backend->registerCallback([&](ULONG event, const TrayNotifyItem* item) {
+			auto registration = state->backend->registerCallback([&](ULONG event, const TrayNotifyItem* item) {
 				if (registering) receivedInitialCallback = true;
-				if (connected && !this->stopping.load()) deliverIcon(sink, event, item, registering);
+				if (connected && !state->stopping.load()) deliverIcon(sink, event, item, registering);
 			});
 			registering = false;
 
-			auto state = ComObserverState::Unavailable;
+			auto nextState = ComObserverState::Unavailable;
 			if (SUCCEEDED(registration.result)) {
-				if (registration.handle != 0 || receivedInitialCallback) state = ComObserverState::Live;
-				else if (registration.hasHandle) state = ComObserverState::StubNoOp;
+				if (registration.handle != 0 || receivedInitialCallback) nextState = ComObserverState::Live;
+				else if (registration.hasHandle) nextState = ComObserverState::StubNoOp;
 			}
-			if (state != ComObserverState::Live) disconnect();
-			this->retryable.store(transientFailure(registration.result));
-			publish(state);
+			if (nextState != ComObserverState::Live) disconnect();
+			state->retryable.store(transientFailure(registration.result));
+			publish(nextState);
 		};
 
-		if (!this->stopping.load()) connect();
-		while (!this->stopping.load() && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+		if (!state->stopping.load()) connect();
+		while (!state->stopping.load() && GetMessageW(&msg, nullptr, 0, 0) > 0) {
 			if (msg.hwnd == nullptr && msg.message == RESYNC_MESSAGE) {
 				disconnect();
-				if (!this->stopping.load()) connect();
+				if (!state->stopping.load()) connect();
 			} else {
 				TranslateMessage(&msg);
 				DispatchMessageW(&msg);
@@ -250,22 +272,37 @@ void TrayNotifyObserver::start(TrayIconSink sink, std::function<void(ComObserver
 		disconnect();
 		if (initialized) CoUninitialize();
 	});
-	this->threadId = queueId.get();
+	state->threadId.store(queueId.get());
 }
 
 void TrayNotifyObserver::resync() {
-	if (this->threadId != 0) PostThreadMessageW(this->threadId, RESYNC_MESSAGE, 0, 0);
+	auto state = this->workerState;
+	auto threadId = state ? state->threadId.load() : 0;
+	if (threadId != 0) PostThreadMessageW(threadId, RESYNC_MESSAGE, 0, 0);
 }
 
 void TrayNotifyObserver::stop() {
 	if (!this->worker.joinable()) return;
 
-	this->stopping.store(true);
-	PostThreadMessageW(this->threadId, WM_QUIT, 0, 0);
-	this->worker.join();
-	this->threadId = 0;
-	this->retryable.store(false);
-	this->mState.store(ComObserverState::Inactive);
+	auto state = this->workerState;
+	state->stopping.store(true);
+	PostThreadMessageW(state->threadId.load(), WM_QUIT, 0, 0);
+
+	if (stopWorker(this->worker) == WorkerStopResult::Detached) {
+		qCWarning(logTrayNotify) << "Tray observer thread exceeded its shutdown deadline; detached";
+	}
+
+	state->threadId.store(0);
+	state->retryable.store(false);
+	state->mState.store(ComObserverState::Inactive);
+}
+
+ComObserverState TrayNotifyObserver::state() const {
+	return this->workerState ? this->workerState->mState.load() : ComObserverState::Inactive;
+}
+
+bool TrayNotifyObserver::canRetry() const {
+	return this->workerState && this->workerState->retryable.load();
 }
 
 } // namespace qs::windows::services::systray

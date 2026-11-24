@@ -25,6 +25,15 @@ void afterFirstFrame(QObject* context, std::function<void()> callback) {
 
 namespace qs::windows {
 QPixmap iconForKey(const QString&, const QSize&) { return {}; }
+
+void requestShellIcon(
+    const QString&,
+    const QSize&,
+    std::function<bool()> cancelled,
+    std::function<void(QImage)> done
+) {
+	if (!cancelled || !cancelled()) done({});
+}
 } // namespace qs::windows
 
 namespace qs::redact {
@@ -38,6 +47,9 @@ bool observerCanRetry = false;
 std::function<void(ComObserverState)> observerStateChanged;
 int observerStarts = 0;
 int observerResyncs = 0;
+DWORD observerThreadId = 0;
+bool observerRetryable = false;
+ComObserverState observerState = ComObserverState::Inactive;
 QList<bool> hookStarts;
 QList<bool> hookModeChanges;
 } // namespace
@@ -64,24 +76,31 @@ TrayNotifyObserver::~TrayNotifyObserver() = default;
 void TrayNotifyObserver::start(TrayIconSink, std::function<void(ComObserverState)> onState) {
 	observerStarts++;
 	observerStateChanged = std::move(onState);
-	this->threadId = GetCurrentThreadId();
+	observerThreadId = GetCurrentThreadId();
 	observerStateChanged(ComObserverState::Connecting);
-	this->retryable.store(observerCanRetry);
+	observerRetryable = observerCanRetry;
+	observerState = observerResult;
 	observerStateChanged(observerResult);
 }
 
 void TrayNotifyObserver::resync() {
-	if (this->threadId == 0) return;
+	if (observerThreadId == 0) return;
 	observerResyncs++;
 	observerStateChanged(ComObserverState::Connecting);
-	this->retryable.store(observerCanRetry);
+	observerRetryable = observerCanRetry;
+	observerState = observerResult;
 	observerStateChanged(observerResult);
 }
 
 void TrayNotifyObserver::stop() {
-	this->threadId = 0;
+	observerThreadId = 0;
+	observerRetryable = false;
+	observerState = ComObserverState::Inactive;
 	observerStateChanged = {};
 }
+
+ComObserverState TrayNotifyObserver::state() const { return observerState; }
+bool TrayNotifyObserver::canRetry() const { return observerRetryable; }
 } // namespace qs::windows::services::systray
 
 using namespace qs::windows::services::systray;
@@ -96,6 +115,9 @@ private slots:
 		observerCanRetry = false;
 		observerStarts = 0;
 		observerResyncs = 0;
+		observerThreadId = 0;
+		observerRetryable = false;
+		observerState = ComObserverState::Inactive;
 		hookStarts.clear();
 		hookModeChanges.clear();
 	}

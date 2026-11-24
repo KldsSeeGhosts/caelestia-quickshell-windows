@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <memory>
 #include <thread>
 
@@ -60,17 +59,16 @@ public:
 	void start(TrayIconSink sink, std::function<void(ComObserverState)> onState);
 	void resync();
 	void stop();
-	[[nodiscard]] ComObserverState state() const { return this->mState.load(); }
+	[[nodiscard]] ComObserverState state() const;
 	// Only transport failures that may clear on their own get timed retries.
-	[[nodiscard]] bool canRetry() const { return this->retryable.load(); }
+	[[nodiscard]] bool canRetry() const;
 
 private:
-	std::unique_ptr<TrayNotifyBackend> backend;
+	struct State;
+
+	std::shared_ptr<TrayNotifyBackend> backend;
+	std::shared_ptr<State> workerState;
 	std::thread worker;
-	DWORD threadId = 0;
-	std::atomic<bool> stopping = false;
-	std::atomic<bool> retryable = false;
-	std::atomic<ComObserverState> mState = ComObserverState::Inactive;
 };
 
 } // namespace qs::windows::services::systray

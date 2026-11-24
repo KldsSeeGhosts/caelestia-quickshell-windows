@@ -34,6 +34,8 @@
 #include "util.hpp"
 #include "virtual_desktops.hpp"
 #include "window_event_filter.hpp"
+#include "window_identity_policy.hpp"
+#include "window_responsiveness.hpp"
 
 #include <initguid.h>
 
@@ -270,20 +272,35 @@ void TrackedWindow::refreshIdentity() {
 	this->mFrameThreadId = GetWindowThreadProcessId(this->mHwnd, &pid);
 	this->mFrameProcessId = pid;
 
-	this->uwpFrame = windowClass(this->mHwnd) == QString::fromWCharArray(UWP_FRAME_CLASS);
+	auto className = windowClass(this->mHwnd);
+	this->uwpFrame = className == QString::fromWCharArray(UWP_FRAME_CLASS);
 
 	if (this->uwpFrame) {
 		auto* core = FindWindowExW(this->mHwnd, nullptr, UWP_CORE_CLASS, nullptr);
 		if (core != nullptr) GetWindowThreadProcessId(core, &pid);
 	}
 
-	auto* process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-
 	QString exe;
-	auto appId = appUserModelIdOf(this->mHwnd);
+	auto* process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
 
 	if (process != nullptr) {
 		exe = processImagePath(process);
+	}
+
+	auto processName = QFileInfo(exe).fileName();
+	if (processName.isEmpty()) processName = processImageNameFromSnapshot(pid);
+
+	auto appId = shouldQueryWindowPropertyStore(
+	                 processName,
+	                 className,
+	                 windowResponding(this->mHwnd),
+	                 system_surface::isShellHostProcess,
+	                 system_surface::isShellClass
+	             )
+	                 ? appUserModelIdOf(this->mHwnd)
+	                 : QString();
+
+	if (process != nullptr) {
 		if (appId.isEmpty()) appId = appUserModelIdOf(process);
 		CloseHandle(process);
 	}
@@ -293,7 +310,7 @@ void TrackedWindow::refreshIdentity() {
 	// A window with no application id never reaches the task list, so the
 	// deferred User Account Control request of consent.exe (a SYSTEM process
 	// this one cannot open) had no row to activate and waited forever.
-	if (appId.isEmpty()) appId = appIdFromImageName(processImageNameFromSnapshot(pid));
+	if (appId.isEmpty()) appId = appIdFromImageName(processName);
 
 	WindowsDesktopEntryBackend::noteWindowExe(appId, exe);
 

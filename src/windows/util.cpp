@@ -19,6 +19,7 @@
 
 #include "activation_policy.hpp"
 #include "focus_monitor.hpp"
+#include "window_responsiveness.hpp"
 
 namespace qs::windows {
 
@@ -188,7 +189,7 @@ bool forceForegroundFromHook(HWND hwnd) {
 	auto ownThread = GetCurrentThreadId();
 
 	if (foregroundThread == 0 || foregroundThread == ownThread) return false;
-	if (IsHungAppWindow(foreground)) return false;
+	if (!windowResponding(foreground)) return false;
 
 	if (!AttachThreadInput(ownThread, foregroundThread, TRUE)) return false;
 	auto ok = SetForegroundWindow(hwnd) != FALSE;
