@@ -7,6 +7,7 @@
 #include <limits>
 #include <utility>
 
+#include <qbuffer.h>
 #include <qbytearray.h>
 #include <qcoreapplication.h>
 #include <qdir.h>
@@ -129,6 +130,22 @@ void* globalFromImage(const QImage& imageIn) {
 	return mem;
 }
 
+void* globalFromBytes(const QByteArray& bytes) {
+	if (bytes.isEmpty()) return nullptr;
+	auto* mem = GlobalAlloc(GMEM_MOVEABLE, static_cast<SIZE_T>(bytes.size()));
+	if (mem == nullptr) return nullptr;
+
+	auto* dst = GlobalLock(mem);
+	if (dst == nullptr) {
+		GlobalFree(mem);
+		return nullptr;
+	}
+
+	memcpy(dst, bytes.constData(), static_cast<SIZE_T>(bytes.size())); // NOLINT
+	GlobalUnlock(mem);
+	return mem;
+}
+
 void* globalFromText(const QString& text) {
 	auto bytes = (text.size() + 1) * sizeof(wchar_t);
 	auto* mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
@@ -148,6 +165,8 @@ void* globalFromText(const QString& text) {
 class NativeClipboardWriteProvider final: public ClipboardWriteProvider {
 public:
 	void* imageData(const QImage& image) override { return globalFromImage(image); }
+	void* binaryData(const QByteArray& bytes) override { return globalFromBytes(bytes); }
+	quint32 pngFormat() override { return RegisterClipboardFormatW(L"PNG"); }
 	void* textData(const QString& text) override { return globalFromText(text); }
 	void freeData(void* data) override { GlobalFree(data); }
 	bool open() override {
@@ -478,16 +497,29 @@ public:
 		    [self = QPointer(this), handle = std::move(handle), done = std::move(done)]() mutable {
 			    auto bytes = readHandoverFile(std::move(handle));
 			    auto image = bytes ? QImage::fromData(*bytes) : QImage();
+			    QByteArray png;
+			    if (!image.isNull() && bytes->size() >= 8
+			        && bytes->startsWith(QByteArray::fromHex("89504e470d0a1a0a")))
+			    {
+				    png = *bytes;
+			    } else if (!image.isNull()) {
+				    QBuffer buffer(&png);
+				    if (buffer.open(QIODevice::WriteOnly)) image.save(&buffer, "PNG");
+			    }
 			    QMetaObject::invokeMethod(
 			        QCoreApplication::instance(),
-			        [self, image = std::move(image), readable = bytes.has_value(), done]() {
+			        [self, image = std::move(image), png = std::move(png), readable = bytes.has_value(), done]() {
 				        if (!self) return;
 				        if (image.isNull()) {
 					        done(false, readable ? QStringLiteral("decode-failed")
 					                             : QStringLiteral("read-failed"));
 					        return;
 				        }
-				        self->writeData(CF_DIB, self->provider->imageData(image), done);
+				        if (png.isEmpty()) {
+					        done(false, QStringLiteral("decode-failed"));
+					        return;
+				        }
+				        self->writeImageData(png, image, done);
 			        },
 			        Qt::QueuedConnection
 			    );
@@ -527,6 +559,53 @@ private:
 			if (this->handle) this->provider->freeData(this->handle);
 		}
 	};
+
+	struct ImageData {
+		std::shared_ptr<ClipboardWriteProvider> provider;
+		void* pngHandle;
+		void* dibHandle;
+		~ImageData() {
+			if (this->pngHandle) this->provider->freeData(this->pngHandle);
+			if (this->dibHandle) this->provider->freeData(this->dibHandle);
+		}
+	};
+
+	void writeImageData(const QByteArray& png, const QImage& image, Done done) {
+		auto pngHandle = this->provider->binaryData(png);
+		auto dibHandle = this->provider->imageData(image);
+		if (!pngHandle || !dibHandle) {
+			if (pngHandle) this->provider->freeData(pngHandle);
+			if (dibHandle) this->provider->freeData(dibHandle);
+			done(false, QStringLiteral("allocation-failed"));
+			return;
+		}
+		auto data = std::make_shared<ImageData>(this->provider, pngHandle, dibHandle);
+		this->writeImageData(std::move(data), std::move(done), 1);
+	}
+
+	void writeImageData(std::shared_ptr<ImageData> data, Done done, int attempt) {
+		if (!this->provider->open()) {
+			if (attempt >= WRITE_ATTEMPTS) {
+				done(false, QStringLiteral("clipboard-busy"));
+				return;
+			}
+			QTimer::singleShot(OPEN_RETRY_MS, this, [this, data, done, attempt]() {
+				this->writeImageData(data, done, attempt + 1);
+			});
+			return;
+		}
+
+		auto ok = this->provider->empty();
+		if (ok) {
+			const auto pngOk = this->provider->set(this->provider->pngFormat(), data->pngHandle);
+			if (pngOk) data->pngHandle = nullptr; // Windows now owns this HGLOBAL.
+			const auto dibOk = this->provider->set(CF_DIB, data->dibHandle);
+			if (dibOk) data->dibHandle = nullptr; // Windows now owns this HGLOBAL.
+			ok = pngOk && dibOk;
+		}
+		this->provider->close();
+		done(ok, ok ? QString() : QStringLiteral("set-failed"));
+	}
 
 	void writeData(quint32 format, void* handle, Done done) {
 		if (!handle) {
