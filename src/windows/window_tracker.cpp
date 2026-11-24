@@ -1,5 +1,4 @@
 #include "window_tracker.hpp"
-#include "transition_trace.hpp"
 #include <atomic>
 #include <mutex>
 #include <string>
@@ -8,6 +7,11 @@
 #include <utility>
 #include <vector>
 
+#include <appmodel.h>
+#include <dwmapi.h>
+#include <initguid.h>
+#include <propkey.h>
+#include <propsys.h>
 #include <qfileinfo.h>
 #include <qguiapplication.h>
 #include <qhash.h>
@@ -23,25 +27,21 @@
 #include <qstring.h>
 #include <qtimer.h>
 #include <qtypes.h>
+#include <shellapi.h>
 
 #include "activation_policy.hpp"
 #include "desktopentry_backend.hpp"
 #include "fullscreen_geometry.hpp"
 #include "process_image_name.hpp"
-#include "startup.hpp"
 #include "redact.hpp"
+#include "startup.hpp"
 #include "system_surface.hpp"
+#include "transition_trace.hpp"
 #include "util.hpp"
 #include "virtual_desktops.hpp"
 #include "window_event_filter.hpp"
-
-#include <initguid.h>
-
-#include <appmodel.h>
-#include <dwmapi.h>
-#include <propkey.h>
-#include <propsys.h>
-#include <shellapi.h>
+#include "window_identity_policy.hpp"
+#include "window_responsiveness.hpp"
 
 #ifndef EVENT_OBJECT_CLOAKED
 #define EVENT_OBJECT_CLOAKED 0x8017
@@ -58,12 +58,12 @@ constexpr UINT WM_QS_WINEVENTS = WM_APP + 1;
 constexpr int MOVING_FLUSH_MS = 50;
 constexpr int SWEEP_INTERVAL_MS = 10000;
 
-std::mutex gEventMutex;                          // NOLINT
-std::vector<WindowEvent> gEvents;                // NOLINT
-std::unordered_set<HWND> gTracked;               // NOLINT
-std::atomic<bool> gEventWakePending = false;     // NOLINT
-std::atomic<HWND> gEventTarget = nullptr;        // NOLINT
-std::atomic<quint64> gEventSequence = 0;         // NOLINT
+std::mutex gEventMutex;                      // NOLINT
+std::vector<WindowEvent> gEvents;            // NOLINT
+std::unordered_set<HWND> gTracked;           // NOLINT
+std::atomic<bool> gEventWakePending = false; // NOLINT
+std::atomic<HWND> gEventTarget = nullptr;    // NOLINT
+std::atomic<quint64> gEventSequence = 0;     // NOLINT
 
 bool onlyForTracked(DWORD event) {
 	switch (event) {
@@ -93,10 +93,11 @@ void CALLBACK queueEvent(
     DWORD /*eventThread*/,
     DWORD eventTime
 ) {
-	auto desktopReorder = event == EVENT_OBJECT_REORDER
+	auto desktopReorder =
+	    event == EVENT_OBJECT_REORDER
 	    && window_events::isDesktopReorder(event, hwnd, idObject, idChild, GetDesktopWindow());
-	if (!desktopReorder
-	    && (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || hwnd == nullptr)) return;
+	if (!desktopReorder && (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || hwnd == nullptr))
+		return;
 
 	auto trackedOnly = onlyForTracked(event);
 	if (!trackedOnly && event != EVENT_SYSTEM_FOREGROUND && GetAncestor(hwnd, GA_ROOT) != hwnd) {
@@ -250,7 +251,7 @@ void TrackedWindow::releaseFullscreenOwnership() {
 	this->endingTracking = true;
 	if (this->fullscreenOwner.release() == fullscreen_ownership::Release::Failed) {
 		qCWarning(logTracker) << "Could not restore optional fullscreen ownership for"
-		                     << this->addressHex();
+		                      << this->addressHex();
 	}
 }
 
@@ -270,20 +271,35 @@ void TrackedWindow::refreshIdentity() {
 	this->mFrameThreadId = GetWindowThreadProcessId(this->mHwnd, &pid);
 	this->mFrameProcessId = pid;
 
-	this->uwpFrame = windowClass(this->mHwnd) == QString::fromWCharArray(UWP_FRAME_CLASS);
+	auto className = windowClass(this->mHwnd);
+	this->uwpFrame = className == QString::fromWCharArray(UWP_FRAME_CLASS);
 
 	if (this->uwpFrame) {
 		auto* core = FindWindowExW(this->mHwnd, nullptr, UWP_CORE_CLASS, nullptr);
 		if (core != nullptr) GetWindowThreadProcessId(core, &pid);
 	}
 
-	auto* process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-
 	QString exe;
-	auto appId = appUserModelIdOf(this->mHwnd);
+	auto* process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
 
 	if (process != nullptr) {
 		exe = processImagePath(process);
+	}
+
+	auto processName = QFileInfo(exe).fileName();
+	if (processName.isEmpty()) processName = processImageNameFromSnapshot(pid);
+
+	auto appId = shouldQueryWindowPropertyStore(
+	                 processName,
+	                 className,
+	                 [this] { return windowResponding(this->mHwnd); },
+	                 system_surface::isShellHostProcess,
+	                 system_surface::isShellClass
+	             )
+	               ? appUserModelIdOf(this->mHwnd)
+	               : QString();
+
+	if (process != nullptr) {
 		if (appId.isEmpty()) appId = appUserModelIdOf(process);
 		CloseHandle(process);
 	}
@@ -293,7 +309,7 @@ void TrackedWindow::refreshIdentity() {
 	// A window with no application id never reaches the task list, so the
 	// deferred User Account Control request of consent.exe (a SYSTEM process
 	// this one cannot open) had no row to activate and waited forever.
-	if (appId.isEmpty()) appId = appIdFromImageName(processImageNameFromSnapshot(pid));
+	if (appId.isEmpty()) appId = appIdFromImageName(processName);
 
 	WindowsDesktopEntryBackend::noteWindowExe(appId, exe);
 
@@ -328,9 +344,9 @@ void TrackedWindow::refreshState() {
 	RECT frame {};
 	auto trace = transition_trace::enabled();
 	RECT raw {};
-	auto hasFrame = SUCCEEDED(DwmGetWindowAttribute(
-	    this->mHwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame)
-	));
+	auto hasFrame = SUCCEEDED(
+	    DwmGetWindowAttribute(this->mHwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))
+	);
 	if (!hasFrame || trace) GetWindowRect(this->mHwnd, &raw);
 	if (!hasFrame) frame = raw;
 
@@ -359,17 +375,30 @@ void TrackedWindow::refreshState() {
 		auto id = transition_trace::handle(reinterpret_cast<quintptr>(this->mHwnd));
 		auto frameRect = toQRect(frame);
 		if (!this->traceObserved || style != this->traceStyle || exStyle != this->traceExStyle) {
-			QS_TRANSITION_TRACE("window_style", {{"window", id},
-			    {"style", QString::number(static_cast<quintptr>(style), 16)},
-			    {"exstyle", QString::number(static_cast<quintptr>(exStyle), 16)}});
+			QS_TRANSITION_TRACE(
+			    "window_style",
+			    {{"window", id},
+			     {"style", QString::number(static_cast<quintptr>(style), 16)},
+			     {"exstyle", QString::number(static_cast<quintptr>(exStyle), 16)}}
+			);
 		}
 		if (!this->traceObserved || frameRect != this->traceRect) {
-			QS_TRANSITION_TRACE("window_rect", {{"window", id}, {"frame", transition_trace::rect(frameRect)},
-			    {"raw", transition_trace::rect(toQRect(raw))}});
+			QS_TRANSITION_TRACE(
+			    "window_rect",
+			    {{"window", id},
+			     {"frame", transition_trace::rect(frameRect)},
+			     {"raw", transition_trace::rect(toQRect(raw))}}
+			);
 		}
 		if (!this->traceObserved || fullscreen != this->bFullscreen.value()) {
-			QS_TRANSITION_TRACE("fullscreen", {{"window", id}, {"active", fullscreen},
-			    {"cloaked", cloaked}, {"app_cloaked", appCloaked}, {"initial", !this->traceObserved}});
+			QS_TRANSITION_TRACE(
+			    "fullscreen",
+			    {{"window", id},
+			     {"active", fullscreen},
+			     {"cloaked", cloaked},
+			     {"app_cloaked", appCloaked},
+			     {"initial", !this->traceObserved}}
+			);
 		}
 		this->traceStyle = style;
 		this->traceExStyle = exStyle;
@@ -434,8 +463,7 @@ bool TrackedWindow::activate() {
 		// A minimized window of a higher-integrity process, such as a waiting
 		// User Account Control request, refuses the restore. The policy names
 		// the one case that may use the taskbar's own switch instead.
-		if (minimizedActivation(restored, GetLastError(), source)
-		    == MinimizedActivation::TaskbarSwitch)
+		if (minimizedActivation(restored, GetLastError(), source) == MinimizedActivation::TaskbarSwitch)
 		{
 			SwitchToThisWindow(this->mHwnd, TRUE);
 			return true;
@@ -487,7 +515,7 @@ void TrackedWindow::fullscreenOn(QScreen* screen) {
 	auto rects = monitorRects(monitorForScreen(screen));
 	if (!rects.valid) return;
 	auto rect = toRECT(rects.monitor);
-	(void)this->fullscreenOwner.enter(rect, this->bFullscreen.value());
+	(void) this->fullscreenOwner.enter(rect, this->bFullscreen.value());
 }
 
 bool TrackedWindow::moveToDesktop(qsizetype index) {
@@ -510,7 +538,10 @@ void TrackedWindow::moveTo(const QPoint& logical) {
 	RECT raw {};
 	RECT frame {};
 	GetWindowRect(this->mHwnd, &raw);
-	if (FAILED(DwmGetWindowAttribute(this->mHwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame)))) {
+	if (FAILED(
+	        DwmGetWindowAttribute(this->mHwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))
+	    ))
+	{
 		frame = raw;
 	}
 
@@ -557,8 +588,12 @@ WindowTracker::WindowTracker() {
 	this->sweepTimer.start();
 
 	this->updateScreens();
-	QObject::connect(ScreenIdentityRegistry::instance(), &ScreenIdentityRegistry::screenChanged,
-	                 this, &WindowTracker::onScreensChanged);
+	QObject::connect(
+	    ScreenIdentityRegistry::instance(),
+	    &ScreenIdentityRegistry::screenChanged,
+	    this,
+	    &WindowTracker::onScreensChanged
+	);
 
 	if (auto* app = qobject_cast<QGuiApplication*>(QGuiApplication::instance())) {
 		// instance() is process-lifetime, so its destructor is not the normal
@@ -663,7 +698,9 @@ void WindowTracker::startEventThread() {
 		}
 	}
 	DestroyWindow(window);
-	qCWarning(logTracker) << "Failed to start the window event thread, windows won't be tracked live.";
+	qCWarning(
+	    logTracker
+	) << "Failed to start the window event thread, windows won't be tracked live.";
 }
 
 void WindowTracker::drainEvents() {
@@ -688,8 +725,11 @@ void WindowTracker::onEvent(DWORD event, HWND hwnd, DWORD time, quint64 sequence
 
 	switch (event) {
 	case EVENT_SYSTEM_FOREGROUND:
-		QS_TRANSITION_TRACE("foreground", {{"window", transition_trace::handle(reinterpret_cast<quintptr>(hwnd))},
-		    {"eventTimeMs", static_cast<qint64>(time)}});
+		QS_TRANSITION_TRACE(
+		    "foreground",
+		    {{"window", transition_trace::handle(reinterpret_cast<quintptr>(hwnd))},
+		     {"eventTimeMs", static_cast<qint64>(time)}}
+		);
 		this->foregroundDirty = true;
 		if (!tracked) this->candidates.insert(hwnd);
 		emit this->foregroundChanged(hwnd, time);
@@ -961,10 +1001,12 @@ void WindowTracker::updateActive() {
 		auto identity = system_surface::observe(foreground);
 
 		if (system_surface::isShellSurface(identity)) {
-			QS_TRANSITION_TRACE("foreground_shell",
+			QS_TRANSITION_TRACE(
+			    "foreground_shell",
 			    {{"window", transition_trace::handle(reinterpret_cast<quintptr>(foreground))},
-			        {"class", identity.windowClass},
-			        {"desktop", system_surface::isDesktopSurface(identity)}});
+			     {"class", identity.windowClass},
+			     {"desktop", system_surface::isDesktopSurface(identity)}}
+			);
 			// The task switcher, Task View, Start/Search and the foreground
 			// staging windows are shell overlays, not applications. Keeping the
 			// last application through them avoids the active-window churn that
@@ -1005,7 +1047,11 @@ void WindowTracker::refreshForeground() {
 
 void WindowTracker::setActive(TrackedWindow* window) {
 	if (window == this->mActive) return;
-	QS_TRANSITION_TRACE("focus", {{"window", transition_trace::handle(window ? reinterpret_cast<quintptr>(window->hwnd()) : 0)}});
+	QS_TRANSITION_TRACE(
+	    "focus",
+	    {{"window",
+	      transition_trace::handle(window ? reinterpret_cast<quintptr>(window->hwnd()) : 0)}}
+	);
 
 	Qt::beginPropertyUpdateGroup();
 	if (this->mActive != nullptr) this->mActive->bActivated = false;

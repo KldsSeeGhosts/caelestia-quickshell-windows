@@ -1,21 +1,24 @@
 #include "item.hpp"
+#include <utility>
 
-#include <qt_windows.h>
-#include <shellapi.h>
-
+#include <qcoreapplication.h>
 #include <qimage.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
+#include <qmetaobject.h>
 #include <qnamespace.h>
 #include <qobject.h>
 #include <qpixmap.h>
+#include <qpointer.h>
 #include <qquickitem.h>
 #include <qquickwindow.h>
 #include <qsize.h>
 #include <qstring.h>
+#include <qt_windows.h>
 #include <qtimer.h>
 #include <qtypes.h>
 #include <quuid.h>
+#include <shellapi.h>
 
 #include "../../../core/logcat.hpp"
 #include "../../appicon.hpp"
@@ -34,7 +37,8 @@ constexpr int REPLAY_DELAY_MS = 150;
 
 } // namespace
 
-QPixmap TrayIconImage::requestPixmap(const QString& /*id*/, QSize* size, const QSize& requestedSize) {
+QPixmap
+TrayIconImage::requestPixmap(const QString& /*id*/, QSize* size, const QSize& requestedSize) {
 	auto pixmap = QPixmap::fromImage(this->image);
 
 	if (!pixmap.isNull() && requestedSize.width() > 0 && requestedSize.height() > 0
@@ -52,6 +56,8 @@ SystemTrayItem::SystemTrayItem(HWND hwnd, UINT uid, const QUuid& guid, QObject* 
     , hwnd(hwnd)
     , uid(uid)
     , guid(guid) {}
+
+SystemTrayItem::~SystemTrayItem() { this->iconRevision->fetch_add(1, std::memory_order_relaxed); }
 
 bool SystemTrayItem::matches(HWND hwnd, UINT uid, const QUuid& guid) const {
 	if (!guid.isNull() && guid == this->guid) return true;
@@ -82,6 +88,9 @@ void SystemTrayItem::update(const TrayIconMessage& message) {
 	if (message.message == NIM_SETVERSION) this->version = message.version;
 
 	if ((message.flags & NIF_ICON) != 0) {
+		this->iconRevision->fetch_add(1, std::memory_order_relaxed);
+		this->requestedIconRevision.reset();
+		this->imageIsFallback = false;
 		this->image.image = message.icon;
 		this->updateIconSource();
 	}
@@ -98,9 +107,16 @@ void SystemTrayItem::update(const TrayIconMessage& message) {
 }
 
 void SystemTrayItem::refreshFromExplorer(const TrayIconMessage& message) {
-	if (!message.icon.isNull() && message.icon != this->image.image) {
-		this->image.image = message.icon;
-		this->updateIconSource();
+	if (!message.icon.isNull()) {
+		auto changed = message.icon != this->image.image;
+		auto replacesFallback = this->imageIsFallback;
+		if (changed || replacesFallback) {
+			this->iconRevision->fetch_add(1, std::memory_order_relaxed);
+			this->requestedIconRevision.reset();
+			this->imageIsFallback = false;
+			this->image.image = message.icon;
+			this->updateIconSource();
+		}
 	}
 
 	if (message.tip != this->tip) this->setTip(message.tip);
@@ -120,14 +136,21 @@ void SystemTrayItem::setTip(const QString& tip) {
 void SystemTrayItem::setIdentity(const QString& id, const QString& title, const QString& exePath) {
 	this->bId = id;
 	this->bTitle = title;
+	auto executableChanged = this->exePath != exePath;
 	this->exePath = exePath;
+
+	if (executableChanged) {
+		this->iconRevision->fetch_add(1, std::memory_order_relaxed);
+		this->requestedIconRevision.reset();
+		if (this->imageIsFallback) this->image.image = QImage();
+	}
+
 	if (this->image.image.isNull()) this->updateIconSource();
 }
 
 void SystemTrayItem::updateIconSource() {
 	if (this->image.image.isNull() && !this->exePath.isEmpty()) {
-		this->image.image =
-		    iconForKey(this->exePath, QSize(FALLBACK_ICON_SIZE, FALLBACK_ICON_SIZE)).toImage();
+		this->requestFallbackIcon();
 	}
 
 	if (this->image.image.isNull()) {
@@ -137,6 +160,49 @@ void SystemTrayItem::updateIconSource() {
 
 	this->image.imageChanged();
 	this->bIcon = this->image.url();
+}
+
+void SystemTrayItem::requestFallbackIcon() {
+	auto revisionToken = this->iconRevision;
+	auto revision = revisionToken->load(std::memory_order_relaxed);
+	if (this->requestedIconRevision == revision) return;
+
+	this->requestedIconRevision = revision;
+	auto guard = QPointer<SystemTrayItem>(this);
+
+	requestShellIcon(
+	    this->exePath,
+	    QSize(FALLBACK_ICON_SIZE, FALLBACK_ICON_SIZE),
+	    [revision, revisionToken] {
+		    return revisionToken->load(std::memory_order_relaxed) != revision;
+	    },
+	    [guard, revision, revisionToken](QImage icon) {
+		    auto* app = QCoreApplication::instance();
+		    if (app == nullptr) return;
+		    QMetaObject::invokeMethod(
+		        app,
+		        [guard, revision, revisionToken, icon = std::move(icon)]() mutable {
+			        auto* target = guard.data();
+			        if (target == nullptr || revisionToken->load(std::memory_order_relaxed) != revision)
+				        return;
+
+			        if (icon.isNull()) {
+				        if (target->requestedIconRevision == revision) {
+					        target->requestedIconRevision.reset();
+				        }
+				        return;
+			        }
+
+			        if (!target->image.image.isNull()) return;
+
+			        target->image.image = std::move(icon);
+			        target->imageIsFallback = true;
+			        target->updateIconSource();
+		        },
+		        Qt::QueuedConnection
+		    );
+	    }
+	);
 }
 
 void SystemTrayItem::allowForeground() const {
@@ -171,8 +237,9 @@ void SystemTrayItem::activate() {
 	this->lastActivate = doubleClick ? 0 : now;
 
 	if (!this->hasCallback()) {
-		this->hold(doubleClick && this->pending == Pending::Activate ? Pending::DoubleClick
-		                                                            : Pending::Activate);
+		this->hold(
+		    doubleClick && this->pending == Pending::Activate ? Pending::DoubleClick : Pending::Activate
+		);
 		return;
 	}
 
@@ -208,10 +275,11 @@ void SystemTrayItem::display(QObject* parentWindow, qint32 relativeX, qint32 rel
 		}
 	}
 
-	qCDebug(logTrayItem) << "Opening the menu of"
-	                     << qs::windows::logId(this->bId.value()) << "from" << parentWindow
-	                     << "at" << relativeX << relativeY << "window" << window << "cursor target"
-	                     << (this->displayAt ? QPoint(this->displayAt->x, this->displayAt->y) : QPoint());
+	qCDebug(logTrayItem) << "Opening the menu of" << qs::windows::logId(this->bId.value()) << "from"
+	                     << parentWindow << "at" << relativeX << relativeY << "window" << window
+	                     << "cursor target"
+	                     << (this->displayAt ? QPoint(this->displayAt->x, this->displayAt->y)
+	                                         : QPoint());
 
 	if (!this->hasCallback()) {
 		this->hold(Pending::Display);

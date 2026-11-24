@@ -1,15 +1,15 @@
 #pragma once
 
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
-
-#include <qt_windows.h>
 
 #include <qhash.h>
 #include <qlist.h>
 #include <qobject.h>
 #include <qstring.h>
+#include <qt_windows.h>
 #include <qtclasshelpermacros.h>
 #include <qtimer.h>
 #include <qtmetamacros.h>
@@ -19,6 +19,7 @@
 #include "hook.hpp"
 #include "item.hpp"
 #include "seed.hpp"
+#include "worker_stop.hpp"
 
 namespace qs::windows::services::systray {
 
@@ -112,6 +113,7 @@ private:
 	bool transportsStarted = false;
 	bool stopping = false;
 	bool fallbackLogged = false;
+	CallbackGate::Ptr callbackGate = std::make_shared<CallbackGate>();
 	QList<Deletion> deletions;
 	QHash<SystemTrayItem*, OwnerWatch> ownerWatches;
 	struct UnwatchedOwner {

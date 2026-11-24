@@ -1015,6 +1015,21 @@ target_compile_definitions(qs_suite_input_settle PRIVATE NOMINMAX WIN32_LEAN_AND
 target_include_directories(qs_suite_input_settle PRIVATE ${QS_WINDOWS_SRC})
 target_link_libraries(qs_suite_input_settle PRIVATE Qt6::Core Qt6::Test)
 
+# Explorer-hang guards: the bounded worker-stop contract keeps detached thread
+# state on the heap, and the property-store policy skips shell-owned or
+# unresponsive windows. No fixture window or live desktop is touched.
+qs_add_portable_suite(explorer_hang_hardening
+	explorer_hang_hardening_test.cpp
+	${QS_WINDOWS_SRC}/services/systray/seed.cpp
+)
+target_compile_definitions(qs_suite_explorer_hang_hardening PRIVATE
+	NOMINMAX WIN32_LEAN_AND_MEAN
+)
+target_include_directories(qs_suite_explorer_hang_hardening PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(qs_suite_explorer_hang_hardening PRIVATE
+	Qt6::Core Qt6::Gui Qt6::Test user32 ole32
+)
+
 # Super-drag restore/placement waits: geometry decides completion, the deadline
 # only reports failure.
 qs_add_portable_suite(super_drag_wait super_drag_wait_test.cpp)
@@ -1205,7 +1220,7 @@ qs_add_portable_runner(portable_core SUITES
 )
 qs_add_portable_runner(portable_runtime SUITES
 	fs_utils ipc_limits input_settle super_drag_wait process_image_name
-	idle_request fullscreen_ownership capture_affinity
+	idle_request fullscreen_ownership capture_affinity explorer_hang_hardening
 )
 qs_add_portable_runner(portable_tiling SUITES
 	tiling_layout tiling_observability tiling_manager tiling_drag tiling_reload
@@ -1293,7 +1308,8 @@ set(QS_TESTS_PORTABLE
 	transition_trace foreground_observer activation_policy fullscreen_app_state
 	panel_topmost power_profiles brightness_route display_identity
 	native_desktop_recovery pw_session_worker idle_request launcher_exit input_settle
-	super_drag_wait process_image_name network_wifi_route runtime_paths lazyloader
+	super_drag_wait process_image_name explorer_hang_hardening
+	network_wifi_route runtime_paths lazyloader
 	fullscreen_ownership display_transaction clipboard_capture clipboard_writer capture_dimensions
 	erm625_native_desktop_facade network_wifi_identity capture_affinity window_stack
 	fileview_transaction

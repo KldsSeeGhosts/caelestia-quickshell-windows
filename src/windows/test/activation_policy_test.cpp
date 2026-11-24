@@ -482,6 +482,10 @@ private slots:
 		QCOMPARE(util.count(QStringLiteral("SetFocus(")), 1);
 		QCOMPARE(util.count(QStringLiteral("forceForegroundFromHook(")), 2);
 		QVERIFY2(
+		    util.contains(QStringLiteral("if (!windowResponding(foreground)) return false;")),
+		    "the foreground input-queue escalation probes responsiveness first"
+		);
+		QVERIFY2(
 		    util.contains(QStringLiteral("mayForceForeground(source) && forceForegroundFromHook(hwnd)")),
 		    "util.cpp does not gate the hook escalation on the activation source"
 		);

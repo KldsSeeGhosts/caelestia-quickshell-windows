@@ -25,6 +25,15 @@ void afterFirstFrame(QObject* context, std::function<void()> callback) {
 
 namespace qs::windows {
 QPixmap iconForKey(const QString&, const QSize&) { return {}; }
+
+void requestShellIcon(
+    const QString&,
+    const QSize&,
+    std::function<bool()> cancelled,
+    std::function<void(QImage)> done
+) {
+	if (!cancelled || !cancelled()) done({});
+}
 } // namespace qs::windows
 
 namespace qs::redact {
@@ -38,6 +47,9 @@ bool observerCanRetry = false;
 std::function<void(ComObserverState)> observerStateChanged;
 int observerStarts = 0;
 int observerResyncs = 0;
+DWORD observerThreadId = 0;
+bool observerRetryable = false;
+ComObserverState observerState = ComObserverState::Inactive;
 QList<bool> hookStarts;
 QList<bool> hookModeChanges;
 } // namespace
@@ -58,30 +70,37 @@ bool TrayHook::running() { return false; }
 QVariantMap TrayHook::capability() { return {}; }
 void TrayHook::announceTo(std::vector<HWND>) {}
 
-TrayNotifyObserver::TrayNotifyObserver(std::unique_ptr<TrayNotifyBackend>) {}
+TrayNotifyObserver::TrayNotifyObserver(BackendFactory) {}
 TrayNotifyObserver::~TrayNotifyObserver() = default;
 
 void TrayNotifyObserver::start(TrayIconSink, std::function<void(ComObserverState)> onState) {
 	observerStarts++;
 	observerStateChanged = std::move(onState);
-	this->threadId = GetCurrentThreadId();
+	observerThreadId = GetCurrentThreadId();
 	observerStateChanged(ComObserverState::Connecting);
-	this->retryable.store(observerCanRetry);
+	observerRetryable = observerCanRetry;
+	observerState = observerResult;
 	observerStateChanged(observerResult);
 }
 
 void TrayNotifyObserver::resync() {
-	if (this->threadId == 0) return;
+	if (observerThreadId == 0) return;
 	observerResyncs++;
 	observerStateChanged(ComObserverState::Connecting);
-	this->retryable.store(observerCanRetry);
+	observerRetryable = observerCanRetry;
+	observerState = observerResult;
 	observerStateChanged(observerResult);
 }
 
 void TrayNotifyObserver::stop() {
-	this->threadId = 0;
+	observerThreadId = 0;
+	observerRetryable = false;
+	observerState = ComObserverState::Inactive;
 	observerStateChanged = {};
 }
+
+ComObserverState TrayNotifyObserver::state() const { return observerState; }
+bool TrayNotifyObserver::canRetry() const { return observerRetryable; }
 } // namespace qs::windows::services::systray
 
 using namespace qs::windows::services::systray;
@@ -96,6 +115,9 @@ private slots:
 		observerCanRetry = false;
 		observerStarts = 0;
 		observerResyncs = 0;
+		observerThreadId = 0;
+		observerRetryable = false;
+		observerState = ComObserverState::Inactive;
 		hookStarts.clear();
 		hookModeChanges.clear();
 	}
@@ -137,8 +159,9 @@ void TrayHostTest::transportByObserverOutcome_data() {
 	                            << QStringLiteral("brief") << true << false;
 	QTest::newRow("brief-stub") << QByteArray("brief") << int(ComObserverState::StubNoOp)
 	                            << QStringLiteral("brief") << true << false;
-	QTest::newRow("brief-permanent-failure") << QByteArray("brief") << int(ComObserverState::Unavailable)
-	                                         << QStringLiteral("brief") << true << false;
+	QTest::newRow("brief-permanent-failure")
+	    << QByteArray("brief") << int(ComObserverState::Unavailable) << QStringLiteral("brief")
+	    << true << false;
 	QTest::newRow("default") << QByteArray("") << int(ComObserverState::StubNoOp)
 	                         << QStringLiteral("mirror") << false << false;
 	QTest::newRow("disabled") << QByteArray("0") << int(ComObserverState::Inactive)
@@ -156,9 +179,15 @@ void TrayHostTest::transportByObserverOutcome() {
 	const auto disabled = observerResult == ComObserverState::Inactive;
 	auto host = std::unique_ptr<TrayHost>(TrayHost::createForTest());
 
-	QTRY_COMPARE(host->hookCapability().value("comObserver").toString(), comObserverStateName(observerResult));
+	QTRY_COMPARE(
+	    host->hookCapability().value("comObserver").toString(),
+	    comObserverStateName(observerResult)
+	);
 	QCOMPARE(host->hookCapability().value("transport").toString(), transport);
-	QCOMPARE(host->hookCapability().value("availability").toString(), disabled ? "disabled" : "available");
+	QCOMPARE(
+	    host->hookCapability().value("availability").toString(),
+	    disabled ? "disabled" : "available"
+	);
 	QCOMPARE(host->hookCapability().value("reason").toString(), disabled ? "hook-disabled" : "");
 	QCOMPARE(observerStarts, disabled ? 0 : 1);
 	QCOMPARE(hookStarts, disabled ? QList<bool>() : QList<bool> {brief});
@@ -181,7 +210,10 @@ void TrayHostTest::briefStopsRetryOnLiveOrStub() {
 	QTRY_VERIFY(host->pollActiveForTest());
 
 	observerResult = static_cast<ComObserverState>(state);
-	QTRY_COMPARE(host->hookCapability().value("comObserver").toString(), comObserverStateName(observerResult));
+	QTRY_COMPARE(
+	    host->hookCapability().value("comObserver").toString(),
+	    comObserverStateName(observerResult)
+	);
 	QCOMPARE(observerResyncs, 1);
 	QVERIFY(!host->pollActiveForTest());
 	QVERIFY(hookModeChanges.isEmpty());
@@ -195,10 +227,10 @@ void TrayHostTest::explorerRestartResyncsObserver() {
 	QCOMPARE(observerResyncs, 0);
 
 	observerResult = ComObserverState::Live;
-	emit qs::windows::SupervisorBridge::instance()->explorerSettled(1234, 5678, 1, true);
+	emit qs::windows::SupervisorBridge::instance() -> explorerSettled(1234, 5678, 1, true);
 	QCOMPARE(observerResyncs, 0);
 
-	emit qs::windows::SupervisorBridge::instance()->explorerSettled(1234, 5679, 2, true);
+	emit qs::windows::SupervisorBridge::instance() -> explorerSettled(1234, 5679, 2, true);
 	QCOMPARE(observerResyncs, 1);
 	QTRY_COMPARE(host->hookCapability().value("comObserver").toString(), "live");
 	QCOMPARE(host->hookCapability().value("transport").toString(), "com-hybrid");

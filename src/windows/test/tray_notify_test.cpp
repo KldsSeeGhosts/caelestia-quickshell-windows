@@ -4,8 +4,8 @@
 #include <utility>
 
 #include <qscopeguard.h>
-#include <qtest.h>
 #include <qt_windows.h>
+#include <qtest.h>
 #include <shellapi.h>
 
 #include "../services/systray/seed.hpp"
@@ -19,7 +19,8 @@ using namespace qs::windows::services::systray;
 namespace {
 
 constexpr auto CALLBACK_MESSAGE = WM_APP + 1;
-constexpr GUID ICON_GUID = {0x9d3a704c, 0xea80, 0x4bd3, {0x8b, 0x09, 0x41, 0x2a, 0x26, 0xc9, 0xb4, 0x88}};
+constexpr GUID ICON_GUID =
+    {0x9d3a704c, 0xea80, 0x4bd3, {0x8b, 0x09, 0x41, 0x2a, 0x26, 0xc9, 0xb4, 0x88}};
 
 class TestBackend: public TrayNotifyBackend {
 public:
@@ -39,7 +40,18 @@ public:
 		cls.lpszClassName = L"QsTrayNotifyTestBackend";
 		RegisterClassW(&cls);
 		auto* hwnd = CreateWindowExW(
-		    0, cls.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, cls.hInstance, this
+		    0,
+		    cls.lpszClassName,
+		    L"",
+		    0,
+		    0,
+		    0,
+		    0,
+		    0,
+		    HWND_MESSAGE,
+		    nullptr,
+		    cls.hInstance,
+		    this
 		);
 		if (hwnd == nullptr) return {HRESULT_FROM_WIN32(GetLastError())};
 
@@ -82,7 +94,11 @@ private:
 		wchar_t exe[] = L"C:\\tray-test\\owner.exe";
 		wchar_t tip[] = L"fixture icon";
 		const TrayNotifyItem item {
-		    .exeName = exe, .tip = tip, .hwnd = hwnd, .id = 19, .guid = ICON_GUID,
+		    .exeName = exe,
+		    .tip = tip,
+		    .hwnd = hwnd,
+		    .id = 19,
+		    .guid = ICON_GUID,
 		};
 		this->notify(event, &item);
 	}
@@ -102,22 +118,28 @@ private slots:
 	void liveAddModifyDelete() {
 		std::mutex mutex;
 		QList<TrayIconMessage> icons;
-		auto backend = std::make_unique<TestBackend>(TrayNotifyBackend::Registration {S_OK, 7}, true);
+		auto backend = std::make_shared<TestBackend>(TrayNotifyBackend::Registration {S_OK, 7}, true);
 		auto* fake = backend.get();
-		TrayNotifyObserver observer(std::move(backend));
+		TrayNotifyObserver observer([backend] { return backend; });
 		QCOMPARE(observer.state(), ComObserverState::Inactive);
-		observer.start([&](TrayIconMessage message) {
-			const auto lock = std::lock_guard(mutex);
-			icons.append(std::move(message));
-		}, {});
+		observer.start(
+		    [&](TrayIconMessage message) {
+			    const auto lock = std::lock_guard(mutex);
+			    icons.append(std::move(message));
+		    },
+		    {}
+		);
 		QTRY_COMPARE(observer.state(), ComObserverState::Live);
 		QVERIFY(fake->post(0));
 		QVERIFY(fake->post(1));
 		QVERIFY(fake->post(2));
-		QTRY_COMPARE(([&] {
-			const auto lock = std::lock_guard(mutex);
-			return icons.size();
-		}()), 4);
+		QTRY_COMPARE(
+		    ([&] {
+			    const auto lock = std::lock_guard(mutex);
+			    return icons.size();
+		    }()),
+		    4
+		);
 
 		observer.stop();
 		QCOMPARE(icons.at(0).message, DWORD(NIM_ADD));
@@ -144,13 +166,15 @@ private slots:
 		QTest::addColumn<bool>("seed");
 		QTest::addColumn<int>("state");
 		QTest::newRow("silent-stub") << S_OK << 0UL << true << false << int(ComObserverState::StubNoOp);
-		QTest::newRow("access-denied") << E_ACCESSDENIED << 0UL << true << false << int(ComObserverState::Unavailable);
+		QTest::newRow("access-denied")
+		    << E_ACCESSDENIED << 0UL << true << false << int(ComObserverState::Unavailable);
 		QTest::newRow("server-retry") << RPC_E_SERVERCALL_RETRYLATER << 0UL << true << false
 		                              << int(ComObserverState::Unavailable);
 		QTest::newRow("handle-only") << S_OK << 33UL << true << false << int(ComObserverState::Live);
 		QTest::newRow("callback-only") << S_OK << 0UL << true << true << int(ComObserverState::Live);
 		QTest::newRow("win7") << S_OK << 0UL << false << true << int(ComObserverState::Live);
-		QTest::newRow("win7-empty") << S_OK << 0UL << false << false << int(ComObserverState::Unavailable);
+		QTest::newRow("win7-empty") << S_OK << 0UL << false << false
+		                            << int(ComObserverState::Unavailable);
 	}
 
 	void registrationOutcomes() {
@@ -160,12 +184,13 @@ private slots:
 		QFETCH(bool, seed);
 		QFETCH(int, state);
 		auto expected = static_cast<ComObserverState>(state);
-		auto backend = std::make_unique<TestBackend>(
-		    TrayNotifyBackend::Registration {result, handle, hasHandle}, seed
+		auto backend = std::make_shared<TestBackend>(
+		    TrayNotifyBackend::Registration {result, handle, hasHandle},
+		    seed
 		);
 		auto* fake = backend.get();
 		std::atomic<ComObserverState> published = ComObserverState::Inactive;
-		TrayNotifyObserver observer(std::move(backend));
+		TrayNotifyObserver observer([backend] { return backend; });
 		observer.start({}, [&](ComObserverState next) { published.store(next); });
 		QTRY_COMPARE(published.load(), expected);
 		QCOMPARE(observer.state(), expected);
@@ -178,13 +203,16 @@ private slots:
 	}
 
 	void resyncAndStopJoinSta() {
-		auto backend = std::make_unique<TestBackend>(TrayNotifyBackend::Registration {S_OK, 7}, true);
+		auto backend = std::make_shared<TestBackend>(TrayNotifyBackend::Registration {S_OK, 7}, true);
 		auto* fake = backend.get();
 		std::atomic<int> seeds = 0;
-		TrayNotifyObserver observer(std::move(backend));
-		observer.start([&](const TrayIconMessage& icon) {
-			if (icon.seeded) seeds++;
-		}, {});
+		TrayNotifyObserver observer([backend] { return backend; });
+		observer.start(
+		    [&](const TrayIconMessage& icon) {
+			    if (icon.seeded) seeds++;
+		    },
+		    {}
+		);
 		QTRY_COMPARE(observer.state(), ComObserverState::Live);
 		auto id = fake->workerId.load();
 		QVERIFY(id != GetCurrentThreadId());
@@ -204,6 +232,28 @@ private slots:
 		QCOMPARE(fake->unregistrations.load(), 2);
 		QCOMPARE(fake->unregisterThread.load(), id);
 		QCOMPARE(WaitForSingleObject(thread, 0), DWORD(WAIT_OBJECT_0));
+	}
+
+	void restartCreatesFreshBackend() {
+		QList<std::shared_ptr<TestBackend>> created;
+		TrayNotifyObserver observer([&] {
+			auto backend =
+			    std::make_shared<TestBackend>(TrayNotifyBackend::Registration {S_OK, 7}, false);
+			created.append(backend);
+			return backend;
+		});
+
+		observer.start({}, {});
+		QTRY_COMPARE(observer.state(), ComObserverState::Live);
+		observer.stop();
+		observer.start({}, {});
+		QTRY_COMPARE(observer.state(), ComObserverState::Live);
+		observer.stop();
+
+		QCOMPARE(created.size(), 2);
+		QVERIFY(created.at(0) != created.at(1));
+		QCOMPARE(created.at(0)->registrations.load(), 1);
+		QCOMPARE(created.at(1)->registrations.load(), 1);
 	}
 };
 
