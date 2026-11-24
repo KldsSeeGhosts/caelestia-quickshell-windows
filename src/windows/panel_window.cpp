@@ -1098,7 +1098,13 @@ void WinPanelWindow::applyCaptureExclusion() {
 
 void WinPanelWindow::applyNativeStyles() {
 	auto* hwnd = this->hwnd();
-	setExStyleBits(hwnd, WS_EX_TOOLWINDOW, true);
+	if (hwnd == nullptr) return;
+
+	auto exStyle = static_cast<std::uint32_t>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+	auto styled = panel_focus_style::applyExtendedStyle(exStyle, this->bKeyboardFocus.value());
+	if (styled != exStyle) {
+		SetWindowLongPtrW(hwnd, GWL_EXSTYLE, static_cast<LONG_PTR>(styled));
+	}
 
 	if (this->mEmbedParent != nullptr) {
 		setChildStyle(hwnd, true);
@@ -1817,6 +1823,7 @@ void WinPanelWindow::updateFocus() {
 	}
 
 	this->updateFocusFlag();
+	if (this->hwnd() != nullptr) this->applyNativeStyles();
 
 	if (focus == PanelKeyboardFocus::None) {
 		// A pinned popout gives up focus without closing, so this is the only
@@ -1850,9 +1857,9 @@ void WinPanelWindow::updateFocusFlag() {
 
 void WinPanelWindow::applyFocusFlag() {
 	auto noFocus = this->bKeyboardFocus.value() == PanelKeyboardFocus::None;
-	if (this->window->flags().testFlag(Qt::WindowDoesNotAcceptFocus) == noFocus) return;
-
-	this->window->setFlag(Qt::WindowDoesNotAcceptFocus, noFocus);
+	if (this->window->flags().testFlag(Qt::WindowDoesNotAcceptFocus) != noFocus) {
+		this->window->setFlag(Qt::WindowDoesNotAcceptFocus, noFocus);
+	}
 	if (this->hwnd() != nullptr) this->applyNativeStyles();
 	InputMaskTracker::instance()->refresh();
 }
@@ -1892,6 +1899,8 @@ void WinPanelWindow::takeFocusOnExpose() {
 }
 
 void WinPanelWindow::grabKeyboardFocus() {
+	if (!panel_focus_style::allowsKeyboardFocusGrab(this->bKeyboardFocus.value())) return;
+
 	auto* hwnd = this->hwnd();
 	if (hwnd == nullptr) return;
 
@@ -1943,6 +1952,15 @@ void WinPanelWindow::applyBoundedMask(bool hasMask) {
 
 bool WinPanelWindow::handleNativeMessage(MSG* msg, qintptr* result) {
 	if (this->window == nullptr) return false;
+
+	if (msg->message == WM_MOUSEACTIVATE) {
+		auto activation =
+		    panel_focus_style::mouseActivationResult(this->bKeyboardFocus.value());
+		if (activation) {
+			*result = *activation;
+			return true;
+		}
+	}
 
 	if (msg->message == WM_WINDOWPOSCHANGING) {
 		auto* pos = reinterpret_cast<WINDOWPOS*>(msg->lParam); // NOLINT(performance-no-int-to-ptr)

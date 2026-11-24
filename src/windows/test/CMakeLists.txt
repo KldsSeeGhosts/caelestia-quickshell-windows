@@ -812,6 +812,10 @@ qs_add_portable_suite(panel_topmost panel_topmost_test.cpp)
 target_include_directories(qs_suite_panel_topmost PRIVATE ${QS_WINDOWS_SRC})
 target_link_libraries(qs_suite_panel_topmost PRIVATE Qt6::Core Qt6::Test)
 
+qs_add_portable_suite(panel_focus_style panel_focus_style_test.cpp)
+target_include_directories(qs_suite_panel_focus_style PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(qs_suite_panel_focus_style PRIVATE Qt6::Core Qt6::Test)
+
 qs_add_portable_suite(power_profiles
 	power_profiles_test.cpp
 	${QS_WINDOWS_SRC}/services/upower/powerprofiles.cpp
@@ -1200,7 +1204,7 @@ target_link_libraries(qs_tiling_fakes PRIVATE Qt6::Gui Qt6::GuiPrivate Qt6::Qml)
 qs_add_portable_runner(portable_core SUITES
 	crash_relaunch_policy crash_retention redaction log_scrub log_redaction_guard
 	supervisor_protocol
-	transition_trace activation_policy fullscreen_app_state panel_topmost
+	transition_trace activation_policy fullscreen_app_state panel_topmost panel_focus_style
 	dispatcher erm625_native_desktop_facade lazyloader runtime_paths
 )
 qs_add_portable_runner(portable_runtime SUITES
@@ -1291,7 +1295,7 @@ set(QS_TESTS_PORTABLE
 	bt_pairing_policy mpris_status mpris_art_cache pw_audio_control
 	upower_status tiling_observability tiling_manager tiling_drag tiling_reload
 	transition_trace foreground_observer activation_policy fullscreen_app_state
-	panel_topmost power_profiles brightness_route display_identity
+	panel_topmost panel_focus_style power_profiles brightness_route display_identity
 	native_desktop_recovery pw_session_worker idle_request launcher_exit input_settle
 	super_drag_wait process_image_name network_wifi_route runtime_paths lazyloader
 	fullscreen_ownership display_transaction clipboard_capture clipboard_writer capture_dimensions

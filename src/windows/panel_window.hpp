@@ -34,6 +34,7 @@
 #include "capture_affinity.hpp"
 #include "panel_animation.hpp"
 #include "panel_effects.hpp"
+#include "panel_focus_style.hpp"
 #include "screen_surface_guard.hpp"
 #include "util.hpp"
 
@@ -48,12 +49,6 @@ enum class PanelLayer : quint8 {
 	Bottom = 1,
 	Top = 2,
 	Overlay = 3,
-};
-
-enum class PanelKeyboardFocus : quint8 {
-	None = 0,
-	Exclusive = 1,
-	OnDemand = 2,
 };
 
 class WinPanelWindow;
