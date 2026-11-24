@@ -1,9 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
+#include <memory>
 #include <optional>
-
-#include <qt_windows.h>
 
 #include <qimage.h>
 #include <qobject.h>
@@ -11,6 +11,7 @@
 #include <qproperty.h>
 #include <qqmlintegration.h>
 #include <qquickimageprovider.h>
+#include <qt_windows.h>
 #include <qtclasshelpermacros.h>
 #include <qtmetamacros.h>
 #include <qtypes.h>
@@ -82,6 +83,7 @@ class SystemTrayItem: public QObject {
 
 public:
 	explicit SystemTrayItem(HWND hwnd, UINT uid, const QUuid& guid, QObject* parent = nullptr);
+	~SystemTrayItem() override;
 
 	Q_INVOKABLE void activate();
 	Q_INVOKABLE void secondaryActivate();
@@ -170,7 +172,7 @@ private:
 	QString tip;
 	TrayIconImage image;
 	bool imageIsFallback = false;
-	quint64 iconRevision = 0;
+	std::shared_ptr<std::atomic<quint64>> iconRevision = std::make_shared<std::atomic<quint64>>(0);
 	std::optional<quint64> requestedIconRevision;
 	ULONGLONG lastActivate = 0;
 	Pending pending = Pending::None;

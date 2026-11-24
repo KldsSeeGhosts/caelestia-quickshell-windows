@@ -1018,12 +1018,17 @@ target_link_libraries(qs_suite_input_settle PRIVATE Qt6::Core Qt6::Test)
 # Explorer-hang guards: the bounded worker-stop contract keeps detached thread
 # state on the heap, and the property-store policy skips shell-owned or
 # unresponsive windows. No fixture window or live desktop is touched.
-qs_add_portable_suite(explorer_hang_hardening explorer_hang_hardening_test.cpp)
+qs_add_portable_suite(explorer_hang_hardening
+	explorer_hang_hardening_test.cpp
+	${QS_WINDOWS_SRC}/services/systray/seed.cpp
+)
 target_compile_definitions(qs_suite_explorer_hang_hardening PRIVATE
 	NOMINMAX WIN32_LEAN_AND_MEAN
 )
 target_include_directories(qs_suite_explorer_hang_hardening PRIVATE ${QS_WINDOWS_SRC})
-target_link_libraries(qs_suite_explorer_hang_hardening PRIVATE Qt6::Core Qt6::Test user32)
+target_link_libraries(qs_suite_explorer_hang_hardening PRIVATE
+	Qt6::Core Qt6::Gui Qt6::Test user32 ole32
+)
 
 # Super-drag restore/placement waits: geometry decides completion, the deadline
 # only reports failure.

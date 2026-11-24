@@ -1,13 +1,11 @@
 #include "host.hpp"
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>
-
-#include <qt_windows.h>
-#include <shellapi.h>
 
 #include <qcoreapplication.h>
 #include <qfileinfo.h>
@@ -18,8 +16,10 @@
 #include <qobject.h>
 #include <qstring.h>
 #include <qstringbuilder.h>
+#include <qt_windows.h>
 #include <qtenvironmentvariables.h>
 #include <quuid.h>
+#include <shellapi.h>
 
 #include "../../../core/logcat.hpp"
 #include "../../redact.hpp"
@@ -55,15 +55,51 @@ struct KnownIcon {
 const KnownIcon* knownIcon(const QUuid& guid) {
 	// NOLINTBEGIN(cert-err58-cpp)
 	static const KnownIcon icons[] = {
-	    {QUuid("{7820ae73-23e3-4229-82c1-e41cb67d5b9c}"), "Windows.Volume", "Volume", Category::Hardware, true},
-	    {QUuid("{7820ae74-23e3-4229-82c1-e41cb67d5b9c}"), "Windows.Network", "Network", Category::Hardware, true},
-	    {QUuid("{7820ae75-23e3-4229-82c1-e41cb67d5b9c}"), "Windows.Power", "Power", Category::Hardware, true},
-	    {QUuid("{7820ae76-23e3-4229-82c1-e41cb67d5b9c}"), "Windows.Health", "Security and Maintenance", Category::SystemServices, false},
-	    {QUuid("{7820ae77-23e3-4229-82c1-e41cb67d5b9c}"), "Windows.Location", "Location", Category::SystemServices, false},
-	    {QUuid("{7820ae78-23e3-4229-82c1-e41cb67d5b9c}"), "Windows.Hardware", "Safely Remove Hardware", Category::Hardware, false},
-	    {QUuid("{7820ae81-23e3-4229-82c1-e41cb67d5b9c}"), "Windows.Update", "Windows Update", Category::SystemServices, false},
-	    {QUuid("{7820ae82-23e3-4229-82c1-e41cb67d5b9c}"), "Windows.Microphone", "Microphone", Category::Hardware, false},
-	    {QUuid("{7820ae83-23e3-4229-82c1-e41cb67d5b9c}"), "Windows.MeetNow", "Meet Now", Category::Communications, false},
+	    {QUuid("{7820ae73-23e3-4229-82c1-e41cb67d5b9c}"),
+	     "Windows.Volume",
+	     "Volume",
+	     Category::Hardware,
+	     true},
+	    {QUuid("{7820ae74-23e3-4229-82c1-e41cb67d5b9c}"),
+	     "Windows.Network",
+	     "Network",
+	     Category::Hardware,
+	     true},
+	    {QUuid("{7820ae75-23e3-4229-82c1-e41cb67d5b9c}"),
+	     "Windows.Power",
+	     "Power",
+	     Category::Hardware,
+	     true},
+	    {QUuid("{7820ae76-23e3-4229-82c1-e41cb67d5b9c}"),
+	     "Windows.Health",
+	     "Security and Maintenance",
+	     Category::SystemServices,
+	     false},
+	    {QUuid("{7820ae77-23e3-4229-82c1-e41cb67d5b9c}"),
+	     "Windows.Location",
+	     "Location",
+	     Category::SystemServices,
+	     false},
+	    {QUuid("{7820ae78-23e3-4229-82c1-e41cb67d5b9c}"),
+	     "Windows.Hardware",
+	     "Safely Remove Hardware",
+	     Category::Hardware,
+	     false},
+	    {QUuid("{7820ae81-23e3-4229-82c1-e41cb67d5b9c}"),
+	     "Windows.Update",
+	     "Windows Update",
+	     Category::SystemServices,
+	     false},
+	    {QUuid("{7820ae82-23e3-4229-82c1-e41cb67d5b9c}"),
+	     "Windows.Microphone",
+	     "Microphone",
+	     Category::Hardware,
+	     false},
+	    {QUuid("{7820ae83-23e3-4229-82c1-e41cb67d5b9c}"),
+	     "Windows.MeetNow",
+	     "Meet Now",
+	     Category::Communications,
+	     false},
 	};
 	// NOLINTEND(cert-err58-cpp)
 
@@ -136,6 +172,22 @@ QString fileDescription(const QString& path) {
 	return QString::fromWCharArray(value).trimmed();
 }
 
+void dispatchToHost(
+    const CallbackGate::Ptr& callbacks,
+    TrayHost* host,
+    std::function<void(TrayHost&)> callback
+) {
+	callbacks->invoke([callbacks, host, callback = std::move(callback)]() mutable {
+		QMetaObject::invokeMethod(
+		    host,
+		    [callbacks, host, callback = std::move(callback)]() mutable {
+			    callbacks->invoke([host, callback = std::move(callback)]() mutable { callback(*host); });
+		    },
+		    Qt::QueuedConnection
+		);
+	});
+}
+
 } // namespace
 
 TrayHost* TrayHost::instance() {
@@ -160,9 +212,7 @@ TrayHost::~TrayHost() {
 		// Blocking unregistration means the callback has finished, so its
 		// context and the process handle can go. A failed unregister leaves a
 		// live callback, so leak both rather than risk a use-after-free.
-		if (watch.wait != nullptr
-		    && !UnregisterWaitEx(watch.wait, INVALID_HANDLE_VALUE))
-		{
+		if (watch.wait != nullptr && !UnregisterWaitEx(watch.wait, INVALID_HANDLE_VALUE)) {
 			clean = false;
 			continue;
 		}
@@ -189,7 +239,12 @@ TrayHost::TrayHost() {
 	this->recoverTimer.setInterval(RECOVER_DELAY_MS);
 	QObject::connect(&this->recoverTimer, &QTimer::timeout, this, &TrayHost::recoverCallbacks);
 
-	QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, this, &TrayHost::stopWorkers);
+	QObject::connect(
+	    QCoreApplication::instance(),
+	    &QCoreApplication::aboutToQuit,
+	    this,
+	    &TrayHost::stopWorkers
+	);
 	QObject::connect(
 	    SupervisorBridge::instance(),
 	    &SupervisorBridge::explorerSettled,
@@ -199,28 +254,21 @@ TrayHost::TrayHost() {
 	    }
 	);
 
-	this->sink = [this](TrayIconMessage message) {
-		QMetaObject::invokeMethod(
-		    this,
-		    [this, message = std::move(message)]() {
-			    if (!this->stopping) this->apply(message);
-		    },
-		    Qt::QueuedConnection
-		);
+	auto callbacks = this->callbackGate;
+	this->sink = [this, callbacks](TrayIconMessage message) {
+		dispatchToHost(callbacks, this, [this, message = std::move(message)](TrayHost& host) {
+			if (!host.stopping) host.apply(message);
+		});
 	};
 
-	auto missedTraffic = [this]() {
-		QMetaObject::invokeMethod(
-		    this,
-		    [this]() {
-			    if (!this->stopping && this->transport == Transport::Mirror
-			        && this->observerState == ComObserverState::Live)
-			    {
-				    this->scheduleSnapshot(RESYNC_DELAY_MS);
-			    }
-		    },
-		    Qt::QueuedConnection
-		);
+	auto missedTraffic = [this, callbacks]() {
+		dispatchToHost(callbacks, this, [](TrayHost& host) {
+			if (!host.stopping && host.transport == Transport::Mirror
+			    && host.observerState == ComObserverState::Live)
+			{
+				host.scheduleSnapshot(RESYNC_DELAY_MS);
+			}
+		});
 	};
 
 	auto mode = qEnvironmentVariable("QS_WINDOWS_TRAY_HOOK");
@@ -230,38 +278,30 @@ TrayHost::TrayHost() {
 		return;
 	}
 
-	this->configuredTransport = mode == QStringLiteral("com") ? Transport::ComHybrid
+	this->configuredTransport = mode == QStringLiteral("com")   ? Transport::ComHybrid
 	                          : mode == QStringLiteral("brief") ? Transport::Brief
-	                                                           : Transport::Mirror;
+	                                                            : Transport::Mirror;
 	this->transport = this->configuredTransport;
 	this->hookState = TrayHookState::Starting;
 
-	startup::afterFirstFrame(this, [this, missedTraffic]() {
+	startup::afterFirstFrame(this, [this, callbacks, missedTraffic]() {
 		if (this->stopping) return;
 		this->transportsStarted = true;
 		auto brief = this->transport != Transport::Mirror;
 
-		TrayHook::start(this->sink, missedTraffic, brief, [this](TrayHookState state) {
-			QMetaObject::invokeMethod(
-			    this,
-			    [this, state]() {
-				    if (this->stopping || this->hookState == state) return;
-				    this->hookState = state;
-				    emit this->hookCapabilityChanged();
-			    },
-			    Qt::QueuedConnection
-			);
+		TrayHook::start(this->sink, missedTraffic, brief, [this, callbacks](TrayHookState state) {
+			dispatchToHost(callbacks, this, [state](TrayHost& host) {
+				if (host.stopping || host.hookState == state) return;
+				host.hookState = state;
+				emit host.hookCapabilityChanged();
+			});
 		});
 
 		this->beginSnapshot();
-		this->observer.start(this->sink, [this](ComObserverState state) {
-			QMetaObject::invokeMethod(
-			    this,
-			    [this, state]() {
-				    if (!this->stopping) this->onObserverState(state);
-			    },
-			    Qt::QueuedConnection
-			);
+		this->observer.start(this->sink, [this, callbacks](ComObserverState state) {
+			dispatchToHost(callbacks, this, [state](TrayHost& host) {
+				if (!host.stopping) host.onObserverState(state);
+			});
 		});
 	});
 }
@@ -286,6 +326,7 @@ QVariantMap TrayHost::hookCapability() const {
 void TrayHost::stopWorkers() {
 	if (this->stopping) return;
 	this->stopping = true;
+	this->callbackGate->deactivate();
 	this->pollTimer.stop();
 	this->snapshotTimer.stop();
 	this->recoverTimer.stop();
@@ -425,8 +466,8 @@ void TrayHost::watchOwner(SystemTrayItem* item) {
 		if (existing->pid == pid && WaitForSingleObject(existing->process, 0) == WAIT_TIMEOUT) return;
 	}
 	auto fallback = this->unwatchedOwners.constFind(item);
-	if (fallback != this->unwatchedOwners.cend() && fallback->hwnd == hwnd
-	    && fallback->pid == pid && fallback->thread == thread)
+	if (fallback != this->unwatchedOwners.cend() && fallback->hwnd == hwnd && fallback->pid == pid
+	    && fallback->thread == thread)
 		return;
 	this->unwatchOwner(item);
 
@@ -439,8 +480,9 @@ void TrayHost::watchOwner(SystemTrayItem* item) {
 	if (process == nullptr) {
 		// Elevated or protected owners may deny SYNCHRONIZE. Their HWND
 		// and owning thread still tell us when the icon can no longer work.
-		if (pid) qCDebug(logTrayHost) << "Polling the tray owner window, process wait unavailable:"
-		                             << GetLastError();
+		if (pid)
+			qCDebug(logTrayHost) << "Polling the tray owner window, process wait unavailable:"
+			                     << GetLastError();
 		sweep();
 		return;
 	}
@@ -459,8 +501,8 @@ void TrayHost::watchOwner(SystemTrayItem* item) {
 	    ))
 	{
 		qCWarning(logTrayHost) << "Can't register the owner-process wait of"
-		                      << qs::windows::logId(item->bindableId().value()) << ":"
-		                      << GetLastError();
+		                       << qs::windows::logId(item->bindableId().value()) << ":"
+		                       << GetLastError();
 		CloseHandle(process);
 		delete context;
 		sweep();
@@ -641,9 +683,8 @@ void TrayHost::onSnapshotDone(bool ok) {
 }
 
 void TrayHost::recoverCallbacks() {
-	auto missing = std::ranges::any_of(this->mItems, [](SystemTrayItem* item) {
-		return !item->hasCallback();
-	});
+	auto missing =
+	    std::ranges::any_of(this->mItems, [](SystemTrayItem* item) { return !item->hasCallback(); });
 
 	if (!missing) return;
 
@@ -674,23 +715,21 @@ void TrayHost::requestTitle(const QString& exePath) {
 }
 
 void TrayHost::readTitles() {
-	this->titlesWorker = std::jthread([this, paths = this->titleQueue](std::stop_token stop) {
-		SetThreadDescription(GetCurrentThread(), L"qs tray titles");
+	this->titlesWorker = std::jthread(
+	    [this, callbacks = this->callbackGate, paths = this->titleQueue](std::stop_token stop) {
+		    SetThreadDescription(GetCurrentThread(), L"qs tray titles");
 
-		QHash<QString, QString> found;
-		for (const auto& path: paths) {
-			if (stop.stop_requested()) return;
-			found.insert(path, fileDescription(path));
-		}
+		    QHash<QString, QString> found;
+		    for (const auto& path: paths) {
+			    if (stop.stop_requested()) return;
+			    found.insert(path, fileDescription(path));
+		    }
 
-		QMetaObject::invokeMethod(
-		    this,
-		    [this, found = std::move(found)]() {
-			    if (!this->stopping) this->onTitles(found);
-		    },
-		    Qt::QueuedConnection
-		);
-	});
+		    dispatchToHost(callbacks, this, [found = std::move(found)](TrayHost& host) {
+			    if (!host.stopping) host.onTitles(found);
+		    });
+	    }
+	);
 }
 
 void TrayHost::onTitles(const QHash<QString, QString>& found) {

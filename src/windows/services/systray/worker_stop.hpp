@@ -2,7 +2,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <thread>
+#include <utility>
 
 #include <qt_windows.h>
 
@@ -14,6 +18,30 @@ enum class WorkerStopResult {
 	NotRunning,
 	Joined,
 	Detached,
+};
+
+// Worker callbacks run under this gate. stop() first deactivates the gate, so
+// once it returns a detached worker can no longer reach its owner's callback.
+class CallbackGate {
+public:
+	using Ptr = std::shared_ptr<CallbackGate>;
+
+	template <typename Callback>
+	bool invoke(Callback&& callback) {
+		const auto lock = std::lock_guard(this->mutex);
+		if (!this->active) return false;
+		std::invoke(std::forward<Callback>(callback));
+		return true;
+	}
+
+	void deactivate() {
+		const auto lock = std::lock_guard(this->mutex);
+		this->active = false;
+	}
+
+private:
+	std::mutex mutex;
+	bool active = true;
 };
 
 // A wedged Win32 or COM call cannot be cancelled. Detach only after the

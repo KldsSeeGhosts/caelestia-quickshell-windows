@@ -8,11 +8,11 @@ namespace qs::windows {
 // shell hosts are skipped before the responsiveness probe, because hanging
 // taskbar or shell windows are the usual source of this stall. The callbacks
 // keep the policy testable without constructing windows.
-template <typename IsShellHost, typename IsShellClass>
+template <typename IsResponding, typename IsShellHost, typename IsShellClass>
 [[nodiscard]] bool shouldQueryWindowPropertyStore(
     const QString& processName,
     const QString& windowClass,
-    bool responding,
+    IsResponding isResponding,
     IsShellHost isShellHost,
     IsShellClass isShellClass
 ) {
@@ -22,7 +22,7 @@ template <typename IsShellHost, typename IsShellClass>
 		return false;
 	}
 
-	return responding;
+	return isResponding();
 }
 
 } // namespace qs::windows

@@ -70,7 +70,7 @@ bool TrayHook::running() { return false; }
 QVariantMap TrayHook::capability() { return {}; }
 void TrayHook::announceTo(std::vector<HWND>) {}
 
-TrayNotifyObserver::TrayNotifyObserver(std::unique_ptr<TrayNotifyBackend>) {}
+TrayNotifyObserver::TrayNotifyObserver(BackendFactory) {}
 TrayNotifyObserver::~TrayNotifyObserver() = default;
 
 void TrayNotifyObserver::start(TrayIconSink, std::function<void(ComObserverState)> onState) {
@@ -159,8 +159,9 @@ void TrayHostTest::transportByObserverOutcome_data() {
 	                            << QStringLiteral("brief") << true << false;
 	QTest::newRow("brief-stub") << QByteArray("brief") << int(ComObserverState::StubNoOp)
 	                            << QStringLiteral("brief") << true << false;
-	QTest::newRow("brief-permanent-failure") << QByteArray("brief") << int(ComObserverState::Unavailable)
-	                                         << QStringLiteral("brief") << true << false;
+	QTest::newRow("brief-permanent-failure")
+	    << QByteArray("brief") << int(ComObserverState::Unavailable) << QStringLiteral("brief")
+	    << true << false;
 	QTest::newRow("default") << QByteArray("") << int(ComObserverState::StubNoOp)
 	                         << QStringLiteral("mirror") << false << false;
 	QTest::newRow("disabled") << QByteArray("0") << int(ComObserverState::Inactive)
@@ -178,9 +179,15 @@ void TrayHostTest::transportByObserverOutcome() {
 	const auto disabled = observerResult == ComObserverState::Inactive;
 	auto host = std::unique_ptr<TrayHost>(TrayHost::createForTest());
 
-	QTRY_COMPARE(host->hookCapability().value("comObserver").toString(), comObserverStateName(observerResult));
+	QTRY_COMPARE(
+	    host->hookCapability().value("comObserver").toString(),
+	    comObserverStateName(observerResult)
+	);
 	QCOMPARE(host->hookCapability().value("transport").toString(), transport);
-	QCOMPARE(host->hookCapability().value("availability").toString(), disabled ? "disabled" : "available");
+	QCOMPARE(
+	    host->hookCapability().value("availability").toString(),
+	    disabled ? "disabled" : "available"
+	);
 	QCOMPARE(host->hookCapability().value("reason").toString(), disabled ? "hook-disabled" : "");
 	QCOMPARE(observerStarts, disabled ? 0 : 1);
 	QCOMPARE(hookStarts, disabled ? QList<bool>() : QList<bool> {brief});
@@ -203,7 +210,10 @@ void TrayHostTest::briefStopsRetryOnLiveOrStub() {
 	QTRY_VERIFY(host->pollActiveForTest());
 
 	observerResult = static_cast<ComObserverState>(state);
-	QTRY_COMPARE(host->hookCapability().value("comObserver").toString(), comObserverStateName(observerResult));
+	QTRY_COMPARE(
+	    host->hookCapability().value("comObserver").toString(),
+	    comObserverStateName(observerResult)
+	);
 	QCOMPARE(observerResyncs, 1);
 	QVERIFY(!host->pollActiveForTest());
 	QVERIFY(hookModeChanges.isEmpty());
@@ -217,10 +227,10 @@ void TrayHostTest::explorerRestartResyncsObserver() {
 	QCOMPARE(observerResyncs, 0);
 
 	observerResult = ComObserverState::Live;
-	emit qs::windows::SupervisorBridge::instance()->explorerSettled(1234, 5678, 1, true);
+	emit qs::windows::SupervisorBridge::instance() -> explorerSettled(1234, 5678, 1, true);
 	QCOMPARE(observerResyncs, 0);
 
-	emit qs::windows::SupervisorBridge::instance()->explorerSettled(1234, 5679, 2, true);
+	emit qs::windows::SupervisorBridge::instance() -> explorerSettled(1234, 5679, 2, true);
 	QCOMPARE(observerResyncs, 1);
 	QTRY_COMPARE(host->hookCapability().value("comObserver").toString(), "live");
 	QCOMPARE(host->hookCapability().value("transport").toString(), "com-hybrid");

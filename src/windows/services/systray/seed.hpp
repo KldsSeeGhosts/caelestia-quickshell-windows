@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <thread>
 
@@ -50,7 +51,9 @@ public:
 
 class TrayNotifyObserver {
 public:
-	explicit TrayNotifyObserver(std::unique_ptr<TrayNotifyBackend> backend = {});
+	using BackendFactory = std::function<std::shared_ptr<TrayNotifyBackend>()>;
+
+	explicit TrayNotifyObserver(BackendFactory backendFactory = {});
 	~TrayNotifyObserver();
 	Q_DISABLE_COPY_MOVE(TrayNotifyObserver);
 
@@ -66,7 +69,7 @@ public:
 private:
 	struct State;
 
-	std::shared_ptr<TrayNotifyBackend> backend;
+	BackendFactory backendFactory;
 	std::shared_ptr<State> workerState;
 	std::thread worker;
 };

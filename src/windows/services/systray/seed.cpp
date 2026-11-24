@@ -27,8 +27,9 @@ public:
 MIDL_INTERFACE("D133CE13-3537-48BA-93A7-AFCD5D2053B4")
 ITrayNotifyWin8: public IUnknown {
 public:
-	virtual HRESULT STDMETHODCALLTYPE RegisterCallback(INotificationCB* callback, ULONG* handle) = 0;
-	virtual HRESULT STDMETHODCALLTYPE UnregisterCallback(ULONG* handle) = 0;
+	virtual HRESULT STDMETHODCALLTYPE
+	    RegisterCallback(INotificationCB * callback, ULONG * handle) = 0;
+	virtual HRESULT STDMETHODCALLTYPE UnregisterCallback(ULONG * handle) = 0;
 	virtual HRESULT STDMETHODCALLTYPE SetPreference(const TrayNotifyItem* item) = 0;
 	virtual HRESULT STDMETHODCALLTYPE EnableAutoTray(BOOL enable) = 0;
 	virtual HRESULT STDMETHODCALLTYPE DoAction(BOOL action) = 0;
@@ -37,7 +38,7 @@ public:
 MIDL_INTERFACE("FB852B2C-6BAD-4605-9551-F15F87830935")
 ITrayNotifyWin7: public IUnknown {
 public:
-	virtual HRESULT STDMETHODCALLTYPE RegisterCallback(INotificationCB* callback) = 0;
+	virtual HRESULT STDMETHODCALLTYPE RegisterCallback(INotificationCB * callback) = 0;
 	virtual HRESULT STDMETHODCALLTYPE SetPreference(const TrayNotifyItem* item) = 0;
 	virtual HRESULT STDMETHODCALLTYPE EnableAutoTray(BOOL enable) = 0;
 };
@@ -88,12 +89,8 @@ class ExplorerTrayNotifyBackend: public TrayNotifyBackend {
 public:
 	Registration registerCallback(Callback notify) override {
 		IUnknown* unknown = nullptr;
-		auto hr = CoCreateInstance(
-		    CLSID_TRAY_NOTIFY,
-		    nullptr,
-		    CLSCTX_LOCAL_SERVER,
-		    IID_PPV_ARGS(&unknown)
-		);
+		auto hr =
+		    CoCreateInstance(CLSID_TRAY_NOTIFY, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&unknown));
 		if (FAILED(hr) || unknown == nullptr) return {FAILED(hr) ? hr : E_NOINTERFACE};
 
 		hr = unknown->QueryInterface(IID_PPV_ARGS(&this->win8));
@@ -180,81 +177,99 @@ bool transientFailure(HRESULT result) {
 } // namespace
 
 struct TrayNotifyObserver::State {
-	explicit State(std::shared_ptr<TrayNotifyBackend> backend): backend(std::move(backend)) {}
+	State(
+	    std::shared_ptr<TrayNotifyBackend> backend,
+	    TrayIconSink sink,
+	    std::function<void(ComObserverState)> onState
+	)
+	    : backend(std::move(backend))
+	    , callbacks(std::make_shared<CallbackGate>())
+	    , sink(std::move(sink))
+	    , onState(std::move(onState)) {}
 
 	std::shared_ptr<TrayNotifyBackend> backend;
+	CallbackGate::Ptr callbacks;
+	TrayIconSink sink;
+	std::function<void(ComObserverState)> onState;
 	std::atomic<DWORD> threadId = 0;
 	std::atomic<bool> stopping = false;
 	std::atomic<bool> retryable = false;
+	std::atomic<bool> connected = false;
+	std::atomic<bool> registering = false;
+	std::atomic<bool> receivedInitialCallback = false;
 	std::atomic<ComObserverState> mState = ComObserverState::Inactive;
 };
 
-TrayNotifyObserver::TrayNotifyObserver(std::unique_ptr<TrayNotifyBackend> backend)
-    : backend(
-          backend ? std::shared_ptr<TrayNotifyBackend>(std::move(backend))
-                  : std::make_shared<ExplorerTrayNotifyBackend>()
-      )
-    , workerState(std::make_shared<State>(this->backend)) {}
+TrayNotifyObserver::TrayNotifyObserver(BackendFactory backendFactory)
+    : backendFactory(std::move(backendFactory)) {}
 
 TrayNotifyObserver::~TrayNotifyObserver() { this->stop(); }
 
 void TrayNotifyObserver::start(TrayIconSink sink, std::function<void(ComObserverState)> onState) {
 	if (this->worker.joinable()) return;
 
-	auto state = std::make_shared<State>(this->backend);
+	auto backend =
+	    this->backendFactory ? this->backendFactory() : std::make_shared<ExplorerTrayNotifyBackend>();
+	if (!backend) backend = std::make_shared<ExplorerTrayNotifyBackend>();
+	auto state = std::make_shared<State>(std::move(backend), std::move(sink), std::move(onState));
 	state->mState.store(ComObserverState::Connecting);
 	this->workerState = state;
 
 	std::promise<DWORD> ready;
 	auto queueId = ready.get_future();
-	this->worker = std::thread([state, ready = std::move(ready), sink = std::move(sink), onState = std::move(onState)]() mutable {
+	this->worker = std::thread([state, ready = std::move(ready)]() mutable {
 		SetThreadDescription(GetCurrentThread(), L"qs tray notify");
 
 		MSG msg {};
 		PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 		ready.set_value(GetCurrentThreadId());
 
-		auto publish = [&](ComObserverState next) {
-			state->mState.store(next);
-			if (onState && !state->stopping.load()) onState(next);
+		auto publish = [state](ComObserverState next) {
+			state->callbacks->invoke([state, next] {
+				state->mState.store(next);
+				if (state->onState) state->onState(next);
+			});
 		};
 
 		const auto initialized =
 		    SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
-		auto connected = false;
-		auto registering = false;
-		auto receivedInitialCallback = false;
 
 		auto disconnect = [&] {
-			if (!connected) return;
-			connected = false;
+			if (!state->connected.exchange(false)) return;
 			state->backend->unregisterCallback();
 		};
 
 		auto connect = [&] {
-			state->retryable.store(false);
+			state->callbacks->invoke([state] { state->retryable.store(false); });
 			publish(ComObserverState::Connecting);
 			if (!initialized) {
 				publish(ComObserverState::Unavailable);
 				return;
 			}
 
-			connected = true;
-			registering = true;
-			receivedInitialCallback = false;
-			auto registration = state->backend->registerCallback([&](ULONG event, const TrayNotifyItem* item) {
-				if (registering) receivedInitialCallback = true;
-				if (connected && !state->stopping.load()) deliverIcon(sink, event, item, registering);
-			});
-			registering = false;
+			state->connected.store(true);
+			state->registering.store(true);
+			state->receivedInitialCallback.store(false);
+			auto registration =
+			    state->backend->registerCallback([state](ULONG event, const TrayNotifyItem* item) {
+				    state->callbacks->invoke([state, event, item] {
+					    const auto registering = state->registering.load();
+					    if (registering) state->receivedInitialCallback.store(true);
+					    if (state->connected.load()) deliverIcon(state->sink, event, item, registering);
+				    });
+			    });
+			state->registering.store(false);
 
 			auto nextState = ComObserverState::Unavailable;
 			if (SUCCEEDED(registration.result)) {
-				if (registration.handle != 0 || receivedInitialCallback) nextState = ComObserverState::Live;
-				else if (registration.hasHandle) nextState = ComObserverState::StubNoOp;
+				if (registration.handle != 0 || state->receivedInitialCallback.load()) {
+					nextState = ComObserverState::Live;
+				} else if (registration.hasHandle) nextState = ComObserverState::StubNoOp;
 			}
 			if (nextState != ComObserverState::Live) disconnect();
-			state->retryable.store(transientFailure(registration.result));
+			state->callbacks->invoke([state, result = registration.result] {
+				state->retryable.store(transientFailure(result));
+			});
 			publish(nextState);
 		};
 
@@ -286,6 +301,7 @@ void TrayNotifyObserver::stop() {
 
 	auto state = this->workerState;
 	state->stopping.store(true);
+	state->callbacks->deactivate();
 	PostThreadMessageW(state->threadId.load(), WM_QUIT, 0, 0);
 
 	if (stopWorker(this->worker) == WorkerStopResult::Detached) {
