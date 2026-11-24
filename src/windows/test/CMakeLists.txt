@@ -994,6 +994,9 @@ qs_add_portable_suite(idle_request idle_request_test.cpp)
 target_compile_definitions(qs_suite_idle_request PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(qs_suite_idle_request PRIVATE Qt6::Core Qt6::Test)
 
+qs_add_portable_suite(desktop_embedding desktop_embedding_test.cpp)
+target_link_libraries(qs_suite_desktop_embedding PRIVATE Qt6::Core Qt6::Test)
+
 # An app launch blocked forever must not keep the process alive after main
 # returns: launches use runLauncher's pool, which nothing waits for at exit.
 qs_add_portable_suite(launcher_exit
@@ -1224,7 +1227,7 @@ qs_add_portable_runner(portable_core SUITES
 )
 qs_add_portable_runner(portable_runtime SUITES
 	fs_utils ipc_limits input_settle super_drag_wait process_image_name
-	idle_request fullscreen_ownership capture_affinity explorer_hang_hardening
+	idle_request fullscreen_ownership capture_affinity explorer_hang_hardening desktop_embedding
 )
 qs_add_portable_runner(portable_tiling SUITES
 	tiling_layout tiling_observability tiling_manager tiling_drag tiling_reload
@@ -1316,7 +1319,7 @@ set(QS_TESTS_PORTABLE
 	network_wifi_route runtime_paths lazyloader
 	fullscreen_ownership display_transaction clipboard_capture clipboard_writer capture_dimensions
 	erm625_native_desktop_facade network_wifi_identity capture_affinity window_stack
-	fileview_transaction
+	fileview_transaction desktop_embedding
 )
 set(QS_TESTS_NATIVE
 	appbar_call tray_hook tray_host tray_notify keyboard_layout native_lifetime

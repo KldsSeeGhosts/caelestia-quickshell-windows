@@ -574,6 +574,14 @@ void DesktopHost::removeForeignHooks() { this->syncForeignHooks(false); }
 
 void DesktopHost::scheduleRefresh(int delayMs) { this->refreshTimer.start(delayMs); }
 
+void DesktopHost::refreshAfterDesktopSwitch() {
+	if (!this->mEnabled) return;
+	// A switch can invalidate the embedded frame without changing WorkerW or
+	// its child order. Rediscover the host after Explorer has had time to
+	// settle. Even an unchanged host emits parentMoved to reconcile its panels.
+	this->scheduleRefresh(SETTLE_MS);
+}
+
 void DesktopHost::refresh() {
 	this->refreshTimer.stop();
 

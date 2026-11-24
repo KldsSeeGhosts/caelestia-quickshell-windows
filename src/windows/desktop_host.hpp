@@ -79,6 +79,8 @@ public:
 
 	[[nodiscard]] bool active() const { return this->mEnabled && this->mParent != nullptr; }
 
+	void refreshAfterDesktopSwitch();
+
 #ifdef QS_TEST
 	// Adopt a synthetic desktop hierarchy instead of looking up Progman, so
 	// tests can exercise the real host state against temporary windows.
