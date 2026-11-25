@@ -268,7 +268,9 @@ private slots:
 		QVERIFY(manager->setSubmap("resize"));
 		QVERIFY(manager->hookActive()); // Desktop reset even with only WM_HOTKEY binds.
 		QCOMPARE(manager->triggers.at(0).mechanism, Bind::Mechanism::Hotkey);
-		HotkeyManager::messageWindowProc(manager->messageWindow, WM_HOTKEY, 1, 0);
+		const auto resizeHotkeyId = manager->triggers.at(0).hotkeyId;
+		QVERIFY(resizeHotkeyId > 0);
+		HotkeyManager::messageWindowProc(manager->messageWindow, WM_HOTKEY, static_cast<WPARAM>(resizeHotkeyId), 0);
 		QCOMPARE(resize.presses, 1);
 		QCOMPARE(resize.source, std::optional(qs::windows::ActivationSource::Hotkey));
 		HotkeyManager::messageWindowProc(
@@ -282,6 +284,54 @@ private slots:
 		QVERIFY(manager->setSubmap("resize"));
 		manager->reload(); // No config: reload must still cancel the selected map.
 		QVERIFY(manager->activeSubmap().isEmpty());
+	}
+
+	void retiredHotkeyIdDoesNotDispatchAfterSubmapReset() {
+		using namespace qs::windows::hotkeys;
+		auto* manager = HotkeyManager::instance();
+		hotkey_fixture::registerChords = true;
+		manager->parse(R"({"binds":[
+			{"keys":"Ctrl+F10","action":"global","name":"global"},
+			{"keys":"Escape","submap":"resize","action":"dispatch","dispatch":"submap reset"}
+		]})", "fixture");
+		RoutingShortcut global("global");
+		manager->registerShortcut(&global);
+		manager->registerAll();
+		QCOMPARE(manager->triggers.size(), 1);
+		QCOMPARE(manager->triggers.at(0).mechanism, Bind::Mechanism::Hotkey);
+		const auto initialGlobalId = manager->triggers.at(0).hotkeyId;
+		QVERIFY(initialGlobalId > 0);
+
+		QVERIFY(manager->setSubmap("resize"));
+		QCOMPARE(manager->triggers.size(), 1);
+		QCOMPARE(manager->triggers.at(0).mechanism, Bind::Mechanism::Hotkey);
+		const auto escapeId = manager->triggers.at(0).hotkeyId;
+		QVERIFY(escapeId > 0);
+		QVERIFY(escapeId != initialGlobalId);
+
+		// Recovery resets back to the global map; slot 0 is now Ctrl+F10 again
+		// under a fresh registration ID.
+		HotkeyManager::messageWindowProc(
+		    manager->messageWindow,
+		    WM_APP + 16 + HookReset,
+		    hookEventWParam(0, hotkey_fixture::generation),
+		    hookEventLParam(manager->serial, hotkey_fixture::generation)
+		);
+		QVERIFY(manager->activeSubmap().isEmpty());
+		QCOMPARE(manager->triggers.size(), 1);
+		QCOMPARE(manager->triggers.at(0).mechanism, Bind::Mechanism::Hotkey);
+		const auto recoveredGlobalId = manager->triggers.at(0).hotkeyId;
+		QVERIFY(recoveredGlobalId > 0);
+		QVERIFY(recoveredGlobalId != escapeId);
+		QVERIFY(recoveredGlobalId != initialGlobalId);
+
+		// Queued WM_HOTKEY deliveries for retired IDs must not hit the new slot 0 bind.
+		HotkeyManager::messageWindowProc(manager->messageWindow, WM_HOTKEY, static_cast<WPARAM>(escapeId), 0);
+		HotkeyManager::messageWindowProc(manager->messageWindow, WM_HOTKEY, static_cast<WPARAM>(initialGlobalId), 0);
+		QCOMPARE(global.presses, 0);
+
+		HotkeyManager::messageWindowProc(manager->messageWindow, WM_HOTKEY, static_cast<WPARAM>(recoveredGlobalId), 0);
+		QCOMPARE(global.presses, 1);
 	}
 
 	void submapConflictsStayLocalAndEscapeIsNotImplicit() {

@@ -820,12 +820,13 @@ void HotkeyManager::unregisterAll(bool resetSubmap) {
 	this->releaseAllGlobals();
 	this->releaseTimer.stop();
 
-	for (auto i = 0; i < this->triggers.size(); i++) {
-		if (this->triggers.at(i).mechanism == Bind::Mechanism::Hotkey) {
-			UnregisterHotKey(this->messageWindow, static_cast<int>(i + 1));
+	for (const auto& trigger: this->triggers) {
+		if (trigger.mechanism == Bind::Mechanism::Hotkey && trigger.hotkeyId > 0) {
+			UnregisterHotKey(this->messageWindow, trigger.hotkeyId);
 		}
 	}
 
+	this->hotkeyTriggers.clear();
 	this->triggers.clear();
 
 	this->serial++;
@@ -834,6 +835,17 @@ void HotkeyManager::unregisterAll(bool resetSubmap) {
 		this->mActiveSubmap.clear();
 		emit this->activeSubmapChanged();
 	}
+}
+
+int HotkeyManager::allocateHotkeyId() {
+	// Win32 reserves 0xC000-0xFFFF for shared DLL atoms and 0 is our sentinel.
+	constexpr int MaxHotkeyId = 0xBFFF;
+	for (int attempt = 0; attempt < MaxHotkeyId; attempt++) {
+		const auto candidate = this->nextHotkeyId;
+		this->nextHotkeyId = candidate >= MaxHotkeyId ? 1 : candidate + 1;
+		if (!this->hotkeyTriggers.contains(candidate)) return candidate;
+	}
+	return 0;
 }
 
 qsizetype HotkeyManager::addToTrigger(qsizetype index) {
@@ -877,8 +889,10 @@ void HotkeyManager::registerAll() {
 void HotkeyManager::resetTrigger(qsizetype index) {
 	auto& trigger = this->triggers[index];
 
-	if (trigger.mechanism == Bind::Mechanism::Hotkey) {
-		UnregisterHotKey(this->messageWindow, static_cast<int>(index + 1));
+	if (trigger.mechanism == Bind::Mechanism::Hotkey && trigger.hotkeyId > 0) {
+		UnregisterHotKey(this->messageWindow, trigger.hotkeyId);
+		this->hotkeyTriggers.remove(trigger.hotkeyId);
+		trigger.hotkeyId = 0;
 	}
 
 	trigger.mechanism = Bind::Mechanism::None;
@@ -944,6 +958,7 @@ void HotkeyManager::registerTriggers() {
 		}
 
 		auto registered = false;
+		auto registeredId = 0;
 
 		if (trigger.preferRegister && trigger.kind == HookTrigger::Combo
 		    && !taskbarShortcutFilterEnabled()
@@ -962,19 +977,29 @@ void HotkeyManager::registerTriggers() {
 		    ))
 		{
 			auto modifiers = hotkeyModifiers(trigger.combo.mods) | (trigger.repeat ? 0 : MOD_NOREPEAT);
-			auto id = static_cast<int>(i + 1);
+			auto id = this->allocateHotkeyId();
 
-			registered = RegisterHotKey(this->messageWindow, id, modifiers, trigger.combo.vk) != FALSE;
+			if (id > 0) {
+				registered = RegisterHotKey(this->messageWindow, id, modifiers, trigger.combo.vk) != FALSE;
+				if (registered) registeredId = id;
+			}
 
 			if (!registered) {
 				qCInfo(logHotkeys) << "RegisterHotKey failed for" << this->binds.at(trigger.binds.first()).keys
-				                   << "(error" << GetLastError() << "), using the keyboard hook";
+				                   << "(error" << (id > 0 ? GetLastError() : ERROR_NO_SYSTEM_RESOURCES)
+				                   << "), using the keyboard hook";
 			}
 		}
 
 		auto mechanism = resolveTriggerMechanism(trigger.kind, trigger.combo.mods, registered);
 
-		if (mechanism.hotkey) trigger.mechanism = Bind::Mechanism::Hotkey;
+		if (mechanism.hotkey) {
+			trigger.mechanism = Bind::Mechanism::Hotkey;
+			trigger.hotkeyId = registeredId;
+			this->hotkeyTriggers.insert(registeredId, i);
+		} else if (registered) {
+			UnregisterHotKey(this->messageWindow, registeredId);
+		}
 
 		if (mechanism.hook) {
 			trigger.mechanism = Bind::Mechanism::Hook;
@@ -1200,11 +1225,14 @@ LRESULT CALLBACK HotkeyManager::messageWindowProc(HWND hwnd, UINT msg, WPARAM wP
 }
 
 void HotkeyManager::onHotkey(int id) {
-	auto index = static_cast<qsizetype>(id) - 1;
+	auto it = this->hotkeyTriggers.constFind(id);
+	if (it == this->hotkeyTriggers.constEnd()) return;
+
+	auto index = it.value();
 	if (index < 0 || index >= this->triggers.size()) return;
 
 	auto& trigger = this->triggers[index];
-	if (trigger.mechanism != Bind::Mechanism::Hotkey) return;
+	if (trigger.mechanism != Bind::Mechanism::Hotkey || trigger.hotkeyId != id) return;
 
 	// WM_HOTKEY is a key Windows delivered to this process, so the activation
 	// it causes may ask for the foreground once under the documented rule.
