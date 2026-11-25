@@ -523,6 +523,8 @@ struct Channel {
 		std::future<Snapshot> result;
 		Kind kind = Kind::Command;
 		bool queryWindows = false;
+		bool publicOperation = false;
+		HWND moveTarget = nullptr;
 	};
 	std::shared_ptr<Worker> worker;
 	Snapshot snapshot;
@@ -530,6 +532,7 @@ struct Channel {
 	QPointer<QObject> context;
 	std::function<void()> recovered;
 	std::function<void()> updated;
+	std::function<void(quint64, HWND, bool, HRESULT)> moveCompleted;
 	QTimer deadline;
 	std::atomic<bool> completionWake = false;
 	std::optional<Pending> refresh;
@@ -583,7 +586,18 @@ struct Channel {
 		if (this->context && this->updated) QTimer::singleShot(0, this->context, this->updated);
 	}
 
+	void notifyMoveCompleted(quint64 seq, HWND hwnd, bool succeeded, HRESULT error) {
+		if (hwnd == nullptr || !this->context || !this->moveCompleted) return;
+		QTimer::singleShot(0, this->context, [this, seq, hwnd, succeeded, error] {
+			if (this->context && this->moveCompleted) this->moveCompleted(seq, hwnd, succeeded, error);
+		});
+	}
+
 	void retire(HRESULT error) {
+		const auto pendingMove =
+		    this->pending && this->pending->moveTarget != nullptr ? this->pending->moveTarget : nullptr;
+		const auto pendingSequence =
+		    this->pending && this->pending->request ? this->pending->request->sequence : 0;
 		if (auto previous = std::exchange(this->worker, {})) previous->stop();
 		this->refresh.reset();
 		this->pending.reset();
@@ -593,6 +607,7 @@ struct Channel {
 		// Keep the last desktop/window values as explicitly stale state.
 		this->recovery.disconnected();
 		this->notify();
+		if (pendingMove != nullptr) this->notifyMoveCompleted(pendingSequence, pendingMove, false, error);
 	}
 
 	bool apply(Snapshot result) {
@@ -623,7 +638,8 @@ struct Channel {
 	    std::function<int()> operation,
 	    bool queryWindows = false,
 	    bool publicOperation = false,
-	    Kind kind = Kind::Command
+	    Kind kind = Kind::Command,
+	    HWND moveTarget = nullptr
 	) {
 		if (this->waiting) {
 			this->snapshot.error = HRESULT_FROM_WIN32(ERROR_BUSY);
@@ -678,7 +694,9 @@ struct Channel {
 			}
 			// The request is still owned by this generation, not failed.
 			// Keep its future so the GUI can apply the eventual result.
-			this->pending.emplace(Pending {request, std::move(result), kind, queryWindows});
+			this->pending.emplace(
+			    Pending {request, std::move(result), kind, queryWindows, publicOperation, moveTarget}
+			);
 			this->armDeadline();
 			return kind == Kind::Command ? 0 : -1;
 		}
@@ -823,10 +841,18 @@ struct Channel {
 		slot.reset();
 		try {
 			auto value = finished.result.get();
-			const auto success = value.result != -1;
+			const auto outcome = value.result;
+			const auto success = outcome != -1;
+			const auto error = value.error;
+			const auto publicReady = value.publicReady;
 			if (!finished.queryWindows) value.windows = this->snapshot.windows;
 			if (value.sequence < this->applied) this->refreshAgain = true;
 			const auto available = this->apply(std::move(value));
+			if (finished.moveTarget != nullptr) {
+				const auto moveOk = outcome == 0 && (available || (finished.publicOperation && publicReady));
+				const auto moveSequence = finished.request ? finished.request->sequence : 0;
+				this->notifyMoveCompleted(moveSequence, finished.moveTarget, moveOk, moveOk ? S_OK : error);
+			}
 			if (finished.kind == Kind::Acquisition && success && available) {
 				++this->windowRevision;
 				this->recovery.reset();
@@ -844,6 +870,10 @@ struct Channel {
 			this->notify();
 		} catch (...) {
 			this->retire(E_UNEXPECTED);
+			if (finished.moveTarget != nullptr) {
+				const auto moveSequence = finished.request ? finished.request->sequence : 0;
+				this->notifyMoveCompleted(moveSequence, finished.moveTarget, false, E_UNEXPECTED);
+			}
 		}
 	}
 
@@ -920,7 +950,13 @@ int boundedCreate() {
 }
 int boundedMove(HWND hwnd, int index) {
 	const auto id = cachedId(index);
-	const auto result = channel().execute([hwnd, id] { return moveWindow(hwnd, workerIndex(id)); });
+	const auto result = channel().execute(
+	    [hwnd, id] { return moveWindow(hwnd, workerIndex(id)); },
+	    false,
+	    false,
+	    Channel::Kind::Command,
+	    hwnd
+	);
 	if (result == 0) channel().requestRefresh();
 	return result;
 }
@@ -991,14 +1027,29 @@ void initializeNativeDesktopQueries(QObject* context, std::function<void()> upda
 		c.context = nullptr;
 		c.recovered = {};
 		c.updated = {};
+		c.moveCompleted = {};
 	});
 	if (!c.worker && !c.recovery.active() && !c.acquire() && !c.pending) c.recovery.disconnected();
+}
+
+void setNativeDesktopMoveObserver(
+    QObject* context,
+    std::function<void(quint64, HWND, bool, HRESULT)> onMoveCompleted
+) {
+	auto& c = channel();
+	c.context = context;
+	c.moveCompleted = std::move(onMoveCompleted);
 }
 
 void requestNativeDesktopRefresh() { channel().requestRefresh(); }
 bool nativeDesktopCommandPending() {
 	const auto& c = channel();
 	return c.waiting || (c.pending && c.pending->kind == Channel::Kind::Command);
+}
+quint64 nativeDesktopPendingMoveSequence() {
+	const auto& c = channel();
+	if (!c.pending || c.pending->moveTarget == nullptr || !c.pending->request) return 0;
+	return c.pending->request->sequence;
 }
 bool nativeDesktopRequestPending() {
 	const auto& c = channel();
@@ -1021,7 +1072,9 @@ std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop) {
 		             : -1;
 	    },
 	    false,
-	    true
+	    true,
+	    Channel::Kind::Command,
+	    hwnd
 	);
 	if (result == 0) channel().requestRefresh();
 	return result == -2 ? std::nullopt : std::optional<bool>(result == 0);
@@ -1042,6 +1095,7 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.context = nullptr;
 	p.recovered = {};
 	p.updated = {};
+	p.moveCompleted = {};
 	p.supported = false;
 	p.privateEnabled = false;
 	p.refusedBuild = false;

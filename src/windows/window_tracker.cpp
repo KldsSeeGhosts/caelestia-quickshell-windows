@@ -33,6 +33,7 @@
 #include "desktopentry_backend.hpp"
 #include "fullscreen_geometry.hpp"
 #include "hyprland/dispatch_refusals.hpp"
+#include "native_desktop_accessor.hpp"
 #include "process_image_name.hpp"
 #include "redact.hpp"
 #include "startup.hpp"
@@ -632,7 +633,14 @@ void TrackedWindow::fullscreenOn(QScreen* screen) {
 }
 
 bool TrackedWindow::moveToDesktop(qsizetype index) {
-	if (!this->ensureCurrentOwner(QStringLiteral("move"))) return false;
+	if (!this->hasCurrentOwner()) {
+		this->reportActionRefused(
+		    QStringLiteral("move"),
+		    qs::hyprland::ipc::moveRefusalReason(QStringLiteral("invalid-window"), false),
+		    false
+		);
+		return false;
+	}
 	if (!this->tracker->desktops()->moveWindow(this->mHwnd, index)) {
 		const auto code =
 		    this->tracker->desktops()->lastCommand().value(QStringLiteral("reason")).toString();
@@ -646,7 +654,11 @@ bool TrackedWindow::moveToDesktop(qsizetype index) {
 		);
 		return false;
 	}
-	this->clearActionError();
+	if (const auto sequence = nativeDesktopPendingMoveSequence(); sequence != 0) {
+		this->tracker->notePendingUserMove(sequence, this->mHwnd);
+	} else {
+		this->clearActionError();
+	}
 	this->refreshDesktop(true);
 	return true;
 }
@@ -758,6 +770,13 @@ WindowTracker::WindowTracker() {
 			if (IsWindow(hwnd)) this->candidates.insert(hwnd);
 		this->onDesktopsChanged();
 	});
+
+	QObject::connect(
+	    this->mDesktops,
+	    &VirtualDesktops::moveWindowCompleted,
+	    this,
+	    &WindowTracker::onMoveWindowCompleted
+	);
 
 	QObject::connect(this->mDesktops, &VirtualDesktops::currentChanged, this, [this]() {
 		for (auto* window: this->mWindows) {
@@ -1248,6 +1267,45 @@ void WindowTracker::onScreensChanged() {
 	this->updateScreens();
 	for (auto* window: this->mWindows) this->dirty[window->hwnd()].state = true;
 	this->schedule();
+}
+
+void WindowTracker::notePendingUserMove(quint64 sequence, HWND hwnd) {
+	if (sequence == 0 || hwnd == nullptr) return;
+	this->mPendingUserMoves.insert(sequence, hwnd);
+}
+
+void WindowTracker::onMoveWindowCompleted(
+    quint64 sequence,
+    quintptr rawHwnd,
+    bool succeeded,
+    const QString& code
+) {
+	const auto hwnd = reinterpret_cast<HWND>(rawHwnd);
+	const auto pending = this->mPendingUserMoves.constFind(sequence);
+	if (sequence == 0 || pending == this->mPendingUserMoves.cend() || pending.value() != hwnd) {
+		return;
+	}
+	this->mPendingUserMoves.erase(pending);
+
+	auto* window = this->windowFor(hwnd);
+	if (succeeded) {
+		if (window != nullptr) window->clearActionError();
+		return;
+	}
+
+	if (window != nullptr && window->hasCurrentOwner()) {
+		const auto elevated = isMoreElevated(hwnd);
+		window->bElevated = elevated;
+		const auto reportElevated = elevated && qs::hyprland::ipc::isWindowRejectionMoveCode(code);
+		window->reportActionRefused(
+		    QStringLiteral("move"),
+		    qs::hyprland::ipc::moveRefusalReason(code, reportElevated),
+		    reportElevated
+		);
+		return;
+	}
+
+	qs::hyprland::ipc::reportMoveRefusal(this, code, false);
 }
 
 void WindowTracker::onDesktopsChanged() {

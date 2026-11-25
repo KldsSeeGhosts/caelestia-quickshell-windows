@@ -288,6 +288,30 @@ void VirtualDesktops::applyNativeSnapshot() {
 	this->notifyCapability();
 }
 
+void VirtualDesktops::bindNativeDesktopQueries() {
+	setNativeDesktopMoveObserver(
+	    this,
+	    [this](quint64 sequence, HWND hwnd, bool succeeded, HRESULT error) {
+		    this->onNativeMoveCompleted(sequence, hwnd, succeeded, error);
+	    }
+	);
+	initializeNativeDesktopQueries(this, [this] { this->applyNativeSnapshot(); });
+}
+
+void VirtualDesktops::onNativeMoveCompleted(
+    quint64 sequence,
+    HWND hwnd,
+    bool succeeded,
+    HRESULT error
+) {
+	emit this->moveWindowCompleted(
+	    sequence,
+	    reinterpret_cast<quintptr>(hwnd),
+	    succeeded,
+	    succeeded ? QString() : this->failureReasonForError(error)
+	);
+}
+
 void VirtualDesktops::loadAccessor() {
 	services::ServiceMessageWindow::instance()
 	    ->addHandler(RegisterWindowMessageW(L"TaskbarCreated"), this, [this](WPARAM, LPARAM) {
@@ -311,7 +335,7 @@ void VirtualDesktops::loadAccessor() {
 	}
 	// Public queries share the private worker when enabled. Otherwise create
 	// only a public manager, without bypassing a failed acquisition's backoff.
-	initializeNativeDesktopQueries(this, [this] { this->applyNativeSnapshot(); });
+	this->bindNativeDesktopQueries();
 	this->notifyCapability();
 }
 
@@ -628,6 +652,15 @@ void VirtualDesktops::notifyCapability() {
 	if (value == this->emittedCapability) return;
 	this->emittedCapability = value;
 	emit this->capabilityChanged();
+}
+
+QString VirtualDesktops::failureReasonForError(HRESULT error) const {
+	if (error == HRESULT_FROM_WIN32(ERROR_TIMEOUT)) return QStringLiteral("provider-timeout");
+	if (error == HRESULT_FROM_WIN32(ERROR_BUSY)) return QStringLiteral("provider-busy");
+	if (error == E_ACCESSDENIED) return QStringLiteral("permission-denied");
+	const auto reason = desktopAvailabilityReason(this->availability());
+	if (!reason.isEmpty()) return reason;
+	return QStringLiteral("command-rejected");
 }
 
 QString VirtualDesktops::commandFailureReason() const {

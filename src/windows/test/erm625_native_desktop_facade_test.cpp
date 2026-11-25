@@ -28,7 +28,7 @@ struct NativeDesktopFacadeTestHook {
 		desktops.testAvailability = DesktopAvailability::Disconnected;
 	}
 	static void observeSnapshots(VirtualDesktops& desktops) {
-		initializeNativeDesktopQueries(&desktops, [&desktops] { desktops.applyNativeSnapshot(); });
+		desktops.bindNativeDesktopQueries();
 	}
 	static QVariantMap nativeCapability(VirtualDesktops& desktops) {
 		const auto testMode = desktops.testMode;
@@ -321,6 +321,7 @@ private slots:
 		QCOMPARE(this->desktops->windowDesktopIndex(window), qsizetype(0));
 		QCoreApplication::processEvents();
 		QSignalSpy membership(this->desktops, &VirtualDesktops::windowDesktopsChanged);
+		QSignalSpy moveCompleted(this->desktops, &VirtualDesktops::moveWindowCompleted);
 		this->old.manager.publishSwitch = this->old.manager.publishCreation = true;
 		if (operation == "switch") {
 			this->old.manager.beforeSwitch = delay;
@@ -362,10 +363,24 @@ private slots:
 		QCOMPARE(nativeDesktopWorkerCountForTest(), 1);
 		QCOMPARE(nativeDesktopRecoveryPendingDelayForTest(), -1);
 		QCOMPARE(completion->calls, 0);
+		QCOMPARE(moveCompleted.size(), 0);
+		if (operation == "move") QVERIFY(nativeDesktopPendingMoveSequence() != 0);
 		QVERIFY(waitUntil([] { return !nativeDesktopCommandPending(); }, 1000));
 		QVERIFY(!nativeDesktopCommandPending());
 		QCOMPARE(this->acquisitions, 1);
 		if (operation == "move") {
+			QVERIFY(waitUntil([&moveCompleted] { return moveCompleted.size() == 1; }, 1000));
+			QCOMPARE(moveCompleted.size(), 1);
+			QVERIFY(moveCompleted.first().at(0).toULongLong() != 0);
+			QCOMPARE(
+			    moveCompleted.first().at(1).value<quintptr>(),
+			    reinterpret_cast<quintptr>(window)
+			);
+			QCOMPARE(moveCompleted.first().at(2).toBool(), succeed);
+			QCOMPARE(
+			    moveCompleted.first().at(3).toString(),
+			    succeed ? QString() : QStringLiteral("permission-denied")
+			);
 			QVERIFY(waitUntil(
 			    [this, window, succeed] {
 				    return this->desktops->windowDesktopIndex(window)

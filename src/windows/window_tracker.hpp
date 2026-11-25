@@ -393,6 +393,8 @@ private:
 	void updateScreens();
 	void onScreensChanged();
 	void onDesktopsChanged();
+	void notePendingUserMove(quint64 sequence, HWND hwnd);
+	void onMoveWindowCompleted(quint64 sequence, quintptr hwnd, bool succeeded, const QString& code);
 	void reportWindowActionRefused(
 	    const TrackedWindow* window,
 	    const QString& action,
@@ -404,6 +406,7 @@ private:
 	QList<TrackedWindow*> mWindows;
 	QString mLastActionError;
 	const TrackedWindow* mLastActionErrorWindow = nullptr;
+	QHash<quint64, HWND> mPendingUserMoves;
 	QHash<HWND, TrackedWindow*> byHwnd;
 	TrackedWindow* mActive = nullptr;
 	VirtualDesktops* mDesktops = nullptr;

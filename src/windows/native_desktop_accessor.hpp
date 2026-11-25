@@ -17,8 +17,13 @@ void invalidateNativeDesktopAccessor(HRESULT error = S_OK);
 [[nodiscard]] DesktopAvailability nativeDesktopAvailability();
 [[nodiscard]] HRESULT nativeDesktopLastError();
 void initializeNativeDesktopQueries(QObject* context, std::function<void()> updated);
+void setNativeDesktopMoveObserver(
+    QObject* context,
+    std::function<void(quint64, HWND, bool, HRESULT)> onMoveCompleted
+);
 void requestNativeDesktopRefresh();
 [[nodiscard]] bool nativeDesktopCommandPending();
+[[nodiscard]] quint64 nativeDesktopPendingMoveSequence();
 // Observation must also wait for the snapshot that can confirm a command.
 [[nodiscard]] bool nativeDesktopRequestPending();
 [[nodiscard]] quint64 nativeDesktopWindowSnapshotRevision();
