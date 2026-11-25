@@ -39,7 +39,11 @@ using RegistryEnumValue = std::function<LSTATUS(
     bool* scanComplete = nullptr
 );
 [[nodiscard]] bool registryTextContainsClsid(const QString& text, const QString& clsid);
-[[nodiscard]] bool hasActiveIncludeDirective(const QString& text, const QString& includePath);
+[[nodiscard]] bool hasActiveIncludeDirective(
+    const QString& text,
+    const QString& configPath,
+    const QString& includePath
+);
 [[nodiscard]] QString elevatedHookScript(const QString& configPath, const QString& includePath);
 struct ElevationCompletion {
 	bool success = false;

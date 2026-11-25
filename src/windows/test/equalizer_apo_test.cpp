@@ -1,6 +1,10 @@
 #include <cstring>
 #include <vector>
 
+#include <qdir.h>
+#include <qfile.h>
+#include <qprocess.h>
+#include <qtemporarydir.h>
 #include <qtest.h>
 #include <qt_windows.h>
 
@@ -24,6 +28,18 @@ struct Entry {
 	DWORD type = REG_SZ;
 	bool terminate = false;
 };
+
+bool writeUtf8(const QString& path, const QString& text) {
+	QFile file(path);
+	if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+	return file.write(text.toUtf8()) == text.toUtf8().size();
+}
+
+QString readUtf8(const QString& path) {
+	QFile file(path);
+	if (!file.open(QIODevice::ReadOnly)) return QString();
+	return QString::fromUtf8(file.readAll());
+}
 
 class EqualizerApoTest: public QObject {
 	Q_OBJECT
@@ -189,26 +205,118 @@ private slots:
 		QVERIFY(script.contains(QStringLiteral("[IO.File]::AppendAllText($configPath")));
 	}
 
-	void commentedIncludeDoesNotCountAsActive() {
+	void includeDirectiveParsingUsesBalancedQuotesAndConfigRelativePaths() {
+		const auto configPath = QStringLiteral("C:/EqualizerAPO/config/config.txt");
 		const auto includePath = QStringLiteral("C:/EqualizerAPO/config/ii-equalizer.txt");
-		using equalizer_apo_detail::hasActiveIncludeDirective;
-		QVERIFY(!hasActiveIncludeDirective(QStringLiteral("# Include: ii-equalizer.txt\n"), includePath));
-		QVERIFY(!hasActiveIncludeDirective(QStringLiteral("   # Include: ii-equalizer.txt\n"), includePath));
-		QVERIFY(!hasActiveIncludeDirective(QStringLiteral("Include: other.txt # ii-equalizer.txt\n"), includePath));
-		QVERIFY(hasActiveIncludeDirective(QStringLiteral("Include: ii-equalizer.txt\n"), includePath));
-		QVERIFY(hasActiveIncludeDirective(QStringLiteral("  Include: ii-equalizer.txt\r\n"), includePath));
-		QVERIFY(hasActiveIncludeDirective(QStringLiteral("Include : ii-equalizer.txt\n"), includePath));
-		QVERIFY(hasActiveIncludeDirective(QStringLiteral("Include: ./ii-equalizer.txt\n"), includePath));
-		QVERIFY(hasActiveIncludeDirective(QStringLiteral("Include: %1\n").arg(includePath), includePath));
+		const auto newline = QChar(10);
+		const auto doubleQuote = QChar(34);
+		const auto singleQuote = QChar(39);
+		const auto parentTarget = QStringLiteral("..") + QChar(92) + QStringLiteral("config")
+		    + QChar(92) + QStringLiteral("ii-equalizer.txt");
+		auto quoted = [](const QString& target, const QChar& quote) {
+			return QString() + quote + target + quote;
+		};
+		auto active = [&configPath, &includePath](const QString& text) {
+			return equalizer_apo_detail::hasActiveIncludeDirective(text, configPath, includePath);
+		};
 
-		const auto script = equalizer_apo_detail::elevatedHookScript(
-		    QStringLiteral("C:/EqualizerAPO/config/config.txt"),
-		    includePath
-		);
+		QVERIFY(!active(QStringLiteral("# Include: ii-equalizer.txt") + newline));
+		QVERIFY(!active(QStringLiteral("   # Include: ii-equalizer.txt") + newline));
+		QVERIFY(!active(QStringLiteral("Include: other.txt # ii-equalizer.txt") + newline));
+		QVERIFY(active(QStringLiteral("Include: ii-equalizer.txt") + newline));
+		QVERIFY(active(QStringLiteral("  Include: ii-equalizer.txt") + QChar(13) + newline));
+		QVERIFY(active(QStringLiteral("Include : ii-equalizer.txt") + newline));
+		QVERIFY(active(QStringLiteral("Include: ./ii-equalizer.txt") + newline));
+		QVERIFY(active(
+		    QStringLiteral("Include: ") + quoted(QStringLiteral("./ii-equalizer.txt"), doubleQuote)
+		    + newline
+		));
+		QVERIFY(active(
+		    QStringLiteral("Include: ") + quoted(QStringLiteral("./ii-equalizer.txt"), singleQuote)
+		    + newline
+		));
+		QVERIFY(active(QStringLiteral("Include: ") + parentTarget + newline));
+		QVERIFY(active(QStringLiteral("Include: ") + quoted(parentTarget, doubleQuote) + newline));
+		QVERIFY(active(QStringLiteral("Include: ") + includePath + newline));
+		QVERIFY(!active(QStringLiteral("Include: ") + doubleQuote + QStringLiteral("ii-equalizer.txt") + newline));
+		QVERIFY(!active(QStringLiteral("Include: ") + singleQuote + QStringLiteral("ii-equalizer.txt") + newline));
+		QVERIFY(!active(QStringLiteral("Include: ../other/ii-equalizer.txt") + newline));
+
+		const auto script = equalizer_apo_detail::elevatedHookScript(configPath, includePath);
 		QVERIFY(script.contains(QStringLiteral("$entry.StartsWith('#')")));
 		QVERIFY(script.contains(QStringLiteral("foreach ($rawLine in ($text -split")));
-		QVERIFY(script.contains(QStringLiteral("$target -eq $includeName")));
-		QVERIFY(!script.contains(QStringLiteral("[regex]::Escape($line)")));
+		QVERIFY(script.contains(QStringLiteral("[System.IO.Path]::GetFullPath")));
+		QVERIFY(script.contains(QStringLiteral("$targetFullPath -ieq $includeFullPath")));
+		QVERIFY(!script.contains(QStringLiteral("$includeName")));
+	}
+
+	void elevatedPowerShellParserMatchesCppOnDisk() {
+		const auto doubleQuote = QChar(34);
+		const auto parentTarget = QStringLiteral("..") + QChar(92) + QStringLiteral("config")
+		    + QChar(92) + QStringLiteral("ii-equalizer.txt");
+		struct Case {
+			QString line;
+			bool active;
+		};
+		const QList<Case> cases {
+		    {QStringLiteral("Include: ./ii-equalizer.txt"), true},
+		    {QStringLiteral("Include: ") + doubleQuote + QStringLiteral("./ii-equalizer.txt") + doubleQuote,
+		        true},
+		    {QStringLiteral("Include: ") + parentTarget, true},
+		    {QStringLiteral("Include: ") + doubleQuote + QStringLiteral("ii-equalizer.txt"), false},
+		};
+
+		for (const auto& testCase: cases) {
+			QTemporaryDir root;
+			QVERIFY(root.isValid());
+			QDir rootDir(root.path());
+			QVERIFY(rootDir.mkpath(QStringLiteral("config")));
+			const auto configDir = rootDir.filePath(QStringLiteral("config"));
+			const auto configPath = QDir::toNativeSeparators(
+			    QDir(configDir).filePath(QStringLiteral("config.txt"))
+			);
+			const auto includePath = QDir::toNativeSeparators(
+			    QDir(configDir).filePath(QStringLiteral("ii-equalizer.txt"))
+			);
+			const auto initial = testCase.line + QChar(10);
+			QVERIFY(writeUtf8(configPath, initial));
+			QCOMPARE(
+			    equalizer_apo_detail::hasActiveIncludeDirective(initial, configPath, includePath),
+			    testCase.active
+			);
+
+			const auto scriptPath = root.filePath(QStringLiteral("hook.ps1"));
+			QVERIFY(writeUtf8(
+			    scriptPath,
+			    equalizer_apo_detail::elevatedHookScript(configPath, includePath)
+			));
+			QProcess process;
+			process.start(
+			    QStringLiteral("powershell.exe"),
+			    QStringList({
+			        QStringLiteral("-NoLogo"),
+			        QStringLiteral("-NoProfile"),
+			        QStringLiteral("-NonInteractive"),
+			        QStringLiteral("-ExecutionPolicy"),
+			        QStringLiteral("Bypass"),
+			        QStringLiteral("-File"),
+			        scriptPath,
+			    })
+			);
+			QVERIFY2(process.waitForStarted(5000), qPrintable(process.errorString()));
+			QVERIFY2(process.waitForFinished(10000), qPrintable(process.errorString()));
+			const auto standardError = QString::fromLocal8Bit(process.readAllStandardError());
+			QVERIFY2(process.exitCode() == 0, qPrintable(standardError));
+
+			const auto finalText = readUtf8(configPath);
+			if (testCase.active) {
+				QCOMPARE(finalText, initial);
+			} else {
+				QVERIFY(finalText.startsWith(initial));
+				QCOMPARE(finalText.count(includePath), 1);
+				QVERIFY(equalizer_apo_detail::hasActiveIncludeDirective(finalText, configPath, includePath));
+			}
+		}
 	}
 
 	void elevationCompletionNeverClaimsSuccessWithoutAProcessHandle() {

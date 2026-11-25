@@ -1412,7 +1412,6 @@ public:
 	    const std::function<void(const QString&, int)>& deliver
 	) {
 		this->state = state;
-		this->deliver = deliver;
 		WNDCLASSW wc {};
 		wc.lpfnWndProc = &WmiEventPump::windowProc;
 		wc.hInstance = GetModuleHandleW(nullptr);
@@ -1432,19 +1431,23 @@ public:
 		    wc.hInstance,
 		    this
 		);
-		if (this->window == nullptr) return false;
+		if (this->window == nullptr) {
+			this->state.reset();
+			return false;
+		}
+		this->drainEvents.start(state, deliver);
 		brightness_detail::setWmiWakeWindow(state, this->window);
 		return true;
 	}
 
 	void stop() {
+		this->drainEvents.stop();
 		if (this->state != nullptr) brightness_detail::clearWmiWakeWindow(this->state);
 		if (this->window != nullptr) {
 			DestroyWindow(this->window);
 			this->window = nullptr;
 		}
 		this->state.reset();
-		this->deliver = nullptr;
 	}
 
 private:
@@ -1456,28 +1459,19 @@ private:
 			SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
 		}
 		if (self != nullptr && message == brightness_detail::WM_APP_BRIGHTNESS_EVENT) {
-			self->drain();
+			// Warnings are drained on the same GUI-thread wake as events. Conversion
+			// and logging deliberately happen here, never in the WMI worker.
+			self->drainEvents.drain([](const std::wstring& warning) {
+				qCWarning(logBrightness).noquote() << QString::fromStdWString(warning);
+			});
 			return 0;
 		}
 		return DefWindowProcW(hwnd, message, wParam, lParam);
 	}
 
-	void drain() {
-		// Warnings are drained on the same GUI-thread wake as events. Conversion
-		// and logging deliberately happen here, never in the WMI worker.
-		std::wstring warning;
-		while (brightness_detail::popWmiWarning(this->state, warning)) {
-			qCWarning(logBrightness).noquote() << QString::fromStdWString(warning);
-		}
-		brightness_detail::WmiBrightnessEvent event;
-		while (brightness_detail::popWmiBrightnessEvent(this->state, event)) {
-			if (this->deliver != nullptr) this->deliver(QString::fromStdWString(event.instanceName), event.percent);
-		}
-	}
-
 	HWND window = nullptr;
 	std::shared_ptr<brightness_detail::SharedWmiState> state;
-	std::function<void(const QString&, int)> deliver;
+	brightness_detail::WmiEventDrain drainEvents;
 };
 
 struct EventWatch {

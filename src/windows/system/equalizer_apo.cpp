@@ -64,6 +64,24 @@ QString psSingleQuote(const QString& text) {
 	return escaped;
 }
 
+bool unquoteIncludeTarget(const QString& rawTarget, QString& target) {
+	target = rawTarget.trimmed();
+	if (target.isEmpty()) return false;
+	const auto quote = target.front();
+	if (quote != u'"' && quote != u'\'') return true;
+	if (target.size() < 2 || target.back() != quote) return false;
+	target = target.mid(1, target.size() - 2);
+	return !target.isEmpty();
+}
+
+QString cleanPathAgainstBase(const QString& path, const QString& baseDir) {
+	const auto separatorsNormalized = QDir::fromNativeSeparators(path);
+	const QFileInfo info(separatorsNormalized);
+	const auto absolute = info.isAbsolute() ? separatorsNormalized
+	                                       : QDir(baseDir).filePath(separatorsNormalized);
+	return QDir::cleanPath(absolute);
+}
+
 HWND parentHwnd(QObject* parentWindow) {
 	auto* window = qobject_cast<QWindow*>(parentWindow);
 	if (window == nullptr && parentWindow != nullptr) {
@@ -199,22 +217,23 @@ bool registryTextContainsClsid(const QString& text, const QString& clsid) {
 	return !clsid.isEmpty() && text.contains(clsid, Qt::CaseInsensitive);
 }
 
-bool hasActiveIncludeDirective(const QString& text, const QString& includePath) {
-	const auto includeName = QFileInfo(includePath).fileName();
-	const auto cleanPath = QDir::cleanPath(includePath);
+bool hasActiveIncludeDirective(
+    const QString& text,
+    const QString& configPath,
+    const QString& includePath
+) {
+	const auto configDir = QFileInfo(configPath).absolutePath();
+	const auto includeFullPath = cleanPathAgainstBase(includePath, configDir);
 	for (const auto& rawLine: text.split(u'\n')) {
 		auto line = rawLine.trimmed();
 		if (line.startsWith(u'#')) continue;
 		if (!line.startsWith(QStringLiteral("Include"), Qt::CaseInsensitive)) continue;
 		auto directive = line.mid(7).trimmed();
 		if (!directive.startsWith(u':')) continue;
-		auto target = directive.mid(1).trimmed();
-		if (target.size() >= 2 && target.startsWith(u'\"') && target.endsWith(u'\"'))
-			target = target.mid(1, target.size() - 2);
-		const auto cleanTarget = QDir::cleanPath(target);
-		if (cleanTarget.compare(includeName, Qt::CaseInsensitive) == 0
-		    || cleanTarget.compare(cleanPath, Qt::CaseInsensitive) == 0)
-			return true;
+		QString target;
+		if (!unquoteIncludeTarget(directive.mid(1), target)) continue;
+		const auto targetFullPath = cleanPathAgainstBase(target, configDir);
+		if (targetFullPath.compare(includeFullPath, Qt::CaseInsensitive) == 0) return true;
 	}
 	return false;
 }
@@ -232,14 +251,44 @@ QString elevatedHookScript(const QString& configPath, const QString& includePath
 	           "    if (!(Test-Path -LiteralPath $includePath -PathType Leaf)) { exit 3 }\n"
 	           "    $text = Get-Content -LiteralPath $configPath -Raw -ErrorAction Stop\n"
 	           "    if ($null -eq $text) { $text = '' }\n"
-	           "    $includeName = Split-Path $includePath -Leaf\n"
+	           "    $configDir = Split-Path $configPath -Parent\n"
+	           "    if ([System.IO.Path]::IsPathRooted($includePath)) {\n"
+	           "        $includeFullPath = [System.IO.Path]::GetFullPath($includePath)\n"
+	           "    } else {\n"
+	           "        $includeFullPath = [System.IO.Path]::GetFullPath((Join-Path $configDir $includePath))\n"
+	           "    }\n"
 	           "    $active = $false\n"
 	           "    foreach ($rawLine in ($text -split \"`r?`n\")) {\n"
 	           "        $entry = $rawLine.Trim()\n"
 	           "        if ($entry.StartsWith('#')) { continue }\n"
-	           "        if ($entry -match '^Include\\s*:\\s*(.+)$') {\n"
-	           "            $target = $Matches[1].Trim().Trim([char]34)\n"
-	           "            if ($target -eq $includePath -or $target -eq $includeName) { $active = $true }\n"
+	           "        if ($entry.StartsWith('Include', [System.StringComparison]::OrdinalIgnoreCase)) {\n"
+	           "            $directive = $entry.Substring(7).TrimStart()\n"
+	           "            if ($directive.StartsWith(':')) {\n"
+	           "                $target = $directive.Substring(1).Trim()\n"
+	           "                $valid = $target.Length -gt 0\n"
+	           "                if ($valid) {\n"
+	           "                    $quote = $target[0]\n"
+	           "                    if (($quote -eq [char]34) -or ($quote -eq [char]39)) {\n"
+	           "                        if (($target.Length -lt 2) -or ($target[$target.Length - 1] -ne $quote)) {\n"
+	           "                            $valid = $false\n"
+	           "                        } else {\n"
+	           "                            $target = $target.Substring(1, $target.Length - 2)\n"
+	           "                            $valid = $target.Length -gt 0\n"
+	           "                        }\n"
+	           "                    }\n"
+	           "                }\n"
+	           "                if ($valid) {\n"
+	           "                    try {\n"
+	           "                        if ([System.IO.Path]::IsPathRooted($target)) {\n"
+	           "                            $targetFullPath = [System.IO.Path]::GetFullPath($target)\n"
+	           "                        } else {\n"
+	           "                            $targetFullPath = [System.IO.Path]::GetFullPath((Join-Path $configDir $target))\n"
+	           "                        }\n"
+	           "                        if ($targetFullPath -ieq $includeFullPath) { $active = $true }\n"
+	           "                    } catch {\n"
+	           "                    }\n"
+	           "                }\n"
+	           "            }\n"
 	           "        }\n"
 	           "    }\n"
 	           "    if (!$active) {\n"
@@ -322,8 +371,11 @@ void EqualizerApo::detectHooked() {
 	auto text = QString::fromUtf8(file.readAll());
 	file.close();
 
-	this->mHooked =
-	    equalizer_apo_detail::hasActiveIncludeDirective(text, this->includeFilePath());
+	this->mHooked = equalizer_apo_detail::hasActiveIncludeDirective(
+	    text,
+	    this->configFilePath(),
+	    this->includeFilePath()
+	);
 }
 
 void EqualizerApo::detectActiveOnDevice() {

@@ -166,6 +166,80 @@ inline bool popWmiWarning(const std::shared_ptr<SharedWmiState>& state, std::wst
 	return true;
 }
 
+// Lifecycle token for a GUI-thread drain. stop() invalidates only the token;
+// a drain that captured it by value can therefore notice teardown without
+// touching the pump object after an event callback returns.
+struct WmiEventDrainGuard {
+	std::atomic<bool> active {false};
+	std::atomic<const SharedWmiState*> mailbox {nullptr};
+};
+
+// Draining copies the mailbox, callback, and lifecycle token before invoking
+// user code. If the callback cancels the mailbox or stops/replaces the pump,
+// the loop checks only those copies and never resumes into cleared members.
+class WmiEventDrain {
+public:
+	~WmiEventDrain() { this->stop(); }
+
+	void start(
+	    const std::shared_ptr<SharedWmiState>& state,
+	    const std::function<void(const QString&, int)>& deliver
+	) {
+		this->stop();
+		this->state = state;
+		this->deliver = deliver;
+		this->guard = std::make_shared<WmiEventDrainGuard>();
+		if (state != nullptr) {
+			this->guard->mailbox.store(state.get(), std::memory_order_release);
+			this->guard->active.store(true, std::memory_order_release);
+		}
+	}
+
+	void stop() {
+		if (this->guard != nullptr) {
+			this->guard->active.store(false, std::memory_order_release);
+			this->guard->mailbox.store(nullptr, std::memory_order_release);
+		}
+		this->guard.reset();
+		this->state.reset();
+		this->deliver = nullptr;
+	}
+
+	template <typename WarningHandler>
+	void drain(WarningHandler&& warningHandler) {
+		const auto state = this->state;
+		const auto deliver = this->deliver;
+		const auto guard = this->guard;
+		if (!current(state, guard)) return;
+
+		std::wstring warning;
+		while (current(state, guard) && popWmiWarning(state, warning)) {
+			warningHandler(warning);
+		}
+
+		WmiBrightnessEvent event;
+		while (current(state, guard) && popWmiBrightnessEvent(state, event)) {
+			if (deliver != nullptr)
+				deliver(QString::fromStdWString(event.instanceName), event.percent);
+		}
+	}
+
+private:
+	static bool current(
+	    const std::shared_ptr<SharedWmiState>& state,
+	    const std::shared_ptr<WmiEventDrainGuard>& guard
+	) {
+		return state != nullptr && guard != nullptr
+		    && !state->cancelled.load(std::memory_order_acquire)
+		    && guard->active.load(std::memory_order_acquire)
+		    && guard->mailbox.load(std::memory_order_acquire) == state.get();
+	}
+
+	std::shared_ptr<SharedWmiState> state;
+	std::function<void(const QString&, int)> deliver;
+	std::shared_ptr<WmiEventDrainGuard> guard;
+};
+
 // Owns the watcher thread and shares RAII ownership of its stop event with that
 // worker. stop() cancels and joins a finitely polling worker with a bounded wait;
 // if the wait times out, the detached worker still owns a valid event handle and

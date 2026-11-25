@@ -1617,6 +1617,44 @@ private slots:
 		QVERIFY(audit->finished.load(std::memory_order_acquire));
 	}
 
+	void wmiEventDrainStopsAfterCallbackTeardown_data() {
+		QTest::addColumn<int>("teardown");
+		QTest::newRow("cancel-mailbox") << 0;
+		QTest::newRow("stop-pump") << 1;
+		QTest::newRow("destroy-pump") << 2;
+	}
+
+	void wmiEventDrainStopsAfterCallbackTeardown() {
+		QFETCH(int, teardown);
+		auto state = brightness_detail::createSharedWmiState();
+		QVERIFY(state != nullptr);
+		QVERIFY(brightness_detail::queueWmiBrightnessEvent(state, L"FIRST", 20));
+		QVERIFY(brightness_detail::queueWmiBrightnessEvent(state, L"SECOND", 80));
+
+		auto drain = std::make_unique<brightness_detail::WmiEventDrain>();
+		auto delivered = 0;
+		QStringList names;
+		drain->start(state, [&](const QString& instanceName, int) {
+			++delivered;
+			names.append(instanceName);
+			if (teardown == 0) state->cancelled.store(true, std::memory_order_release);
+			else if (teardown == 1) drain->stop();
+			else drain.reset();
+		});
+
+		auto warnings = 0;
+		drain->drain([&](const std::wstring&) { ++warnings; });
+		QCOMPARE(warnings, 0);
+		QCOMPARE(delivered, 1);
+		QCOMPARE(names, QStringList({QStringLiteral("FIRST")}));
+
+		brightness_detail::WmiBrightnessEvent leftover;
+		QVERIFY(brightness_detail::popWmiBrightnessEvent(state, leftover));
+		QCOMPARE(leftover.instanceName, std::wstring(L"SECOND"));
+		QCOMPARE(leftover.percent, 80);
+		QVERIFY(!brightness_detail::popWmiBrightnessEvent(state, leftover));
+	}
+
 	void eventWatchThreadDetachKeepsTheStopEventAlive() {
 		brightness_detail::EventWatchThread watch;
 		std::atomic<bool> release = false;
