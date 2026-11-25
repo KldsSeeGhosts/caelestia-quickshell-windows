@@ -826,6 +826,100 @@ private slots:
 		QCOMPARE(hookEventSerial(hookEventLParam(99, highGeneration)), uint32_t(99));
 	}
 
+	void sessionInfoExSnapshotCarriesConnectAndLockState() {
+		WTSINFOEX_LEVEL1_W info {};
+		info.SessionState = WTSActive;
+		info.SessionFlags = WTS_SESSIONSTATE_UNLOCK;
+		auto snapshot = sessionSnapshotFromInfoEx(info);
+		QVERIFY(snapshot.connected);
+		QVERIFY(!snapshot.locked);
+
+		info.SessionState = WTSDisconnected;
+		info.SessionFlags = WTS_SESSIONSTATE_LOCK;
+		snapshot = sessionSnapshotFromInfoEx(info);
+		QVERIFY(!snapshot.connected);
+		QVERIFY(snapshot.locked);
+
+		info.SessionState = WTSActive;
+		info.SessionFlags = static_cast<LONG>(WTS_SESSIONSTATE_UNKNOWN);
+		snapshot = sessionSnapshotFromInfoEx(info);
+		QVERIFY(snapshot.connected);
+		QVERIFY(snapshot.locked);
+	}
+
+	void wtsRegistrationRetriesAndImmediatelyRequeriesSessionState() {
+		SessionNotificationState state;
+		auto registrationAttempts = 0;
+		auto queries = 0;
+		auto tryRegister = [&] {
+			++registrationAttempts;
+			return registrationAttempts >= 2;
+		};
+		auto querySnapshot = [&](bool& connected, bool& locked) {
+			++queries;
+			connected = queries >= 2;
+			locked = queries < 2;
+			return true;
+		};
+
+		QVERIFY(!state.poll(tryRegister, querySnapshot));
+		QVERIFY(!state.registered);
+		QCOMPARE(registrationAttempts, 1);
+		QCOMPARE(queries, 1);
+		QVERIFY(!state.safe());
+
+		// The next watchdog tick retries registration. A successful registration
+		// is followed immediately by a fresh snapshot, and the prior disconnected
+		// snapshot still counts as transition evidence.
+		QVERIFY(state.poll(tryRegister, querySnapshot));
+		QVERIFY(state.registered);
+		QCOMPARE(registrationAttempts, 2);
+		QCOMPARE(queries, 2);
+		QVERIFY(state.safe());
+
+		QVERIFY(!state.poll(tryRegister, querySnapshot));
+		QCOMPARE(registrationAttempts, 2);
+		QCOMPARE(queries, 2);
+	}
+
+	void polledSessionSnapshotSchedulesRecoveryWhenSessionBecomesUsable() {
+		SessionNotificationState state;
+		SessionRecovery recovery;
+		const std::array snapshots {
+		    std::pair {false, true},  // disconnected and locked
+		    std::pair {true, true},   // reconnected but still locked
+		    std::pair {true, false},  // unlocked and usable
+		};
+		auto queries = 0;
+		auto registrationAttempts = 0;
+		auto registrationStillFails = [&] {
+			++registrationAttempts;
+			return false;
+		};
+		auto querySnapshot = [&](bool& connected, bool& locked) {
+			const auto index = std::min<size_t>(queries, snapshots.size() - 1);
+			++queries;
+			connected = snapshots[index].first;
+			locked = snapshots[index].second;
+			return true;
+		};
+
+		QVERIFY(!state.poll(registrationStillFails, querySnapshot));
+		QVERIFY(!state.safe());
+		QVERIFY(!state.poll(registrationStillFails, querySnapshot));
+		QVERIFY(!state.safe());
+		QCOMPARE(recovery.pendingAt, uint64_t(0));
+
+		constexpr uint64_t now = 1000;
+		QVERIFY(state.poll(registrationStillFails, querySnapshot));
+		QVERIFY(state.safe());
+		QVERIFY(recovery.request(now));
+		QCOMPARE(recovery.pendingAt, now + SESSION_SETTLE_MS);
+		QVERIFY(recovery.take(now + SESSION_SETTLE_MS, state.safe()));
+		QCOMPARE(registrationAttempts, 3);
+		QCOMPARE(queries, 3);
+	}
+
 	void disconnectedSessionKeepsRecoveryPendingUntilReconnect() {
 		auto connected = true;
 		auto locked = false;

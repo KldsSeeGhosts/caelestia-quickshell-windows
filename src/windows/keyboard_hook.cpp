@@ -212,6 +212,67 @@ constexpr auto HOOK_MONITOR_CLASS = L"QuickshellLowLevelHookMonitor";
 	return locked;
 }
 
+struct SessionSnapshot {
+	bool connected = false;
+	bool locked = true;
+};
+
+[[nodiscard]] constexpr SessionSnapshot sessionSnapshotFromInfoEx(const WTSINFOEX_LEVEL1_W& info) {
+	return {
+	    .connected = info.SessionState == WTSActive,
+	    // Treat unknown as locked so recovery stays fail-closed until the
+	    // session is explicitly usable.
+	    .locked = info.SessionFlags != WTS_SESSIONSTATE_UNLOCK,
+	};
+}
+
+struct SessionNotificationState {
+	bool registered = false;
+	bool connected = false;
+	bool locked = false;
+	bool stateKnown = false;
+	bool snapshotObserved = false;
+
+	[[nodiscard]] bool safe() const { return this->stateKnown && this->connected && !this->locked; }
+
+	void applyEvent(WPARAM event) {
+		this->connected = sessionConnectedAfterEvent(this->connected, event);
+		this->locked = sessionLockedAfterEvent(this->locked, event);
+	}
+
+	bool applySnapshot(bool nextConnected, bool nextLocked) {
+		const auto wasObserved = this->snapshotObserved;
+		const auto wasSafe = this->connected && !this->locked;
+		this->connected = nextConnected;
+		this->locked = nextLocked;
+		this->stateKnown = true;
+		this->snapshotObserved = true;
+		return wasObserved && !wasSafe && this->safe();
+	}
+
+	// Registration is retried until Remote Desktop Services can accept it. While
+	// notifications are unavailable, every poll needs a fresh snapshot because
+	// connect and lock changes cannot arrive as messages.
+	bool poll(auto&& tryRegister, auto&& querySnapshot) {
+		auto registeredNow = false;
+		if (!this->registered) {
+			this->registered = tryRegister();
+			registeredNow = this->registered;
+		}
+		// A successful retry still needs an immediate snapshot, but the prior
+		// polled state remains valid transition evidence.
+		if (this->registered && this->stateKnown && !registeredNow) return false;
+
+		auto nextConnected = false;
+		auto nextLocked = true;
+		if (!querySnapshot(nextConnected, nextLocked)) {
+			this->stateKnown = false;
+			return false;
+		}
+		return this->applySnapshot(nextConnected, nextLocked);
+	}
+};
+
 struct HookRecovery {
 	uint64_t rawTick = 0;
 	uint64_t unmatchedSince = 0;
@@ -306,7 +367,7 @@ public:
 	}
 
 	~LowLevelHookMonitor() override {
-		if (this->sessionRegistered) this->unregisterSession(this->window);
+		if (this->sessionState.registered) this->unregisterSession(this->window);
 		if (this->wtsModule != nullptr) FreeLibrary(this->wtsModule);
 		if (this->rawRegistered) this->registerRawInput(RIDEV_REMOVE, nullptr);
 		if (this->window != nullptr) DestroyWindow(this->window);
@@ -323,16 +384,16 @@ public:
 
 private:
 	bool safeToRearm() const {
-		if (!this->sessionConnected || this->sessionLocked || inputDesktopIsForeign()) return false;
+		if (!this->sessionState.safe() || inputDesktopIsForeign()) return false;
 		auto* foreground = GetForegroundWindow();
 		return foreground != nullptr && !isHiddenFromUs(foreground);
 	}
 
 	void poll() {
 		startForegroundIntegrityWorker();
-		if (!this->sessionRegistered || !this->sessionStateKnown) this->applyQueriedSessionState();
+		const auto now = GetTickCount64();
+		if (this->pollSessionState() && this->sessionRecovery.request(now)) this->sessionTimer.start();
 		auto safe = safeToRearm();
-		auto now = GetTickCount64();
 		if (this->sessionRecovery.take(now, safe)) {
 			this->keyboardRecovery.sessionPending = keyboardHookState.needed;
 			this->mouseRecovery.sessionPending = mouseHookState.needed;
@@ -369,22 +430,57 @@ private:
 			this->mouseRecovery.rawTick = messageTick;
 	}
 
-	void applyQueriedSessionState() {
-		if (this->querySessionInformation == nullptr || this->freeWtsMemory == nullptr) return;
-		WTS_CONNECTSTATE_CLASS* state = nullptr;
+	bool tryRegisterSessionNotifications() {
+		if (this->registerSession == nullptr || this->unregisterSession == nullptr || this->window == nullptr)
+			return false;
+		return this->registerSession(this->window, NOTIFY_FOR_THIS_SESSION) != 0;
+	}
+
+	bool querySessionSnapshot(bool& connected, bool& locked) {
+		if (this->querySessionInformation == nullptr || this->freeWtsMemory == nullptr) return false;
+		WTSINFOEXW* info = nullptr;
 		DWORD bytes = 0;
 		if (!this->querySessionInformation(
 		        WTS_CURRENT_SERVER_HANDLE,
 		        WTS_CURRENT_SESSION,
-		        WTSConnectState,
-		        reinterpret_cast<LPWSTR*>(&state),
+		        WTSSessionInfoEx,
+		        reinterpret_cast<LPWSTR*>(&info),
 		        &bytes
 		    )
-		    || state == nullptr)
-			return;
-		this->sessionConnected = *state == WTSActive;
-		this->sessionStateKnown = true;
-		this->freeWtsMemory(state);
+		    || info == nullptr)
+			return false;
+
+		const auto valid = info->Level == 1 && bytes >= sizeof(WTSINFOEXW);
+		auto nextConnected = false;
+		auto nextLocked = true;
+		if (valid) {
+			const auto& level1 = info->Data.WTSInfoExLevel1;
+			const auto snapshot = sessionSnapshotFromInfoEx(level1);
+			nextConnected = snapshot.connected;
+			nextLocked = snapshot.locked;
+		}
+		this->freeWtsMemory(info);
+		if (!valid) return false;
+		connected = nextConnected;
+		locked = nextLocked;
+		return true;
+	}
+
+	bool applyQueriedSessionState() {
+		auto connected = false;
+		auto locked = true;
+		if (!this->querySessionSnapshot(connected, locked)) {
+			this->sessionState.stateKnown = false;
+			return false;
+		}
+		return this->sessionState.applySnapshot(connected, locked);
+	}
+
+	bool pollSessionState() {
+		return this->sessionState.poll(
+		    [this] { return this->tryRegisterSessionNotifications(); },
+		    [this](bool& connected, bool& locked) { return this->querySessionSnapshot(connected, locked); }
+		);
 	}
 
 	void createListener() {
@@ -430,7 +526,7 @@ private:
 			qCWarning(logKeyboardHook) << "Could not load session notifications for hook recovery:" << GetLastError();
 			return;
 		}
-		auto registerSession = reinterpret_cast<BOOL(WINAPI*)(HWND, DWORD)>(
+		this->registerSession = reinterpret_cast<BOOL(WINAPI*)(HWND, DWORD)>(
 		    GetProcAddress(this->wtsModule, "WTSRegisterSessionNotification")
 		);
 		this->unregisterSession = reinterpret_cast<BOOL(WINAPI*)(HWND)>(
@@ -443,12 +539,11 @@ private:
 		    GetProcAddress(this->wtsModule, "WTSFreeMemory")
 		);
 		// Register before querying so a reconnect cannot slip between the two.
-		if (registerSession != nullptr && this->unregisterSession != nullptr)
-			this->sessionRegistered = registerSession(this->window, NOTIFY_FOR_THIS_SESSION) != 0;
-		if (!this->sessionRegistered) {
+		this->sessionState.registered = this->tryRegisterSessionNotifications();
+		if (!this->sessionState.registered) {
 			qCWarning(logKeyboardHook) << "Could not observe session changes for hook recovery:" << GetLastError();
 		}
-		this->applyQueriedSessionState();
+		(void)this->applyQueriedSessionState();
 	}
 
 	static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -470,9 +565,8 @@ private:
 					self->sessionTimer.start();
 				return TRUE;
 			} else if (message == WM_WTSSESSION_CHANGE) {
-				self->sessionConnected = sessionConnectedAfterEvent(self->sessionConnected, wParam);
-				self->sessionLocked = sessionLockedAfterEvent(self->sessionLocked, wParam);
-				if (self->sessionConnected && !self->sessionLocked
+				self->sessionState.applyEvent(wParam);
+				if (self->sessionState.safe()
 				    && (wParam == WTS_SESSION_UNLOCK || wParam == WTS_CONSOLE_CONNECT
 				        || wParam == WTS_REMOTE_CONNECT)
 				    && self->sessionRecovery.request(GetTickCount64()))
@@ -490,15 +584,13 @@ private:
 	SessionRecovery sessionRecovery;
 	HWND window = nullptr;
 	HMODULE wtsModule = nullptr;
+	BOOL (WINAPI* registerSession)(HWND, DWORD) = nullptr;
 	BOOL (WINAPI* unregisterSession)(HWND) = nullptr;
 	BOOL (WINAPI* querySessionInformation)(HANDLE, DWORD, WTS_INFO_CLASS, LPWSTR*, DWORD*) = nullptr;
 	void (WINAPI* freeWtsMemory)(PVOID) = nullptr;
+	SessionNotificationState sessionState;
 	bool classRegistered = false;
 	bool rawRegistered = false;
-	bool sessionRegistered = false;
-	bool sessionConnected = false;
-	bool sessionLocked = false;
-	bool sessionStateKnown = false;
 };
 
 QPointer<LowLevelHookMonitor> gHookMonitor; // NOLINT
