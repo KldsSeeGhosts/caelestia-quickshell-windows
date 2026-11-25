@@ -910,6 +910,109 @@ private slots:
 		QCOMPARE(this->old.manager.moves, 0);
 		QCOMPARE(results.size(), 0);
 	}
+
+	void switchToOnObservedRunsOnlyAfterObservationAndNotOnTimeout() {
+		this->old.manager.publishSwitch = true;
+		this->old.manager.beforeSwitch = [] { QThread::msleep(150); };
+		int observedCalls = 0;
+		qsizetype observedIndex = -1;
+		QVERIFY(this->desktops->switchTo(
+		    1,
+		    {},
+		    [&observedCalls, &observedIndex](qsizetype idx) {
+			    ++observedCalls;
+			    observedIndex = idx;
+		    }
+		));
+		// Still pending: onObserved must not run before observation.
+		QCOMPARE(observedCalls, 0);
+		QVERIFY(waitUntil([&observedCalls] { return observedCalls == 1; }, 1000));
+		QCOMPARE(observedCalls, 1);
+		QCOMPARE(observedIndex, qsizetype(1));
+
+		// A timed-out switch must never invoke onObserved.
+		this->old.manager.publishSwitch = false;
+		this->old.manager.beforeSwitch = {};
+		int timedOutObserved = 0;
+		QVERIFY(this->desktops->switchTo(0, {}, [&timedOutObserved](qsizetype) { ++timedOutObserved; }));
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("timed-out");
+		    },
+		    1000
+		));
+		QCOMPARE(timedOutObserved, 0);
+	}
+
+	void switchToExpectedIntentAbortsWhenNewerWorkspaceIntentSupersedes() {
+		this->old.manager.publishSwitch = true;
+		this->old.manager.beforeSwitch = {};
+		const auto olderIntent = this->desktops->beginWorkspaceIntent();
+		QVERIFY(this->desktops->switchTo(1));
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("observed");
+		    },
+		    1000
+		));
+
+		int nativeSwitches = 0;
+		int observedCalls = 0;
+		this->old.manager.beforeSwitch = [&nativeSwitches] { ++nativeSwitches; };
+		QVERIFY(!this->desktops->switchTo(
+		    0, {}, [&observedCalls](qsizetype) { ++observedCalls; }, olderIntent
+		));
+		this->old.manager.beforeSwitch = {};
+		QCOMPARE(nativeSwitches, 0);
+		QCOMPARE(observedCalls, 0);
+	}
+
+	void reentrantRefusedSwitchDuringAcceptedStillRefreshesAndObserves() {
+		this->old.manager.publishSwitch = true;
+		this->old.manager.beforeSwitch = {};
+		bool refusedInner = false;
+		QVariantMap outerAccepted;
+		int observedCalls = 0;
+		auto conn = QObject::connect(
+		    this->desktops,
+		    &VirtualDesktops::commandResult,
+		    this->desktops,
+		    [this, &refusedInner, &outerAccepted](const QVariantMap& result) {
+			    if (!refusedInner && result.value("outcome").toString() == QStringLiteral("accepted")) {
+				    refusedInner = true;
+				    outerAccepted = result;
+				    QVERIFY(!this->desktops->switchTo(-1));
+			    }
+		    }
+		);
+
+		QVERIFY(this->desktops->switchTo(1, {}, [&observedCalls](qsizetype) { ++observedCalls; }));
+		QObject::disconnect(conn);
+		QVERIFY(refusedInner);
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("observed");
+		    },
+		    1000
+		));
+		QCOMPARE(this->desktops->lastCommand().value("requestId"), outerAccepted.value("requestId"));
+		QCOMPARE(observedCalls, 1);
+	}
+
+	void moveWindowReportsResolvedDestinationGuid() {
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xba));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		this->old.manager.moveResult = S_OK;
+		this->old.manager.beforeMove = {};
+		const auto expectedGuid = this->desktops->desktops().at(1).id;
+		GUID targetGuid {};
+
+		QVERIFY(this->desktops->moveWindow(window, 1, nullptr, nullptr, {}, {}, &targetGuid));
+		QVERIFY(IsEqualGUID(targetGuid, expectedGuid) != FALSE);
+	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)
 #include "erm625_native_desktop_facade_test.moc"

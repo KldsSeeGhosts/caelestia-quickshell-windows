@@ -626,7 +626,7 @@ bool TrackedWindow::isTrackedAndOwned() const {
 bool TrackedWindow::moveToDesktop(
     qsizetype index,
     quint64 existingMoveSequence,
-    std::function<void(quint64)> onConfirmedSuccess
+    std::function<void(quint64, GUID)> onConfirmedSuccess
 ) {
 	const auto actionOrder = this->mActionOrder;
 	quint64 moveSequence = existingMoveSequence;
@@ -660,10 +660,14 @@ bool TrackedWindow::moveToDesktop(
 	quint64 pendingSequence = 0;
 	bool pendingRegistered = false;
 	auto pendingOutcome = std::make_shared<std::optional<bool>>();
+	auto targetDesktop = std::make_shared<GUID>(GUID {});
 	QString failureCode;
 	QPointer<TrackedWindow> self(this);
 	QPointer<WindowTracker> guardedTracker(this->tracker);
-	auto finishConfirmed = [self, actionOrder, onConfirmedSuccess = std::move(onConfirmedSuccess)](
+	auto finishConfirmed = [self,
+	                        actionOrder,
+	                        targetDesktop,
+	                        onConfirmedSuccess = std::move(onConfirmedSuccess)](
 	                           quint64 confirmedSequence
 	                       ) {
 		if (!self || !self->isTrackedAndOwned()
@@ -677,7 +681,7 @@ bool TrackedWindow::moveToDesktop(
 		{
 			return;
 		}
-		if (onConfirmedSuccess) onConfirmedSuccess(confirmedSequence);
+		if (onConfirmedSuccess) onConfirmedSuccess(confirmedSequence, *targetDesktop);
 	};
 	bool abortedBeforeMove = false;
 	bool lostWindowDuringRecovery = false;
@@ -716,7 +720,8 @@ bool TrackedWindow::moveToDesktop(
 			    return false;
 		    }
 		    return true;
-	    }
+	    },
+	    targetDesktop.get()
 	);
 	if (abortedBeforeMove) return false;
 	if (lostWindowDuringRecovery) {

@@ -89,7 +89,14 @@ public:
 	void setWorkspaceLimit(int count) { this->mWorkspaceLimit = qBound(1, count, 20); }
 	void retryAccessor();
 	[[nodiscard]] quint64 switchOrder() const { return this->mSwitchOrder; }
-	bool switchTo(qsizetype index, const std::function<bool()>& shouldProceed = {});
+	[[nodiscard]] quint64 workspaceIntentOrder() const { return this->mWorkspaceIntentOrder; }
+	[[nodiscard]] quint64 beginWorkspaceIntent() { return ++this->mWorkspaceIntentOrder; }
+	bool switchTo(
+	    qsizetype index,
+	    const std::function<bool()>& shouldProceed = {},
+	    std::function<void(qsizetype)> onObserved = {},
+	    std::optional<quint64> expectedIntent = std::nullopt
+	);
 	void ensureCount(qsizetype count, std::function<void(bool)> done);
 	void ensureCountWithReason(qsizetype count, std::function<void(bool, const QString&)> done);
 	bool removeDesktop(qsizetype index, qsizetype fallback);
@@ -99,7 +106,8 @@ public:
 	    quint64* pendingSequence = nullptr,
 	    QString* failureReason = nullptr,
 	    const std::function<void(quint64)>& onPendingSequence = {},
-	    const std::function<bool()>& shouldProceed = {}
+	    const std::function<bool()>& shouldProceed = {},
+	    GUID* targetDesktopId = nullptr
 	);
 	bool pinWindow(HWND hwnd, bool pinned);
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;
@@ -221,11 +229,14 @@ private:
 		quint64 id;
 		qsizetype index;
 		GUID desktop;
+		quint64 intentOrder = 0;
+		std::function<void(qsizetype)> onObserved;
 	};
 	std::optional<PendingSwitch> pendingSwitch;
 	QTimer switchDeadline;
 	quint64 nextRequest = 0;
 	quint64 mSwitchOrder = 0;
+	quint64 mWorkspaceIntentOrder = 0;
 };
 
 } // namespace qs::windows
