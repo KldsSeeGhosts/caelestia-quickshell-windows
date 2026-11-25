@@ -15,6 +15,7 @@ struct AppActionInfo {
 	QString target;
 	QString packageFamilyName;
 	QString executionAlias;
+	QString elevationTarget;
 	bool packaged = false;
 	bool allowAppsFolderElevation = false;
 	bool canRunAsAdmin = false;
@@ -55,7 +56,7 @@ public:
 
 signals:
 	void lastErrorChanged();
-	void shellActionFinished(const QVariantMap& result);
+	void shellActionFinished(quint64 requestId, const QString& status, const QString& error);
 
 private:
 	AppActionInfo details(const QString& entryId);

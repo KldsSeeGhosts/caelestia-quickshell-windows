@@ -38,7 +38,9 @@
 #include "../process_launch.hpp"
 #include "../redact.hpp"
 #include "../util.hpp"
+#include "app_exec_alias.hpp"
 #include "appx_manifest.hpp"
+#include "shell_action_request.hpp"
 
 using Microsoft::WRL::ComPtr;
 
@@ -108,24 +110,37 @@ struct PackageInstallInfo {
 	QString path;
 	bool allowElevation = false;
 	QString executionAlias;
+	QString elevationTarget;
 };
 
-QString verifiedPackageAlias(const QString& family, const QStringList& aliases) {
-	if (aliases.isEmpty()) return {};
+std::optional<AppExecAliasInfo> verifiedPackageAlias(
+    const QString& family,
+    const QStringList& aliases,
+    const QString& aumid
+) {
+	if (aliases.isEmpty()) return std::nullopt;
 
 	PWSTR raw = nullptr;
 	const auto hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &raw);
 	const auto localAppData = takeComString(raw);
-	if (FAILED(hr) || localAppData.isEmpty()) return {};
+	if (FAILED(hr) || localAppData.isEmpty()) return std::nullopt;
 
 	// The unscoped alias can belong to a different package. Only consider a
-	// registered AppExecLink inside the requested package family's directory.
-	const auto directory = QDir(localAppData + QStringLiteral("/Microsoft/WindowsApps/") + family);
+	// registered AppExecLink inside the requested package family's directory,
+	// then verify the package identity and target inside its reparse payload.
+	const auto root = QDir(localAppData + QStringLiteral("/Microsoft/WindowsApps"));
+	const auto scoped = QDir(root.filePath(family));
 	for (const auto& alias: aliases) {
-		const auto path = QDir::toNativeSeparators(directory.filePath(alias));
-		if (process::isAppExecutionAlias(path)) return path;
+		// Prefer the package-scoped alias. Also accept the legacy unscoped alias
+		// only after its reparse payload proves the same family and AUMID.
+		for (const auto& path:
+		     {QDir::toNativeSeparators(scoped.filePath(alias)),
+		      QDir::toNativeSeparators(root.filePath(alias))})
+		{
+			if (auto info = verifiedAppExecAlias(path, family, aumid)) return info;
+		}
 	}
-	return {};
+	return std::nullopt;
 }
 
 std::optional<PackageInstallInfo> packageInstall(const QString& family, QStringView applicationId) {
@@ -160,7 +175,11 @@ std::optional<PackageInstallInfo> packageInstall(const QString& family, QStringV
 		const auto manifest = readAppxManifest(&file, applicationId);
 		if (!manifest.applicationFound) continue;
 		install.allowElevation = manifest.allowElevation;
-		install.executionAlias = verifiedPackageAlias(family, manifest.desktopExecutionAliases);
+		const auto aumid = family + u'!' + applicationId.toString();
+		if (const auto alias = verifiedPackageAlias(family, manifest.desktopExecutionAliases, aumid)) {
+			install.executionAlias = alias->aliasName;
+			install.elevationTarget = alias->targetPath;
+		}
 		return install;
 	}
 	return firstInstall;
@@ -320,7 +339,19 @@ DWORD runElevated(const QString& id, const AppActionInfo& app, HWND owner) {
 			result = launch(QStringLiteral("shell:AppsFolder\\") + app.token, true);
 		}
 		result = process::detail::fallbackOnFailure(result, [&] {
-			return app.executionAlias.isEmpty() ? result : launch(app.executionAlias, false);
+			if (app.executionAlias.isEmpty()) return result;
+			// Package-scoped WindowsApps aliases are user-writable. Re-read the
+			// reparse payload immediately before launch and use the verified
+			// read-only package target rather than the mutable alias itself.
+			const auto verified = verifiedPackageAlias(
+			    app.packageFamilyName,
+			    {app.executionAlias},
+			    app.token
+			);
+			if (!verified || verified->targetPath.compare(app.elevationTarget, Qt::CaseInsensitive) != 0) {
+				return process::detail::launchResultForError(ERROR_ACCESS_DENIED);
+			}
+			return launch(verified->targetPath, false);
 		});
 	} else {
 		const auto shortcut = startMenuShortcut(app);
@@ -473,7 +504,8 @@ AppActionInfo AppActions::details(const QString& entryId) {
 			app.canUninstall = !isUnderWindows(install->path);
 			app.allowAppsFolderElevation = install->allowElevation;
 			app.executionAlias = install->executionAlias;
-			app.canRunAsAdmin = app.allowAppsFolderElevation || !app.executionAlias.isEmpty();
+			app.elevationTarget = install->elevationTarget;
+			app.canRunAsAdmin = app.allowAppsFolderElevation || !app.elevationTarget.isEmpty();
 		} else {
 			// Preserve the old failure behavior: metadata lookup failure did not
 			// prove that the package is a system package.
@@ -573,17 +605,20 @@ QVariantMap AppActions::launchShellAction(const QVariantMap& spec, QObject* pare
 
 	const auto directory = spec.value(QStringLiteral("workingDir")).toString();
 	if (verb == QStringLiteral("open")) {
+		const auto requestId = detail::nextShellActionRequestId();
 		// Explorer COM and the fallback helper can both block. The watcher is
 		// owned by AppActions, but the launcher task never captures AppActions.
 		auto promise = std::make_shared<QPromise<DWORD>>();
 		promise->start();
 		auto* watcher = new QFutureWatcher<DWORD>(this);
-		connect(watcher, &QFutureWatcher<DWORD>::finished, this, [this, watcher] {
+		connect(watcher, &QFutureWatcher<DWORD>::finished, this, [this, watcher, requestId] {
 			const auto error = watcher->result();
 			watcher->deleteLater();
 			const auto message = windowsErrorString(error);
 			this->setLastError(message);
-			emit this->shellActionFinished(actionResultMap(actionResultForError(error), error, message));
+			emit this->shellActionFinished(
+			    requestId, actionStatus(actionResultForError(error)), message
+			);
 		});
 		watcher->setFuture(promise->future());
 		runLauncher([target, arguments, directory, invokeIdList, promise] {
@@ -594,7 +629,9 @@ QVariantMap AppActions::launchShellAction(const QVariantMap& spec, QObject* pare
 			promise->finish();
 		});
 		this->setLastError({});
-		return actionResultMap(ActionResult::Queued, ERROR_SUCCESS, {});
+		auto queued = actionResultMap(ActionResult::Queued, ERROR_SUCCESS, {});
+		detail::addShellActionRequestId(queued, requestId);
+		return queued;
 	}
 
 	const auto result = process::shellExecuteTarget(

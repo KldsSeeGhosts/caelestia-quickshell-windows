@@ -1390,6 +1390,10 @@ void HotkeyManager::runDispatch(const Bind& bind) {
 	}
 }
 
+bool shouldTryNextAlternative(process::LaunchStatus status) {
+	return status == process::LaunchStatus::Failed;
+}
+
 void HotkeyManager::runExec(const Bind& bind) const {
 	auto commands = QStringList();
 
@@ -1413,7 +1417,7 @@ void HotkeyManager::runExec(const Bind& bind) const {
 		for (const auto& command: commands) {
 			const auto result = elevate ? process::launchElevatedCommand(command)
 			                            : process::launchCommand(command);
-			if (result.started() || result.status == process::LaunchStatus::Cancelled) return;
+			if (!shouldTryNextAlternative(result.status)) return;
 			lastError = result.error;
 		}
 

@@ -70,6 +70,17 @@ bool hasFileExtension(QStringView path) {
 	return dot > separator && dot + 1 < path.size();
 }
 
+bool hasExecutableExtension(QStringView path) {
+	const auto separator = std::max(path.lastIndexOf(u'\\'), path.lastIndexOf(u'/'));
+	const auto dot = path.lastIndexOf(u'.');
+	if (dot <= separator || dot + 1 >= path.size()) return false;
+	const auto extension = path.sliced(dot + 1);
+	return extension.compare(u"exe", Qt::CaseInsensitive) == 0
+	    || extension.compare(u"com", Qt::CaseInsensitive) == 0
+	    || extension.compare(u"bat", Qt::CaseInsensitive) == 0
+	    || extension.compare(u"cmd", Qt::CaseInsensitive) == 0;
+}
+
 bool isSeparateArgument(QStringView word) {
 	if (word.startsWith(u'-') || word.startsWith(u'/')) {
 		const auto option = word.sliced(1);
@@ -99,31 +110,43 @@ bool hasAmbiguousRelativePath(QStringView line, qsizetype firstEnd) {
 	return false;
 }
 
-// An unquoted path with spaces needs an identifiable end. Once a file
-// extension supplies that boundary, a further filename-like token could
-// still be part of the path (e.g. C:\bin.exe files\tool.exe). Require quotes
-// in that case. Never use file existence to shorten an explicit path.
+// An unquoted path with spaces needs an identifiable end. A file extension
+// supplies that end. Anything after it is the argument tail; a longer path
+// containing spaces must be quoted instead. Never use file existence to
+// shorten an explicit path.
 qsizetype explicitPathEnd(QStringView line, qsizetype firstEnd) {
-	auto boundary = hasFileExtension(line.first(firstEnd)) ? firstEnd : -1;
+	if (hasFileExtension(line.first(firstEnd))) return firstEnd;
+
 	auto lastEnd = firstEnd;
 	for (auto start = skipCommandSpace(line, firstEnd); start < line.size();
 	     start = skipCommandSpace(line, lastEnd)) {
 		const auto end = endOfWord(line, start);
 		const auto word = line.sliced(start, end - start);
-		if (isSeparateArgument(word)) {
-			// Without an extension, this might be the middle of a filename.
-			// Do not try the shorter extensionless prefix with PATHEXT.
-			return boundary;
-		}
-		if (boundary >= 0) {
-			if (word.contains(u'\\') || word.contains(u'/') || hasFileExtension(word)) return -1;
-		} else {
-			if (word.contains(u'"')) return -1;
-			if (hasFileExtension(word)) boundary = end;
-		}
+		if (isSeparateArgument(word) || word.contains(u'"')) return -1;
+		if (hasFileExtension(word)) return end;
 		lastEnd = end;
 	}
-	return boundary >= 0 ? boundary : lastEnd;
+	return lastEnd;
+}
+
+bool hasUnquotedPathSeparator(QStringView tail) {
+	auto quoted = false;
+	for (auto i = qsizetype(0); i < tail.size();) {
+		const auto c = tail[i];
+		if (c == u'\\') {
+			auto slashes = qsizetype(0);
+			while (i + slashes < tail.size() && tail[i + slashes] == u'\\') ++slashes;
+			const auto escapedQuote = i + slashes < tail.size() && tail[i + slashes] == u'"'
+			                       && slashes % 2 != 0;
+			if (!quoted && !escapedQuote) return true;
+			i += slashes + (escapedQuote ? 1 : 0);
+			continue;
+		}
+		if (c == u'"') quoted = !quoted;
+		if (!quoted && c == u'/') return true;
+		++i;
+	}
+	return false;
 }
 
 QString normalizedExistingFile(const QString& path) {
@@ -628,6 +651,7 @@ LaunchCommand parseLaunchCommand(const QString& command) {
 			return parsed;
 		}
 		parsed.program = line.sliced(1, close - 1).toString();
+		parsed.quotedProgram = true;
 		end = close + 1;
 	} else {
 		end = endOfWord(line, 0);
@@ -637,7 +661,7 @@ LaunchCommand parseLaunchCommand(const QString& command) {
 			if (looksLikePath(first)) {
 				end = explicitPathEnd(line, end);
 				if (end < 0) return parsed;
-			} else if (hasAmbiguousRelativePath(line, end)) {
+			} else if (!hasExecutableExtension(first) && hasAmbiguousRelativePath(line, end)) {
 				return parsed;
 			}
 		}
@@ -740,12 +764,29 @@ LaunchResult launchCommand(const QString& command, const QString& workingDirecto
 	);
 }
 
+LaunchCommand parseElevatedLaunchCommand(const QString& command) {
+	auto parsed = parseLaunchCommand(command);
+	if (parsed.error != ERROR_SUCCESS || parsed.quotedProgram) return parsed;
+
+	// For elevation, an unquoted executable path containing spaces is not a
+	// safe guess. Path separators in unquoted tail text can also mean that the
+	// first executable-looking token was only a prefix of the intended path.
+	if (parsed.program.contains(u' ') || parsed.program.contains(u'\t')
+	    || hasUnquotedPathSeparator(parsed.argumentTail))
+	{
+		parsed.executable.clear();
+		parsed.kind = ProgramKind::Unresolved;
+		parsed.error = ERROR_INVALID_PARAMETER;
+	}
+	return parsed;
+}
+
 LaunchResult launchElevatedCommand(
     const QString& command,
     const QString& workingDirectory,
     HWND owner
 ) {
-	const auto parsed = parseLaunchCommand(command);
+	const auto parsed = parseElevatedLaunchCommand(command);
 	if (parsed.error != ERROR_SUCCESS) return detail::launchResultForError(parsed.error);
 
 	return shellExecuteTarget(

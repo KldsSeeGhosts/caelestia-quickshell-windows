@@ -41,6 +41,7 @@ struct LaunchCommand {
 	QString executable;
 	ProgramKind kind = ProgramKind::Unresolved;
 	DWORD error = ERROR_FILE_NOT_FOUND;
+	bool quotedProgram = false;
 
 	[[nodiscard]] bool useProcess() const
 	{
@@ -51,6 +52,8 @@ struct LaunchCommand {
 // Parsing and classification are exposed for the offscreen fixtures. They are
 // pure apart from executable lookup/inspection and never launch a process.
 [[nodiscard]] LaunchCommand parseLaunchCommand(const QString& command);
+// Elevated raw commands do not guess at ambiguous unquoted path boundaries.
+[[nodiscard]] LaunchCommand parseElevatedLaunchCommand(const QString& command);
 [[nodiscard]] QString quoteCommandArgument(const QString& argument);
 [[nodiscard]] QString joinCommandArguments(const QStringList& arguments);
 [[nodiscard]] QString joinCommandLine(const QString& program, const QStringList& arguments);

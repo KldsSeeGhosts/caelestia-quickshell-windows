@@ -79,6 +79,15 @@ private slots:
 		QVERIFY(manager->binds.first().elevate);
 	}
 
+	void indeterminateExecDoesNotTryNextAlternative() {
+		using qs::windows::hotkeys::shouldTryNextAlternative;
+		using qs::windows::process::LaunchStatus;
+		QVERIFY(shouldTryNextAlternative(LaunchStatus::Failed));
+		QVERIFY(!shouldTryNextAlternative(LaunchStatus::Indeterminate));
+		QVERIFY(!shouldTryNextAlternative(LaunchStatus::Started));
+		QVERIFY(!shouldTryNextAlternative(LaunchStatus::Cancelled));
+	}
+
 	void backendFilterAllowsRegisteredBindsToWin() {
 		for (int mods = 0; mods < 16; mods++) {
 			for (int vk = 0; vk < 256; vk++) {

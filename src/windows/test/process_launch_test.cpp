@@ -9,7 +9,40 @@
 
 #include "../core/common.hpp"
 #include "../process_launch.hpp"
+#include "../system/app_exec_alias.hpp"
 #include "../system/appx_manifest.hpp"
+#include "../system/shell_action_request.hpp"
+
+
+namespace {
+
+void appendUtf16Le(QByteArray& data, const QString& value) {
+	const auto* utf16 = value.utf16();
+	for (qsizetype i = 0; i < value.size(); ++i) {
+		const auto unit = static_cast<quint16>(utf16[i]);
+		data.append(static_cast<char>(unit & 0xff));
+		data.append(static_cast<char>(unit >> 8));
+	}
+	data.append('\0');
+	data.append('\0');
+}
+
+QByteArray appExecPayload(
+    const QString& family,
+    const QString& aumid,
+    const QString& target,
+    quint32 version = 3
+) {
+	auto data = QByteArray();
+	for (auto shift: {0, 8, 16, 24}) data.append(static_cast<char>((version >> shift) & 0xff));
+	appendUtf16Le(data, family);
+	appendUtf16Le(data, aumid);
+	appendUtf16Le(data, target);
+	appendUtf16Le(data, QStringLiteral("0"));
+	return data;
+}
+
+} // namespace
 
 using qs::windows::process::LaunchStatus;
 using qs::windows::process::ProgramKind;
@@ -75,7 +108,14 @@ private slots:
 		const auto ambiguous = QDir::toNativeSeparators(
 		    directory.filePath(QStringLiteral("Program.exe Files/Vendor/Missing.exe"))
 		);
-		QCOMPARE(parseLaunchCommand(ambiguous).error, DWORD(ERROR_INVALID_PARAMETER));
+		const auto ambiguousParsed = parseLaunchCommand(ambiguous);
+		QCOMPARE(ambiguousParsed.error, DWORD(ERROR_SUCCESS));
+		QCOMPARE(
+		    ambiguousParsed.executable,
+		    QDir::toNativeSeparators(directory.filePath(QStringLiteral("Program.exe")))
+		);
+		QCOMPARE(ambiguousParsed.argumentTail, QStringLiteral("Files\\Vendor\\Missing.exe"));
+		QCOMPARE(parseElevatedLaunchCommand(ambiguous).error, DWORD(ERROR_INVALID_PARAMETER));
 
 		const auto switchLike = QDir::toNativeSeparators(
 		    directory.filePath(QStringLiteral("Program -Files/Vendor/Missing.exe"))
@@ -293,6 +333,85 @@ private slots:
 		QVERIFY(read(allowed, u"App").allowElevation);
 		QVERIFY(!read(allowed + "<broken", u"App").applicationFound);
 	}
+	void executableTokenEndsBeforeArgumentPaths() {
+		using namespace qs::windows::process;
+		QTemporaryDir root;
+		QVERIFY(root.isValid());
+		QVERIFY(QDir(root.path()).mkpath(QStringLiteral("tools")));
+		const auto executable = QDir::toNativeSeparators(
+		    QDir(root.path()).filePath(QStringLiteral("tools/editor.exe"))
+		);
+		QVERIFY(QFile::copy(QCoreApplication::applicationFilePath(), executable));
+
+		const auto withDocument = parseLaunchCommand(executable + QStringLiteral(" notes.txt"));
+		QCOMPARE(withDocument.error, DWORD(ERROR_SUCCESS));
+		QCOMPARE(withDocument.executable, executable);
+		QCOMPARE(withDocument.argumentTail, QStringLiteral("notes.txt"));
+
+		const auto withRelativePath = parseLaunchCommand(QStringLiteral("tool.exe src\\file.cpp"));
+		QCOMPARE(withRelativePath.error, DWORD(ERROR_SUCCESS));
+		QCOMPARE(withRelativePath.program, QStringLiteral("tool.exe"));
+		QCOMPARE(withRelativePath.argumentTail, QStringLiteral("src\\file.cpp"));
+	}
+
+	void elevatedParsingRejectsAmbiguousUnquotedPrefixes() {
+		using namespace qs::windows::process;
+		QTemporaryDir root;
+		QVERIFY(root.isValid());
+		const auto bin = QDir::toNativeSeparators(QDir(root.path()).filePath(QStringLiteral("Bin.exe")));
+		QVERIFY(QFile::copy(QCoreApplication::applicationFilePath(), bin));
+
+		const auto ambiguous = parseElevatedLaunchCommand(
+		    bin + QStringLiteral(" - staging\\Target.exe")
+		);
+		QCOMPARE(ambiguous.error, DWORD(ERROR_INVALID_PARAMETER));
+		QVERIFY(ambiguous.executable.isEmpty());
+
+		QVERIFY(QDir(root.path()).mkpath(QStringLiteral("bin dir")));
+		const auto target = QDir::toNativeSeparators(
+		    QDir(root.path()).filePath(QStringLiteral("bin dir/target.exe"))
+		);
+		QVERIFY(QFile::copy(QCoreApplication::applicationFilePath(), target));
+		const auto quoted = parseElevatedLaunchCommand(
+		    u'"' + target + QStringLiteral("\" --flag")
+		);
+		QCOMPARE(quoted.error, DWORD(ERROR_SUCCESS));
+		QCOMPARE(quoted.executable, target);
+		QCOMPARE(quoted.argumentTail, QStringLiteral("--flag"));
+	}
+
+	void appExecAliasPayloadMatchesExactPackageIdentity() {
+		using namespace qs::windows::sys;
+		const auto family = QStringLiteral("Microsoft.WindowsTerminal_8wekyb3d8bbwe");
+		const auto aumid = family + QStringLiteral("!App");
+		const auto target = QStringLiteral(
+		    "C:\\Program Files\\WindowsApps\\Microsoft.WindowsTerminal_1.0_x64__8wekyb3d8bbwe\\wt.exe"
+		);
+		const auto parsed = parseAppExecAliasPayload(appExecPayload(family, aumid, target));
+		QVERIFY(parsed.has_value());
+		QCOMPARE(parsed->packageFamilyName, family);
+		QCOMPARE(parsed->aumid, aumid);
+		QCOMPARE(parsed->targetPath, QDir::toNativeSeparators(target));
+		QVERIFY(appExecAliasMatches(*parsed, family, aumid));
+		QVERIFY(!appExecAliasMatches(*parsed, family, family + QStringLiteral("!Other")));
+		QVERIFY(!appExecAliasMatches(
+		    *parsed, QStringLiteral("Microsoft.Other_8wekyb3d8bbwe"), aumid
+		));
+		QVERIFY(!parseAppExecAliasPayload(appExecPayload(family, aumid, target, 2)).has_value());
+		QVERIFY(!parseAppExecAliasPayload(appExecPayload(family, aumid, target).chopped(3)).has_value());
+	}
+
+	void shellActionRequestIdsAreMonotonic() {
+		const auto first = qs::windows::sys::detail::nextShellActionRequestId();
+		const auto second = qs::windows::sys::detail::nextShellActionRequestId();
+		const auto third = qs::windows::sys::detail::nextShellActionRequestId();
+		QVERIFY(second > first);
+		QVERIFY(third > second);
+		auto queued = QVariantMap();
+		qs::windows::sys::detail::addShellActionRequestId(queued, second);
+		QCOMPARE(queued.value(QStringLiteral("requestId")).value<quint64>(), second);
+	}
+
 };
 
 int main(int argc, char** argv) {
