@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstring>
+#include <functional>
 #include <optional>
 
 #include <qbytearray.h>
@@ -8,7 +9,6 @@
 #include <qendian.h>
 #include <qfileinfo.h>
 #include <qstring.h>
-#include <qtenvironmentvariables.h>
 
 #include <qt_windows.h>
 
@@ -126,38 +126,46 @@ inline std::optional<AppExecAliasInfo> readAppExecAlias(const QString& path) {
 	return parseAppExecAliasPayload(buffer.mid(8, length));
 }
 
-inline bool isWindowsAppsPackageTarget(const QString& targetPath, const QString& packageFamilyName) {
-	const auto programFiles = QDir::toNativeSeparators(qEnvironmentVariable("ProgramFiles"));
-	if (programFiles.isEmpty()) return false;
+using CanonicalPathProvider = std::function<QString(const QString&)>;
 
-	const auto targetInfo = QFileInfo(targetPath);
-	const auto target = QDir::toNativeSeparators(targetInfo.canonicalFilePath());
-	if (target.isEmpty()) return false;
-	const auto root = QDir::toNativeSeparators(programFiles + QStringLiteral("\\WindowsApps"));
-	if (!target.startsWith(root + u'\\', Qt::CaseInsensitive)) return false;
+inline QString canonicalFilesystemPath(const QString& path) {
+	return QDir::toNativeSeparators(QFileInfo(path).canonicalFilePath());
+}
 
-	const auto underscore = packageFamilyName.lastIndexOf(u'_');
-	if (underscore <= 0 || underscore + 1 >= packageFamilyName.size()) return false;
-	const auto packageName = packageFamilyName.left(underscore);
-	const auto publisher = packageFamilyName.mid(underscore + 1);
-	const auto rest = QStringView(target).sliced(root.size() + 1);
-	const auto folder = rest.first(rest.indexOf(u'\\') < 0 ? rest.size() : rest.indexOf(u'\\'));
-	return folder.startsWith(packageName + u'_', Qt::CaseInsensitive)
-	    && folder.endsWith(QStringLiteral("__") + publisher, Qt::CaseInsensitive)
-	    && targetInfo.isFile();
+// Verifies that targetPath is an existing regular file strictly inside the
+// registered package install directory. The resolver is injectable so tests
+// can model junctions without depending on machine-wide packages or links.
+inline std::optional<QString> canonicalPackageTargetInsideRoot(
+    const QString& targetPath,
+    const QString& installRoot,
+    const CanonicalPathProvider& canonicalize = {}
+) {
+	const auto canonical = canonicalize ? canonicalize : CanonicalPathProvider(canonicalFilesystemPath);
+	const auto root = canonical(installRoot);
+	const auto target = canonical(targetPath);
+	if (root.isEmpty() || target.isEmpty() || target == root
+	    || !target.startsWith(root + u'\\', Qt::CaseInsensitive)
+	    || !QFileInfo(target).isFile())
+	{
+		return std::nullopt;
+	}
+	return target;
 }
 
 inline std::optional<AppExecAliasInfo> verifiedAppExecAlias(
     const QString& aliasPath,
     const QString& packageFamilyName,
-    const QString& aumid
+    const QString& aumid,
+    const QString& installRoot,
+    const CanonicalPathProvider& canonicalize = {}
 ) {
-	const auto info = readAppExecAlias(aliasPath);
-	if (!info || !appExecAliasMatches(*info, packageFamilyName, aumid)
-	    || !isWindowsAppsPackageTarget(info->targetPath, packageFamilyName))
-	{
-		return std::nullopt;
-	}
+	auto info = readAppExecAlias(aliasPath);
+	if (info) info->aliasName = QFileInfo(aliasPath).fileName();
+	if (!info || !appExecAliasMatches(*info, packageFamilyName, aumid)) return std::nullopt;
+
+	const auto target = canonicalPackageTargetInsideRoot(info->targetPath, installRoot, canonicalize);
+	if (!target) return std::nullopt;
+	info->targetPath = *target;
 	return info;
 }
 

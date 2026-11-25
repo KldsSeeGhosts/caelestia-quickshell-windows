@@ -401,6 +401,113 @@ private slots:
 		QVERIFY(!parseAppExecAliasPayload(appExecPayload(family, aumid, target).chopped(3)).has_value());
 	}
 
+
+	void elevatedBoundaryRulesAreSharedByExplicitAndAutomaticElevation() {
+		using namespace qs::windows::process;
+		QTemporaryDir root;
+		QVERIFY(root.isValid());
+		const auto bin = QDir::toNativeSeparators(QDir(root.path()).filePath(QStringLiteral("Bin.exe")));
+		QVERIFY(QFile::copy(QCoreApplication::applicationFilePath(), bin));
+
+		const auto ambiguous = bin + QStringLiteral(" Staging Target.exe");
+		const auto parsed = parseLaunchCommand(ambiguous);
+		QCOMPARE(parsed.error, DWORD(ERROR_SUCCESS));
+		QVERIFY(!canElevateParsedCommand(parsed));
+		QVERIFY(!canUseAutomaticElevation(parsed, ERROR_ELEVATION_REQUIRED));
+		QCOMPARE(parseElevatedLaunchCommand(ambiguous).error, DWORD(ERROR_INVALID_PARAMETER));
+
+		const auto quoted = parseElevatedLaunchCommand(
+		    u'"' + bin + QStringLiteral("\" Staging Target.exe")
+		);
+		QCOMPARE(quoted.error, DWORD(ERROR_SUCCESS));
+		QVERIFY(canElevateParsedCommand(quoted));
+
+		const auto bare = parseElevatedLaunchCommand(QStringLiteral("wt.exe -p PowerShell"));
+		QCOMPARE(bare.error, DWORD(ERROR_SUCCESS));
+		QVERIFY(canElevateParsedCommand(bare));
+		QCOMPARE(
+		    parseElevatedLaunchCommand(QStringLiteral("wt.exe src\\file.cpp")).error,
+		    DWORD(ERROR_INVALID_PARAMETER)
+		);
+		const auto quotedArgument = parseElevatedLaunchCommand(
+		    QStringLiteral("wt.exe \"src\\file.cpp\"")
+		);
+		QCOMPARE(quotedArgument.error, DWORD(ERROR_SUCCESS));
+
+		// A structured target has an explicit executable boundary, so trailing
+		// arguments cannot make it part of a longer unquoted path.
+		QCOMPARE(validateElevatedTarget(bin), DWORD(ERROR_SUCCESS));
+		QCOMPARE(validateElevatedTarget(root.path()), DWORD(ERROR_INVALID_PARAMETER));
+	}
+
+	void bareCommandLooksUpPathBeforeRejectingPathArguments() {
+		using namespace qs::windows::process;
+		QTemporaryDir root;
+		QVERIFY(root.isValid());
+		const auto tool = QDir::toNativeSeparators(QDir(root.path()).filePath(QStringLiteral("tool.exe")));
+		QVERIFY(QFile::copy(QCoreApplication::applicationFilePath(), tool));
+
+		const auto oldPath = qgetenv("PATH");
+		qputenv("PATH", QDir::toNativeSeparators(root.path()).toUtf8() + ';' + oldPath);
+		const auto parsed = parseLaunchCommand(QStringLiteral("tool src\\file.cpp"));
+		if (oldPath.isNull()) qunsetenv("PATH");
+		else qputenv("PATH", oldPath);
+
+		QCOMPARE(parsed.error, DWORD(ERROR_SUCCESS));
+		QCOMPARE(parsed.program, QStringLiteral("tool"));
+		QCOMPARE(parsed.executable, tool);
+		QCOMPARE(parsed.argumentTail, QStringLiteral("src\\file.cpp"));
+	}
+
+	void existingDirectoryTargetsUseShellOpenButNeverElevation() {
+		using namespace qs::windows::process;
+		QTemporaryDir root;
+		QVERIFY(root.isValid());
+		const auto directory = QDir::toNativeSeparators(root.path());
+		const auto quoted = parseLaunchCommand(u'"' + directory + u'"');
+		QCOMPARE(quoted.error, DWORD(ERROR_SUCCESS));
+		QCOMPARE(quoted.executable, directory);
+		QCOMPARE(quoted.kind, ProgramKind::Shell);
+		QCOMPARE(parseElevatedLaunchCommand(u'"' + directory + u'"').error, DWORD(ERROR_INVALID_PARAMETER));
+		QCOMPARE(validateElevatedTarget(directory), DWORD(ERROR_INVALID_PARAMETER));
+	}
+
+	void packageTargetsAreCanonicalAndConfinedToInstallRoot() {
+		using namespace qs::windows::sys;
+		QTemporaryDir root;
+		QVERIFY(root.isValid());
+		QVERIFY(QDir(root.path()).mkpath(QStringLiteral("package")));
+		QVERIFY(QDir(root.path()).mkpath(QStringLiteral("outside")));
+		const auto packageRoot = QDir::toNativeSeparators(
+		    QDir(root.path()).filePath(QStringLiteral("package"))
+		);
+		const auto inside = QDir::toNativeSeparators(
+		    QDir(packageRoot).filePath(QStringLiteral("app.exe"))
+		);
+		const auto outside = QDir::toNativeSeparators(
+		    QDir(root.path()).filePath(QStringLiteral("outside/evil.exe"))
+		);
+		QVERIFY(QFile::copy(QCoreApplication::applicationFilePath(), inside));
+		QVERIFY(QFile::copy(QCoreApplication::applicationFilePath(), outside));
+
+		const auto canonicalInside = canonicalPackageTargetInsideRoot(inside, packageRoot);
+		QVERIFY(canonicalInside.has_value());
+		QCOMPARE(*canonicalInside, canonicalFilesystemPath(inside));
+		QVERIFY(!canonicalPackageTargetInsideRoot(outside, packageRoot).has_value());
+
+		// Model a junction inside the package resolving outside it. The injected
+		// canonicalizer makes the escape deterministic without requiring symlink rights.
+		const auto junctionInput = QDir::toNativeSeparators(
+		    QDir(packageRoot).filePath(QStringLiteral("junction/evil.exe"))
+		);
+		const auto outsideCanonical = canonicalFilesystemPath(outside);
+		const CanonicalPathProvider resolver = [&](const QString& path) {
+			if (QDir::toNativeSeparators(path) == junctionInput) return outsideCanonical;
+			return canonicalFilesystemPath(path);
+		};
+		QVERIFY(!canonicalPackageTargetInsideRoot(junctionInput, packageRoot, resolver).has_value());
+	}
+
 	void shellActionRequestIdsAreMonotonic() {
 		const auto first = qs::windows::sys::detail::nextShellActionRequestId();
 		const auto second = qs::windows::sys::detail::nextShellActionRequestId();

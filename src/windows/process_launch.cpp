@@ -161,6 +161,15 @@ QString normalizedExistingFile(const QString& path) {
 	return {};
 }
 
+QString normalizedExistingDirectory(const QString& path) {
+	const auto absolute = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
+	const auto attributes = GetFileAttributesW(absolute.toStdWString().c_str());
+	if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+		return absolute;
+	}
+	return {};
+}
+
 QStringList executableExtensions() {
 	auto extensions = QStringList();
 	const auto pathext = qEnvironmentVariable("PATHEXT");
@@ -576,7 +585,10 @@ QString joinCommandLine(const QString& program, const QStringList& arguments) {
 QString resolveExecutable(const QString& program) {
 	if (program.isEmpty()) return QString();
 
-	if (looksLikePath(program)) return resolvePathCandidate(program);
+	if (looksLikePath(program)) {
+		if (auto directory = normalizedExistingDirectory(program); !directory.isEmpty()) return directory;
+		return resolvePathCandidate(program);
+	}
 
 	// A file beside the shell wins over PATH, matching the keybind behavior that
 	// shipped before the unified launcher.
@@ -661,7 +673,9 @@ LaunchCommand parseLaunchCommand(const QString& command) {
 			if (looksLikePath(first)) {
 				end = explicitPathEnd(line, end);
 				if (end < 0) return parsed;
-			} else if (!hasExecutableExtension(first) && hasAmbiguousRelativePath(line, end)) {
+			} else if (!hasExecutableExtension(first) && resolveExecutable(first.toString()).isEmpty()
+			           && hasAmbiguousRelativePath(line, end))
+			{
 				return parsed;
 			}
 		}
@@ -736,6 +750,9 @@ LaunchResult shellExecuteTarget(
 		);
 	}
 	if (verb == QStringLiteral("runas")) {
+		if (const auto error = validateElevatedTarget(target); error != ERROR_SUCCESS) {
+			return detail::launchResultForError(error);
+		}
 		return shellExecuteExTarget(target, arguments, directory, verb, owner, invokeIdList);
 	}
 	return detail::launchResultForError(ERROR_NOT_SUPPORTED);
@@ -753,6 +770,9 @@ LaunchResult launchCommand(const QString& command, const QString& workingDirecto
 		    if (parsed.useProcess()) {
 			    const auto result = createProcess(parsed, directory, environment);
 			    if (result.error == ERROR_ELEVATION_REQUIRED) {
+				    if (!canUseAutomaticElevation(parsed, result.error)) {
+					    return detail::launchResultForError(ERROR_INVALID_PARAMETER);
+				    }
 				    return shellExecuteTarget(
 				        target, parsed.argumentTail, directory, QStringLiteral("runas"), owner
 				    );
@@ -764,15 +784,33 @@ LaunchResult launchCommand(const QString& command, const QString& workingDirecto
 	);
 }
 
+bool canUseAutomaticElevation(const LaunchCommand& command, DWORD processError) {
+	return processError == ERROR_ELEVATION_REQUIRED && canElevateParsedCommand(command);
+}
+
+DWORD validateElevatedTarget(const QString& target) {
+	if (target.isEmpty()) return ERROR_FILE_NOT_FOUND;
+	if (target.contains(QChar::Null) || QFileInfo(target).isDir()) return ERROR_INVALID_PARAMETER;
+	return ERROR_SUCCESS;
+}
+
+bool canElevateParsedCommand(const LaunchCommand& command) {
+	if (command.error != ERROR_SUCCESS) return false;
+	if (command.quotedProgram || command.argumentTail.isEmpty()) return true;
+	// A bare command name is resolved through PATH and cannot be a prefix of a
+	// longer drive or relative path. A path-like unquoted first token with any
+	// trailing text is ambiguous and must be quoted for elevation.
+	if (looksLikePath(command.program) && !isShellName(command.program)) return false;
+	// A bare command is still ambiguous when its unquoted trailing text could
+	// instead be the next component of a space-containing relative path.
+	return !hasUnquotedPathSeparator(command.argumentTail);
+}
+
 LaunchCommand parseElevatedLaunchCommand(const QString& command) {
 	auto parsed = parseLaunchCommand(command);
-	if (parsed.error != ERROR_SUCCESS || parsed.quotedProgram) return parsed;
-
-	// For elevation, an unquoted executable path containing spaces is not a
-	// safe guess. Path separators in unquoted tail text can also mean that the
-	// first executable-looking token was only a prefix of the intended path.
-	if (parsed.program.contains(u' ') || parsed.program.contains(u'\t')
-	    || hasUnquotedPathSeparator(parsed.argumentTail))
+	if (parsed.error != ERROR_SUCCESS) return parsed;
+	if (!canElevateParsedCommand(parsed)
+	    || (!parsed.executable.isEmpty() && QFileInfo(parsed.executable).isDir()))
 	{
 		parsed.executable.clear();
 		parsed.kind = ProgramKind::Unresolved;

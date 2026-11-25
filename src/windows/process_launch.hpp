@@ -54,6 +54,11 @@ struct LaunchCommand {
 [[nodiscard]] LaunchCommand parseLaunchCommand(const QString& command);
 // Elevated raw commands do not guess at ambiguous unquoted path boundaries.
 [[nodiscard]] LaunchCommand parseElevatedLaunchCommand(const QString& command);
+// True when a parsed raw command has an unambiguous executable boundary for elevation.
+[[nodiscard]] bool canElevateParsedCommand(const LaunchCommand& command);
+[[nodiscard]] bool canUseAutomaticElevation(const LaunchCommand& command, DWORD processError);
+// Validation for structured elevation targets whose executable/argument boundary is explicit.
+[[nodiscard]] DWORD validateElevatedTarget(const QString& target);
 [[nodiscard]] QString quoteCommandArgument(const QString& argument);
 [[nodiscard]] QString joinCommandArguments(const QStringList& arguments);
 [[nodiscard]] QString joinCommandLine(const QString& program, const QStringList& arguments);

@@ -116,7 +116,8 @@ struct PackageInstallInfo {
 std::optional<AppExecAliasInfo> verifiedPackageAlias(
     const QString& family,
     const QStringList& aliases,
-    const QString& aumid
+    const QString& aumid,
+    const QString& installRoot
 ) {
 	if (aliases.isEmpty()) return std::nullopt;
 
@@ -125,9 +126,9 @@ std::optional<AppExecAliasInfo> verifiedPackageAlias(
 	const auto localAppData = takeComString(raw);
 	if (FAILED(hr) || localAppData.isEmpty()) return std::nullopt;
 
-	// The unscoped alias can belong to a different package. Only consider a
-	// registered AppExecLink inside the requested package family's directory,
-	// then verify the package identity and target inside its reparse payload.
+	// The unscoped alias can belong to a different package. Prefer the
+	// package-scoped alias, then verify package identity and install target
+	// inside the reparse payload before accepting either location.
 	const auto root = QDir(localAppData + QStringLiteral("/Microsoft/WindowsApps"));
 	const auto scoped = QDir(root.filePath(family));
 	for (const auto& alias: aliases) {
@@ -137,7 +138,7 @@ std::optional<AppExecAliasInfo> verifiedPackageAlias(
 		     {QDir::toNativeSeparators(scoped.filePath(alias)),
 		      QDir::toNativeSeparators(root.filePath(alias))})
 		{
-			if (auto info = verifiedAppExecAlias(path, family, aumid)) return info;
+			if (auto info = verifiedAppExecAlias(path, family, aumid, installRoot)) return info;
 		}
 	}
 	return std::nullopt;
@@ -176,7 +177,7 @@ std::optional<PackageInstallInfo> packageInstall(const QString& family, QStringV
 		if (!manifest.applicationFound) continue;
 		install.allowElevation = manifest.allowElevation;
 		const auto aumid = family + u'!' + applicationId.toString();
-		if (const auto alias = verifiedPackageAlias(family, manifest.desktopExecutionAliases, aumid)) {
+		if (const auto alias = verifiedPackageAlias(family, manifest.desktopExecutionAliases, aumid, install.path)) {
 			install.executionAlias = alias->aliasName;
 			install.elevationTarget = alias->targetPath;
 		}
@@ -340,18 +341,17 @@ DWORD runElevated(const QString& id, const AppActionInfo& app, HWND owner) {
 		}
 		result = process::detail::fallbackOnFailure(result, [&] {
 			if (app.executionAlias.isEmpty()) return result;
-			// Package-scoped WindowsApps aliases are user-writable. Re-read the
-			// reparse payload immediately before launch and use the verified
-			// read-only package target rather than the mutable alias itself.
-			const auto verified = verifiedPackageAlias(
-			    app.packageFamilyName,
-			    {app.executionAlias},
-			    app.token
-			);
-			if (!verified || verified->targetPath.compare(app.elevationTarget, Qt::CaseInsensitive) != 0) {
+			// Resolve the registered package install directory and re-read the
+			// mutable alias immediately before launch. The launch target is the
+			// verified canonical regular file inside that registered directory.
+			const auto applicationId = QStringView(app.token).sliced(app.packageFamilyName.size() + 1);
+			const auto install = packageInstall(app.packageFamilyName, applicationId);
+			if (!install || install->executionAlias != app.executionAlias
+			    || install->elevationTarget.isEmpty())
+			{
 				return process::detail::launchResultForError(ERROR_ACCESS_DENIED);
 			}
-			return launch(verified->targetPath, false);
+			return launch(install->elevationTarget, false);
 		});
 	} else {
 		const auto shortcut = startMenuShortcut(app);
