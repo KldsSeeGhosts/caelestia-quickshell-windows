@@ -287,7 +287,15 @@ std::optional<QString> resolveLocalFilesystemPath(const QString& path, int depth
 
 	for (const auto& segment: segments) {
 		if (segment == QStringLiteral(".")) continue;
-		if (segment == QStringLiteral("..")) return std::nullopt;
+		if (segment == QStringLiteral("..") || segment.endsWith(u' ') || segment.endsWith(u'.')
+		    || segment.contains(u':'))
+		{
+			return std::nullopt;
+		}
+	}
+
+	for (const auto& segment: segments) {
+		if (segment == QStringLiteral(".")) continue;
 
 		const auto parentDir = current;
 		current = current.endsWith(u'\\') ? (current + segment) : (current + QStringLiteral("\\") + segment);

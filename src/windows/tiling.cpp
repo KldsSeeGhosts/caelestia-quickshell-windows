@@ -3751,6 +3751,13 @@ TilingManager::setFloatingDetailed(TrackedWindow* window, bool floating, bool to
 		return FloatingChangeResult::ScopeExcluded;
 	}
 
+	if (!floating && m.layout == nullptr
+	    && (window->desktop() < 0 || window->screen() == nullptr
+	        || !QGuiApplication::screens().contains(window->screen())))
+	{
+		return FloatingChangeResult::Failed;
+	}
+
 	if (!toggle) {
 		const auto overrideMatches = floating ? m.override == Override::Float
 		                                      : m.override == Override::Tile;
@@ -3768,6 +3775,7 @@ TilingManager::setFloatingDetailed(TrackedWindow* window, bool floating, bool to
 	this->markWindow(window);
 	if (!floating && !wasTiled) {
 		const auto state = this->stateOf(m);
+		if (state == State::Out) return FloatingChangeResult::Failed;
 		if (state == State::Hidden || state == State::Suspended) {
 			return FloatingChangeResult::Deferred;
 		}

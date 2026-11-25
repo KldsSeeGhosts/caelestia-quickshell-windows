@@ -556,6 +556,40 @@ private slots:
 		QCOMPARE(invoke.path, aliasTarget);
 	}
 
+	void trailingSpaceOrDotSegmentsAreRejectedBeforeProbing_data() {
+		QTest::addColumn<QString>("root");
+		QTest::addColumn<QString>("target");
+		QTest::newRow("trailing space segment")
+		    << QStringLiteral("C:\\Redirected \\Start Menu")
+		    << QStringLiteral("C:\\Redirected \\Start Menu\\app.exe");
+		QTest::newRow("trailing dot segment")
+		    << QStringLiteral("C:\\Redirected.\\Start Menu")
+		    << QStringLiteral("C:\\Redirected.\\Start Menu\\app.exe");
+	}
+
+	void trailingSpaceOrDotSegmentsAreRejectedBeforeProbing() {
+		QFETCH(QString, root);
+		QFETCH(QString, target);
+		auto filesystemProbes = 0;
+
+		qs::windows::sys::test::setDriveTypeInvokerForTest([](const QString&) {
+			return UINT(DRIVE_FIXED);
+		});
+		qs::windows::sys::test::setFileAttributesInvokerForTest([&](const QString&) {
+			filesystemProbes++;
+			return DWORD(FILE_ATTRIBUTE_DIRECTORY);
+		});
+		qs::windows::sys::test::setShortcutRootsForTest({root});
+		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-trimmed-segment"), target);
+		qs::windows::sys::test::setLinkTargetForId(QStringLiteral("fixture-trimmed-segment"), target);
+
+		AppActions actions;
+		const auto id = QStringLiteral("fixture-trimmed-segment");
+		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), false);
+		QVERIFY(!actions.openProperties(id));
+		QCOMPARE(filesystemProbes, 0);
+	}
+
 	void remoteStartMenuShortcutIsRejectedForPropertiesButUsedForElevation() {
 		QTemporaryDir directory;
 		QVERIFY(directory.isValid());

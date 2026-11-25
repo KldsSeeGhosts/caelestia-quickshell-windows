@@ -2068,6 +2068,29 @@ private slots:
 		QCOMPARE(manager->setFloatingDetailed(window, false, false), FloatingChangeResult::Noop);
 	}
 
+	void tileRequestWithoutDesktopOrMonitorFails_data() {
+		QTest::addColumn<QString>("missing");
+		QTest::newRow("no desktop") << QStringLiteral("desktop");
+		QTest::newRow("no monitor") << QStringLiteral("monitor");
+	}
+
+	void tileRequestWithoutDesktopOrMonitorFails() {
+		QFETCH(QString, missing);
+		auto* window = add(1);
+		if (missing == "desktop") {
+			fakeWindow(window->hwnd()).desktop = -1;
+		} else {
+			fakeDesktop.screens = {QGuiApplication::primaryScreen(), nullptr};
+			fakeWindow(window->hwnd()).monitor = 1;
+		}
+		enable();
+		QVERIFY(!manager->isTiled(window));
+
+		QCOMPARE(manager->setFloatingDetailed(window, false, false), FloatingChangeResult::Failed);
+		QCOMPARE(manager->setFloatingDetailed(window, false, true), FloatingChangeResult::Failed);
+		QVERIFY(!manager->isTiled(window));
+	}
+
 	void deferredTileWhilePlacementIsSuspended_data() {
 		QTest::addColumn<QString>("state");
 		QTest::newRow("maximized") << QStringLiteral("maximized");
