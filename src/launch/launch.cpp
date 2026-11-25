@@ -1,4 +1,7 @@
+#include <vector>
+
 #include <qapplication.h>
+#include <qbytearray.h>
 #include <qcoreapplication.h>
 #include <qcryptographichash.h>
 #include <qdebug.h>
@@ -12,6 +15,7 @@
 #include <qnamespace.h>
 #include <qprocess.h>
 #include <qqmldebug.h>
+#include <qquickstyle.h>
 #include <qquickwindow.h>
 #include <qstandardpaths.h>
 #include <qstring.h>
@@ -197,10 +201,11 @@ int launch(const LaunchArgs& args, char** argv) {
 	}
 
 	Common::INITIAL_ENVIRONMENT = QProcessEnvironment::systemEnvironment();
+	Common::INITIAL_ENVIRONMENT.remove(QStringLiteral("CAELESTIA_SUPERVISOR_PIPE"));
+	Common::INITIAL_ENVIRONMENT.remove(QStringLiteral("CAELESTIA_SUPERVISOR_TOKEN"));
 
 	if (!pragmas.useSystemStyle) {
 		qunsetenv("QT_STYLE_OVERRIDE");
-		qputenv("QT_QUICK_CONTROLS_STYLE", "Fusion");
 	}
 
 	for (auto [var, val]: pragmas.defaultEnv.asKeyValueRange()) {
@@ -211,13 +216,12 @@ int launch(const LaunchArgs& args, char** argv) {
 		qputenv(var.toUtf8(), val.toUtf8());
 	}
 
+	const auto useFusionStyle = !pragmas.useSystemStyle
+	                         && !qEnvironmentVariableIsSet("QT_QUICK_CONTROLS_STYLE");
 	pragmas.dropExpensiveFonts |= qEnvironmentVariableIntValue("QS_DROP_EXPENSIVE_FONTS") == 1;
 
 #ifdef _WIN32
-	if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")) {
-		qputenv("QT_QPA_PLATFORM", "windows:fontengine=freetype");
-	}
-
+	const auto useFreetypePlatform = !qEnvironmentVariableIsSet("QT_QPA_PLATFORM");
 	_setmaxstdio(8192);
 
 	if (pragmas.dropExpensiveFonts) {
@@ -319,13 +323,26 @@ int launch(const LaunchArgs& args, char** argv) {
 	QGuiApplication::setDesktopSettingsAware(pragmas.desktopSettingsAware);
 
 	QGuiApplication* app = nullptr;
-	auto qArgC = 0;
+	auto programName = QByteArray(argv != nullptr && argv[0] != nullptr ? argv[0] : "qs");
+	auto qtArgv = std::vector<char*> {programName.data()};
+#ifdef _WIN32
+	auto platformArgument = QByteArray("-platform");
+	auto platformValue = QByteArray("windows:fontengine=freetype");
+	if (useFreetypePlatform) {
+		qtArgv.push_back(platformArgument.data());
+		qtArgv.push_back(platformValue.data());
+	}
+#endif
+	qtArgv.push_back(nullptr);
+	auto qArgC = static_cast<int>(qtArgv.size() - 1);
 
 	if (pragmas.useQApplication) {
-		app = new QApplication(qArgC, argv);
+		app = new QApplication(qArgC, qtArgv.data());
 	} else {
-		app = new QGuiApplication(qArgC, argv);
+		app = new QGuiApplication(qArgC, qtArgv.data());
 	}
+
+	if (useFusionStyle) QQuickStyle::setStyle(QStringLiteral("Fusion"));
 
 	auto appMs = timer.restart();
 	LogManager::initThreadLogging();

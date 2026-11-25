@@ -3,7 +3,6 @@
 #include <optional>
 #include <string>
 
-#include <qdir.h>
 #include <qhash.h>
 #include <qlist.h>
 #include <qlogging.h>
@@ -18,6 +17,7 @@
 
 #include "../keyboard_hook.hpp"
 #include "../hotkeys.hpp"
+#include "../process_launch.hpp"
 #include "../redact.hpp"
 #include "../tiling.hpp"
 #include "../util.hpp"
@@ -30,8 +30,6 @@
 #include "monitor_focus.hpp"
 #include "pin_support.hpp"
 #include "workspace.hpp"
-
-#include <shellapi.h>
 
 using namespace qs::windows;
 
@@ -99,60 +97,10 @@ WORD arrowKey(const QString& direction) {
 }
 
 void launchCommandLine(const QString& line) {
-	auto commandLine = line.toStdWString();
-	auto home = QDir::toNativeSeparators(QDir::homePath()).toStdWString();
-
-	STARTUPINFOW startup {};
-	startup.cb = sizeof(startup);
-	PROCESS_INFORMATION process {};
-
-	auto ok = CreateProcessW(
-	    nullptr,
-	    commandLine.data(),
-	    nullptr,
-	    nullptr,
-	    FALSE,
-	    CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
-	    nullptr,
-	    home.c_str(),
-	    &startup,
-	    &process
-	);
-
-	if (ok) {
-		CloseHandle(process.hProcess);
-		CloseHandle(process.hThread);
-		return;
-	}
-
-	QString file;
-	QString params;
-
-	if (line.startsWith('"')) {
-		auto end = line.indexOf('"', 1);
-		file = line.mid(1, end - 1);
-		if (end != -1) params = line.mid(end + 1).trimmed();
-	} else {
-		auto space = line.indexOf(' ');
-		file = space == -1 ? line : line.left(space);
-		if (space != -1) params = line.mid(space + 1).trimmed();
-	}
-
-	auto wfile = file.toStdWString();
-	auto wparams = params.toStdWString();
-
-	auto result = ShellExecuteW(
-	    nullptr,
-	    L"open",
-	    wfile.c_str(),
-	    params.isEmpty() ? nullptr : wparams.c_str(),
-	    home.c_str(),
-	    SW_SHOWNORMAL
-	);
-
-	if (reinterpret_cast<INT_PTR>(result) <= 32) {
+	const auto result = qs::windows::process::launchCommand(line);
+	if (!result.started() && result.status != qs::windows::process::LaunchStatus::Cancelled) {
 		qCWarning(logDispatch) << "exec failed for" << qs::windows::logId(line) << "error"
-		                       << reinterpret_cast<INT_PTR>(result);
+		                       << result.error;
 	}
 }
 

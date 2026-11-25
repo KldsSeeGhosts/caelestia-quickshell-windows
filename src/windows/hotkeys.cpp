@@ -7,7 +7,6 @@
 
 #include <qcoreapplication.h>
 #include <qdir.h>
-#include <qendian.h>
 #include <qfile.h>
 #include <qfileinfo.h>
 #include <qhash.h>
@@ -21,7 +20,6 @@
 #include <qmetaobject.h>
 #include <qobject.h>
 #include <qpointer.h>
-#include <qprocess.h>
 #include <qqmlengine.h>
 #include <qstandardpaths.h>
 #include <qstring.h>
@@ -33,11 +31,11 @@
 #include "../core/instanceinfo.hpp"
 #include "../core/rootwrapper.hpp"
 #include "../io/ipchandler.hpp"
-#include "../io/processcore.hpp"
 #include "activation_policy.hpp"
 #include "input_mask.hpp"
 #include "input_settle.hpp"
 #include "keyboard_hook.hpp"
+#include "process_launch.hpp"
 #include "redact.hpp"
 #include "system/keyboard.hpp"
 #include "util.hpp"
@@ -161,62 +159,6 @@ bool invokeWithString(QObject* object, const char* name, const QString& argument
 		}
 	}
 
-	return false;
-}
-
-bool isConsoleProgram(const QString& program) {
-	auto path = QFileInfo(program).isFile() ? program : QStandardPaths::findExecutable(program);
-	if (path.isEmpty()) return false;
-
-	QFile file(path);
-	if (!file.open(QIODevice::ReadOnly)) return false;
-
-	auto dos = file.read(0x40);
-	if (dos.length() < 0x40 || !dos.startsWith("MZ")) return false;
-	auto peOffset = qFromLittleEndian<quint32>(dos.constData() + 0x3c);
-
-	if (!file.seek(peOffset)) return false;
-	auto header = file.read(4 + 20 + 70);
-	if (header.length() < 4 + 20 + 70 || !header.startsWith(QByteArray("PE\0\0", 4))) return false;
-
-	auto subsystem = qFromLittleEndian<quint16>(header.constData() + 4 + 20 + 68);
-	return subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI;
-}
-
-bool tryStartDetached(const QString& command) {
-	auto parts = QProcess::splitCommand(command);
-	if (parts.isEmpty()) return false;
-
-	auto program = parts.takeFirst();
-	if (!program.contains('/') && !program.contains('\\')) {
-		auto local = QDir(QCoreApplication::applicationDirPath()).filePath(program);
-		if (QFileInfo(local).isFile()) program = local;
-	}
-
-	auto process = QProcess();
-	process.setProgram(program);
-	process.setArguments(parts);
-	process.setWorkingDirectory(QDir::homePath());
-
-	if (isConsoleProgram(program)) {
-		process.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
-			args->flags &= ~static_cast<DWORD>(CREATE_NO_WINDOW);
-			args->flags |= CREATE_NEW_CONSOLE;
-			args->inheritHandles = false;
-			args->startupInfo->dwFlags &= ~static_cast<DWORD>(STARTF_USESTDHANDLES);
-			args->startupInfo->hStdInput = nullptr;
-			args->startupInfo->hStdOutput = nullptr;
-			args->startupInfo->hStdError = nullptr;
-		});
-	} else {
-		qs::io::process::disownHandles(&process);
-	}
-
-	if (process.startDetached()) return true;
-
-	// File name only: the arguments and directories can hold user data.
-	qCDebug(logHotkeys) << "Could not start" << QFileInfo(program).fileName() << ":"
-	                    << process.errorString();
 	return false;
 }
 
@@ -821,6 +763,8 @@ void HotkeyManager::parse(const QByteArray& data, const QString& path) {
 		} else if (action == "exec") {
 			bind.action = Bind::Action::Exec;
 			bind.argument = object.value("command").toString();
+			bind.name = object.value("name").toString(object.value("id").toString());
+			bind.elevate = object.value("elevate").toBool();
 		} else if (action == "ipc") {
 			bind.action = Bind::Action::Ipc;
 			bind.name = object.value("target").toString();
@@ -850,6 +794,7 @@ void HotkeyManager::parse(const QByteArray& data, const QString& path) {
 
 			auto disabled = object.value("disabled").toObject();
 			if (disabled.value("action").toString() == "global") parseGlobalName(disabled, bind);
+			else if (disabled.value("action").toString() == "exec") parseExecName(disabled, bind);
 		} else {
 			qCWarning(logHotkeys).noquote() << where << ": unknown action" << action;
 			continue;
@@ -1094,7 +1039,11 @@ QVariantList HotkeyManager::bindsInfo() const {
 		switch (bind.action) {
 		case Bind::Action::Global: map["name"] = bind.appid + ':' + bind.name; break;
 		case Bind::Action::Dispatch: map["dispatch"] = bind.argument; break;
-		case Bind::Action::Exec: map["command"] = bind.argument; break;
+		case Bind::Action::Exec:
+			map["command"] = bind.argument;
+			map["elevate"] = bind.elevate;
+			if (!bind.name.isEmpty()) map["name"] = bind.name;
+			break;
 		case Bind::Action::Ipc:
 			map["target"] = bind.name;
 			map["function"] = bind.function;
@@ -1459,13 +1408,17 @@ void HotkeyManager::runExec(const Bind& bind) const {
 		commands.append(command);
 	}
 
-	runLauncher([commands, argument = bind.argument]() {
+	runLauncher([commands, argument = bind.argument, elevate = bind.elevate]() {
+		auto lastError = DWORD(ERROR_SUCCESS);
 		for (const auto& command: commands) {
-			if (tryStartDetached(command)) return;
+			const auto result = elevate ? process::launchElevatedCommand(command)
+			                            : process::launchCommand(command);
+			if (result.started() || result.status == process::LaunchStatus::Cancelled) return;
+			lastError = result.error;
 		}
 
 		qCWarning(logHotkeys) << "Failed to start any alternative of"
-		                      << qs::windows::logId(argument);
+		                      << qs::windows::logId(argument) << "error" << lastError;
 	});
 }
 

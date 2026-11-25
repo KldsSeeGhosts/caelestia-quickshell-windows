@@ -17,6 +17,7 @@ qt_add_library(quickshell-windows STATIC
 	keyboard_hook.cpp
 	input_settle.cpp
 	hotkeys.cpp
+	process_launch.cpp
 	focus_grab.cpp
 	accessor_state.hpp
 	virtual_desktops.cpp

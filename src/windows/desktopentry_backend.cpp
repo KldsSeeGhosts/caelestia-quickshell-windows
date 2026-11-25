@@ -22,6 +22,7 @@
 
 #include "../core/desktopentry.hpp"
 #include "known_folders.hpp"
+#include "process_launch.hpp"
 #include "redact.hpp"
 #include "util.hpp"
 
@@ -345,6 +346,21 @@ namespace {
 
 void launchToken(const QString& token, const QString& workingDirectory) {
 	auto com = ComApartment(COINIT_APARTMENTTHREADED);
+	const auto shellPath = APPS_FOLDER_PREFIX + token;
+
+	// Explorer is the preferred parent for ordinary launches: its shell instance
+	// has the user's unmodified environment even when the shell process had to
+	// set Qt or config-specific variables for itself.
+	const auto shell = process::shellExecuteTarget(
+	    shellPath,
+	    QString(),
+	    workingDirectory,
+	    QStringLiteral("open"),
+	    nullptr,
+	    false,
+	    true
+	);
+	if (shell.started()) return;
 
 	ComPtr<IApplicationActivationManager> activationManager;
 	auto hr = CoCreateInstance(
@@ -361,30 +377,14 @@ void launchToken(const QString& token, const QString& workingDirectory) {
 		if (SUCCEEDED(hr)) return;
 
 		qCDebug(logAppsFolder) << "ActivateApplication failed for"
-		                       << qs::windows::logId(token) << ":" << Qt::hex << hr
-		                       << "- falling back to ShellExecuteExW";
+		                       << qs::windows::logId(token) << ":" << Qt::hex << hr;
 	} else {
 		qCDebug(logAppsFolder) << "CoCreateInstance(ApplicationActivationManager) failed:"
 		                       << Qt::hex << hr;
 	}
 
-	auto shellPath = APPS_FOLDER_PREFIX + token;
-	auto wpath = shellPath.toStdWString();
-	auto wdir = workingDirectory.toStdWString();
-
-	auto info = SHELLEXECUTEINFOW {};
-	info.cbSize = sizeof(info);
-	info.fMask = SEE_MASK_NOASYNC;
-	info.lpVerb = L"open";
-	info.lpFile = wpath.c_str();
-	info.lpDirectory = wdir.empty() ? nullptr : wdir.c_str();
-	info.nShow = SW_SHOWNORMAL;
-
-	if (!ShellExecuteExW(&info)) {
-		qCWarning(logAppsFolder) << "ShellExecuteExW failed for"
-		                         << qs::windows::logPath(shellPath) << ":"
-		                         << GetLastError();
-	}
+	qCWarning(logAppsFolder) << "Could not launch" << qs::windows::logId(token)
+	                         << ": shell error" << shell.error;
 }
 
 } // namespace

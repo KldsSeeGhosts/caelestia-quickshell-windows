@@ -3,6 +3,7 @@
 #include <memory>
 
 #include <qcoreapplication.h>
+#include <qprocess.h>
 #include <qtest.h>
 #include <windows.h>
 

@@ -23,7 +23,7 @@ if (WIN32)
 endif()
 
 target_link_libraries(quickshell-launch PRIVATE
-	Qt::Quick Qt::Widgets CLI11::CLI11 quickshell-build
+	Qt::Quick Qt::QuickControls2 Qt::Widgets CLI11::CLI11 quickshell-build
 )
 
 qs_add_pchset(launch

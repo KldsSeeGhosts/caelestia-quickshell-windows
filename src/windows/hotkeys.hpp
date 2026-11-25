@@ -56,6 +56,7 @@ struct Bind {
 	bool onRelease = false;
 	bool repeat = false;
 	bool preferRegister = false;
+	bool elevate = false;
 	QString description;
 	Mechanism mechanism = Mechanism::None;
 };

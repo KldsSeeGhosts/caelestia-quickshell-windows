@@ -67,6 +67,18 @@ private slots:
 		QCOMPARE(hotkey_fixture::running, taskbarShortcutFilterEnabled());
 	}
 
+	void execBindParsesElevationAndIdentity() {
+		using namespace qs::windows::hotkeys;
+		auto* manager = HotkeyManager::instance();
+		manager->parse(R"({"binds":[
+			{"keys":"Super+Return","action":"exec","id":"terminal","command":"wt.exe","elevate":true}
+		]})", "fixture");
+		QCOMPARE(manager->binds.size(), 1);
+		QCOMPARE(manager->binds.first().action, Bind::Action::Exec);
+		QCOMPARE(manager->binds.first().name, "terminal");
+		QVERIFY(manager->binds.first().elevate);
+	}
+
 	void backendFilterAllowsRegisteredBindsToWin() {
 		for (int mods = 0; mods < 16; mods++) {
 			for (int vk = 0; vk < 256; vk++) {
@@ -363,6 +375,47 @@ private slots:
 		mergeDefaults(binds, defaults, introduced);
 		QCOMPARE(binds.size(), 4);
 		QCOMPARE(binds.at(1).name, "screenshot");
+
+		auto exec = [](uint8_t modifiers, uint8_t vk, const QString& name, bool elevate = false) {
+			Bind bind;
+			bind.action = Bind::Action::Exec;
+			bind.combo.mods = modifiers;
+			bind.combo.vk = vk;
+			bind.name = name;
+			bind.argument = name + ".exe";
+			bind.elevate = elevate;
+			return bind;
+		};
+		const QList<Bind> execDefaults {exec(ModSuper, VK_RETURN, "terminal", true)};
+		const auto introducedExec = qs::windows::hotkeys::introducedDefaults(
+		    QJsonArray {QJsonObject {
+		        {"action", "exec"},
+		        {"id", "terminal"},
+		        {"command", "terminal.exe"},
+		        {"since", "1"},
+		    }});
+		binds.clear();
+		mergeDefaults(binds, execDefaults, introducedExec);
+		QCOMPARE(binds.size(), 1);
+		QCOMPARE(binds.first().name, "terminal");
+		QVERIFY(binds.first().elevate);
+
+		// A user's chord and a user's exec/native identity both reserve the new
+		// default; a global shortcut with the same display name does not.
+		auto userChord = exec(ModSuper, VK_RETURN, "other");
+		binds = {userChord};
+		mergeDefaults(binds, execDefaults, introducedExec);
+		QCOMPARE(binds.size(), 1);
+		QCOMPARE(binds.first().name, "other");
+		auto sameName = exec(ModCtrl | ModAlt, 'T', "terminal");
+		binds = {sameName};
+		mergeDefaults(binds, execDefaults, introducedExec);
+		QCOMPARE(binds.size(), 1);
+		QCOMPARE(binds.first().combo, sameName.combo);
+		auto sameGlobalName = global(ModCtrl | ModAlt, 'T', "terminal");
+		binds = {sameGlobalName};
+		mergeDefaults(binds, execDefaults, introducedExec);
+		QCOMPARE(binds.size(), 2);
 	}
 
 	void superChordStaysOnTheHookByDefault() {
