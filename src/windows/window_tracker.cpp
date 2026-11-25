@@ -449,7 +449,26 @@ void TrackedWindow::refreshDesktop(bool askShell) {
 	this->bDesktop = static_cast<qint32>(desktops->windowDesktopIndex(this->mHwnd));
 }
 
+bool TrackedWindow::hasCurrentOwner() const {
+	DWORD process = 0;
+	auto thread = GetWindowThreadProcessId(this->mHwnd, &process);
+	return window_action_detail::trackedOwnerMatches(
+	    IsWindow(this->mHwnd),
+	    process,
+	    thread,
+	    this->mFrameProcessId,
+	    this->mFrameThreadId
+	);
+}
+
+bool TrackedWindow::ensureCurrentOwner(const QString& action) {
+	if (this->hasCurrentOwner()) return true;
+	this->reportActionRefused(action, window_action_detail::trackedOwnerFailureReason(false));
+	return false;
+}
+
 bool TrackedWindow::activate() {
+	if (!this->ensureCurrentOwner(QStringLiteral("activate"))) return false;
 	auto* desktops = this->tracker->desktops();
 	auto desktop = desktops->windowDesktopIndex(this->mHwnd);
 
@@ -517,6 +536,7 @@ void TrackedWindow::clearActionError() {
 }
 
 void TrackedWindow::close() {
+	if (!this->ensureCurrentOwner(QStringLiteral("close"))) return;
 	SetLastError(ERROR_SUCCESS);
 	if (PostMessageW(this->mHwnd, WM_CLOSE, 0, 0)) {
 		this->clearActionError();
@@ -535,6 +555,7 @@ void TrackedWindow::close() {
 }
 
 void TrackedWindow::setMinimized(bool minimized) {
+	if (!this->ensureCurrentOwner(QStringLiteral("minimize"))) return;
 	SetLastError(ERROR_SUCCESS);
 	if (PostMessageW(this->mHwnd, WM_SYSCOMMAND, minimized ? SC_MINIMIZE : SC_RESTORE, 0)) {
 		this->clearActionError();
@@ -547,6 +568,7 @@ void TrackedWindow::setMinimized(bool minimized) {
 }
 
 void TrackedWindow::setMaximized(bool maximized) {
+	if (!this->ensureCurrentOwner(QStringLiteral("maximize"))) return;
 	SetLastError(ERROR_SUCCESS);
 	if (PostMessageW(this->mHwnd, WM_SYSCOMMAND, maximized ? SC_MAXIMIZE : SC_RESTORE, 0)) {
 		this->clearActionError();
@@ -563,12 +585,18 @@ void TrackedWindow::setFullscreen(bool fullscreen) {
 }
 
 void TrackedWindow::fullscreenOn(QScreen* screen) {
+	if (!this->ensureCurrentOwner(QStringLiteral("fullscreen"))) return;
 	if (screen == nullptr) {
+		this->fullscreenOps.resetAccessDenied();
 		auto release = this->fullscreenOwner.release();
 		if (release == fullscreen_ownership::Release::Failed) {
 			qCWarning(logTracker) << "Could not restore optional fullscreen for" << this->addressHex();
-			if (!IsWindow(this->mHwnd))
-				this->reportActionRefused(QStringLiteral("fullscreen"), QStringLiteral("stale-window"));
+			auto reason = window_action_detail::fullscreenFailureReason(
+			    this->fullscreenOps.accessDenied(),
+			    IsWindow(this->mHwnd),
+			    isMoreElevated(this->mHwnd)
+			);
+			if (!reason.isEmpty()) this->reportActionRefused(QStringLiteral("fullscreen"), reason);
 			return;
 		}
 		if (release == fullscreen_ownership::Release::Restored
@@ -581,20 +609,28 @@ void TrackedWindow::fullscreenOn(QScreen* screen) {
 	auto rects = monitorRects(monitorForScreen(screen));
 	if (!rects.valid) return;
 	auto rect = toRECT(rects.monitor);
+	this->fullscreenOps.resetAccessDenied();
 	if (this->fullscreenOwner.enter(rect, this->bFullscreen.value())) {
 		this->clearActionError();
-	} else if (!IsWindow(this->mHwnd)) {
-		this->reportActionRefused(QStringLiteral("fullscreen"), QStringLiteral("stale-window"));
+	} else {
+		auto reason = window_action_detail::fullscreenFailureReason(
+		    this->fullscreenOps.accessDenied(),
+		    IsWindow(this->mHwnd),
+		    isMoreElevated(this->mHwnd)
+		);
+		if (!reason.isEmpty()) this->reportActionRefused(QStringLiteral("fullscreen"), reason);
 	}
 }
 
 bool TrackedWindow::moveToDesktop(qsizetype index) {
+	if (!this->ensureCurrentOwner(QStringLiteral("move-to-desktop"))) return false;
 	if (!this->tracker->desktops()->moveWindow(this->mHwnd, index)) return false;
 	this->refreshDesktop(true);
 	return true;
 }
 
 void TrackedWindow::moveTo(const QPoint& logical) {
+	if (!this->ensureCurrentOwner(QStringLiteral("move"))) return;
 	auto* screen = QGuiApplication::screenAt(logical);
 	if (screen == nullptr) screen = this->bScreen.value();
 	if (screen == nullptr) return;

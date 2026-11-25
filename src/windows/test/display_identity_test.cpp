@@ -242,6 +242,11 @@ QByteArray originalRamp() {
 	return QByteArray(reinterpret_cast<const char*>(original), sizeof(original));
 }
 
+void bumpFirstCrashSnapshotSequence() {
+	auto sequence = gamma_detail::crashSnapshotSequenceAtForTest(0);
+	gamma_detail::writeCrashSnapshotSequenceAtForTest(0, sequence + 2);
+}
+
 // One screen. Without withPath it is session-only: neither DisplayConfig nor
 // EnumDisplayDevices gave it an interface path. gainPath() supplies one later,
 // remove() unplugs it and reconnect() plugs the same monitor back in.
@@ -314,6 +319,7 @@ private slots:
 	}
 
 	void cleanup() {
+		gamma_detail::setCrashSnapshotReadHookForTest(nullptr);
 		GammaController::clearCrashSnapshots();
 		fixtureMonitors.clear();
 	}
@@ -819,6 +825,100 @@ private slots:
 		QCOMPARE(gammaApi.rampFor(QStringLiteral("DISPLAY1")), originalRamp());
 		gamma.restoreAll();
 		GammaController::clearCrashSnapshots();
+	}
+
+	void gammaCrashSnapshotRejectsOddAndMismatchedSequences() {
+		TestScreen fixture(0x300c, true);
+		ScreenIdentityRegistry registry(
+		    [&fixture] { return fixture.display; },
+		    [&fixture](QScreen* target) { return fixture.sourceOf(target); }
+		);
+		const auto name = registry.identity(fixture.screen).uniqueName;
+		FakeGammaApi gammaApi;
+		GammaController gamma(gammaApi.api(), registry);
+		QVERIFY(gamma.trySetBrightness(name, 0.5));
+		const auto dimmed = gammaApi.rampFor(QStringLiteral("DISPLAY1"));
+		QVERIFY(dimmed != originalRamp());
+		QCOMPARE(GammaController::crashSnapshotCount(), quintptr(1));
+		const auto sequence = gamma_detail::crashSnapshotSequenceAtForTest(0);
+		QVERIFY(sequence != 0);
+		QCOMPARE(sequence % 2, quint64(0));
+
+		// An odd sequence means a writer owned the slot through the copy. The
+		// reader rejects it rather than applying a potentially torn ramp.
+		gamma_detail::writeCrashSnapshotSequenceAtForTest(0, sequence + 1);
+		GammaController::restoreSnapshots(gammaApi.api());
+		QCOMPARE(gammaApi.rampFor(QStringLiteral("DISPLAY1")), dimmed);
+
+		// A writer that lands between the first and second sequence loads keeps
+		// the value even but mismatched. The read hook makes that interleaving
+		// deterministic; restoration is skipped once, then succeeds when quiet.
+		gamma_detail::writeCrashSnapshotSequenceAtForTest(0, sequence);
+		gamma_detail::setCrashSnapshotReadHookForTest(&bumpFirstCrashSnapshotSequence);
+		GammaController::restoreSnapshots(gammaApi.api());
+		QCOMPARE(gammaApi.rampFor(QStringLiteral("DISPLAY1")), dimmed);
+		gamma_detail::setCrashSnapshotReadHookForTest(nullptr);
+		GammaController::restoreSnapshots(gammaApi.api());
+		QCOMPARE(gammaApi.rampFor(QStringLiteral("DISPLAY1")), originalRamp());
+		gamma.restoreAll();
+	}
+
+	void gammaCrashDisplayTopologyUsesStaticBufferBounds() {
+		QVERIFY(gamma_detail::crashDisplayTopologyWithinLimits(1, 0));
+		QVERIFY(gamma_detail::crashDisplayTopologyWithinLimits(64, 128));
+		QVERIFY(!gamma_detail::crashDisplayTopologyWithinLimits(0, 0));
+		QVERIFY(!gamma_detail::crashDisplayTopologyWithinLimits(65, 128));
+		QVERIFY(!gamma_detail::crashDisplayTopologyWithinLimits(64, 129));
+	}
+
+	void gammaCrashRestoreSkipsSessionLocalTargetIdentity() {
+		TestScreen fixture(0x300d, false);
+		ScreenIdentityRegistry registry(
+		    [&fixture] { return fixture.display; },
+		    [&fixture](QScreen* target) { return fixture.sourceOf(target); }
+		);
+		const auto identity = registry.identity(fixture.screen);
+		QVERIFY(!identity.persistent);
+		QVERIFY(!identity.stableId.startsWith(QStringLiteral("path:")));
+		const auto name = identity.uniqueName;
+		FakeGammaApi gammaApi;
+		GammaController gamma(gammaApi.api(), registry);
+		QVERIFY(gamma.trySetBrightness(name, 0.5));
+		const auto dimmed = gammaApi.rampFor(QStringLiteral("DISPLAY1"));
+		QVERIFY(dimmed != originalRamp());
+		QCOMPARE(GammaController::crashSnapshotCount(), quintptr(1));
+
+		// The fake resolver would resolve DISPLAY1 if called. A session-local
+		// adapter target can name a replacement monitor on the same port, so the
+		// crash path must fail closed before even asking for that GDI device.
+		GammaController::restoreSnapshots(gammaApi.api());
+		QCOMPARE(gammaApi.rampFor(QStringLiteral("DISPLAY1")), dimmed);
+		gamma.restoreAll();
+	}
+
+	void newerBrightnessRequestSupersedesAPendingRetry() {
+		TestScreen fixture(0x300e, true);
+		ScreenIdentityRegistry registry(
+		    [&fixture] { return fixture.display; },
+		    [&fixture](QScreen* target) { return fixture.sourceOf(target); }
+		);
+		const auto name = registry.identity(fixture.screen).uniqueName;
+		FakeGammaApi gammaApi;
+		GammaController gamma(gammaApi.api(), registry);
+
+		gammaApi.failSet = true;
+		gamma.setBrightness(name, 0.2);
+		gammaApi.failSet = false;
+		QVERIFY(gamma.trySetBrightness(name, 0.8));
+		gamma.reapplyActive();
+
+		const auto ramp = gammaApi.rampFor(QStringLiteral("DISPLAY1"));
+		QCOMPARE(ramp.size(), qsizetype(sizeof(WORD) * 3 * 256));
+		const auto* words = reinterpret_cast<const WORD*>(ramp.constData()); // NOLINT
+		// apply() writes i * 257 * brightness. At i=255 the 0.8 request is
+		// exactly 52428; the superseded 0.2 retry would be 13107.
+		QCOMPARE(words[255], WORD(52428)); // NOLINT
+		gamma.restoreAll();
 	}
 
 private:

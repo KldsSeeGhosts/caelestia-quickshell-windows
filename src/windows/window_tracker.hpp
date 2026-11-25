@@ -53,7 +53,88 @@ namespace window_action_detail {
 	return action + QLatin1Char(':') + reason;
 }
 
+[[nodiscard]] inline bool trackedOwnerMatches(
+    bool isWindow,
+    DWORD process,
+    DWORD thread,
+    DWORD expectedProcess,
+    DWORD expectedThread
+) {
+	return isWindow && process == expectedProcess && thread == expectedThread;
+}
+
+[[nodiscard]] inline QString trackedOwnerFailureReason(bool ownerMatches) {
+	return ownerMatches ? QString() : QStringLiteral("stale-window");
+}
+
+[[nodiscard]] inline QString fullscreenFailureReason(bool accessDenied, bool windowAlive, bool elevated) {
+	if (accessDenied) return refusalReason(ERROR_ACCESS_DENIED, elevated);
+	if (!windowAlive) return QStringLiteral("stale-window");
+	return {};
+}
+
 } // namespace window_action_detail
+
+namespace window_fullscreen_detail {
+
+// Records genuine native access denials separately from ownership-policy
+// failures. GetLastError is reset immediately before each delegated native
+// operation so a stale thread error cannot become a refusal.
+class ErrorTrackingOps final: public fullscreen_ownership::Ops {
+public:
+	void resetAccessDenied() { this->mAccessDenied = false; }
+	[[nodiscard]] bool accessDenied() const { return this->mAccessDenied; }
+
+	bool read(HWND hwnd, fullscreen_ownership::Snapshot& snapshot) override {
+		return this->invoke([&] { return this->native.read(hwnd, snapshot); });
+	}
+	bool mark(HWND hwnd, const fullscreen_ownership::Identity& identity, const void* token) override {
+		return this->invoke([&] { return this->native.mark(hwnd, identity, token); });
+	}
+	bool matches(HWND hwnd, const fullscreen_ownership::Identity& identity, const void* token) override {
+		return this->invoke([&] { return this->native.matches(hwnd, identity, token); });
+	}
+	void unmark(HWND hwnd, const fullscreen_ownership::Identity& identity, const void* token) override {
+		this->native.unmark(hwnd, identity, token);
+	}
+	bool style(
+	    HWND hwnd,
+	    const fullscreen_ownership::Identity& identity,
+	    const void* token,
+	    LONG_PTR value
+	) override {
+		return this->invoke([&] { return this->native.style(hwnd, identity, token, value); });
+	}
+	bool placement(
+	    HWND hwnd,
+	    const fullscreen_ownership::Identity& identity,
+	    const void* token,
+	    const WINDOWPLACEMENT& value
+	) override {
+		return this->invoke([&] { return this->native.placement(hwnd, identity, token, value); });
+	}
+	bool frame(
+	    HWND hwnd,
+	    const fullscreen_ownership::Identity& identity,
+	    const void* token,
+	    const RECT* rect
+	) override {
+		return this->invoke([&] { return this->native.frame(hwnd, identity, token, rect); });
+	}
+
+private:
+	template <typename Fn> bool invoke(Fn&& fn) {
+		SetLastError(ERROR_SUCCESS);
+		auto ok = fn();
+		if (!ok && GetLastError() == ERROR_ACCESS_DENIED) this->mAccessDenied = true;
+		return ok;
+	}
+
+	fullscreen_ownership::NativeOps native;
+	bool mAccessDenied = false;
+};
+
+} // namespace window_fullscreen_detail
 
 class TrackedWindow: public QObject {
 	Q_OBJECT;
@@ -165,6 +246,8 @@ private:
 	void refreshState();
 	void refreshDesktop(bool askShell);
 	void releaseFullscreenOwnership();
+	[[nodiscard]] bool hasCurrentOwner() const;
+	bool ensureCurrentOwner(const QString& action);
 	void reportActionRefused(const QString& action, const QString& reason);
 	void reportActionFailure(const QString& action, DWORD error);
 	void clearActionError();
@@ -181,7 +264,7 @@ private:
 	QRect traceRect;
 	WindowStyleSnapshot styleSnapshot;
 
-	fullscreen_ownership::NativeOps fullscreenOps;
+	window_fullscreen_detail::ErrorTrackingOps fullscreenOps;
 	fullscreen_ownership::Owner fullscreenOwner;
 	bool endingTracking = false;
 

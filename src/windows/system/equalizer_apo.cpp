@@ -199,6 +199,26 @@ bool registryTextContainsClsid(const QString& text, const QString& clsid) {
 	return !clsid.isEmpty() && text.contains(clsid, Qt::CaseInsensitive);
 }
 
+bool hasActiveIncludeDirective(const QString& text, const QString& includePath) {
+	const auto includeName = QFileInfo(includePath).fileName();
+	const auto cleanPath = QDir::cleanPath(includePath);
+	for (const auto& rawLine: text.split(u'\n')) {
+		auto line = rawLine.trimmed();
+		if (line.startsWith(u'#')) continue;
+		if (!line.startsWith(QStringLiteral("Include"), Qt::CaseInsensitive)) continue;
+		auto directive = line.mid(7).trimmed();
+		if (!directive.startsWith(u':')) continue;
+		auto target = directive.mid(1).trimmed();
+		if (target.size() >= 2 && target.startsWith(u'\"') && target.endsWith(u'\"'))
+			target = target.mid(1, target.size() - 2);
+		const auto cleanTarget = QDir::cleanPath(target);
+		if (cleanTarget.compare(includeName, Qt::CaseInsensitive) == 0
+		    || cleanTarget.compare(cleanPath, Qt::CaseInsensitive) == 0)
+			return true;
+	}
+	return false;
+}
+
 QString elevatedHookScript(const QString& configPath, const QString& includePath) {
 	return QStringLiteral(
 	           "$configPath = '%1'\n"
@@ -212,7 +232,17 @@ QString elevatedHookScript(const QString& configPath, const QString& includePath
 	           "    if (!(Test-Path -LiteralPath $includePath -PathType Leaf)) { exit 3 }\n"
 	           "    $text = Get-Content -LiteralPath $configPath -Raw -ErrorAction Stop\n"
 	           "    if ($null -eq $text) { $text = '' }\n"
-	           "    if ($text -notmatch [regex]::Escape($line)) {\n"
+	           "    $includeName = Split-Path $includePath -Leaf\n"
+	           "    $active = $false\n"
+	           "    foreach ($rawLine in ($text -split \"`r?`n\")) {\n"
+	           "        $entry = $rawLine.Trim()\n"
+	           "        if ($entry.StartsWith('#')) { continue }\n"
+	           "        if ($entry -match '^Include\\s*:\\s*(.+)$') {\n"
+	           "            $target = $Matches[1].Trim().Trim([char]34)\n"
+	           "            if ($target -eq $includePath -or $target -eq $includeName) { $active = $true }\n"
+	           "        }\n"
+	           "    }\n"
+	           "    if (!$active) {\n"
 	           "        [IO.File]::AppendAllText($configPath, \"`n$line`n\", $utf8)\n"
 	           "    }\n"
 	           "    exit 0\n"
@@ -292,16 +322,8 @@ void EqualizerApo::detectHooked() {
 	auto text = QString::fromUtf8(file.readAll());
 	file.close();
 
-	auto includeName = QFileInfo(this->includeFilePath()).fileName();
-	this->mHooked = false;
-	for (const auto& rawLine: text.split(u'\n')) {
-		auto line = rawLine.trimmed();
-		if (!line.startsWith(QStringLiteral("Include:"), Qt::CaseInsensitive)) continue;
-		if (line.contains(includeName, Qt::CaseInsensitive)) {
-			this->mHooked = true;
-			break;
-		}
-	}
+	this->mHooked =
+	    equalizer_apo_detail::hasActiveIncludeDirective(text, this->includeFilePath());
 }
 
 void EqualizerApo::detectActiveOnDevice() {

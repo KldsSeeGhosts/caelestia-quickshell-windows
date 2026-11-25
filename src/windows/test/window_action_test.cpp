@@ -37,6 +37,40 @@ private slots:
 		QCOMPARE(window_action_detail::refusalReason(ERROR_INVALID_PARAMETER, true), QString());
 	}
 
+	void recycledHwndOwnerMismatchIsStale() {
+		QVERIFY(window_action_detail::trackedOwnerMatches(true, 1234, 55, 1234, 55));
+		QVERIFY(!window_action_detail::trackedOwnerMatches(true, 4321, 55, 1234, 55));
+		QVERIFY(!window_action_detail::trackedOwnerMatches(true, 1234, 56, 1234, 55));
+		QVERIFY(!window_action_detail::trackedOwnerMatches(false, 1234, 55, 1234, 55));
+		QCOMPARE(
+		    window_action_detail::trackedOwnerFailureReason(
+		        window_action_detail::trackedOwnerMatches(true, 4321, 55, 1234, 55)
+		    ),
+		    QStringLiteral("stale-window")
+		);
+		QVERIFY(window_action_detail::trackedOwnerFailureReason(true).isEmpty());
+		QCOMPARE(
+		    window_action_detail::refusalReason(ERROR_INVALID_WINDOW_HANDLE, false),
+		    QStringLiteral("stale-window")
+		);
+	}
+
+	void fullscreenAccessDenialPropagatesOnALiveWindow() {
+		QCOMPARE(
+		    window_action_detail::fullscreenFailureReason(true, true, false),
+		    QStringLiteral("access-denied")
+		);
+		QCOMPARE(
+		    window_action_detail::fullscreenFailureReason(true, true, true),
+		    QStringLiteral("elevated-window")
+		);
+		QCOMPARE(
+		    window_action_detail::fullscreenFailureReason(false, false, true),
+		    QStringLiteral("stale-window")
+		);
+		QVERIFY(window_action_detail::fullscreenFailureReason(false, true, true).isEmpty());
+	}
+
 	void elevatedWindowsUseTheStableElevatedReasonOnlyForAccessDenied() {
 		QVERIFY(window_action_detail::shouldReportFailure(ERROR_ACCESS_DENIED, true));
 		QCOMPARE(

@@ -178,9 +178,10 @@ void handleCrash(const wchar_t* reason, EXCEPTION_POINTERS* ep) {
 			CloseHandle(dumpFile);
 		}
 
-		qs::windows::sys::GammaController::restoreForCrash();
 		qs::windows::DecorationManager::restoreForCrash();
 		qs::windows::TilingManager::restoreForCrash();
+		if (crashGammaRestoreAllowed(static_cast<DWORD>(exceptionCode)))
+			qs::windows::sys::GammaController::restoreForCrash();
 
 		auto elapsed = currentEpochMs() - gLaunchTimeMs;
 		if (gRelaunchEnabled && (gLaunchTimeMs == 0 || elapsed >= 10000)) {

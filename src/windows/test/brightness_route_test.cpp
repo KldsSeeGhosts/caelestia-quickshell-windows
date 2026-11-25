@@ -1,4 +1,6 @@
+#include <atomic>
 #include <cstring>
+#include <thread>
 #include <functional>
 #include <memory>
 #include <utility>
@@ -1572,6 +1574,47 @@ private slots:
 			WaitForSingleObject(stop, 50);
 		}));
 		watch.stop();
+	}
+
+	void sharedWmiQueueIsPureCppAndSafeAfterOwnerTeardown() {
+		auto state = brightness_detail::createSharedWmiState();
+		QVERIFY(state != nullptr);
+		QVERIFY(brightness_detail::queueWmiBrightnessEvent(state, L"DISPLAYTEST", 42));
+		brightness_detail::WmiBrightnessEvent event;
+		QVERIFY(brightness_detail::popWmiBrightnessEvent(state, event));
+		QCOMPARE(event.instanceName, std::wstring(L"DISPLAYTEST"));
+		QCOMPARE(event.percent, 42);
+
+		// The test audit reference is neither the GUI owner nor the worker; it only
+		// lets the fixture inspect the plain queue after both sides finish.
+		auto audit = state;
+		std::atomic<bool> release = false;
+		std::atomic<bool> done = false;
+		std::atomic<bool> queuedAfterCancel = false;
+		std::thread worker([state, &release, &done, &queuedAfterCancel] {
+			// The owner cancels and destroys its side while this detachable worker
+			// is still inside the gate. Shared ownership keeps only plain C++ state
+			// alive; queueing after cancellation is refused without Qt access.
+			while (!release.load(std::memory_order_acquire)) Sleep(1);
+			queuedAfterCancel =
+			    brightness_detail::queueWmiBrightnessEvent(state, L"LATE", 10)
+			    || brightness_detail::queueWmiWarning(state, L"late warning");
+			state->finished.store(true, std::memory_order_release);
+			done.store(true, std::memory_order_release);
+		});
+
+		state->cancelled.store(true, std::memory_order_release);
+		SetEvent(state->stopEvent.get());
+		brightness_detail::clearWmiWakeWindow(state);
+		state.reset();
+		release.store(true, std::memory_order_release);
+		worker.detach();
+		QTRY_VERIFY(done.load(std::memory_order_acquire));
+		QVERIFY(!queuedAfterCancel.load(std::memory_order_acquire));
+
+		QVERIFY(audit->events.empty());
+		QVERIFY(audit->warnings.empty());
+		QVERIFY(audit->finished.load(std::memory_order_acquire));
 	}
 
 	void eventWatchThreadDetachKeepsTheStopEventAlive() {

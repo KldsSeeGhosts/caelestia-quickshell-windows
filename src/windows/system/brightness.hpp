@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <utility>
 
 #include <qabstractnativeeventfilter.h>
 #include <qhash.h>
@@ -68,6 +71,99 @@ constexpr DWORD EVENT_RETRY_BASE_MS = 5000;
 [[nodiscard]] inline DWORD eventRetryDelayMs(int consecutiveFailures) {
 	const auto factor = std::clamp(consecutiveFailures, 1, EVENT_BACKOFF_CAP);
 	return EVENT_RETRY_BASE_MS * static_cast<DWORD>(factor);
+}
+
+
+constexpr UINT WM_APP_BRIGHTNESS_EVENT = WM_APP + 0x51;
+constexpr size_t WMI_EVENT_QUEUE_CAP = 128;
+
+struct WmiBrightnessEvent {
+	std::wstring instanceName;
+	int percent = -1;
+};
+
+// Pure C++ state shared with the detachable WMI worker. It deliberately has no
+// Qt member or callback: the GUI owner drains events and turns them into Qt
+// signals on the GUI thread.
+struct SharedWmiState {
+	std::shared_ptr<void> stopEvent;
+	std::atomic<bool> cancelled {false};
+	std::atomic<bool> finished {false};
+	mutable std::mutex mutex;
+	HWND wakeHwnd = nullptr; // Guarded by mutex and cleared before window destruction.
+	std::deque<WmiBrightnessEvent> events;
+	std::deque<std::wstring> warnings;
+};
+
+[[nodiscard]] inline std::shared_ptr<SharedWmiState> createSharedWmiState() {
+	auto state = std::make_shared<SharedWmiState>();
+	auto* event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if (event == nullptr) return nullptr;
+	state->stopEvent = std::shared_ptr<void>(event, [](void* handle) { CloseHandle(handle); });
+	return state;
+}
+
+inline void clearWmiWakeWindow(const std::shared_ptr<SharedWmiState>& state) {
+	if (state == nullptr) return;
+	auto lock = std::lock_guard(state->mutex);
+	state->wakeHwnd = nullptr;
+}
+
+inline void setWmiWakeWindow(const std::shared_ptr<SharedWmiState>& state, HWND hwnd) {
+	if (state == nullptr) return;
+	auto lock = std::lock_guard(state->mutex);
+	state->wakeHwnd = hwnd;
+}
+
+inline bool queueWmiBrightnessEvent(
+    const std::shared_ptr<SharedWmiState>& state,
+    std::wstring instanceName,
+    int percent
+) {
+	if (state == nullptr) return false;
+	HWND wake = nullptr;
+	{
+		auto lock = std::lock_guard(state->mutex);
+		if (state->cancelled.load(std::memory_order_acquire)) return false;
+		if (state->events.size() >= WMI_EVENT_QUEUE_CAP) return false;
+		state->events.push_back({std::move(instanceName), percent});
+		wake = state->wakeHwnd;
+	}
+	if (wake != nullptr) PostMessageW(wake, WM_APP_BRIGHTNESS_EVENT, 0, 0);
+	return true;
+}
+
+inline bool queueWmiWarning(const std::shared_ptr<SharedWmiState>& state, std::wstring warning) {
+	if (state == nullptr) return false;
+	HWND wake = nullptr;
+	{
+		auto lock = std::lock_guard(state->mutex);
+		if (state->cancelled.load(std::memory_order_acquire)) return false;
+		if (state->warnings.size() >= WMI_EVENT_QUEUE_CAP) return false;
+		state->warnings.push_back(std::move(warning));
+		wake = state->wakeHwnd;
+	}
+	if (wake != nullptr) PostMessageW(wake, WM_APP_BRIGHTNESS_EVENT, 0, 0);
+	return true;
+}
+
+inline bool popWmiBrightnessEvent(
+    const std::shared_ptr<SharedWmiState>& state,
+    WmiBrightnessEvent& event
+) {
+	auto lock = std::lock_guard(state->mutex);
+	if (state->events.empty()) return false;
+	event = std::move(state->events.front());
+	state->events.pop_front();
+	return true;
+}
+
+inline bool popWmiWarning(const std::shared_ptr<SharedWmiState>& state, std::wstring& warning) {
+	auto lock = std::lock_guard(state->mutex);
+	if (state->warnings.empty()) return false;
+	warning = std::move(state->warnings.front());
+	state->warnings.pop_front();
+	return true;
 }
 
 // Owns the watcher thread and shares RAII ownership of its stop event with that

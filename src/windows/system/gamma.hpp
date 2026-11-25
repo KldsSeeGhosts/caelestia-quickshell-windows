@@ -19,6 +19,11 @@ namespace qs::windows::sys {
 namespace gamma_detail {
 
 [[nodiscard]] bool parseCrashTargetIdentity(const wchar_t* identity, LUID& adapter, UINT32& target);
+[[nodiscard]] bool crashDisplayTopologyWithinLimits(UINT32 pathCount, UINT32 modeCount);
+using CrashSnapshotReadHook = void (*)();
+void setCrashSnapshotReadHookForTest(CrashSnapshotReadHook hook);
+[[nodiscard]] quint64 crashSnapshotSequenceAtForTest(size_t index);
+void writeCrashSnapshotSequenceAtForTest(size_t index, quint64 sequence);
 
 } // namespace gamma_detail
 

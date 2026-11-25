@@ -52,6 +52,7 @@ struct CrashSnapshot {
 };
 
 CrashSnapshot gCrashSnapshots[CRASH_SNAPSHOT_COUNT]; // NOLINT
+std::atomic<gamma_detail::CrashSnapshotReadHook> gCrashSnapshotReadHook {nullptr}; // NOLINT
 std::atomic<bool> gExitRestoreRegistered = false;     // NOLINT
 
 bool copyWidePlainBounded(
@@ -76,14 +77,14 @@ void storeWideAtomic(std::atomic<wchar_t>* target, size_t capacity, const std::w
 	if (capacity == 0) return;
 	auto length = std::min(value.size(), capacity - 1);
 	for (size_t index = 0; index < capacity; ++index) {
-		target[index].store(index < length ? value[index] : L'\0', std::memory_order_relaxed);
+		target[index].store(index < length ? value[index] : L'\0', std::memory_order_seq_cst);
 	}
 }
 
 void loadWideAtomic(const std::atomic<wchar_t>* source, wchar_t* target, size_t capacity) {
 	if (capacity == 0) return;
 	for (size_t index = 0; index < capacity; ++index) {
-		target[index] = source[index].load(std::memory_order_relaxed);
+		target[index] = source[index].load(std::memory_order_seq_cst);
 	}
 }
 
@@ -94,7 +95,7 @@ bool atomicWideEquals(
 ) {
 	for (size_t index = 0; index < capacity; ++index) {
 		auto expected = index < value.size() ? value[index] : L'\0';
-		if (source[index].load(std::memory_order_relaxed) != expected) return false;
+		if (source[index].load(std::memory_order_seq_cst) != expected) return false;
 		if (expected == L'\0') return true;
 	}
 	return value.size() == capacity - 1;
@@ -128,61 +129,62 @@ bool wideStartsWith(const wchar_t* text, const wchar_t* prefix) {
 	return true;
 }
 
-// Crash/atexit-safe display config resolution: fixed stack storage, native API
-// calls only, and no Qt, heap allocation, mutex, or shared mutable buffer. A
-// topology larger than the fixed buffers fails closed rather than risking a
-// restore on the wrong target.
+// Crash/atexit-safe display config resolution: static storage, native API
+// calls only, and no Qt, heap allocation, or mutex. The atomic resolver guard
+// keeps the static topology buffers single-threaded even when two unusual
+// crash/exit paths overlap. A topology larger than the fixed buffers fails
+// closed rather than risking a restore on the wrong target.
+DISPLAYCONFIG_PATH_INFO gCrashDisplayPaths[CRASH_MAX_DISPLAY_PATHS]; // NOLINT
+DISPLAYCONFIG_MODE_INFO gCrashDisplayModes[CRASH_MAX_DISPLAY_MODES]; // NOLINT
+std::atomic<bool> gCrashDisplayResolverActive = false;               // NOLINT
+
+void finishCrashDisplayResolution() {
+	gCrashDisplayResolverActive.store(false, std::memory_order_seq_cst);
+}
+
 BOOL WINAPI resolveDisplayDeviceForIdentity(const wchar_t* identity, wchar_t* device, DWORD capacity) {
 	if (identity == nullptr || device == nullptr || capacity == 0) return FALSE;
 	device[0] = L'\0';
-	const auto pathIdentity = wideStartsWith(identity, L"path:");
-	LUID targetAdapter {};
-	UINT32 targetId = 0;
-	const auto targetIdentity = gamma_detail::parseCrashTargetIdentity(identity, targetAdapter, targetId);
-	if (!pathIdentity && !targetIdentity) return FALSE;
+	// Adapter LUID and target id are session-local port coordinates. Only the
+	// persistent monitor device path can verify the physical target.
+	if (!wideStartsWith(identity, L"path:")) return FALSE;
 
 	UINT32 pathCount = 0;
 	UINT32 modeCount = 0;
 	if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
 		return FALSE;
-	if (pathCount == 0 || pathCount > CRASH_MAX_DISPLAY_PATHS || modeCount > CRASH_MAX_DISPLAY_MODES)
-		return FALSE;
+	if (!gamma_detail::crashDisplayTopologyWithinLimits(pathCount, modeCount)) return FALSE;
+	if (gCrashDisplayResolverActive.exchange(true, std::memory_order_seq_cst)) return FALSE;
 
-	std::array<DISPLAYCONFIG_PATH_INFO, CRASH_MAX_DISPLAY_PATHS> paths {};
-	std::array<DISPLAYCONFIG_MODE_INFO, CRASH_MAX_DISPLAY_MODES> modes {};
 	auto status = QueryDisplayConfig(
 	    QDC_ONLY_ACTIVE_PATHS,
 	    &pathCount,
-	    paths.data(),
+	    gCrashDisplayPaths,
 	    &modeCount,
-	    modes.data(),
+	    gCrashDisplayModes,
 	    nullptr
 	);
-	if (status != ERROR_SUCCESS) return FALSE;
+	if (status != ERROR_SUCCESS) {
+		finishCrashDisplayResolution();
+		return FALSE;
+	}
 
 	for (UINT32 index = 0; index < pathCount; ++index) {
-		const auto& path = paths[index];
-		auto matches = false;
-		if (pathIdentity) {
-			DISPLAYCONFIG_TARGET_DEVICE_NAME target {};
-			target.header = {
-			    DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-			    sizeof(target),
-			    path.targetInfo.adapterId,
-			    path.targetInfo.id
-			};
-			if (DisplayConfigGetDeviceInfo(&target.header) != ERROR_SUCCESS) continue;
-			matches = boundedWideEqualsIgnoreCase(
-			    target.monitorDevicePath,
-			    std::size(target.monitorDevicePath),
-			    identity + 5
-			);
-		} else {
-			matches = path.targetInfo.adapterId.HighPart == targetAdapter.HighPart
-			    && path.targetInfo.adapterId.LowPart == targetAdapter.LowPart
-			    && path.targetInfo.id == targetId;
-		}
-		if (!matches) continue;
+		const auto& path = gCrashDisplayPaths[index];
+		DISPLAYCONFIG_TARGET_DEVICE_NAME target {};
+		target.header = {
+		    DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+		    sizeof(target),
+		    path.targetInfo.adapterId,
+		    path.targetInfo.id
+		};
+		if (DisplayConfigGetDeviceInfo(&target.header) != ERROR_SUCCESS) continue;
+		if (!boundedWideEqualsIgnoreCase(
+		        target.monitorDevicePath,
+		        std::size(target.monitorDevicePath),
+		        identity + 5
+		    ))
+			continue;
 
 		DISPLAYCONFIG_SOURCE_DEVICE_NAME source {};
 		source.header = {
@@ -191,16 +193,20 @@ BOOL WINAPI resolveDisplayDeviceForIdentity(const wchar_t* identity, wchar_t* de
 		    path.sourceInfo.adapterId,
 		    path.sourceInfo.id
 		};
-		if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) return FALSE;
-		if (!copyWidePlainBounded(
-		        device,
-		        capacity,
-		        source.viewGdiDeviceName,
-		        std::size(source.viewGdiDeviceName)
-		    ))
+		if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) {
+			finishCrashDisplayResolution();
 			return FALSE;
-		return TRUE;
+		}
+		auto copied = copyWidePlainBounded(
+		    device,
+		    capacity,
+		    source.viewGdiDeviceName,
+		    std::size(source.viewGdiDeviceName)
+		);
+		finishCrashDisplayResolution();
+		return copied ? TRUE : FALSE;
 	}
+	finishCrashDisplayResolution();
 	return FALSE;
 }
 
@@ -250,6 +256,25 @@ bool qs::windows::sys::gamma_detail::parseCrashTargetIdentity(const wchar_t* ide
 	adapter.LowPart = static_cast<DWORD>(low);
 	target = static_cast<UINT32>(id);
 	return true;
+}
+
+bool qs::windows::sys::gamma_detail::crashDisplayTopologyWithinLimits(UINT32 pathCount, UINT32 modeCount) {
+	return pathCount != 0 && pathCount <= CRASH_MAX_DISPLAY_PATHS
+	    && modeCount <= CRASH_MAX_DISPLAY_MODES;
+}
+
+void qs::windows::sys::gamma_detail::setCrashSnapshotReadHookForTest(CrashSnapshotReadHook hook) {
+	gCrashSnapshotReadHook.store(hook, std::memory_order_seq_cst);
+}
+
+quint64 qs::windows::sys::gamma_detail::crashSnapshotSequenceAtForTest(size_t index) {
+	if (index >= CRASH_SNAPSHOT_COUNT) return 0;
+	return gCrashSnapshots[index].sequence.load(std::memory_order_seq_cst);
+}
+
+void qs::windows::sys::gamma_detail::writeCrashSnapshotSequenceAtForTest(size_t index, quint64 sequence) {
+	if (index < CRASH_SNAPSHOT_COUNT)
+		gCrashSnapshots[index].sequence.store(sequence, std::memory_order_seq_cst);
 }
 
 struct GammaController::PowerNotifications {
@@ -417,7 +442,7 @@ void GammaController::updateCrashSnapshot(const QString& key, const Ramp& ramp) 
 			target = &snapshot;
 			break;
 		}
-		if (empty == nullptr && snapshot.key[0].load(std::memory_order_relaxed) == L'\0')
+		if (empty == nullptr && snapshot.key[0].load(std::memory_order_seq_cst) == L'\0')
 			empty = &snapshot;
 	}
 	if (target == nullptr) target = empty;
@@ -427,34 +452,34 @@ void GammaController::updateCrashSnapshot(const QString& key, const Ramp& ramp) 
 	// sequence, so a crash during this copy loses this entry but never applies a
 	// torn ramp to the wrong display. Every element access remains atomic, so a
 	// concurrent crash read is a failed validation rather than undefined behavior.
-	target->sequence.fetch_add(1, std::memory_order_acq_rel);
+	target->sequence.fetch_add(1, std::memory_order_seq_cst);
 	writeSnapshotKey(*target, key);
 	storeWideAtomic(target->device, CRASH_DEVICE_CHARS, device.toStdWString());
 	for (auto channel = 0; channel < 3; ++channel) {
 		for (auto index = 0; index < 256; ++index) {
-			target->ramp[channel][index].store(ramp.values[channel][index], std::memory_order_relaxed);
+			target->ramp[channel][index].store(ramp.values[channel][index], std::memory_order_seq_cst);
 		}
 	}
-	target->sequence.fetch_add(1, std::memory_order_acq_rel);
+	target->sequence.fetch_add(1, std::memory_order_seq_cst);
 }
 
 void GammaController::removeCrashSnapshot(const QString& key) {
 	for (auto& snapshot: gCrashSnapshots) {
 		if (!snapshotKeyIs(snapshot, key)) continue;
-		snapshot.sequence.fetch_add(1, std::memory_order_acq_rel);
+		snapshot.sequence.fetch_add(1, std::memory_order_seq_cst);
 		storeWideAtomic(snapshot.key, CRASH_KEY_CHARS, {});
 		storeWideAtomic(snapshot.device, CRASH_DEVICE_CHARS, {});
 		storeWideAtomic(snapshot.identity, CRASH_KEY_CHARS, {});
-		snapshot.sequence.fetch_add(1, std::memory_order_acq_rel);
+		snapshot.sequence.fetch_add(1, std::memory_order_seq_cst);
 	}
 }
 
 quintptr GammaController::crashSnapshotCount() {
 	quintptr count = 0;
 	for (const auto& snapshot: gCrashSnapshots) {
-		auto sequence = snapshot.sequence.load(std::memory_order_acquire);
+		auto sequence = snapshot.sequence.load(std::memory_order_seq_cst);
 		if (sequence != 0 && sequence % 2 == 0
-		    && snapshot.key[0].load(std::memory_order_relaxed) != L'\0')
+		    && snapshot.key[0].load(std::memory_order_seq_cst) != L'\0')
 			++count;
 	}
 	return count;
@@ -462,17 +487,17 @@ quintptr GammaController::crashSnapshotCount() {
 
 void GammaController::clearCrashSnapshots() {
 	for (auto& snapshot: gCrashSnapshots) {
-		snapshot.sequence.fetch_add(1, std::memory_order_acq_rel);
+		snapshot.sequence.fetch_add(1, std::memory_order_seq_cst);
 		storeWideAtomic(snapshot.key, CRASH_KEY_CHARS, {});
 		storeWideAtomic(snapshot.device, CRASH_DEVICE_CHARS, {});
 		storeWideAtomic(snapshot.identity, CRASH_KEY_CHARS, {});
-		snapshot.sequence.fetch_add(1, std::memory_order_acq_rel);
+		snapshot.sequence.fetch_add(1, std::memory_order_seq_cst);
 	}
 }
 
 void GammaController::restoreSnapshots(const NativeApi& api) {
 	for (auto& snapshot: gCrashSnapshots) {
-		auto before = snapshot.sequence.load(std::memory_order_acquire);
+		auto before = snapshot.sequence.load(std::memory_order_seq_cst);
 		if (before == 0 || before % 2 != 0) continue;
 
 		wchar_t identity[CRASH_KEY_CHARS] {};
@@ -482,15 +507,17 @@ void GammaController::restoreSnapshots(const NativeApi& api) {
 		loadWideAtomic(snapshot.device, savedDevice, CRASH_DEVICE_CHARS);
 		for (auto channel = 0; channel < 3; ++channel) {
 			for (auto index = 0; index < 256; ++index) {
-				ramp[channel][index] = snapshot.ramp[channel][index].load(std::memory_order_relaxed);
+				ramp[channel][index] = snapshot.ramp[channel][index].load(std::memory_order_seq_cst);
 			}
 		}
-		auto after = snapshot.sequence.load(std::memory_order_acquire);
+		if (auto* hook = gCrashSnapshotReadHook.load(std::memory_order_seq_cst)) hook();
+		auto after = snapshot.sequence.load(std::memory_order_seq_cst);
 		if (before != after || identity[0] == L'\0' || savedDevice[0] == L'\0') continue;
 
-		// DISPLAYn is only a topology slot. Resolve the saved target identity
-		// against the active display configuration immediately before writing;
-		// if it cannot be verified, fail closed instead of restoring another monitor.
+		// DISPLAYn is only a topology slot and an adapter target id is only a
+		// session-local port number. Only a persistent monitor device path may
+		// authorize crash restoration; everything else fails closed.
+		if (!wideStartsWith(identity, L"path:")) continue;
 		wchar_t device[CRASH_DEVICE_CHARS] {};
 		if (api.resolveDevice == nullptr
 		    || !api.resolveDevice(identity, device, CRASH_DEVICE_CHARS) || device[0] == L'\0')
@@ -556,6 +583,8 @@ bool GammaController::trySetBrightness(const QString& screenName, qreal brightne
 	const auto lifetime = this->lifetimeOf(key);
 	auto clamped = std::clamp(brightness, 0.0, 1.0);
 	auto previous = this->backlightFactor.value(key, 1.0);
+	// A newer user request supersedes any retry queued by an older request.
+	this->retryBacklightFactor.remove(key);
 	if (clamped >= 1.0) {
 		this->backlightFactor.remove(key);
 		if (!this->dimFactor.contains(key)) this->dimmingRequested.remove(key);

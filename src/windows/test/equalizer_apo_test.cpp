@@ -189,6 +189,28 @@ private slots:
 		QVERIFY(script.contains(QStringLiteral("[IO.File]::AppendAllText($configPath")));
 	}
 
+	void commentedIncludeDoesNotCountAsActive() {
+		const auto includePath = QStringLiteral("C:/EqualizerAPO/config/ii-equalizer.txt");
+		using equalizer_apo_detail::hasActiveIncludeDirective;
+		QVERIFY(!hasActiveIncludeDirective(QStringLiteral("# Include: ii-equalizer.txt\n"), includePath));
+		QVERIFY(!hasActiveIncludeDirective(QStringLiteral("   # Include: ii-equalizer.txt\n"), includePath));
+		QVERIFY(!hasActiveIncludeDirective(QStringLiteral("Include: other.txt # ii-equalizer.txt\n"), includePath));
+		QVERIFY(hasActiveIncludeDirective(QStringLiteral("Include: ii-equalizer.txt\n"), includePath));
+		QVERIFY(hasActiveIncludeDirective(QStringLiteral("  Include: ii-equalizer.txt\r\n"), includePath));
+		QVERIFY(hasActiveIncludeDirective(QStringLiteral("Include : ii-equalizer.txt\n"), includePath));
+		QVERIFY(hasActiveIncludeDirective(QStringLiteral("Include: ./ii-equalizer.txt\n"), includePath));
+		QVERIFY(hasActiveIncludeDirective(QStringLiteral("Include: %1\n").arg(includePath), includePath));
+
+		const auto script = equalizer_apo_detail::elevatedHookScript(
+		    QStringLiteral("C:/EqualizerAPO/config/config.txt"),
+		    includePath
+		);
+		QVERIFY(script.contains(QStringLiteral("$entry.StartsWith('#')")));
+		QVERIFY(script.contains(QStringLiteral("foreach ($rawLine in ($text -split")));
+		QVERIFY(script.contains(QStringLiteral("$target -eq $includeName")));
+		QVERIFY(!script.contains(QStringLiteral("[regex]::Escape($line)")));
+	}
+
 	void elevationCompletionNeverClaimsSuccessWithoutAProcessHandle() {
 		auto unverified = equalizer_apo_detail::elevationCompletion(false, 0, 0);
 		QVERIFY(!unverified.success);
