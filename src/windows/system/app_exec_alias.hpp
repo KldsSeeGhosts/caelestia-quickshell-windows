@@ -3,6 +3,7 @@
 #include <cstring>
 #include <functional>
 #include <optional>
+#include <vector>
 
 #include <qbytearray.h>
 #include <qdir.h>
@@ -128,24 +129,87 @@ inline std::optional<AppExecAliasInfo> readAppExecAlias(const QString& path) {
 
 using CanonicalPathProvider = std::function<QString(const QString&)>;
 
+struct FinalPathInfo {
+	QString path;
+	DWORD attributes = 0;
+};
+
+// Resolves junctions, symlinks and volume mount points through the object
+// manager. FILE_FLAG_OPEN_REPARSE_POINT is deliberately absent.
+inline std::optional<FinalPathInfo> finalPathByHandle(const QString& path) {
+	const auto wide = QDir::toNativeSeparators(path).toStdWString();
+	auto* handle = CreateFileW(
+	    wide.c_str(),
+	    0,
+	    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+	    nullptr,
+	    OPEN_EXISTING,
+	    FILE_FLAG_BACKUP_SEMANTICS,
+	    nullptr
+	);
+	if (handle == INVALID_HANDLE_VALUE) return std::nullopt;
+
+	auto size = DWORD(1024);
+	auto buffer = std::vector<wchar_t>(size);
+	auto length = DWORD(0);
+	for (;;) {
+		length = GetFinalPathNameByHandleW(
+		    handle, buffer.data(), size, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+		);
+		if (length == 0 || length < size) break;
+		size = length + 1;
+		buffer.assign(size, L'\0');
+	}
+
+	BY_HANDLE_FILE_INFORMATION fileInformation {};
+	const auto hasInformation = GetFileInformationByHandle(handle, &fileInformation);
+	CloseHandle(handle);
+	if (length == 0 || !hasInformation) return std::nullopt;
+
+	auto finalPath = QString::fromWCharArray(buffer.data(), static_cast<qsizetype>(length));
+	const auto uncPrefix = QString::fromWCharArray(LR"(\?\UNC\)");
+	const auto extendedPrefix = QString::fromWCharArray(LR"(\?\)");
+	if (finalPath.startsWith(uncPrefix, Qt::CaseInsensitive)) {
+		finalPath = QString::fromWCharArray(LR"(\)") + finalPath.mid(uncPrefix.size());
+	} else if (finalPath.startsWith(extendedPrefix, Qt::CaseInsensitive)) {
+		finalPath = finalPath.mid(extendedPrefix.size());
+	}
+	finalPath = QDir::toNativeSeparators(finalPath);
+	return FinalPathInfo {.path = finalPath, .attributes = fileInformation.dwFileAttributes};
+}
+
 inline QString canonicalFilesystemPath(const QString& path) {
-	return QDir::toNativeSeparators(QFileInfo(path).canonicalFilePath());
+	const auto finalPath = finalPathByHandle(path);
+	return finalPath ? finalPath->path : QString();
 }
 
 // Verifies that targetPath is an existing regular file strictly inside the
 // registered package install directory. The resolver is injectable so tests
-// can model junctions without depending on machine-wide packages or links.
+// can model canonicalization failures without machine-wide packages.
 inline std::optional<QString> canonicalPackageTargetInsideRoot(
     const QString& targetPath,
     const QString& installRoot,
     const CanonicalPathProvider& canonicalize = {}
 ) {
-	const auto canonical = canonicalize ? canonicalize : CanonicalPathProvider(canonicalFilesystemPath);
-	const auto root = canonical(installRoot);
-	const auto target = canonical(targetPath);
+	QString root;
+	QString target;
+	auto targetIsFile = false;
+	if (canonicalize) {
+		root = canonicalize(installRoot);
+		target = canonicalize(targetPath);
+		targetIsFile = QFileInfo(target).isFile();
+	} else {
+		const auto rootInfo = finalPathByHandle(installRoot);
+		const auto targetInfo = finalPathByHandle(targetPath);
+		if (rootInfo) root = rootInfo->path;
+		if (targetInfo) {
+			target = targetInfo->path;
+			targetIsFile = (targetInfo->attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+		}
+	}
+
 	if (root.isEmpty() || target.isEmpty() || target == root
-	    || !target.startsWith(root + u'\\', Qt::CaseInsensitive)
-	    || !QFileInfo(target).isFile())
+	    || !target.startsWith(root + u'\\', Qt::CaseInsensitive) || !targetIsFile)
 	{
 		return std::nullopt;
 	}

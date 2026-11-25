@@ -4,6 +4,7 @@
 
 #include <optional>
 #include <string>
+#include <utility>
 
 #include <qstring.h>
 #include <qstringlist.h>
@@ -118,6 +119,34 @@ template <typename Fallback>
 template <typename ExplorerLaunch, typename CleanLaunch>
 [[nodiscard]] LaunchResult openWithFallback(ExplorerLaunch&& explorer, CleanLaunch&& clean) {
 	return fallbackOnFailure(explorer(), [&] { return clean(cleanEnvironmentBlock()); });
+}
+
+struct ProcessRouteResult {
+	LaunchResult result;
+	bool allowShellFallback = false;
+};
+
+template <typename ExplorerOpen, typename ProcessLaunch, typename ShellFallback>
+[[nodiscard]] LaunchResult routeLaunchCommand(
+    const LaunchCommand& command,
+    ExplorerOpen&& explorerOpen,
+    ProcessLaunch&& processLaunch,
+    ShellFallback&& shellFallback
+) {
+	if (!canElevateParsedCommand(command)) {
+		if (!command.useProcess()) return launchResultForError(ERROR_INVALID_PARAMETER);
+		auto environment = cleanEnvironmentBlock();
+		return processLaunch(false, environment).result;
+	}
+	return openWithFallback(std::forward<ExplorerOpen>(explorerOpen), [&](std::wstring environment) {
+		if (command.useProcess()) {
+			const auto processResult = processLaunch(true, environment);
+			if (processResult.result.status != LaunchStatus::Failed || !processResult.allowShellFallback) {
+				return processResult.result;
+			}
+		}
+		return shellFallback(environment);
+	});
 }
 
 } // namespace detail

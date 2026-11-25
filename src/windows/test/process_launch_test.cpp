@@ -2,6 +2,7 @@
 #include <qcoreapplication.h>
 #include <qdir.h>
 #include <qfile.h>
+#include <qprocess.h>
 #include <qstringlist.h>
 #include <qtemporarydir.h>
 #include <qtest.h>
@@ -440,6 +441,45 @@ private slots:
 		QCOMPARE(validateElevatedTarget(root.path()), DWORD(ERROR_INVALID_PARAMETER));
 	}
 
+	void ambiguousCommandsUseOnlyNonElevatingCreateProcessRoute() {
+		using namespace qs::windows::process;
+		QTemporaryDir root;
+		QVERIFY(root.isValid());
+		const auto bin = QDir::toNativeSeparators(QDir(root.path()).filePath(QStringLiteral("Bin.exe")));
+		QVERIFY(QFile::copy(QCoreApplication::applicationFilePath(), bin));
+		const auto parsed = parseLaunchCommand(bin + QStringLiteral(" Staging Target.exe"));
+		QCOMPARE(parsed.error, DWORD(ERROR_SUCCESS));
+		QVERIFY(parsed.useProcess());
+
+		auto explorerCalls = 0;
+		auto processCalls = 0;
+		auto shellCalls = 0;
+		auto automaticElevationAllowed = true;
+		const auto result = detail::routeLaunchCommand(
+		    parsed,
+		    [&] {
+			    ++explorerCalls;
+			    return LaunchResult {.status = LaunchStatus::Started};
+		    },
+		    [&](bool allowAutomaticElevation, std::wstring&) {
+			    ++processCalls;
+			    automaticElevationAllowed = allowAutomaticElevation;
+			    return detail::ProcessRouteResult {
+			        .result = detail::launchResultForError(ERROR_INVALID_PARAMETER),
+			    };
+		    },
+		    [&](std::wstring&) {
+			    ++shellCalls;
+			    return LaunchResult {.status = LaunchStatus::Started};
+		    }
+		);
+		QCOMPARE(result.error, DWORD(ERROR_INVALID_PARAMETER));
+		QCOMPARE(explorerCalls, 0);
+		QCOMPARE(processCalls, 1);
+		QCOMPARE(shellCalls, 0);
+		QVERIFY(!automaticElevationAllowed);
+	}
+
 	void bareCommandLooksUpPathBeforeRejectingPathArguments() {
 		using namespace qs::windows::process;
 		QTemporaryDir root;
@@ -495,11 +535,32 @@ private slots:
 		QCOMPARE(*canonicalInside, canonicalFilesystemPath(inside));
 		QVERIFY(!canonicalPackageTargetInsideRoot(outside, packageRoot).has_value());
 
-		// Model a junction inside the package resolving outside it. The injected
-		// canonicalizer makes the escape deterministic without requiring symlink rights.
-		const auto junctionInput = QDir::toNativeSeparators(
-		    QDir(packageRoot).filePath(QStringLiteral("junction/evil.exe"))
+		// Create a real NTFS junction inside the package root. Junction creation
+		// does not require elevation, and the final-path resolver must follow it.
+		const auto outsideRoot = QDir::toNativeSeparators(
+		    QDir(root.path()).filePath(QStringLiteral("outside"))
 		);
+		const auto junctionRoot = QDir::toNativeSeparators(
+		    QDir(packageRoot).filePath(QStringLiteral("junction"))
+		);
+		const auto linkExit = QProcess::execute(
+		    QStringLiteral("cmd.exe"),
+		    {QStringLiteral("/c"), QStringLiteral("mklink"), QStringLiteral("/J"), junctionRoot, outsideRoot}
+		);
+		QCOMPARE(linkExit, 0);
+		const auto junctionInput = QDir::toNativeSeparators(
+		    QDir(junctionRoot).filePath(QStringLiteral("evil.exe"))
+		);
+		QVERIFY(QFileInfo::exists(junctionInput));
+		const auto junctionCanonical = canonicalFilesystemPath(junctionInput);
+		const auto outsideCanonicalPath = canonicalFilesystemPath(outside);
+		QVERIFY(!junctionCanonical.isEmpty());
+		QVERIFY(!outsideCanonicalPath.isEmpty());
+		QCOMPARE(junctionCanonical, outsideCanonicalPath);
+		QVERIFY(!canonicalPackageTargetInsideRoot(junctionInput, packageRoot).has_value());
+
+		// The injected resolver seam still covers canonicalization failures and
+		// exact target mismatches without depending on machine state.
 		const auto outsideCanonical = canonicalFilesystemPath(outside);
 		const CanonicalPathProvider resolver = [&](const QString& path) {
 			if (QDir::toNativeSeparators(path) == junctionInput) return outsideCanonical;

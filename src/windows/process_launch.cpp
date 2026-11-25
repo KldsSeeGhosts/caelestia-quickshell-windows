@@ -764,21 +764,29 @@ LaunchResult launchCommand(const QString& command, const QString& workingDirecto
 
 	const auto directory = defaultWorkingDirectory(workingDirectory);
 	const auto target = targetFor(parsed);
-	return detail::openWithFallback(
+	return detail::routeLaunchCommand(
+	    parsed,
 	    [&] { return explorerOpen(target, parsed.argumentTail, directory); },
-	    [&](std::wstring environment) {
-		    if (parsed.useProcess()) {
-			    const auto result = createProcess(parsed, directory, environment);
-			    if (result.error == ERROR_ELEVATION_REQUIRED) {
-				    if (!canUseAutomaticElevation(parsed, result.error)) {
-					    return detail::launchResultForError(ERROR_INVALID_PARAMETER);
-				    }
-				    return shellExecuteTarget(
-				        target, parsed.argumentTail, directory, QStringLiteral("runas"), owner
-				    );
-			    }
-			    if (result.status != LaunchStatus::Failed) return result;
+	    [&](bool allowAutomaticElevation, std::wstring& environment) {
+		    const auto result = createProcess(parsed, directory, environment);
+		    if (result.error != ERROR_ELEVATION_REQUIRED) {
+			    return detail::ProcessRouteResult {
+			        .result = result,
+			        .allowShellFallback = result.status == LaunchStatus::Failed,
+			    };
 		    }
+		    if (!allowAutomaticElevation || !canUseAutomaticElevation(parsed, result.error)) {
+			    return detail::ProcessRouteResult {
+			        .result = detail::launchResultForError(ERROR_INVALID_PARAMETER),
+			    };
+		    }
+		    return detail::ProcessRouteResult {
+		        .result = shellExecuteTarget(
+		            target, parsed.argumentTail, directory, QStringLiteral("runas"), owner
+		        ),
+		    };
+	    },
+	    [&](std::wstring& environment) {
 		    return cleanShellExecute(target, parsed.argumentTail, directory, false, environment);
 	    }
 	);
