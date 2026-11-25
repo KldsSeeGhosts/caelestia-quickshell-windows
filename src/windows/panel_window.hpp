@@ -177,7 +177,7 @@ private slots:
 	void onSurfaceCreated();
 	void onWindowVisibleChanged();
 	void onDesktopAccessorReady();
-	void onOwnWindowPinCompleted(quintptr hwnd, qs::windows::OwnWindowPin result);
+	void onOwnWindowPinCompleted(quint64 requestId, quintptr hwnd, qs::windows::OwnWindowPin result);
 	void updateScreen();
 	void followFocusedScreen();
 	void scheduleUpdateDimensions();
@@ -284,6 +284,7 @@ private:
 	QTimer explorerRecoveryTimer;
 	HWND stuckHwnd = nullptr;
 	qsizetype stuckDesktop = -1;
+	quint64 pendingFollowMoveSeq = 0;
 
 	HWND mEmbedParent = nullptr;
 	HWND mEmbedInsertAfter = nullptr;

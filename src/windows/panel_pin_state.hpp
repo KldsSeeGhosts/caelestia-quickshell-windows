@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include <qt_windows.h>
 
 #include "virtual_desktops.hpp"
@@ -7,14 +9,16 @@
 namespace qs::windows {
 
 // Per-panel state machine for pinning a top-level shell panel to every virtual
-// desktop. Ties every retry and in-flight async pin to a specific HWND and
-// generation so overlapping signals, HWND recreation, hide/embed transitions,
-// accessor recovery and Explorer restarts cannot spend another window's retry
-// budget or apply stale completions.
+// desktop. Ties every retry and in-flight async pin to a specific HWND,
+// generation, and unique request ID so overlapping signals, HWND recreation,
+// hide/show races, embed transitions, accessor recovery, and Explorer restarts
+// cannot consume another attempt's completion or cut short the wait budget.
 struct PanelPinState {
-	// Exceeds the native worker's 5 s stall bound (30 * 200 ms = 6 s) so a
-	// second panel waiting behind one slow pin never gives up prematurely.
-	static constexpr int MAX_BUSY_RETRIES = 30;
+	// Exceeds the pin worker's 5 s stall bound so a waiting panel never gives
+	// up while a preceding slow pin is still within its stall window.
+	static constexpr qint64 BUSY_WAIT_BUDGET_MS = 6000;
+	// Hard ceiling across consecutive slot handoffs.
+	static constexpr qint64 MAX_TOTAL_BUSY_WAIT_MS = 30000;
 	static constexpr int BUSY_RETRY_MS = 200;
 
 	enum class SubmitAction : quint8 {
@@ -37,7 +41,9 @@ struct PanelPinState {
 	HWND attemptHwnd = nullptr;
 	HWND inFlightHwnd = nullptr;
 	quint64 inFlightGeneration = 0;
-	int busyRetries = 0;
+	quint64 inFlightRequestId = 0;
+	std::optional<qint64> busySinceMs;
+	std::optional<qint64> firstBusyMs;
 	bool pinned = false;
 
 	[[nodiscard]] bool pinnedHere(HWND hwnd) const {
@@ -45,7 +51,7 @@ struct PanelPinState {
 	}
 
 	[[nodiscard]] bool inFlightFor(HWND hwnd) const {
-		return hwnd != nullptr && this->inFlightHwnd == hwnd
+		return hwnd != nullptr && this->inFlightRequestId != 0 && this->inFlightHwnd == hwnd
 		    && this->inFlightGeneration == this->generation;
 	}
 
@@ -53,7 +59,9 @@ struct PanelPinState {
 		++this->generation;
 		this->inFlightHwnd = nullptr;
 		this->inFlightGeneration = 0;
-		this->busyRetries = 0;
+		this->inFlightRequestId = 0;
+		this->busySinceMs.reset();
+		this->firstBusyMs.reset();
 		if (clearPinned) {
 			this->pinned = false;
 			this->pinnedHwnd = nullptr;
@@ -89,36 +97,57 @@ struct PanelPinState {
 		return !this->inFlightFor(hwnd) && this->failedHwnd != hwnd;
 	}
 
-	[[nodiscard]] SubmitAction
-	onSubmitResult(HWND hwnd, quint64 expectedGeneration, OwnWindowPin result) {
+	[[nodiscard]] SubmitAction onSubmitResult(
+	    HWND hwnd,
+	    quint64 expectedGeneration,
+	    OwnWindowPin result,
+	    qint64 nowMs,
+	    quint64 requestId = 0
+	) {
 		if (hwnd == nullptr || expectedGeneration != this->generation || this->attemptHwnd != hwnd) {
 			return SubmitAction::None;
 		}
 		switch (result) {
 		case OwnWindowPin::Pinned:
+			this->busySinceMs.reset();
+			this->firstBusyMs.reset();
 			this->applyResult(hwnd, expectedGeneration, true);
 			return SubmitAction::None;
 		case OwnWindowPin::Pending:
+			this->busySinceMs.reset();
+			this->firstBusyMs.reset();
 			this->inFlightHwnd = hwnd;
 			this->inFlightGeneration = expectedGeneration;
+			this->inFlightRequestId = requestId;
 			return SubmitAction::None;
-		case OwnWindowPin::Busy:
-			if (this->busyRetries < MAX_BUSY_RETRIES) {
-				++this->busyRetries;
+		case OwnWindowPin::Busy: {
+			if (!this->firstBusyMs) this->firstBusyMs = nowMs;
+			if (!this->busySinceMs) this->busySinceMs = nowMs;
+			const auto sinceHandoff = nowMs - *this->busySinceMs;
+			const auto totalElapsed = nowMs - *this->firstBusyMs;
+			if (sinceHandoff < BUSY_WAIT_BUDGET_MS && totalElapsed < MAX_TOTAL_BUSY_WAIT_MS) {
 				return SubmitAction::RetryLater;
 			}
+			this->busySinceMs.reset();
+			this->firstBusyMs.reset();
 			this->applyResult(hwnd, expectedGeneration, false);
 			return SubmitAction::TriggerFollow;
+		}
 		case OwnWindowPin::Refused:
+			this->busySinceMs.reset();
+			this->firstBusyMs.reset();
 			this->applyResult(hwnd, expectedGeneration, false);
 			return SubmitAction::TriggerFollow;
 		case OwnWindowPin::Unavailable:
+			this->busySinceMs.reset();
+			this->firstBusyMs.reset();
 			return SubmitAction::FallbackLegacy;
 		}
 		return SubmitAction::None;
 	}
 
 	[[nodiscard]] CompletionAction onAsyncCompletion(
+	    quint64 completedRequestId,
 	    HWND completedHwnd,
 	    OwnWindowPin result,
 	    HWND currentHwnd,
@@ -127,14 +156,20 @@ struct PanelPinState {
 	    bool accessorLoaded,
 	    bool retryScheduled
 	) {
-		if (completedHwnd == nullptr) return CompletionAction::None;
+		if (completedHwnd == nullptr || completedRequestId == 0) return CompletionAction::None;
 
-		// Another panel's pin just freed the worker slot: kick our busy retry
-		// immediately instead of waiting for the remaining 200 ms interval.
-		if (completedHwnd != this->inFlightHwnd || this->inFlightGeneration != this->generation) {
+		const auto matchesInFlight = this->inFlightRequestId != 0
+		                          && completedRequestId == this->inFlightRequestId
+		                          && completedHwnd == this->inFlightHwnd
+		                          && this->inFlightGeneration == this->generation;
+
+		if (!matchesInFlight) {
+			// Another pin just freed the worker slot: renew the per-handoff
+			// wait budget and kick our busy retry immediately if waiting.
 			if (retryScheduled && visible && !embedded && currentHwnd != nullptr
 			    && !this->pinnedHere(currentHwnd) && !this->inFlightFor(currentHwnd))
 			{
+				this->busySinceMs.reset();
 				return CompletionAction::RetryImmediate;
 			}
 			return CompletionAction::None;
@@ -143,6 +178,7 @@ struct PanelPinState {
 		const auto gen = this->generation;
 		this->inFlightHwnd = nullptr;
 		this->inFlightGeneration = 0;
+		this->inFlightRequestId = 0;
 
 		// Revalidate HWND, visibility and embedding before applying the result.
 		if (currentHwnd != completedHwnd || !visible || embedded) {

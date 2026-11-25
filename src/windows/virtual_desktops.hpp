@@ -123,7 +123,7 @@ public:
 	bool pinWindow(HWND hwnd, bool pinned);
 	// Own panels only. Never exposed as Hyprland pin support, so toplevel
 	// queries keep reading cached state instead of waiting on COM.
-	OwnWindowPin pinOwnWindow(HWND hwnd);
+	OwnWindowPin pinOwnWindow(HWND hwnd, quint64* outRequestId = nullptr);
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;
 	[[nodiscard]] DesktopAvailability availability() const;
 	[[nodiscard]] bool supports(DesktopOperation operation) const;
@@ -164,7 +164,7 @@ signals:
 	void lastCommandChanged();
 	void commandResult(QVariantMap result);
 	void moveWindowCompleted(quint64 sequence, quintptr hwnd, bool succeeded, QString reason);
-	void ownWindowPinCompleted(quintptr hwnd, qs::windows::OwnWindowPin result);
+	void ownWindowPinCompleted(quint64 requestId, quintptr hwnd, qs::windows::OwnWindowPin result);
 
 private:
 #ifdef QS_TEST
@@ -186,7 +186,7 @@ private:
 	    DesktopAvailability availability,
 	    HRESULT error
 	);
-	void onNativePinCompleted(HWND hwnd, OwnWindowPin result);
+	void onNativePinCompleted(quint64 requestId, HWND hwnd, OwnWindowPin result);
 	void applyNativeSnapshot();
 	void notifyCapability();
 	bool readRegistry(QList<GUID>& ids, GUID& current) const;

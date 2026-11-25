@@ -45,11 +45,14 @@ struct FakeCom: Interface {
 		*out = nullptr;
 		return E_NOINTERFACE;
 	}
-	ULONG STDMETHODCALLTYPE AddRef() override { return ++this->refs; }
+	ULONG STDMETHODCALLTYPE AddRef() override {
+		return static_cast<ULONG>(InterlockedIncrement(reinterpret_cast<volatile LONG*>(&this->refs)));
+	}
 	ULONG STDMETHODCALLTYPE Release() override {
 		if (this->beforeRelease) this->beforeRelease();
-		++this->releases;
-		const auto remaining = --this->refs;
+		InterlockedIncrement(reinterpret_cast<volatile LONG*>(&this->releases));
+		const auto remaining =
+		    static_cast<ULONG>(InterlockedDecrement(reinterpret_cast<volatile LONG*>(&this->refs)));
 		if (this->faultOnRelease) fault();
 		return remaining;
 	}
