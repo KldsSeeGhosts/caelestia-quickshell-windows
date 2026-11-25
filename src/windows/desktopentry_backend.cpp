@@ -356,6 +356,9 @@ DWORD launchToken(
 	const auto shellPath = APPS_FOLDER_PREFIX + token;
 
 	const auto error = sys::detail::launchAppsFolderTokenWithFallback(
+	    token,
+	    workingDirectory,
+	    arguments,
 	    [&] {
 		    // Explorer is the preferred parent for ordinary launches: its shell instance
 		    // has the user's unmodified environment even when the shell process had to
