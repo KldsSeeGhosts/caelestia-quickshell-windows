@@ -1,6 +1,7 @@
 #pragma once
 
 #include <qtenvironmentvariables.h>
+#include <qt_windows.h>
 
 namespace qs::crash {
 
@@ -14,6 +15,12 @@ namespace qs::crash {
 // this variable never has to be set alongside it.
 [[nodiscard]] inline bool crashRelaunchDisabled() {
 	return qEnvironmentVariableIsSet("QS_DISABLE_CRASH_RELAUNCH");
+}
+
+// Gamma recovery performs a display topology query. A stack-overflowing thread
+// may not have enough stack left for that work, so crash cleanup skips it there.
+[[nodiscard]] inline bool crashGammaRestoreAllowed(DWORD exceptionCode) {
+	return exceptionCode != EXCEPTION_STACK_OVERFLOW;
 }
 
 } // namespace qs::crash

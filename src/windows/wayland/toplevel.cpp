@@ -19,6 +19,11 @@ Toplevel::Toplevel(TrackedWindow* window, QObject* parent): QObject(parent), mWi
 	// clang-format off
 	QObject::connect(window, &TrackedWindow::appIdChanged, this, &Toplevel::appIdChanged);
 	QObject::connect(window, &TrackedWindow::titleChanged, this, &Toplevel::titleChanged);
+	QObject::connect(window, &TrackedWindow::elevatedChanged, this, &Toplevel::elevatedChanged);
+	QObject::connect(window, &TrackedWindow::imagePathChanged, this, &Toplevel::imagePathChanged);
+	QObject::connect(window, &TrackedWindow::aumidChanged, this, &Toplevel::aumidChanged);
+	QObject::connect(window, &TrackedWindow::lastActionErrorChanged, this, &Toplevel::lastActionErrorChanged);
+	QObject::connect(window, &TrackedWindow::actionRefused, this, &Toplevel::actionRefused);
 	QObject::connect(window, &TrackedWindow::activatedChanged, this, &Toplevel::activatedChanged);
 	QObject::connect(window, &TrackedWindow::screenChanged, this, &Toplevel::screensChanged);
 	QObject::connect(window, &TrackedWindow::maximizedChanged, this, &Toplevel::maximizedChanged);
@@ -37,6 +42,10 @@ void Toplevel::close() { this->mWindow->close(); }
 
 QString Toplevel::appId() const { return this->mWindow->appId(); }
 QString Toplevel::title() const { return this->mWindow->title(); }
+bool Toplevel::elevated() const { return this->mWindow->elevated(); }
+QString Toplevel::imagePath() const { return this->mWindow->imagePath(); }
+QString Toplevel::aumid() const { return this->mWindow->aumid(); }
+QString Toplevel::lastActionError() const { return this->mWindow->lastActionError(); }
 
 Toplevel* Toplevel::parent() const {
 	return ToplevelManager::instance()->forWindow(this->mWindow->owner());

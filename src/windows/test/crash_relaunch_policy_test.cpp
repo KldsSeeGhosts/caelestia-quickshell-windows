@@ -23,6 +23,7 @@ private slots:
 	void anySetValueDisablesTheRelaunch_data();
 	void anySetValueDisablesTheRelaunch();
 	void theWholeHandlerSwitchIsIndependent();
+	void gammaRestoreIsSkippedOnlyForStackOverflow();
 };
 
 void TestCrashRelaunchPolicy::relaunchStaysEnabledWithoutTheVariable() {
@@ -47,6 +48,12 @@ void TestCrashRelaunchPolicy::anySetValueDisablesTheRelaunch() {
 void TestCrashRelaunchPolicy::theWholeHandlerSwitchIsIndependent() {
 	QVERIFY(qputenv("QS_DISABLE_CRASH_HANDLER", QByteArray("1")));
 	QVERIFY(!qs::crash::crashRelaunchDisabled());
+}
+
+void TestCrashRelaunchPolicy::gammaRestoreIsSkippedOnlyForStackOverflow() {
+	QVERIFY(!qs::crash::crashGammaRestoreAllowed(EXCEPTION_STACK_OVERFLOW));
+	QVERIFY(qs::crash::crashGammaRestoreAllowed(EXCEPTION_ACCESS_VIOLATION));
+	QVERIFY(qs::crash::crashGammaRestoreAllowed(0));
 }
 
 QTEST_GUILESS_MAIN(TestCrashRelaunchPolicy)

@@ -1,10 +1,14 @@
 #pragma once
 
+#include <memory>
+
+#include <qabstractnativeeventfilter.h>
 #include <qhash.h>
 #include <qobject.h>
 #include <qset.h>
 #include <qstring.h>
 #include <qt_windows.h>
+#include <qtimer.h>
 
 namespace qs::windows {
 class ScreenIdentityRegistry;
@@ -12,7 +16,20 @@ class ScreenIdentityRegistry;
 
 namespace qs::windows::sys {
 
-class GammaController: public QObject {
+namespace gamma_detail {
+
+[[nodiscard]] bool parseCrashTargetIdentity(const wchar_t* identity, LUID& adapter, UINT32& target);
+[[nodiscard]] bool crashDisplayTopologyWithinLimits(UINT32 pathCount, UINT32 modeCount);
+using CrashSnapshotReadHook = void (*)();
+void setCrashSnapshotReadHookForTest(CrashSnapshotReadHook hook);
+[[nodiscard]] quint64 crashSnapshotSequenceAtForTest(size_t index);
+void writeCrashSnapshotSequenceAtForTest(size_t index, quint64 sequence);
+
+} // namespace gamma_detail
+
+class GammaController
+    : public QObject
+    , public QAbstractNativeEventFilter {
 	Q_OBJECT;
 
 public:
@@ -24,6 +41,10 @@ public:
 		decltype(&DeleteDC) deleteDc;
 		decltype(&GetDeviceGammaRamp) getRamp;
 		decltype(&SetDeviceGammaRamp) setRamp;
+		// Crash-time identity resolution. It maps a saved stable target identity
+		// to the current GDI device, or fails when the target cannot be verified.
+		using ResolveDevice = BOOL(WINAPI*)(const wchar_t*, wchar_t*, DWORD);
+		ResolveDevice resolveDevice = nullptr;
 	};
 	explicit GammaController(NativeApi api, QObject* parent = nullptr);
 	// Test-only injection of the same identity registry production uses.
@@ -32,6 +53,19 @@ public:
 	    qs::windows::ScreenIdentityRegistry& identities,
 	    QObject* parent = nullptr
 	);
+	~GammaController() override;
+
+	bool nativeEventFilter(const QByteArray& eventType, void* message, qintptr* result) override;
+	// Reapplies every ramp this process still owns. Native display/power events call
+	// this through a debounce; tests may call it directly.
+	void reapplyActive();
+	// Crash/exit-only restore over plain static snapshots. It intentionally uses no Qt.
+	static void restoreForCrash();
+	// Internal seam for the snapshot fixture: same scan and sequence validation as
+	// restoreForCrash, with the native entry points supplied by the fixture.
+	static void restoreSnapshots(const NativeApi& api);
+	static quintptr crashSnapshotCount();
+	static void clearCrashSnapshots();
 
 	void setTemperature(int kelvin);
 	void setBrightness(const QString& screenName, qreal brightness);
@@ -45,6 +79,7 @@ public:
 
 private:
 	explicit GammaController(QObject* parent);
+	void init();
 
 	struct Ramp {
 		WORD values[3][256]; // NOLINT
@@ -59,8 +94,12 @@ private:
 	bool saveOriginal(const QString& key, HDC hdc);
 	bool restore(const QString& key);
 	HDC screenDc(const QString& key) const;
+	[[nodiscard]] QString deviceFor(const QString& key) const;
 	qreal floorFor(const QString& key);
 	void watchIdentities();
+	void scheduleReapply();
+	void updateCrashSnapshot(const QString& key, const Ramp& ramp);
+	void removeCrashSnapshot(const QString& key);
 	// An id stops naming its screen (removal, or another identity). Puts the
 	// original ramp back while the id still resolves, then drops all of its state
 	// and invalidates native calls still running for it.
@@ -76,8 +115,17 @@ private:
 	QHash<QString, Ramp> originals;
 	// A saved snapshot alone creates no restoration obligation.
 	QSet<QString> written;
+	// Keys with an outstanding user-requested dimming factor. Unlike `written`,
+	// this survives a transient write failure so the next display wake retries it.
+	QSet<QString> dimmingRequested;
+	// The requested backlight factor while `backlightFactor` is rolled back to
+	// the last owned state after a failed write.
+	QHash<QString, qreal> retryBacklightFactor;
 	// Bumped each time an id is retired; a native call that spans a bump aborts.
 	QHash<QString, quint64> lifetimes;
+	QTimer reapplyTimer;
+	struct PowerNotifications;
+	std::unique_ptr<PowerNotifications> powerNotifications;
 };
 
 } // namespace qs::windows::sys

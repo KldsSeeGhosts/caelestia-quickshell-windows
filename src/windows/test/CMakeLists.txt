@@ -421,11 +421,20 @@ target_compile_definitions(qs_suite_process_launch PRIVATE NOMINMAX WIN32_LEAN_A
 target_include_directories(qs_suite_process_launch PRIVATE ${QS_WINDOWS_SRC})
 target_link_libraries(qs_suite_process_launch PRIVATE Qt6::Core Qt6::Test ole32 oleaut32 shell32)
 
-# Compile the native dispatcher too: the pure fixture above deliberately does
-# not link its platform singletons or execute any real activation.
+# Compile the native dispatcher and toplevel adaptors too: the pure fixture
+# above deliberately does not link their platform singletons or execute activation.
 add_library(dispatcher_compile_check OBJECT ${QS_WINDOWS_SRC}/hyprland/dispatcher.cpp)
 target_compile_definitions(dispatcher_compile_check PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(dispatcher_compile_check PRIVATE Qt6::Quick Qt6::Qml)
+
+add_library(toplevel_compile_check OBJECT
+	${QS_WINDOWS_SRC}/wayland/toplevel.cpp
+	${QS_WINDOWS_SRC}/hyprland/hyprland_toplevel.cpp
+	${QS_WINDOWS_SRC}/hyprland/qml.cpp
+)
+target_compile_definitions(toplevel_compile_check PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(toplevel_compile_check PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(toplevel_compile_check PRIVATE Qt6::Quick Qt6::Qml)
 
 add_library(process_launch_compile_check OBJECT ${QS_WINDOWS_SRC}/process_launch.cpp)
 target_compile_definitions(process_launch_compile_check PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -873,8 +882,27 @@ qs_add_portable_suite(brightness_route
 )
 target_compile_definitions(qs_suite_brightness_route PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(qs_suite_brightness_route PRIVATE
-	Qt6::Gui Qt6::Qml Qt6::Test user32 gdi32 dxva2 wbemuuid ole32 oleaut32
+	Qt6::Gui Qt6::Qml Qt6::Test user32 gdi32 dxva2 wbemuuid ole32 oleaut32 powrprof
 )
+
+# EqualizerAPO registry decoding uses a fake enumeration callback. No machine
+# registry key, audio device, elevated process or PowerShell instance is touched.
+qs_add_portable_suite(equalizer_apo
+	equalizer_apo_test.cpp
+	${QS_WINDOWS_SRC}/system/equalizer_apo.cpp
+)
+target_compile_definitions(qs_suite_equalizer_apo PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(qs_suite_equalizer_apo PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(qs_suite_equalizer_apo PRIVATE
+	Qt6::Gui Qt6::Quick Qt6::Qml Qt6::Test advapi32 shell32 user32
+)
+
+# Portable refusal policy for privileged window actions. The fixture checks the
+# structured reason and silence rules without owning or messaging a real window.
+qs_add_portable_suite(window_action window_action_test.cpp)
+target_compile_definitions(qs_suite_window_action PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(qs_suite_window_action PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(qs_suite_window_action PRIVATE Qt6::Gui Qt6::Test user32)
 
 # Two synthetic monitors with the same vendor/model label. Brightness and gamma
 # route by the persistent target identity, never by the label. The fixture
@@ -889,7 +917,7 @@ qs_add_portable_suite(display_identity
 )
 target_compile_definitions(qs_suite_display_identity PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(qs_suite_display_identity PRIVATE
-	Qt6::Gui Qt6::GuiPrivate Qt6::Qml Qt6::Test user32 gdi32 dxva2 wbemuuid ole32 oleaut32
+	Qt6::Gui Qt6::GuiPrivate Qt6::Qml Qt6::Test user32 gdi32 dxva2 wbemuuid ole32 oleaut32 powrprof
 )
 
 # The real gamma state machine runs with injected Create/Get/Set/Delete calls.
@@ -1265,7 +1293,7 @@ qs_add_portable_runner(portable_core SUITES
 	dispatcher erm625_native_desktop_facade lazyloader runtime_paths
 )
 qs_add_portable_runner(portable_runtime SUITES
-	fs_utils ipc_limits input_settle super_drag_wait process_image_name
+	fs_utils ipc_limits input_settle super_drag_wait process_image_name window_action
 	idle_request fullscreen_ownership capture_affinity explorer_hang_hardening desktop_embedding
 )
 qs_add_portable_runner(portable_tiling SUITES
@@ -1280,7 +1308,7 @@ qs_add_portable_runner(portable_display SUITES
 	display_identity screen_identity panel_animation screenshot_jobs capture_dimensions
 )
 qs_add_portable_runner(portable_system SUITES
-	brightness_route display_transaction power_profiles network_wifi_route
+	brightness_route display_transaction power_profiles network_wifi_route equalizer_apo
 )
 qs_add_portable_runner(portable_clipboard SUITES
 	clipboard_capture clipboard_writer window_stack hyprland_monitor launcher_exit
@@ -1353,6 +1381,7 @@ set(QS_TESTS_PORTABLE
 	upower_status tiling_observability tiling_manager tiling_drag tiling_reload
 	transition_trace foreground_observer activation_policy fullscreen_app_state
 	panel_topmost panel_focus_style power_profiles brightness_route display_identity
+	equalizer_apo window_action
 	native_desktop_recovery pw_session_worker idle_request launcher_exit input_settle
 	super_drag_wait process_image_name explorer_hang_hardening process_launch
 	network_wifi_route runtime_paths lazyloader
