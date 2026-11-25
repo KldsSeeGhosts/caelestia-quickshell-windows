@@ -23,6 +23,10 @@ class HyprlandToplevel: public QObject {
 	Q_PROPERTY(HyprlandToplevel* handle READ hyprlandHandle NOTIFY hyprlandHandleChanged);
 	Q_PROPERTY(qs::wayland::toplevel::Toplevel* wayland READ waylandHandle NOTIFY waylandHandleChanged);
 	Q_PROPERTY(QString title READ default NOTIFY titleChanged BINDABLE bindableTitle);
+	Q_PROPERTY(bool elevated READ elevated NOTIFY elevatedChanged);
+	Q_PROPERTY(QString imagePath READ imagePath NOTIFY imagePathChanged);
+	Q_PROPERTY(QString aumid READ aumid NOTIFY aumidChanged);
+	Q_PROPERTY(QString lastActionError READ lastActionError NOTIFY lastActionErrorChanged);
 	Q_PROPERTY(bool activated READ default NOTIFY activatedChanged BINDABLE bindableActivated);
 	Q_PROPERTY(bool urgent READ default NOTIFY urgentChanged BINDABLE bindableUrgent);
 	Q_PROPERTY(QVariantMap lastIpcObject READ default BINDABLE bindableLastIpcObject NOTIFY lastIpcObjectChanged);
@@ -39,6 +43,10 @@ public:
 	[[nodiscard]] QString addressStr() const { return QString::number(this->mAddress, 16); }
 	[[nodiscard]] quint64 address() const { return this->mAddress; }
 	[[nodiscard]] qs::windows::TrackedWindow* window() const { return this->mWindow; }
+	[[nodiscard]] bool elevated() const;
+	[[nodiscard]] QString imagePath() const;
+	[[nodiscard]] QString aumid() const;
+	[[nodiscard]] QString lastActionError() const;
 
 	[[nodiscard]] HyprlandToplevel* hyprlandHandle();
 	[[nodiscard]] qs::wayland::toplevel::Toplevel* waylandHandle();
@@ -65,6 +73,11 @@ signals:
 	QSDOC_HIDE void hyprlandHandleChanged();
 
 	void titleChanged();
+	void elevatedChanged();
+	void imagePathChanged();
+	void aumidChanged();
+	void lastActionErrorChanged();
+	void actionRefused(const QString& action, const QString& reason, bool elevated);
 	void activatedChanged();
 	void urgentChanged();
 	void workspaceChanged();
@@ -78,6 +91,7 @@ private slots:
 private:
 	void setHyprlandHandle(HyprlandToplevel* handle);
 	void bindToHandle();
+	[[nodiscard]] qs::windows::TrackedWindow* effectiveWindow() const;
 
 	quint64 mAddress = 0;
 	HyprlandIpc* ipc;

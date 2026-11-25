@@ -52,14 +52,19 @@ if (WIN32)
 	string(REPLACE ";" "," QS_RC_VERSION_NUMBERS "${QS_VERSION_PARTS}")
 	configure_file(version_info.h.in "${CMAKE_CURRENT_BINARY_DIR}/version_info.h" @ONLY)
 
-	target_sources(quickshell PRIVATE quickshell.rc)
-	target_sources(quickshell-gui PRIVATE quickshell.rc)
+	# Tell Qt we provide a manifest. It is embedded by quickshell.rc, so
+	# CMake must not pass it to the linker for a second embedding.
+	set_source_files_properties(quickshell.manifest PROPERTIES HEADER_FILE_ONLY TRUE)
+	target_sources(quickshell PRIVATE quickshell.rc quickshell.manifest)
+	target_sources(quickshell-gui PRIVATE quickshell.rc quickshell.manifest)
 	set_property(SOURCE quickshell.rc APPEND PROPERTY OBJECT_DEPENDS
 		"${CMAKE_CURRENT_BINARY_DIR}/version_info.h" "${CMAKE_CURRENT_SOURCE_DIR}/quickshell.manifest")
-	if (CMAKE_HOST_WIN32)
-		target_sources(quickshell PRIVATE quickshell.manifest)
-		target_sources(quickshell-gui PRIVATE quickshell.manifest)
-		set_property(SOURCE quickshell.rc APPEND PROPERTY COMPILE_DEFINITIONS QS_EXTERNAL_MANIFEST)
+	if (MSVC)
+		# quickshell.rc embeds the complete manifest. Do not merge it with a
+		# generated UAC manifest: llvm-mt can qualify the level attribute
+		# during the merge, which Windows then refuses at startup.
+		target_link_options(quickshell PRIVATE /MANIFEST:NO)
+		target_link_options(quickshell-gui PRIVATE /MANIFEST:NO)
 	endif()
 	target_include_directories(quickshell PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 	target_include_directories(quickshell-gui PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")

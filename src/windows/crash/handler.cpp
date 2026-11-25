@@ -25,6 +25,7 @@
 #include "../../core/logcat.hpp"
 #include "../../core/paths.hpp"
 #include "../redact.hpp"
+#include "../system/gamma.hpp"
 #include "../tiling.hpp"
 #include "../window_decorations.hpp"
 #include "relaunch_policy.hpp"
@@ -179,6 +180,8 @@ void handleCrash(const wchar_t* reason, EXCEPTION_POINTERS* ep) {
 
 		qs::windows::DecorationManager::restoreForCrash();
 		qs::windows::TilingManager::restoreForCrash();
+		if (crashGammaRestoreAllowed(static_cast<DWORD>(exceptionCode)))
+			qs::windows::sys::GammaController::restoreForCrash();
 
 		auto elapsed = currentEpochMs() - gLaunchTimeMs;
 		if (gRelaunchEnabled && (gLaunchTimeMs == 0 || elapsed >= 10000)) {

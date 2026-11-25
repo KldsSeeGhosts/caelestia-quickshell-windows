@@ -1,15 +1,22 @@
 #include "app_actions.hpp"
 
+#include <memory>
+#include <optional>
 #include <vector>
 
 #include <qdir.h>
 #include <qdiriterator.h>
+#include <qfile.h>
 #include <qfileinfo.h>
+#include <qfuturewatcher.h>
 #include <qhash.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
 #include <qmutex.h>
 #include <qobject.h>
+#include <qpromise.h>
+#include <qquickitem.h>
+#include <qquickwindow.h>
 #include <qstring.h>
 #include <qstringlist.h>
 #include <quuid.h>
@@ -28,8 +35,12 @@
 #include "../../core/desktopentry.hpp"
 #include "../../core/logcat.hpp"
 #include "../desktopentry_backend.hpp"
+#include "../process_launch.hpp"
 #include "../redact.hpp"
 #include "../util.hpp"
+#include "app_exec_alias.hpp"
+#include "appx_manifest.hpp"
+#include "shell_action_request.hpp"
 
 using Microsoft::WRL::ComPtr;
 
@@ -95,30 +106,84 @@ QString packageFamilyOf(const QString& token) {
 	return family;
 }
 
-bool isSystemPackage(const QString& family) {
+struct PackageInstallInfo {
+	QString path;
+	bool allowElevation = false;
+	QString executionAlias;
+	QString elevationTarget;
+};
+
+std::optional<AppExecAliasInfo> verifiedPackageAlias(
+    const QString& family,
+    const QStringList& aliases,
+    const QString& aumid,
+    const QString& installRoot
+) {
+	if (aliases.isEmpty()) return std::nullopt;
+
+	PWSTR raw = nullptr;
+	const auto hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &raw);
+	const auto localAppData = takeComString(raw);
+	if (FAILED(hr) || localAppData.isEmpty()) return std::nullopt;
+
+	// The unscoped alias can belong to a different package. Prefer the
+	// package-scoped alias, then verify package identity and install target
+	// inside the reparse payload before accepting either location.
+	const auto root = QDir(localAppData + QStringLiteral("/Microsoft/WindowsApps"));
+	const auto scoped = QDir(root.filePath(family));
+	for (const auto& alias: aliases) {
+		// Prefer the package-scoped alias. Also accept the legacy unscoped alias
+		// only after its reparse payload proves the same family and AUMID.
+		for (const auto& path:
+		     {QDir::toNativeSeparators(scoped.filePath(alias)),
+		      QDir::toNativeSeparators(root.filePath(alias))})
+		{
+			if (auto info = verifiedAppExecAlias(path, family, aumid, installRoot)) return info;
+		}
+	}
+	return std::nullopt;
+}
+
+std::optional<PackageInstallInfo> packageInstall(const QString& family, QStringView applicationId) {
 	auto wfamily = family.toStdWString();
 	UINT32 count = 0;
 	UINT32 length = 0;
 
 	auto rc = GetPackagesByPackageFamily(wfamily.c_str(), &count, nullptr, &length, nullptr);
-	if (rc != ERROR_INSUFFICIENT_BUFFER || count == 0) return false;
+	if (rc != ERROR_INSUFFICIENT_BUFFER || count == 0) return std::nullopt;
 
 	auto names = std::vector<PWSTR>(count);
 	auto buffer = std::vector<wchar_t>(length);
 	rc = GetPackagesByPackageFamily(wfamily.c_str(), &count, names.data(), &length, buffer.data());
-	if (rc != ERROR_SUCCESS || count == 0) return false;
+	if (rc != ERROR_SUCCESS || count == 0) return std::nullopt;
 
-	UINT32 pathLength = 0;
-	if (GetPackagePathByFullName(names.front(), &pathLength, nullptr) != ERROR_INSUFFICIENT_BUFFER) {
-		return false;
+	auto firstInstall = std::optional<PackageInstallInfo>();
+	for (UINT32 i = 0; i < count; ++i) {
+		UINT32 pathLength = 0;
+		if (GetPackagePathByFullName(names[i], &pathLength, nullptr) != ERROR_INSUFFICIENT_BUFFER) {
+			continue;
+		}
+
+		auto path = std::vector<wchar_t>(pathLength);
+		if (GetPackagePathByFullName(names[i], &pathLength, path.data()) != ERROR_SUCCESS) continue;
+
+		auto install = PackageInstallInfo();
+		install.path = QDir::toNativeSeparators(QString::fromWCharArray(path.data()));
+		if (!firstInstall) firstInstall = install;
+		QFile file(QDir(install.path).filePath(QStringLiteral("AppxManifest.xml")));
+		if (!file.open(QFile::ReadOnly)) continue;
+
+		const auto manifest = readAppxManifest(&file, applicationId);
+		if (!manifest.applicationFound) continue;
+		install.allowElevation = manifest.allowElevation;
+		const auto aumid = family + u'!' + applicationId.toString();
+		if (const auto alias = verifiedPackageAlias(family, manifest.desktopExecutionAliases, aumid, install.path)) {
+			install.executionAlias = alias->aliasName;
+			install.elevationTarget = alias->targetPath;
+		}
+		return install;
 	}
-
-	auto path = std::vector<wchar_t>(pathLength);
-	if (GetPackagePathByFullName(names.front(), &pathLength, path.data()) != ERROR_SUCCESS) {
-		return false;
-	}
-
-	return isUnderWindows(QString::fromWCharArray(path.data()));
+	return firstInstall;
 }
 
 QString knownFolderTarget(const QString& token) {
@@ -262,44 +327,103 @@ QString startMenuShortcut(const AppActionInfo& app) {
 	return path;
 }
 
-DWORD shellExecute(const QString& file, const wchar_t* verb, ULONG mask, const QString& directory) {
-	auto wfile = file.toStdWString();
-	auto wdir = directory.toStdWString();
+DWORD runElevated(const QString& id, const AppActionInfo& app, HWND owner) {
+	const auto launch = [&](const QString& target, bool invokeIdList, const QString& directory = {}) {
+		return process::shellExecuteTarget(
+		    target, {}, directory, QStringLiteral("runas"), owner, invokeIdList
+		);
+	};
+	auto result = process::detail::launchResultForError(ERROR_FILE_NOT_FOUND);
 
-	auto info = SHELLEXECUTEINFOW {};
-	info.cbSize = sizeof(info);
-	info.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI | mask;
-	info.lpVerb = verb;
-	info.lpFile = wfile.c_str();
-	info.lpDirectory = wdir.empty() ? nullptr : wdir.c_str();
-	info.nShow = SW_SHOWNORMAL;
-
-	return ShellExecuteExW(&info) ? ERROR_SUCCESS : GetLastError();
-}
-
-void runElevated(const QString& id, const AppActionInfo& app) {
-	auto shortcut = startMenuShortcut(app);
-	auto error = static_cast<DWORD>(ERROR_FILE_NOT_FOUND);
-
-	if (!shortcut.isEmpty()) {
-		error = shellExecute(shortcut, L"runas", SEE_MASK_INVOKEIDLIST, QString());
-		if (error != ERROR_SUCCESS && error != ERROR_CANCELLED) {
-			qCDebug(logAppActions) << "Elevating the shortcut of"
-			                       << qs::windows::logId(id) << "failed:" << error;
+	if (app.packaged) {
+		if (app.allowAppsFolderElevation) {
+			result = launch(QStringLiteral("shell:AppsFolder\\") + app.token, true);
 		}
+		result = process::detail::fallbackOnFailure(result, [&] {
+			if (app.executionAlias.isEmpty()) return result;
+			// Resolve the registered package install directory and re-read the
+			// mutable alias immediately before launch. The launch target is the
+			// verified canonical regular file inside that registered directory.
+			const auto applicationId = QStringView(app.token).sliced(app.packageFamilyName.size() + 1);
+			const auto install = packageInstall(app.packageFamilyName, applicationId);
+			if (!install || install->executionAlias != app.executionAlias
+			    || install->elevationTarget.isEmpty())
+			{
+				return process::detail::launchResultForError(ERROR_ACCESS_DENIED);
+			}
+			return launch(install->elevationTarget, false);
+		});
+	} else {
+		const auto shortcut = startMenuShortcut(app);
+		if (!shortcut.isEmpty()) result = launch(shortcut, true);
+		result = process::detail::fallbackOnFailure(result, [&] {
+			const auto directory = QDir::toNativeSeparators(QFileInfo(app.target).absolutePath());
+			return launch(app.target, true, directory);
+		});
 	}
 
-	if (error != ERROR_SUCCESS && error != ERROR_CANCELLED) {
-		auto directory = QDir::toNativeSeparators(QFileInfo(app.target).absolutePath());
-		error = shellExecute(app.target, L"runas", SEE_MASK_INVOKEIDLIST, directory);
-	}
-
+	const auto error = result.error;
 	if (error == ERROR_CANCELLED) {
 		qCDebug(logAppActions) << "Elevation of" << qs::windows::logId(id) << "was cancelled";
 	} else if (error != ERROR_SUCCESS) {
 		qCWarning(logAppActions) << "Could not run" << qs::windows::logId(id)
 		                         << "as administrator:" << error;
 	}
+
+	return error;
+}
+
+QString windowsErrorString(DWORD error) {
+	if (error == ERROR_SUCCESS) return QString();
+
+	wchar_t buffer[1024] = {};
+	const auto length = FormatMessageW(
+	    FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+	    nullptr,
+	    error,
+	    MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+	    buffer,
+	    static_cast<DWORD>(std::size(buffer)),
+	    nullptr
+	);
+	if (length == 0) return QStringLiteral("Windows error %1").arg(error);
+	return QString::fromWCharArray(buffer, static_cast<qsizetype>(length)).trimmed();
+}
+
+AppActions::ActionResult actionResultForError(DWORD error) {
+	if (error == ERROR_SUCCESS) return AppActions::ActionResult::Started;
+	if (error == ERROR_CANCELLED) return AppActions::ActionResult::Cancelled;
+	return AppActions::ActionResult::Refused;
+}
+
+QString actionStatus(AppActions::ActionResult result) {
+	switch (result) {
+	case AppActions::ActionResult::Started: return QStringLiteral("started");
+	case AppActions::ActionResult::Cancelled: return QStringLiteral("cancelled");
+	case AppActions::ActionResult::Refused: return QStringLiteral("refused");
+	case AppActions::ActionResult::NotSupported: return QStringLiteral("notSupported");
+	case AppActions::ActionResult::Queued: return QStringLiteral("queued");
+	}
+	Q_UNREACHABLE_RETURN(QString());
+}
+
+QVariantMap actionResultMap(AppActions::ActionResult result, DWORD error, const QString& message) {
+	return {
+	    {QStringLiteral("status"), actionStatus(result)},
+	    {QStringLiteral("code"), static_cast<int>(result)},
+	    {QStringLiteral("error"), message.isEmpty() ? windowsErrorString(error) : message},
+	};
+}
+
+HWND hwndForObject(QObject* object) {
+	if (object == nullptr) return nullptr;
+
+	auto* window = qobject_cast<QWindow*>(object);
+	if (window == nullptr) {
+		if (auto* item = qobject_cast<QQuickItem*>(object)) window = item->window();
+	}
+
+	return hwndOf(window);
 }
 
 bool selectInExplorer(const QString& id, const QString& path) {
@@ -337,10 +461,10 @@ void openLocation(const QString& id, const AppActionInfo& app) {
 
 void openSettings(const QString& id, const QString& uri) {
 	runLauncher([id, uri]() {
-		auto error = shellExecute(uri, L"open", 0, QString());
-		if (error != ERROR_SUCCESS) {
+		const auto result = process::shellExecuteTarget(uri);
+		if (!result.started()) {
 			qCWarning(logAppActions) << "Could not open Settings for"
-			                         << qs::windows::logId(id) << ":" << error;
+			                         << qs::windows::logId(id) << ":" << result.error;
 		}
 	});
 }
@@ -373,7 +497,20 @@ AppActionInfo AppActions::details(const QString& entryId) {
 	app.packaged = !app.packageFamilyName.isEmpty();
 
 	if (app.packaged) {
-		app.canUninstall = !isSystemPackage(app.packageFamilyName);
+		const auto install = packageInstall(
+		    app.packageFamilyName, QStringView(token).sliced(app.packageFamilyName.size() + 1)
+		);
+		if (install.has_value()) {
+			app.canUninstall = !isUnderWindows(install->path);
+			app.allowAppsFolderElevation = install->allowElevation;
+			app.executionAlias = install->executionAlias;
+			app.elevationTarget = install->elevationTarget;
+			app.canRunAsAdmin = app.allowAppsFolderElevation || !app.elevationTarget.isEmpty();
+		} else {
+			// Preserve the old failure behavior: metadata lookup failure did not
+			// prove that the package is a system package.
+			app.canUninstall = true;
+		}
 	} else {
 		app.target = win32Target(id, token);
 
@@ -401,12 +538,123 @@ QVariantMap AppActions::info(const QString& entryId) {
 	};
 }
 
-bool AppActions::runAsAdmin(const QString& entryId) {
-	auto app = this->details(entryId);
-	if (!app.canRunAsAdmin) return false;
+void AppActions::setLastError(const QString& error) {
+	if (this->mLastError == error) return;
+	this->mLastError = error;
+	emit this->lastErrorChanged();
+}
 
-	runLauncher([id = entryId, app]() { runElevated(id, app); });
-	return true;
+bool AppActions::runAsAdmin(const QString& entryId, QObject* parentWindow) {
+	const auto result = this->runAsAdminDetailed(entryId, parentWindow);
+	return result.value(QStringLiteral("status")).toString() == QStringLiteral("started");
+}
+
+QVariantMap AppActions::runAsAdminDetailed(const QString& entryId, QObject* parentWindow) {
+	auto app = this->details(entryId);
+	if (!app.canRunAsAdmin) {
+		const auto message = app.token.isEmpty()
+		    ? QStringLiteral("The application entry is not available")
+		    : QStringLiteral("The application does not support elevation");
+		this->setLastError(message);
+		return actionResultMap(
+		    ActionResult::NotSupported,
+		    ERROR_NOT_SUPPORTED,
+		    message
+		);
+	}
+
+	// ShellExecuteExW stays on the caller thread up to the UAC handoff. The
+	// caller can pass its panel window so consent.exe receives that foreground
+	// ownership before the panel is hidden.
+	const auto error = runElevated(entryId, app, hwndForObject(parentWindow));
+	const auto result = actionResultForError(error);
+	this->setLastError(windowsErrorString(error));
+	return actionResultMap(result, error, QString());
+}
+
+QVariantMap AppActions::launchShellAction(const QVariantMap& spec, QObject* parentWindow) {
+	const auto verb = spec.value(QStringLiteral("verb"), QStringLiteral("open")).toString();
+	if (verb != QStringLiteral("open") && verb != QStringLiteral("runas")) {
+		const auto message = QStringLiteral("Only the open and runas verbs are supported");
+		this->setLastError(message);
+		return actionResultMap(ActionResult::NotSupported, ERROR_NOT_SUPPORTED, message);
+	}
+
+	auto target = spec.value(QStringLiteral("target")).toString();
+	auto invokeIdList = false;
+	if (const auto aumid = spec.value(QStringLiteral("aumid")).toString(); !aumid.isEmpty()) {
+		target = QStringLiteral("shell:AppsFolder\\") + aumid;
+		invokeIdList = true;
+	} else if (const auto uri = spec.value(QStringLiteral("uri")).toString(); !uri.isEmpty()) {
+		target = uri;
+	}
+
+	if (target.isEmpty()) {
+		const auto message = QStringLiteral("A shell action needs a target, aumid, or uri");
+		this->setLastError(message);
+		return actionResultMap(ActionResult::NotSupported, ERROR_FILE_NOT_FOUND, message);
+	}
+
+	auto arguments = QString();
+	const auto argsValue = spec.value(QStringLiteral("args"));
+	if (argsValue.metaType().id() == QMetaType::QString) {
+		arguments = argsValue.toString();
+	} else if (argsValue.canConvert<QStringList>()) {
+		arguments = process::joinCommandArguments(argsValue.toStringList());
+	}
+
+	const auto directory = spec.value(QStringLiteral("workingDir")).toString();
+	if (verb == QStringLiteral("open")) {
+		const auto requestId = detail::nextShellActionRequestId();
+		// Explorer COM and the fallback helper can both block. The watcher is
+		// owned by AppActions, but the launcher task never captures AppActions.
+		auto promise = std::make_shared<QPromise<DWORD>>();
+		promise->start();
+		auto* watcher = new QFutureWatcher<DWORD>(this);
+		connect(watcher, &QFutureWatcher<DWORD>::finished, this, [this, watcher, requestId] {
+			const auto error = watcher->result();
+			watcher->deleteLater();
+			const auto message = windowsErrorString(error);
+			this->setLastError(message);
+			emit this->shellActionFinished(
+			    requestId, actionStatus(actionResultForError(error)), message
+			);
+		});
+		watcher->setFuture(promise->future());
+		runLauncher([target, arguments, directory, invokeIdList, promise] {
+			const auto result = process::shellExecuteTarget(
+			    target, arguments, directory, QStringLiteral("open"), nullptr, invokeIdList
+			);
+			promise->addResult(result.error);
+			promise->finish();
+		});
+		this->setLastError({});
+		auto queued = actionResultMap(ActionResult::Queued, ERROR_SUCCESS, {});
+		detail::addShellActionRequestId(queued, requestId);
+		return queued;
+	}
+
+	const auto result = process::shellExecuteTarget(
+	    target, arguments, directory, verb, hwndForObject(parentWindow), invokeIdList
+	);
+	const auto message = windowsErrorString(result.error);
+	this->setLastError(message);
+	return actionResultMap(actionResultForError(result.error), result.error, message);
+}
+
+bool AppActions::isInlineSudoEnabled() const {
+	DWORD enabled = 0;
+	DWORD size = sizeof(enabled);
+	const auto rc = RegGetValueW(
+	    HKEY_LOCAL_MACHINE,
+	    L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Sudo",
+	    L"Enabled",
+	    RRF_RT_REG_DWORD,
+	    nullptr,
+	    &enabled,
+	    &size
+	);
+	return rc == ERROR_SUCCESS && enabled == 3;
 }
 
 bool AppActions::openFileLocation(const QString& entryId) {

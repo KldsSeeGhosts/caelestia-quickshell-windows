@@ -50,8 +50,6 @@ constexpr int POOL_STOP_TIMEOUT_MS = 2000;
 constexpr long WMI_WAIT_MS = 5000;
 constexpr long WMI_PROBE_WAIT_MS = 15000;
 constexpr int SETTLE_MS = 1200;
-constexpr int EVENT_ATTEMPTS = 5;
-constexpr DWORD EVENT_RETRY_MS = 5000;
 constexpr qreal SAME_VALUE = 0.005;
 constexpr BYTE VCP_BRIGHTNESS = 0x10;
 constexpr BYTE NO_SYSTEM_BATTERY = 128;
@@ -504,7 +502,16 @@ HRESULT connectWmi(IWbemServices** out) {
 	if (!locator) return E_FAIL;
 
 	Bstr ns(L"ROOT\\WMI");
-	hr = locator->ConnectServer(ns.value, nullptr, nullptr, nullptr, 0, nullptr, nullptr, out);
+	hr = locator->ConnectServer(
+	    ns.value,
+	    nullptr,
+	    nullptr,
+	    nullptr,
+	    WBEM_FLAG_CONNECT_USE_MAX_WAIT,
+	    nullptr,
+	    nullptr,
+	    out
+	);
 	if (FAILED(hr)) return hr;
 	if (*out == nullptr) return E_FAIL;
 
@@ -602,15 +609,15 @@ HRESULT nextObject(
 	return returned == 1 && out ? S_OK : S_FALSE;
 }
 
-QString stringProperty(IWbemClassObject* object, const wchar_t* name) {
+std::wstring wideStringProperty(IWbemClassObject* object, const wchar_t* name) {
 	Variant value;
 	if (FAILED(object->Get(name, 0, &value.value, nullptr, nullptr))) return {};
 	if (value.value.vt != VT_BSTR || value.value.bstrVal == nullptr) return {};
+	return std::wstring(value.value.bstrVal, SysStringLen(value.value.bstrVal));
+}
 
-	return QString::fromWCharArray(
-	    value.value.bstrVal,
-	    static_cast<qsizetype>(SysStringLen(value.value.bstrVal))
-	);
+QString stringProperty(IWbemClassObject* object, const wchar_t* name) {
+	return QString::fromStdWString(wideStringProperty(object, name));
 }
 
 int intProperty(IWbemClassObject* object, const wchar_t* name, int fallback) {
@@ -1206,79 +1213,326 @@ ScreenRef resolveId(
 	return ref;
 }
 
-struct EventWatch {
-	std::atomic<bool> started = false;
-};
+} // namespace
 
-EventWatch& eventWatch() {
-	static auto* watch = new EventWatch();
-	return *watch;
+namespace brightness_detail {
+
+EventWatchThread::~EventWatchThread() { this->stop(); }
+
+bool EventWatchThread::start(const Worker& worker) {
+	auto lock = std::lock_guard(this->mutex);
+	if (this->thread.joinable() || this->stopState != nullptr) return false;
+	auto* event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if (event == nullptr) return false;
+
+	auto state = std::make_shared<StopState>(event);
+	this->finished = std::make_shared<std::atomic<bool>>(false);
+	auto finished = this->finished;
+	try {
+		this->thread = std::thread([worker, state, finished] {
+			Cancelled cancelled(state, &state->cancelled);
+			worker(state->event, cancelled);
+			finished->store(true, std::memory_order_release);
+		});
+		this->stopState = std::move(state);
+	} catch (...) {
+		finished->store(true, std::memory_order_release);
+		return false;
+	}
+	return true;
 }
+
+void EventWatchThread::stop() {
+	std::thread worker;
+	std::shared_ptr<StopState> state;
+	std::shared_ptr<std::atomic<bool>> finished;
+	{
+		auto lock = std::lock_guard(this->mutex);
+		if (this->stopState == nullptr && !this->thread.joinable()) return;
+		state = this->stopState;
+		finished = this->finished;
+		if (state != nullptr) {
+			state->cancelled.store(true, std::memory_order_release);
+			SetEvent(state->event);
+		}
+		if (this->thread.joinable()) worker = std::move(this->thread);
+	}
+
+	auto joined = true;
+	if (worker.joinable()) {
+		joined = finished->load(std::memory_order_acquire)
+		    || WaitForSingleObject(worker.native_handle(), EVENT_JOIN_TIMEOUT_MS) == WAIT_OBJECT_0;
+		if (joined) worker.join();
+		else worker.detach();
+	}
+
+	{
+		auto lock = std::lock_guard(this->mutex);
+		this->stopState.reset();
+	}
+}
+
+bool EventWatchThread::running() const {
+	auto lock = std::lock_guard(this->mutex);
+	return this->thread.joinable() && this->finished != nullptr
+	    && !this->finished->load(std::memory_order_acquire);
+}
+
+} // namespace brightness_detail
+
+namespace {
 
 QPointer<Brightness>& activeBrightness() {
 	static auto* instance = new QPointer<Brightness>();
 	return *instance;
 }
 
-void watchBrightnessEvents(const std::function<void(const QString&, int)>& deliver) {
-	auto com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-	if (FAILED(com)) {
-		qCWarning(logBrightness).noquote()
-		    << "Can't watch brightness changes: CoInitializeEx failed with" << hrText(com);
-		return;
-	}
+std::wstring hexCodeWide(HRESULT hr) {
+	wchar_t text[16] {}; // NOLINT
+	swprintf(text, sizeof(text) / sizeof(text[0]), L"0x%08lx", static_cast<unsigned long>(hr));
+	return text;
+}
 
+void queueWmiFailure(
+    const std::shared_ptr<brightness_detail::SharedWmiState>& state,
+    const wchar_t* prefix,
+    HRESULT hr
+) {
+	std::wstring text(prefix);
+	text += L" (";
+	text += hexCodeWide(hr);
+	text += L"); retrying in the background";
+	brightness_detail::queueWmiWarning(state, std::move(text));
+}
+
+// This function is deliberately Qt-free. It runs on a detachable thread and
+// can outlive QCoreApplication, so it only writes plain C++ payloads into the
+// shared queue and posts a harmless window message. Qt delivery happens after
+// the GUI thread drains that queue.
+void watchBrightnessEvents(const std::shared_ptr<brightness_detail::SharedWmiState>& state) {
 	auto failures = 0;
+	auto comFailures = 0;
 	auto announced = false;
+	auto* stop = state->stopEvent.get();
+	const auto stopped = [&] {
+		return WaitForSingleObject(stop, 0) != WAIT_TIMEOUT
+		    || state->cancelled.load(std::memory_order_acquire);
+	};
 
-	while (failures < EVENT_ATTEMPTS) {
-		ComPtr<IWbemServices> services;
-		auto hr = connectWmi(services.GetAddressOf());
-
-		ComPtr<IEnumWbemClassObject> events;
-		if (SUCCEEDED(hr)) {
-			Bstr language(L"WQL");
-			Bstr query(L"SELECT * FROM WmiMonitorBrightnessEvent");
-			hr = services->ExecNotificationQuery(
-			    language.value,
-			    query.value,
-			    WBEM_FLAG_RETURN_IMMEDIATELY | WBEM_FLAG_FORWARD_ONLY,
-			    nullptr,
-			    events.GetAddressOf()
-			);
-			if (SUCCEEDED(hr) && !events) hr = E_FAIL;
+	while (!stopped()) {
+		auto com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+		if (FAILED(com)) {
+			++comFailures;
+			if (comFailures == 1 || comFailures == brightness_detail::EVENT_BACKOFF_CAP)
+				queueWmiFailure(state, L"Can't watch brightness changes yet: CoInitializeEx failed", com);
+			WaitForSingleObject(stop, brightness_detail::eventRetryDelayMs(comFailures));
+			continue;
 		}
+		comFailures = 0;
 
-		if (SUCCEEDED(hr)) {
-			secure(events.Get());
-			if (!announced) {
-				announced = true;
-				qCInfo(logBrightness) << "Watching WmiMonitorBrightnessEvent for brightness changes made "
-				                         "outside ii (Fn keys, Settings, adaptive brightness)";
+		while (!stopped()) {
+			ComPtr<IWbemServices> services;
+			auto hr = connectWmi(services.GetAddressOf());
+
+			ComPtr<IEnumWbemClassObject> events;
+			if (SUCCEEDED(hr)) {
+				Bstr language(L"WQL");
+				Bstr query(L"SELECT * FROM WmiMonitorBrightnessEvent");
+				hr = services->ExecNotificationQuery(
+				    language.value,
+				    query.value,
+				    WBEM_FLAG_RETURN_IMMEDIATELY | WBEM_FLAG_FORWARD_ONLY,
+				    nullptr,
+				    events.GetAddressOf()
+				);
+				if (SUCCEEDED(hr) && !events) hr = E_FAIL;
 			}
 
-			while (true) {
-				ComPtr<IWbemClassObject> event;
-				ULONG returned = 0;
-				hr = events->Next(WBEM_INFINITE, 1, event.GetAddressOf(), &returned);
-				if (FAILED(hr) || returned == 0 || !event) break;
+			auto healthySince = brightness_detail::EventClock::now();
+			if (SUCCEEDED(hr)) {
+				secure(events.Get());
+				if (!announced) {
+					announced = true;
+					brightness_detail::queueWmiWarning(
+					    state,
+					    L"Watching WmiMonitorBrightnessEvent for brightness changes made outside ii"
+					);
+				}
 
+				while (!stopped()) {
+					ComPtr<IWbemClassObject> event;
+					ULONG returned = 0;
+					hr = events->Next(
+					    brightness_detail::EVENT_POLL_WAIT_MS,
+					    1,
+					    event.GetAddressOf(),
+					    &returned
+					);
+					if (hr == static_cast<HRESULT>(WBEM_S_TIMEDOUT)) {
+						hr = S_OK;
+						continue;
+					}
+					if (FAILED(hr) || returned == 0 || !event) break;
+
+					failures = 0;
+					auto instanceName = wideStringProperty(event.Get(), L"InstanceName");
+					auto level = intProperty(event.Get(), L"Brightness", -1);
+					if (!instanceName.empty() && level >= 0)
+						brightness_detail::queueWmiBrightnessEvent(state, std::move(instanceName), level);
+				}
+			}
+
+			if (stopped()) break;
+			if (brightness_detail::healthyRunResetsFailures(
+			        brightness_detail::EventClock::now() - healthySince
+			    ))
+			{
 				failures = 0;
-				auto instanceName = stringProperty(event.Get(), L"InstanceName");
-				auto level = intProperty(event.Get(), L"Brightness", -1);
-				if (!instanceName.isEmpty() && level >= 0) deliver(instanceName, level);
 			}
+			++failures;
+
+			// The watch intentionally never gives up for the process lifetime. A machine
+			// without an internal panel can fail the query forever, while a laptop can
+			// lose WMI during power transitions and recover minutes later. Backoff is
+			// capped and the healthy-run reset above keeps intermittent failures from
+			// accumulating across days.
+			if (failures == 1 || failures == brightness_detail::EVENT_BACKOFF_CAP)
+				queueWmiFailure(state, L"Brightness change events stopped or couldn't start", hr);
+			WaitForSingleObject(stop, brightness_detail::eventRetryDelayMs(failures));
 		}
 
-		failures++;
-		qCWarning(logBrightness).noquote()
-		    << "Brightness change events stopped or couldn't start:" << hrText(hr);
-		if (failures < EVENT_ATTEMPTS) Sleep(EVENT_RETRY_MS * static_cast<DWORD>(failures));
+		CoUninitialize();
+	}
+}
+
+class WmiEventPump {
+public:
+	bool start(
+	    const std::shared_ptr<brightness_detail::SharedWmiState>& state,
+	    const std::function<void(const QString&, int)>& deliver
+	) {
+		this->state = state;
+		WNDCLASSW wc {};
+		wc.lpfnWndProc = &WmiEventPump::windowProc;
+		wc.hInstance = GetModuleHandleW(nullptr);
+		wc.lpszClassName = L"QuickshellBrightnessWmiEventPump";
+		RegisterClassW(&wc);
+		this->window = CreateWindowExW(
+		    0,
+		    wc.lpszClassName,
+		    L"",
+		    0,
+		    0,
+		    0,
+		    0,
+		    0,
+		    HWND_MESSAGE,
+		    nullptr,
+		    wc.hInstance,
+		    this
+		);
+		if (this->window == nullptr) {
+			this->state.reset();
+			return false;
+		}
+		this->drainEvents.start(state, deliver);
+		brightness_detail::setWmiWakeWindow(state, this->window);
+		return true;
 	}
 
-	qCWarning(logBrightness) << "Gave up on brightness change events; changes made outside ii show "
-	                            "up the next time a sidebar opens";
-	CoUninitialize();
+	void stop() {
+		this->drainEvents.stop();
+		if (this->state != nullptr) brightness_detail::clearWmiWakeWindow(this->state);
+		if (this->window != nullptr) {
+			DestroyWindow(this->window);
+			this->window = nullptr;
+		}
+		this->state.reset();
+	}
+
+private:
+	static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+		auto* self = reinterpret_cast<WmiEventPump*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+		if (message == WM_NCCREATE) {
+			auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+			self = static_cast<WmiEventPump*>(create->lpCreateParams);
+			SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+		}
+		if (self != nullptr && message == brightness_detail::WM_APP_BRIGHTNESS_EVENT) {
+			// Warnings are drained on the same GUI-thread wake as events. Conversion
+			// and logging deliberately happen here, never in the WMI worker.
+			self->drainEvents.drain([](const std::wstring& warning) {
+				qCWarning(logBrightness).noquote() << QString::fromStdWString(warning);
+			});
+			return 0;
+		}
+		return DefWindowProcW(hwnd, message, wParam, lParam);
+	}
+
+	HWND window = nullptr;
+	std::shared_ptr<brightness_detail::SharedWmiState> state;
+	brightness_detail::WmiEventDrain drainEvents;
+};
+
+struct EventWatch {
+	std::atomic<bool> started = false;
+	std::mutex mutex;
+	std::shared_ptr<brightness_detail::SharedWmiState> state;
+	std::thread thread;
+	WmiEventPump pump;
+
+	bool start(const std::function<void(const QString&, int)>& deliver) {
+		auto lock = std::lock_guard(this->mutex);
+		if (this->thread.joinable() || this->state != nullptr) return false;
+		auto state = brightness_detail::createSharedWmiState();
+		if (state == nullptr) return false;
+		if (!this->pump.start(state, deliver)) return false;
+		state->cancelled.store(false, std::memory_order_release);
+		state->finished.store(false, std::memory_order_release);
+		try {
+			this->thread = std::thread([state] {
+				watchBrightnessEvents(state);
+				state->finished.store(true, std::memory_order_release);
+			});
+		} catch (...) {
+			this->pump.stop();
+			state->finished.store(true, std::memory_order_release);
+			return false;
+		}
+		this->state = std::move(state);
+		return true;
+	}
+
+	void stop() {
+		std::thread worker;
+		std::shared_ptr<brightness_detail::SharedWmiState> state;
+		{
+			auto lock = std::lock_guard(this->mutex);
+			state = this->state;
+			if (state != nullptr) {
+				state->cancelled.store(true, std::memory_order_release);
+				SetEvent(state->stopEvent.get());
+			}
+			// The GUI owner clears the wake HWND before destroying it. A late
+			// PostMessageW then fails harmlessly and never dereferences Qt state.
+			this->pump.stop();
+			if (this->thread.joinable()) worker = std::move(this->thread);
+			this->state.reset();
+		}
+		if (!worker.joinable()) return;
+		auto joined = state == nullptr
+		    || state->finished.load(std::memory_order_acquire)
+		    || WaitForSingleObject(worker.native_handle(), brightness_detail::EVENT_JOIN_TIMEOUT_MS)
+		        == WAIT_OBJECT_0;
+		if (joined) worker.join();
+		else worker.detach();
+	}
+};
+
+
+EventWatch& eventWatch() {
+	static auto* watch = new EventWatch();
+	return *watch;
 }
 
 class RealBrightnessBackend final: public BrightnessBackend {
@@ -1397,13 +1651,20 @@ public:
 	}
 
 	void startEventWatch(const std::function<void(const QString&, int)>& deliver) override {
-		std::thread([deliver]() { watchBrightnessEvents(deliver); }).detach();
+		auto& watch = eventWatch();
+		if (!watch.start(deliver)) watch.started.store(false, std::memory_order_release);
 	}
 };
 
 BrightnessBackend* realBrightnessBackend() {
 	static auto* backend = new RealBrightnessBackend();
 	return backend;
+}
+
+void stopBrightnessEventWatch() {
+	auto& watch = eventWatch();
+	watch.stop();
+	watch.started.store(false, std::memory_order_release);
 }
 
 } // namespace
@@ -1449,6 +1710,9 @@ Brightness::Brightness(BrightnessBackend& backend, QObject* parent)
 	this->pool->setMaxThreadCount(1);
 	if (this->identities != nullptr) this->watchIdentities();
 	activeBrightness() = this;
+	if (auto* app = QCoreApplication::instance()) {
+		QObject::connect(app, &QCoreApplication::aboutToQuit, this, [] { stopBrightnessEventWatch(); });
+	}
 }
 
 Brightness::Brightness(
@@ -1463,6 +1727,9 @@ Brightness::Brightness(
 	this->pool->setMaxThreadCount(1);
 	this->watchIdentities();
 	activeBrightness() = this;
+	if (auto* app = QCoreApplication::instance()) {
+		QObject::connect(app, &QCoreApplication::aboutToQuit, this, [] { stopBrightnessEventWatch(); });
+	}
 }
 
 void Brightness::watchIdentities() {
@@ -1476,6 +1743,10 @@ void Brightness::watchIdentities() {
 
 Brightness::~Brightness() {
 	if (QCoreApplication::instance()) QCoreApplication::instance()->removeNativeEventFilter(this);
+	if (activeBrightness().data() == this) {
+		activeBrightness() = nullptr;
+		stopBrightnessEventWatch();
+	}
 	this->pool->clear();
 	if (!this->pool->waitForDone(POOL_STOP_TIMEOUT_MS)) {
 		qCWarning(logBrightness) << "A brightness call didn't finish in time";
@@ -2065,17 +2336,8 @@ void Brightness::ensureEventWatch() {
 	if (watch.started.exchange(true)) return;
 
 	this->backend->startEventWatch([](const QString& instanceName, int percent) {
-		auto* app = QCoreApplication::instance();
-		if (app == nullptr) return;
-
-		QMetaObject::invokeMethod(
-		    app,
-		    [instanceName, percent]() {
-			    auto* self = activeBrightness().data();
-			    if (self != nullptr) self->onSystemBrightness(instanceName, percent);
-		    },
-		    Qt::QueuedConnection
-		);
+		auto* self = activeBrightness().data();
+		if (self != nullptr) self->onSystemBrightness(instanceName, percent);
 	});
 }
 

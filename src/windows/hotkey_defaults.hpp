@@ -18,13 +18,25 @@ inline void parseGlobalName(const QJsonObject& object, Bind& bind) {
 	}
 }
 
+inline void parseExecName(const QJsonObject& object, Bind& bind) {
+	bind.name = object.value("name").toString(object.value("id").toString());
+}
+
 inline QList<Bind> introducedDefaults(const QJsonArray& entries) {
 	QList<Bind> introduced;
 	for (const auto& entry: entries) {
 		auto object = entry.toObject();
 		if (!object.contains("since")) continue;
+
 		Bind bind;
-		parseGlobalName(object, bind);
+		if (object.value("action").toString() == "exec") {
+			bind.action = Bind::Action::Exec;
+			bind.argument = object.value("command").toString();
+			parseExecName(object, bind);
+			if (bind.name.isEmpty()) continue;
+		} else {
+			parseGlobalName(object, bind);
+		}
 		introduced.append(bind);
 	}
 	return introduced;
@@ -40,16 +52,28 @@ inline void mergeDefaults(
 	const auto userBinds = binds;
 	for (const auto& bind: defaults) {
 		const auto isIntroduced = std::ranges::any_of(introduced, [&](const Bind& entry) {
+			if (bind.action == Bind::Action::Exec || entry.action == Bind::Action::Exec) {
+				return entry.action == bind.action && !entry.name.isEmpty()
+				    && entry.name == bind.name;
+			}
 			return entry.appid == bind.appid && entry.name == bind.name;
 		});
-		if (bind.action != Bind::Action::Global || !isIntroduced) continue;
+		const auto mergeable = bind.action == Bind::Action::Global
+		    || (bind.action == Bind::Action::Exec && !bind.name.isEmpty());
+		if (!mergeable || !isIntroduced) continue;
 
 		auto taken = std::ranges::any_of(userBinds, [&](const Bind& existing) {
 			// A bind in another submap takes neither the chord nor the name.
-			return existing.submap == bind.submap
-			    && (existing.combo == bind.combo
-			        || ((existing.action == Bind::Action::Global || existing.action == Bind::Action::Native)
-			            && existing.name == bind.name && existing.appid == bind.appid));
+			if (existing.submap != bind.submap) return false;
+			if (existing.combo == bind.combo) return true;
+
+			if (bind.action == Bind::Action::Exec) {
+				return (existing.action == Bind::Action::Exec || existing.action == Bind::Action::Native)
+				    && existing.name == bind.name;
+			}
+
+			return (existing.action == Bind::Action::Global || existing.action == Bind::Action::Native)
+			    && existing.name == bind.name && existing.appid == bind.appid;
 		});
 
 		if (!taken) binds.append(bind);

@@ -23,7 +23,8 @@ if ($Phase -in @('Configure', 'Build')) {
         cmake --build $BuildRoot --parallel $Jobs
         exit $LASTEXITCODE
     }
-    $actual = Get-CaelestiaActualToolchain -QtPrefix $qt -Cli11Include (Join-Path $ToolRoot $spec.cli11Directory)
+    $cli11Include = Join-Path $ToolRoot $spec.cli11Directory
+    $actual = Get-CaelestiaActualToolchain -QtPrefix $qt -Cli11Include $cli11Include
     $actual | Add-Member -NotePropertyName vsInstallationVersion -NotePropertyValue $instance.installationVersion
     $actual | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$Results/actual-toolchain.json" -Encoding UTF8
     $mt = Join-Path $env:WindowsSdkDir "bin/$($spec.windowsSdkVersion)/x64/mt.exe"
@@ -40,6 +41,7 @@ if ($Phase -in @('Configure', 'Build')) {
     }
     # Configuration is separate so compiler failures have a distinct stage.
     cmake -S src/windows/test -B $BuildRoot -G Ninja "-DCMAKE_PREFIX_PATH=$qt" `
+        "-DCLI11_INCLUDE_DIR=$cli11Include" `
         "-DCMAKE_CXX_COMPILER:FILEPATH=$llvm/clang-cl.exe" "-DCMAKE_MT:FILEPATH=$mt" `
         "-DCMAKE_LINKER:FILEPATH=$env:VCToolsInstallDir/bin/Hostx64/x64/link.exe" -DCMAKE_BUILD_TYPE=Release @launcherArgs
     exit $LASTEXITCODE

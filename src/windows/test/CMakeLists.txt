@@ -4,7 +4,7 @@ project(qs_windows_panel_animation_test LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(Qt6 6.11 REQUIRED COMPONENTS Gui GuiPrivate Quick QuickPrivate Qml Test)
+find_package(Qt6 6.11 REQUIRED COMPONENTS Gui GuiPrivate Quick QuickPrivate QuickControls2 Qml Test Widgets)
 qt_standard_project_setup(REQUIRES 6.11)
 
 set(QS_WINDOWS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/..")
@@ -31,7 +31,7 @@ find_program(QS_SDK_MT NAMES mt.exe
 # it cannot pull unrelated platform implementations across a fake boundary.
 set(QS_SHARED_TEST_SOURCES
 	../core/redact ../core/model ../core/qmlscreen ../core/instanceinfo
-	activation_policy window_selectors transition_trace util screen_identity
+	activation_policy window_selectors transition_trace util screen_identity process_launch
 	tiling_scope tiling_layout tiling_persistence system_surface fullscreen_occluders
 	layer_rules panel_effects panel_animation startup input_settle
 	capture_device capture_format capture_texture
@@ -411,11 +411,57 @@ target_compile_definitions(qs_suite_dispatcher PRIVATE NOMINMAX WIN32_LEAN_AND_M
 target_include_directories(qs_suite_dispatcher PRIVATE ${QS_WINDOWS_SRC})
 target_link_libraries(qs_suite_dispatcher PRIVATE Qt6::Core Qt6::Test)
 
-# Compile the native dispatcher too: the pure fixture above deliberately does
-# not link its platform singletons or execute any real activation.
+# Command parsing, clean launch fallback, elevation and packaged app metadata.
+# These slots never create or shell-execute a child process.
+qs_add_portable_suite(process_launch
+	process_launch_test.cpp
+	${QS_WINDOWS_SRC}/process_launch.cpp
+)
+target_compile_definitions(qs_suite_process_launch PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(qs_suite_process_launch PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(qs_suite_process_launch PRIVATE Qt6::Core Qt6::Test ole32 oleaut32 shell32)
+
+# Compile the native dispatcher and toplevel adaptors too: the pure fixture
+# above deliberately does not link their platform singletons or execute activation.
 add_library(dispatcher_compile_check OBJECT ${QS_WINDOWS_SRC}/hyprland/dispatcher.cpp)
 target_compile_definitions(dispatcher_compile_check PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(dispatcher_compile_check PRIVATE Qt6::Quick Qt6::Qml)
+
+add_library(toplevel_compile_check OBJECT
+	${QS_WINDOWS_SRC}/wayland/toplevel.cpp
+	${QS_WINDOWS_SRC}/hyprland/hyprland_toplevel.cpp
+	${QS_WINDOWS_SRC}/hyprland/qml.cpp
+)
+target_compile_definitions(toplevel_compile_check PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(toplevel_compile_check PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(toplevel_compile_check PRIVATE Qt6::Quick Qt6::Qml)
+
+add_library(process_launch_compile_check OBJECT ${QS_WINDOWS_SRC}/process_launch.cpp)
+target_compile_definitions(process_launch_compile_check PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(process_launch_compile_check PRIVATE Qt6::Core)
+
+add_library(app_actions_compile_check OBJECT ${QS_WINDOWS_SRC}/system/app_actions.cpp)
+target_compile_definitions(app_actions_compile_check PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(app_actions_compile_check PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(app_actions_compile_check PRIVATE Qt6::Quick Qt6::Qml)
+
+# Compile the real launch translation unit with the generated build constant
+# supplied by the test build. It is not linked into a fixture.
+find_package(CLI11 CONFIG QUIET)
+set(CLI11_INCLUDE_DIR "" CACHE PATH "Directory containing CLI/CLI.hpp (header-only CLI11)")
+if (NOT TARGET CLI11::CLI11 AND CLI11_INCLUDE_DIR)
+	add_library(CLI11::CLI11 INTERFACE IMPORTED)
+	target_include_directories(CLI11::CLI11 INTERFACE "${CLI11_INCLUDE_DIR}")
+endif()
+if (TARGET CLI11::CLI11)
+	file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/launch-build/build.hpp" "#pragma once\n#define CRASH_HANDLER 0\n")
+	add_library(launch_compile_check OBJECT ${QS_WINDOWS_SRC}/../launch/launch.cpp)
+	target_compile_definitions(launch_compile_check PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+	target_include_directories(launch_compile_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/launch-build")
+	target_link_libraries(launch_compile_check PRIVATE Qt6::Quick Qt6::QuickControls2 Qt6::Widgets Qt6::Qml CLI11::CLI11)
+else()
+	message(WARNING "CLI11 was not found; launch_compile_check is disabled")
+endif()
 
 # Compile the native persistence integration, but never run it. Runtime
 # tiling fixtures below keep the full Win32/desktop boundary replaced.
@@ -657,11 +703,12 @@ qs_add_portable_suite(hotkeys_routing
 	${QS_WINDOWS_SRC}/system/keyboard.hpp
 	${QS_WINDOWS_SRC}/input_settle.cpp
 	${QS_WINDOWS_SRC}/activation_policy.cpp
+	${QS_WINDOWS_SRC}/process_launch.cpp
 	${QS_WINDOWS_SRC}/../core/redact.cpp
 )
 target_compile_definitions(qs_suite_hotkeys_routing PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(qs_suite_hotkeys_routing PRIVATE ${QS_WINDOWS_SRC})
-target_link_libraries(qs_suite_hotkeys_routing PRIVATE Qt6::Quick Qt6::Qml Qt6::Test user32)
+target_link_libraries(qs_suite_hotkeys_routing PRIVATE Qt6::Quick Qt6::Qml Qt6::Test user32 ole32 oleaut32 shell32)
 
 # Target selection, read-only KLID/name resolution and switch result codes.
 # The production name source is included with ActivateKeyboardLayout renamed,
@@ -748,6 +795,7 @@ target_link_libraries(qs_suite_mpris_art_cache PRIVATE Qt6::Gui Qt6::Test window
 qs_add_test_executable(mpris_app_identity_test
 	mpris_app_identity_test.cpp
 	${QS_WINDOWS_SRC}/desktopentry_backend.cpp
+	${QS_WINDOWS_SRC}/process_launch.cpp
 	${QS_WINDOWS_SRC}/../core/redact.cpp
 	${QS_WINDOWS_SRC}/services/mpris/app_identity.cpp
 )
@@ -834,8 +882,27 @@ qs_add_portable_suite(brightness_route
 )
 target_compile_definitions(qs_suite_brightness_route PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(qs_suite_brightness_route PRIVATE
-	Qt6::Gui Qt6::Qml Qt6::Test user32 gdi32 dxva2 wbemuuid ole32 oleaut32
+	Qt6::Gui Qt6::Qml Qt6::Test user32 gdi32 dxva2 wbemuuid ole32 oleaut32 powrprof
 )
+
+# EqualizerAPO registry decoding uses a fake enumeration callback. No machine
+# registry key, audio device, elevated process or PowerShell instance is touched.
+qs_add_portable_suite(equalizer_apo
+	equalizer_apo_test.cpp
+	${QS_WINDOWS_SRC}/system/equalizer_apo.cpp
+)
+target_compile_definitions(qs_suite_equalizer_apo PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(qs_suite_equalizer_apo PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(qs_suite_equalizer_apo PRIVATE
+	Qt6::Gui Qt6::Quick Qt6::Qml Qt6::Test advapi32 shell32 user32
+)
+
+# Portable refusal policy for privileged window actions. The fixture checks the
+# structured reason and silence rules without owning or messaging a real window.
+qs_add_portable_suite(window_action window_action_test.cpp)
+target_compile_definitions(qs_suite_window_action PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(qs_suite_window_action PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(qs_suite_window_action PRIVATE Qt6::Gui Qt6::Test user32)
 
 # Two synthetic monitors with the same vendor/model label. Brightness and gamma
 # route by the persistent target identity, never by the label. The fixture
@@ -850,7 +917,7 @@ qs_add_portable_suite(display_identity
 )
 target_compile_definitions(qs_suite_display_identity PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(qs_suite_display_identity PRIVATE
-	Qt6::Gui Qt6::GuiPrivate Qt6::Qml Qt6::Test user32 gdi32 dxva2 wbemuuid ole32 oleaut32
+	Qt6::Gui Qt6::GuiPrivate Qt6::Qml Qt6::Test user32 gdi32 dxva2 wbemuuid ole32 oleaut32 powrprof
 )
 
 # The real gamma state machine runs with injected Create/Get/Set/Delete calls.
@@ -1226,7 +1293,7 @@ qs_add_portable_runner(portable_core SUITES
 	dispatcher erm625_native_desktop_facade lazyloader runtime_paths
 )
 qs_add_portable_runner(portable_runtime SUITES
-	fs_utils ipc_limits input_settle super_drag_wait process_image_name
+	fs_utils ipc_limits input_settle super_drag_wait process_image_name window_action
 	idle_request fullscreen_ownership capture_affinity explorer_hang_hardening desktop_embedding
 )
 qs_add_portable_runner(portable_tiling SUITES
@@ -1241,7 +1308,7 @@ qs_add_portable_runner(portable_display SUITES
 	display_identity screen_identity panel_animation screenshot_jobs capture_dimensions
 )
 qs_add_portable_runner(portable_system SUITES
-	brightness_route display_transaction power_profiles network_wifi_route
+	brightness_route display_transaction power_profiles network_wifi_route equalizer_apo
 )
 qs_add_portable_runner(portable_clipboard SUITES
 	clipboard_capture clipboard_writer window_stack hyprland_monitor launcher_exit
@@ -1258,7 +1325,7 @@ set_tests_properties(clipboard_capture clipboard_writer PROPERTIES
 	RESOURCE_LOCK clipboard-fixture-data)
 
 qs_add_portable_runner(portable_hooks SUITES
-	hotkeys_routing wallpaper_target fileview_transaction
+	hotkeys_routing process_launch wallpaper_target fileview_transaction
 )
 # The taskbar-filter variant runs only the suite slots that read
 # QS_WINDOWS_TASKBAR_SHORTCUT_FILTER; the remaining slots assert the same under
@@ -1314,8 +1381,9 @@ set(QS_TESTS_PORTABLE
 	upower_status tiling_observability tiling_manager tiling_drag tiling_reload
 	transition_trace foreground_observer activation_policy fullscreen_app_state
 	panel_topmost panel_focus_style power_profiles brightness_route display_identity
+	equalizer_apo window_action
 	native_desktop_recovery pw_session_worker idle_request launcher_exit input_settle
-	super_drag_wait process_image_name explorer_hang_hardening
+	super_drag_wait process_image_name explorer_hang_hardening process_launch
 	network_wifi_route runtime_paths lazyloader
 	fullscreen_ownership display_transaction clipboard_capture clipboard_writer capture_dimensions
 	erm625_native_desktop_facade network_wifi_identity capture_affinity window_stack

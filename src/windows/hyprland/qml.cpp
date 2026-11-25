@@ -8,6 +8,7 @@
 #include "../../core/qmlscreen.hpp"
 #include "../virtual_desktops.hpp"
 #include "../window_stack.hpp"
+#include "../window_tracker.hpp"
 #include "connection.hpp"
 #include "monitor.hpp"
 #include "pin_support.hpp"
@@ -48,6 +49,20 @@ HyprlandIpcQml::HyprlandIpcQml(): pinSupport(HyprlandIpc::instance()->desktops()
 	    &PinSupport::desktopControlSupportedChanged,
 	    this,
 	    &HyprlandIpcQml::desktopControlSupportedChanged
+	);
+
+	auto* tracker = qs::windows::WindowTracker::instance();
+	QObject::connect(
+	    tracker,
+	    &qs::windows::WindowTracker::lastActionErrorChanged,
+	    this,
+	    &HyprlandIpcQml::lastActionErrorChanged
+	);
+	QObject::connect(
+	    tracker,
+	    &qs::windows::WindowTracker::windowActionRefused,
+	    this,
+	    &HyprlandIpcQml::actionRefused
 	);
 }
 
@@ -107,6 +122,10 @@ ObjectModel<HyprlandWorkspace>* HyprlandIpcQml::workspaces() {
 
 ObjectModel<HyprlandToplevel>* HyprlandIpcQml::toplevels() {
 	return HyprlandIpc::instance()->toplevels();
+}
+
+QString HyprlandIpcQml::lastActionError() const {
+	return qs::windows::WindowTracker::instance()->lastActionError();
 }
 
 } // namespace qs::hyprland::ipc

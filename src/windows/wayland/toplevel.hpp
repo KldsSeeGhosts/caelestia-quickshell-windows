@@ -22,6 +22,10 @@ class Toplevel: public QObject {
 	Q_OBJECT;
 	Q_PROPERTY(QString appId READ appId NOTIFY appIdChanged);
 	Q_PROPERTY(QString title READ title NOTIFY titleChanged);
+	Q_PROPERTY(bool elevated READ elevated NOTIFY elevatedChanged);
+	Q_PROPERTY(QString imagePath READ imagePath NOTIFY imagePathChanged);
+	Q_PROPERTY(QString aumid READ aumid NOTIFY aumidChanged);
+	Q_PROPERTY(QString lastActionError READ lastActionError NOTIFY lastActionErrorChanged);
 	Q_PROPERTY(qs::wayland::toplevel::Toplevel* parent READ parent NOTIFY parentChanged);
 	Q_PROPERTY(bool activated READ activated NOTIFY activatedChanged);
 	Q_PROPERTY(QList<QuickshellScreenInfo*> screens READ screens NOTIFY screensChanged);
@@ -46,6 +50,10 @@ public:
 
 	[[nodiscard]] QString appId() const;
 	[[nodiscard]] QString title() const;
+	[[nodiscard]] bool elevated() const;
+	[[nodiscard]] QString imagePath() const;
+	[[nodiscard]] QString aumid() const;
+	[[nodiscard]] QString lastActionError() const;
 	[[nodiscard]] Toplevel* parent() const;
 	[[nodiscard]] bool activated() const;
 	[[nodiscard]] QList<QuickshellScreenInfo*> screens() const;
@@ -65,6 +73,11 @@ signals:
 	void closed();
 	void appIdChanged();
 	void titleChanged();
+	void elevatedChanged();
+	void imagePathChanged();
+	void aumidChanged();
+	void lastActionErrorChanged();
+	void actionRefused(const QString& action, const QString& reason, bool elevated);
 	void parentChanged();
 	void activatedChanged();
 	void screensChanged();

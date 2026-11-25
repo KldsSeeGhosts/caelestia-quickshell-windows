@@ -243,7 +243,9 @@ TrackedWindow::TrackedWindow(WindowTracker* tracker, HWND hwnd)
     : QObject(tracker)
     , tracker(tracker)
     , mHwnd(hwnd)
-    , fullscreenOwner(this->fullscreenOps, hwnd) {}
+    , fullscreenOwner(this->fullscreenOps, hwnd) {
+	QObject::connect(this, &TrackedWindow::exePathChanged, this, &TrackedWindow::imagePathChanged);
+}
 
 TrackedWindow::~TrackedWindow() { this->releaseFullscreenOwnership(); }
 
@@ -289,7 +291,7 @@ void TrackedWindow::refreshIdentity() {
 	auto processName = QFileInfo(exe).fileName();
 	if (processName.isEmpty()) processName = processImageNameFromSnapshot(pid);
 
-	auto appId = shouldQueryWindowPropertyStore(
+	auto aumid = shouldQueryWindowPropertyStore(
 	                 processName,
 	                 className,
 	                 [this] { return windowResponding(this->mHwnd); },
@@ -300,10 +302,11 @@ void TrackedWindow::refreshIdentity() {
 	               : QString();
 
 	if (process != nullptr) {
-		if (appId.isEmpty()) appId = appUserModelIdOf(process);
+		if (aumid.isEmpty()) aumid = appUserModelIdOf(process);
 		CloseHandle(process);
 	}
 
+	auto appId = aumid;
 	if (appId.isEmpty() && !exe.isEmpty()) appId = appIdFromImageName(QFileInfo(exe).fileName());
 
 	// A window with no application id never reaches the task list, so the
@@ -316,6 +319,8 @@ void TrackedWindow::refreshIdentity() {
 	Qt::beginPropertyUpdateGroup();
 	this->bPid = pid;
 	this->bExePath = exe;
+	this->bAumid = aumid;
+	this->bElevated = isMoreElevated(this->mHwnd);
 	this->bAppId = appId;
 	Qt::endPropertyUpdateGroup();
 }
@@ -444,7 +449,26 @@ void TrackedWindow::refreshDesktop(bool askShell) {
 	this->bDesktop = static_cast<qint32>(desktops->windowDesktopIndex(this->mHwnd));
 }
 
+bool TrackedWindow::hasCurrentOwner() const {
+	DWORD process = 0;
+	auto thread = GetWindowThreadProcessId(this->mHwnd, &process);
+	return window_action_detail::trackedOwnerMatches(
+	    IsWindow(this->mHwnd),
+	    process,
+	    thread,
+	    this->mFrameProcessId,
+	    this->mFrameThreadId
+	);
+}
+
+bool TrackedWindow::ensureCurrentOwner(const QString& action) {
+	if (this->hasCurrentOwner()) return true;
+	this->reportActionRefused(action, window_action_detail::trackedOwnerFailureReason(false));
+	return false;
+}
+
 bool TrackedWindow::activate() {
+	if (!this->ensureCurrentOwner(QStringLiteral("activate"))) return false;
 	auto* desktops = this->tracker->desktops();
 	auto desktop = desktops->windowDesktopIndex(this->mHwnd);
 
@@ -485,18 +509,75 @@ bool TrackedWindow::activate() {
 	return true;
 }
 
+void TrackedWindow::reportActionRefused(const QString& action, const QString& reason) {
+	auto elevated = isMoreElevated(this->mHwnd);
+	this->bElevated = elevated;
+	auto text = window_action_detail::errorText(action, reason);
+	if (this->mLastActionError != text) {
+		this->mLastActionError = text;
+		emit this->lastActionErrorChanged();
+	}
+	emit this->actionRefused(action, reason, elevated);
+	this->tracker->reportWindowActionRefused(this, action, reason, elevated);
+}
+
+void TrackedWindow::reportActionFailure(const QString& action, DWORD error) {
+	auto elevated = isMoreElevated(this->mHwnd);
+	if (!window_action_detail::shouldReportFailure(error, elevated)) return;
+	this->reportActionRefused(action, window_action_detail::refusalReason(error, elevated));
+}
+
+void TrackedWindow::clearActionError() {
+	if (!this->mLastActionError.isEmpty()) {
+		this->mLastActionError.clear();
+		emit this->lastActionErrorChanged();
+	}
+	this->tracker->clearWindowActionError(this);
+}
+
 void TrackedWindow::close() {
-	if (PostMessageW(this->mHwnd, WM_CLOSE, 0, 0)) return;
-	if (GetLastError() != ERROR_ACCESS_DENIED) return;
-	PostMessageW(this->mHwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+	if (!this->ensureCurrentOwner(QStringLiteral("close"))) return;
+	SetLastError(ERROR_SUCCESS);
+	if (PostMessageW(this->mHwnd, WM_CLOSE, 0, 0)) {
+		this->clearActionError();
+		return;
+	}
+	auto error = GetLastError();
+	if (error == ERROR_ACCESS_DENIED) {
+		SetLastError(ERROR_SUCCESS);
+		if (PostMessageW(this->mHwnd, WM_SYSCOMMAND, SC_CLOSE, 0)) {
+			this->clearActionError();
+			return;
+		}
+		error = GetLastError();
+	}
+	this->reportActionFailure(QStringLiteral("close"), error);
 }
 
 void TrackedWindow::setMinimized(bool minimized) {
-	PostMessageW(this->mHwnd, WM_SYSCOMMAND, minimized ? SC_MINIMIZE : SC_RESTORE, 0);
+	if (!this->ensureCurrentOwner(QStringLiteral("minimize"))) return;
+	SetLastError(ERROR_SUCCESS);
+	if (PostMessageW(this->mHwnd, WM_SYSCOMMAND, minimized ? SC_MINIMIZE : SC_RESTORE, 0)) {
+		this->clearActionError();
+		return;
+	}
+	this->reportActionFailure(
+	    minimized ? QStringLiteral("minimize") : QStringLiteral("restore"),
+	    GetLastError()
+	);
 }
 
 void TrackedWindow::setMaximized(bool maximized) {
-	PostMessageW(this->mHwnd, WM_SYSCOMMAND, maximized ? SC_MAXIMIZE : SC_RESTORE, 0);
+	if (!this->ensureCurrentOwner(QStringLiteral("maximize"))) return;
+	SetLastError(ERROR_SUCCESS);
+	if (PostMessageW(this->mHwnd, WM_SYSCOMMAND, maximized ? SC_MAXIMIZE : SC_RESTORE, 0)) {
+		this->clearActionError();
+		return;
+	}
+	this->reportActionFailure(
+	    maximized ? QStringLiteral("maximize") : QStringLiteral("restore"),
+	    GetLastError()
+	);
 }
 
 void TrackedWindow::setFullscreen(bool fullscreen) {
@@ -504,10 +585,23 @@ void TrackedWindow::setFullscreen(bool fullscreen) {
 }
 
 void TrackedWindow::fullscreenOn(QScreen* screen) {
+	if (!this->ensureCurrentOwner(QStringLiteral("fullscreen"))) return;
 	if (screen == nullptr) {
-		if (this->fullscreenOwner.release() == fullscreen_ownership::Release::Failed) {
+		this->fullscreenOps.resetAccessDenied();
+		auto release = this->fullscreenOwner.release();
+		if (release == fullscreen_ownership::Release::Failed) {
 			qCWarning(logTracker) << "Could not restore optional fullscreen for" << this->addressHex();
+			auto reason = window_action_detail::fullscreenFailureReason(
+			    this->fullscreenOps.accessDenied(),
+			    IsWindow(this->mHwnd),
+			    isMoreElevated(this->mHwnd)
+			);
+			if (!reason.isEmpty()) this->reportActionRefused(QStringLiteral("fullscreen"), reason);
+			return;
 		}
+		if (release == fullscreen_ownership::Release::Restored
+		    || release == fullscreen_ownership::Release::NotOwned)
+			this->clearActionError();
 		return;
 	}
 
@@ -515,16 +609,28 @@ void TrackedWindow::fullscreenOn(QScreen* screen) {
 	auto rects = monitorRects(monitorForScreen(screen));
 	if (!rects.valid) return;
 	auto rect = toRECT(rects.monitor);
-	(void) this->fullscreenOwner.enter(rect, this->bFullscreen.value());
+	this->fullscreenOps.resetAccessDenied();
+	if (this->fullscreenOwner.enter(rect, this->bFullscreen.value())) {
+		this->clearActionError();
+	} else {
+		auto reason = window_action_detail::fullscreenFailureReason(
+		    this->fullscreenOps.accessDenied(),
+		    IsWindow(this->mHwnd),
+		    isMoreElevated(this->mHwnd)
+		);
+		if (!reason.isEmpty()) this->reportActionRefused(QStringLiteral("fullscreen"), reason);
+	}
 }
 
 bool TrackedWindow::moveToDesktop(qsizetype index) {
+	if (!this->ensureCurrentOwner(QStringLiteral("move-to-desktop"))) return false;
 	if (!this->tracker->desktops()->moveWindow(this->mHwnd, index)) return false;
 	this->refreshDesktop(true);
 	return true;
 }
 
 void TrackedWindow::moveTo(const QPoint& logical) {
+	if (!this->ensureCurrentOwner(QStringLiteral("move"))) return;
 	auto* screen = QGuiApplication::screenAt(logical);
 	if (screen == nullptr) screen = this->bScreen.value();
 	if (screen == nullptr) return;
@@ -545,20 +651,48 @@ void TrackedWindow::moveTo(const QPoint& logical) {
 		frame = raw;
 	}
 
-	SetWindowPos(
-	    this->mHwnd,
-	    nullptr,
-	    physical.x() - (frame.left - raw.left),
-	    physical.y() - (frame.top - raw.top),
-	    0,
-	    0,
-	    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
-	);
+	SetLastError(ERROR_SUCCESS);
+	if (SetWindowPos(
+	        this->mHwnd,
+	        nullptr,
+	        physical.x() - (frame.left - raw.left),
+	        physical.y() - (frame.top - raw.top),
+	        0,
+	        0,
+	        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
+	    ))
+	{
+		this->clearActionError();
+		return;
+	}
+	this->reportActionFailure(QStringLiteral("move"), GetLastError());
 }
 
 namespace {
 WindowTracker* trackerInstance = nullptr;
 } // namespace
+
+void WindowTracker::reportWindowActionRefused(
+    const TrackedWindow* window,
+    const QString& action,
+    const QString& reason,
+    bool elevated
+) {
+	auto text = window_action_detail::errorText(action, reason);
+	this->mLastActionErrorWindow = window;
+	if (this->mLastActionError != text) {
+		this->mLastActionError = text;
+		emit this->lastActionErrorChanged();
+	}
+	emit this->windowActionRefused(action, reason, elevated);
+}
+
+void WindowTracker::clearWindowActionError(const TrackedWindow* window) {
+	if (this->mLastActionError.isEmpty() || this->mLastActionErrorWindow != window) return;
+	this->mLastActionError.clear();
+	this->mLastActionErrorWindow = nullptr;
+	emit this->lastActionErrorChanged();
+}
 
 WindowTracker* WindowTracker::instance() {
 	static auto* instance = new WindowTracker(); // NOLINT

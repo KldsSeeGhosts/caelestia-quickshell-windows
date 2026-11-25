@@ -46,6 +46,14 @@ HyprlandToplevel::HyprlandToplevel(HyprlandIpc* ipc, TrackedWindow* window)
 
 	// clang-format off
 	QObject::connect(window, &TrackedWindow::titleChanged, this, &HyprlandToplevel::markIpcObjectDirty);
+	QObject::connect(window, &TrackedWindow::elevatedChanged, this, &HyprlandToplevel::elevatedChanged);
+	QObject::connect(window, &TrackedWindow::imagePathChanged, this, &HyprlandToplevel::imagePathChanged);
+	QObject::connect(window, &TrackedWindow::aumidChanged, this, &HyprlandToplevel::aumidChanged);
+	QObject::connect(window, &TrackedWindow::lastActionErrorChanged, this, &HyprlandToplevel::lastActionErrorChanged);
+	QObject::connect(window, &TrackedWindow::actionRefused, this, &HyprlandToplevel::actionRefused);
+	QObject::connect(window, &TrackedWindow::elevatedChanged, this, &HyprlandToplevel::markIpcObjectDirty);
+	QObject::connect(window, &TrackedWindow::imagePathChanged, this, &HyprlandToplevel::markIpcObjectDirty);
+	QObject::connect(window, &TrackedWindow::aumidChanged, this, &HyprlandToplevel::markIpcObjectDirty);
 	QObject::connect(window, &TrackedWindow::appIdChanged, this, &HyprlandToplevel::markIpcObjectDirty);
 	QObject::connect(window, &TrackedWindow::pidChanged, this, &HyprlandToplevel::markIpcObjectDirty);
 	QObject::connect(window, &TrackedWindow::rectChanged, this, &HyprlandToplevel::markIpcObjectDirty);
@@ -86,6 +94,11 @@ HyprlandToplevel::HyprlandToplevel(HyprlandIpc* ipc, Toplevel* toplevel)
     , mAddress(toplevel->window()->address())
     , ipc(ipc)
     , mWaylandHandle(toplevel) {
+	QObject::connect(toplevel, &Toplevel::elevatedChanged, this, &HyprlandToplevel::elevatedChanged);
+	QObject::connect(toplevel, &Toplevel::imagePathChanged, this, &HyprlandToplevel::imagePathChanged);
+	QObject::connect(toplevel, &Toplevel::aumidChanged, this, &HyprlandToplevel::aumidChanged);
+	QObject::connect(toplevel, &Toplevel::lastActionErrorChanged, this, &HyprlandToplevel::lastActionErrorChanged);
+	QObject::connect(toplevel, &Toplevel::actionRefused, this, &HyprlandToplevel::actionRefused);
 	this->setHyprlandHandle(ipc->toplevelForWindow(toplevel->window()));
 
 	if (this->mHyprlandHandle == nullptr) {
@@ -108,6 +121,31 @@ HyprlandToplevel* HyprlandToplevel::hyprlandHandle() {
 Toplevel* HyprlandToplevel::waylandHandle() {
 	if (this->mWaylandHandle != nullptr) return this->mWaylandHandle;
 	return ToplevelManager::instance()->forWindow(this->mWindow);
+}
+
+TrackedWindow* HyprlandToplevel::effectiveWindow() const {
+	if (this->mWindow != nullptr) return this->mWindow;
+	return this->mWaylandHandle != nullptr ? this->mWaylandHandle->window() : nullptr;
+}
+
+bool HyprlandToplevel::elevated() const {
+	auto* window = this->effectiveWindow();
+	return window != nullptr && window->elevated();
+}
+
+QString HyprlandToplevel::imagePath() const {
+	auto* window = this->effectiveWindow();
+	return window != nullptr ? window->imagePath() : QString();
+}
+
+QString HyprlandToplevel::aumid() const {
+	auto* window = this->effectiveWindow();
+	return window != nullptr ? window->aumid() : QString();
+}
+
+QString HyprlandToplevel::lastActionError() const {
+	auto* window = this->effectiveWindow();
+	return window != nullptr ? window->lastActionError() : QString();
 }
 
 void HyprlandToplevel::onToplevelAdded(HyprlandToplevel* toplevel) {
@@ -267,6 +305,9 @@ void HyprlandToplevel::refreshIpcObject() {
 	    {"inhibitingIdle", false},
 	    {"minimized", window->minimized()},
 	    {"exe", window->exePath()},
+	    {"elevated", window->elevated()},
+	    {"imagePath", window->imagePath()},
+	    {"aumid", window->aumid()},
 	};
 
 	this->bLastIpcObject = object;

@@ -7,7 +7,6 @@
 
 #include <qcoreapplication.h>
 #include <qdir.h>
-#include <qendian.h>
 #include <qfile.h>
 #include <qfileinfo.h>
 #include <qhash.h>
@@ -21,7 +20,6 @@
 #include <qmetaobject.h>
 #include <qobject.h>
 #include <qpointer.h>
-#include <qprocess.h>
 #include <qqmlengine.h>
 #include <qstandardpaths.h>
 #include <qstring.h>
@@ -33,11 +31,11 @@
 #include "../core/instanceinfo.hpp"
 #include "../core/rootwrapper.hpp"
 #include "../io/ipchandler.hpp"
-#include "../io/processcore.hpp"
 #include "activation_policy.hpp"
 #include "input_mask.hpp"
 #include "input_settle.hpp"
 #include "keyboard_hook.hpp"
+#include "process_launch.hpp"
 #include "redact.hpp"
 #include "system/keyboard.hpp"
 #include "util.hpp"
@@ -161,62 +159,6 @@ bool invokeWithString(QObject* object, const char* name, const QString& argument
 		}
 	}
 
-	return false;
-}
-
-bool isConsoleProgram(const QString& program) {
-	auto path = QFileInfo(program).isFile() ? program : QStandardPaths::findExecutable(program);
-	if (path.isEmpty()) return false;
-
-	QFile file(path);
-	if (!file.open(QIODevice::ReadOnly)) return false;
-
-	auto dos = file.read(0x40);
-	if (dos.length() < 0x40 || !dos.startsWith("MZ")) return false;
-	auto peOffset = qFromLittleEndian<quint32>(dos.constData() + 0x3c);
-
-	if (!file.seek(peOffset)) return false;
-	auto header = file.read(4 + 20 + 70);
-	if (header.length() < 4 + 20 + 70 || !header.startsWith(QByteArray("PE\0\0", 4))) return false;
-
-	auto subsystem = qFromLittleEndian<quint16>(header.constData() + 4 + 20 + 68);
-	return subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI;
-}
-
-bool tryStartDetached(const QString& command) {
-	auto parts = QProcess::splitCommand(command);
-	if (parts.isEmpty()) return false;
-
-	auto program = parts.takeFirst();
-	if (!program.contains('/') && !program.contains('\\')) {
-		auto local = QDir(QCoreApplication::applicationDirPath()).filePath(program);
-		if (QFileInfo(local).isFile()) program = local;
-	}
-
-	auto process = QProcess();
-	process.setProgram(program);
-	process.setArguments(parts);
-	process.setWorkingDirectory(QDir::homePath());
-
-	if (isConsoleProgram(program)) {
-		process.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
-			args->flags &= ~static_cast<DWORD>(CREATE_NO_WINDOW);
-			args->flags |= CREATE_NEW_CONSOLE;
-			args->inheritHandles = false;
-			args->startupInfo->dwFlags &= ~static_cast<DWORD>(STARTF_USESTDHANDLES);
-			args->startupInfo->hStdInput = nullptr;
-			args->startupInfo->hStdOutput = nullptr;
-			args->startupInfo->hStdError = nullptr;
-		});
-	} else {
-		qs::io::process::disownHandles(&process);
-	}
-
-	if (process.startDetached()) return true;
-
-	// File name only: the arguments and directories can hold user data.
-	qCDebug(logHotkeys) << "Could not start" << QFileInfo(program).fileName() << ":"
-	                    << process.errorString();
 	return false;
 }
 
@@ -563,7 +505,7 @@ HotkeyManager::HotkeyManager(QObject* parent): QObject(parent) {
 	QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, this, [this] {
 		this->unregisterAll();
 		KeyboardHook::stop();
-		this->hookRunning = false;
+		this->hookRequested = false;
 	});
 }
 
@@ -610,7 +552,7 @@ bool HotkeyManager::setSubmap(const QString& name, QString* refusal) {
 	this->unregisterAll(false);
 	this->mActiveSubmap = target;
 	this->registerAll();
-	if (!target.isEmpty() && !this->hookRunning) {
+	if (!target.isEmpty() && !this->hookActive()) {
 		// Without the hook's desktop-switch event, even registered-only maps
 		// could survive a session lock. Refuse entry and restore global routing.
 		this->unregisterAll();
@@ -821,6 +763,8 @@ void HotkeyManager::parse(const QByteArray& data, const QString& path) {
 		} else if (action == "exec") {
 			bind.action = Bind::Action::Exec;
 			bind.argument = object.value("command").toString();
+			bind.name = object.value("name").toString(object.value("id").toString());
+			bind.elevate = object.value("elevate").toBool();
 		} else if (action == "ipc") {
 			bind.action = Bind::Action::Ipc;
 			bind.name = object.value("target").toString();
@@ -850,6 +794,7 @@ void HotkeyManager::parse(const QByteArray& data, const QString& path) {
 
 			auto disabled = object.value("disabled").toObject();
 			if (disabled.value("action").toString() == "global") parseGlobalName(disabled, bind);
+			else if (disabled.value("action").toString() == "exec") parseExecName(disabled, bind);
 		} else {
 			qCWarning(logHotkeys).noquote() << where << ": unknown action" << action;
 			continue;
@@ -875,12 +820,13 @@ void HotkeyManager::unregisterAll(bool resetSubmap) {
 	this->releaseAllGlobals();
 	this->releaseTimer.stop();
 
-	for (auto i = 0; i < this->triggers.size(); i++) {
-		if (this->triggers.at(i).mechanism == Bind::Mechanism::Hotkey) {
-			UnregisterHotKey(this->messageWindow, static_cast<int>(i + 1));
+	for (const auto& trigger: this->triggers) {
+		if (trigger.mechanism == Bind::Mechanism::Hotkey && trigger.hotkeyId > 0) {
+			UnregisterHotKey(this->messageWindow, trigger.hotkeyId);
 		}
 	}
 
+	this->hotkeyTriggers.clear();
 	this->triggers.clear();
 
 	this->serial++;
@@ -889,6 +835,17 @@ void HotkeyManager::unregisterAll(bool resetSubmap) {
 		this->mActiveSubmap.clear();
 		emit this->activeSubmapChanged();
 	}
+}
+
+int HotkeyManager::allocateHotkeyId() {
+	// Win32 reserves 0xC000-0xFFFF for shared DLL atoms and 0 is our sentinel.
+	constexpr int MaxHotkeyId = 0xBFFF;
+	for (int attempt = 0; attempt < MaxHotkeyId; attempt++) {
+		const auto candidate = this->nextHotkeyId;
+		this->nextHotkeyId = candidate >= MaxHotkeyId ? 1 : candidate + 1;
+		if (!this->hotkeyTriggers.contains(candidate)) return candidate;
+	}
+	return 0;
 }
 
 qsizetype HotkeyManager::addToTrigger(qsizetype index) {
@@ -932,8 +889,10 @@ void HotkeyManager::registerAll() {
 void HotkeyManager::resetTrigger(qsizetype index) {
 	auto& trigger = this->triggers[index];
 
-	if (trigger.mechanism == Bind::Mechanism::Hotkey) {
-		UnregisterHotKey(this->messageWindow, static_cast<int>(index + 1));
+	if (trigger.mechanism == Bind::Mechanism::Hotkey && trigger.hotkeyId > 0) {
+		UnregisterHotKey(this->messageWindow, trigger.hotkeyId);
+		this->hotkeyTriggers.remove(trigger.hotkeyId);
+		trigger.hotkeyId = 0;
 	}
 
 	trigger.mechanism = Bind::Mechanism::None;
@@ -999,6 +958,7 @@ void HotkeyManager::registerTriggers() {
 		}
 
 		auto registered = false;
+		auto registeredId = 0;
 
 		if (trigger.preferRegister && trigger.kind == HookTrigger::Combo
 		    && !taskbarShortcutFilterEnabled()
@@ -1017,19 +977,29 @@ void HotkeyManager::registerTriggers() {
 		    ))
 		{
 			auto modifiers = hotkeyModifiers(trigger.combo.mods) | (trigger.repeat ? 0 : MOD_NOREPEAT);
-			auto id = static_cast<int>(i + 1);
+			auto id = this->allocateHotkeyId();
 
-			registered = RegisterHotKey(this->messageWindow, id, modifiers, trigger.combo.vk) != FALSE;
+			if (id > 0) {
+				registered = RegisterHotKey(this->messageWindow, id, modifiers, trigger.combo.vk) != FALSE;
+				if (registered) registeredId = id;
+			}
 
 			if (!registered) {
 				qCInfo(logHotkeys) << "RegisterHotKey failed for" << this->binds.at(trigger.binds.first()).keys
-				                   << "(error" << GetLastError() << "), using the keyboard hook";
+				                   << "(error" << (id > 0 ? GetLastError() : ERROR_NO_SYSTEM_RESOURCES)
+				                   << "), using the keyboard hook";
 			}
 		}
 
 		auto mechanism = resolveTriggerMechanism(trigger.kind, trigger.combo.mods, registered);
 
-		if (mechanism.hotkey) trigger.mechanism = Bind::Mechanism::Hotkey;
+		if (mechanism.hotkey) {
+			trigger.mechanism = Bind::Mechanism::Hotkey;
+			trigger.hotkeyId = registeredId;
+			this->hotkeyTriggers.insert(registeredId, i);
+		} else if (registered) {
+			UnregisterHotKey(this->messageWindow, registeredId);
+		}
 
 		if (mechanism.hook) {
 			trigger.mechanism = Bind::Mechanism::Hook;
@@ -1049,23 +1019,16 @@ void HotkeyManager::registerTriggers() {
 	    && this->mActiveSubmap.isEmpty() && !taskbarShortcutFilterEnabled())
 	{
 		KeyboardHook::stop();
-		this->hookRunning = false;
+		this->hookRequested = false;
 	} else {
 		KeyboardHook::setSnapshot(snapshot);
 
-		if (!this->hookRunning) {
-			this->hookRunning = KeyboardHook::start(this->messageWindow, WM_QS_HOOK_BASE);
-			if (this->hookRunning) qCInfo(logHotkeys) << "Keyboard hook installed.";
-		}
-
-		if (!this->hookRunning) {
-			qCWarning(logHotkeys) << "Failed to install the keyboard hook (error" << GetLastError()
-			                      << "), hook-backed binds are unavailable.";
-
-			for (auto& trigger: this->triggers) {
-				if (trigger.mechanism == Bind::Mechanism::Hook) {
-					trigger.mechanism = Bind::Mechanism::Unavailable;
-				}
+		if (!this->hookRequested) {
+			this->hookRequested = true;
+			if (KeyboardHook::start(this->messageWindow, WM_QS_HOOK_BASE)) {
+				qCInfo(logHotkeys) << "Keyboard hook installed.";
+			} else {
+				qCWarning(logHotkeys) << "Keyboard hook unavailable, hook-backed binds will wait for recovery.";
 			}
 		}
 	}
@@ -1075,17 +1038,21 @@ void HotkeyManager::registerTriggers() {
 	}
 }
 
-bool HotkeyManager::hookActive() const { return this->hookRunning; }
+bool HotkeyManager::hookActive() const { return this->hookRequested && KeyboardHook::isRunning(); }
 
 QVariantList HotkeyManager::bindsInfo() const {
 	QVariantList list;
+	const auto hookActive = this->hookActive();
 
 	for (const auto& bind: this->binds) {
 		QVariantMap map;
 		map["keys"] = bind.keys;
 		map["submap"] = bind.submap;
 		map["action"] = actionName(bind.action);
-		map["mechanism"] = mechanismName(bind.mechanism);
+		map["mechanism"] = mechanismName(
+		    bind.mechanism == Bind::Mechanism::Hook && !hookActive ? Bind::Mechanism::Unavailable
+		                                                           : bind.mechanism
+		);
 		map["description"] = bind.description;
 		map["onRelease"] = bind.onRelease;
 		map["repeat"] = bind.repeat;
@@ -1094,7 +1061,11 @@ QVariantList HotkeyManager::bindsInfo() const {
 		switch (bind.action) {
 		case Bind::Action::Global: map["name"] = bind.appid + ':' + bind.name; break;
 		case Bind::Action::Dispatch: map["dispatch"] = bind.argument; break;
-		case Bind::Action::Exec: map["command"] = bind.argument; break;
+		case Bind::Action::Exec:
+			map["command"] = bind.argument;
+			map["elevate"] = bind.elevate;
+			if (!bind.name.isEmpty()) map["name"] = bind.name;
+			break;
 		case Bind::Action::Ipc:
 			map["target"] = bind.name;
 			map["function"] = bind.function;
@@ -1134,18 +1105,12 @@ bool HotkeyManager::beginChordReleaseWait() {
 	case ChordRequest::Wait: break;
 	}
 
-	// Every bind may be a RegisterHotKey chord, in which case the hook was
-	// stopped. Start it for this wait only, with no stale trigger snapshot; it
-	// is stopped again when the wait finishes unless a bind needs it.
-	auto startedHook = false;
-	if (!KeyboardHook::isRunning()) {
-		KeyboardHook::setSnapshot(nullptr);
-		if (!KeyboardHook::start(this->messageWindow, WM_QS_HOOK_BASE)) {
-			qCWarning(logHotkeys) << "Keyboard hook unavailable, display off can't wait for the chord "
-			                         "release.";
-			return false;
-		}
-		startedHook = true;
+	// The display-off wait owns its reference independently of the key map.
+	// If recovery is in progress, failing this wait must not drop map demand.
+	if (!KeyboardHook::retain()) {
+		KeyboardHook::release();
+		qCWarning(logHotkeys) << "Keyboard hook unavailable, display off can't wait for the chord release.";
+		return false;
 	}
 
 	// The hook thread takes the snapshot and subscribes in one step, so a
@@ -1158,10 +1123,7 @@ bool HotkeyManager::beginChordReleaseWait() {
 	        keys
 	    ))
 	{
-		if (startedHook) {
-			KeyboardHook::stop();
-			KeyboardHook::setSnapshot(nullptr);
-		}
+		KeyboardHook::release();
 		qCWarning(logHotkeys) << "Keyboard hook did not answer, display off can't wait for the chord "
 		                         "release.";
 		return false;
@@ -1170,10 +1132,7 @@ bool HotkeyManager::beginChordReleaseWait() {
 	auto result = this->inputSettle.arm(keys);
 	if (result != InputSettle::Result::Waiting) {
 		KeyboardHook::clearInputObserver();
-		if (startedHook) {
-			KeyboardHook::stop();
-			KeyboardHook::setSnapshot(nullptr);
-		}
+		KeyboardHook::release();
 		return false;
 	}
 
@@ -1214,10 +1173,7 @@ void HotkeyManager::finishInputSettle(bool settled) {
 		this->gateButtonEvents = false;
 	}
 
-	if (!this->hookRunning && KeyboardHook::isRunning()) {
-		KeyboardHook::stop();
-		KeyboardHook::setSnapshot(nullptr);
-	}
+	KeyboardHook::release();
 
 	if (settled) emit this->chordReleaseSettled();
 	else emit this->chordReleaseCancelled();
@@ -1243,23 +1199,23 @@ LRESULT CALLBACK HotkeyManager::messageWindowProc(HWND hwnd, UINT msg, WPARAM wP
 	}
 
 	if (msg == WM_QS_INPUT_KEY) {
-		HotkeyManager::instance()->onPhysicalKey(
-		    static_cast<quint8>(wParam),
-		    static_cast<LPARAM>(lParam) != 0
-		);
+		if (hookEventGeneration(wParam, lParam) != KeyboardHook::activeHookGeneration()) return 0;
+		HotkeyManager::instance()->onPhysicalKey(inputObserverKey(wParam), inputObserverUp(wParam));
 		return 0;
 	}
 
 	if (msg == WM_QS_INPUT_RESET) {
+		if (hookEventGeneration(wParam, lParam) != KeyboardHook::activeHookGeneration()) return 0;
 		HotkeyManager::instance()->onInputLifecycleLost();
 		return 0;
 	}
 
 	if (msg >= WM_QS_HOOK_BASE && msg < WM_QS_HOOK_BASE + HookEventCount) {
+		if (hookEventGeneration(wParam, lParam) != KeyboardHook::activeHookGeneration()) return 0;
 		HotkeyManager::instance()->onHookEvent(
 		    static_cast<HookEvent>(msg - WM_QS_HOOK_BASE),
-		    static_cast<quint32>(wParam),
-		    static_cast<quint32>(lParam)
+		    hookEventTriggerId(wParam),
+		    hookEventSerial(lParam)
 		);
 
 		return 0;
@@ -1269,11 +1225,14 @@ LRESULT CALLBACK HotkeyManager::messageWindowProc(HWND hwnd, UINT msg, WPARAM wP
 }
 
 void HotkeyManager::onHotkey(int id) {
-	auto index = static_cast<qsizetype>(id) - 1;
+	auto it = this->hotkeyTriggers.constFind(id);
+	if (it == this->hotkeyTriggers.constEnd()) return;
+
+	auto index = it.value();
 	if (index < 0 || index >= this->triggers.size()) return;
 
 	auto& trigger = this->triggers[index];
-	if (trigger.mechanism != Bind::Mechanism::Hotkey) return;
+	if (trigger.mechanism != Bind::Mechanism::Hotkey || trigger.hotkeyId != id) return;
 
 	// WM_HOTKEY is a key Windows delivered to this process, so the activation
 	// it causes may ask for the foreground once under the documented rule.
@@ -1311,6 +1270,10 @@ void HotkeyManager::pollReleases() {
 }
 
 void HotkeyManager::onHookEvent(HookEvent event, quint32 triggerId, quint32 serial) {
+	if (event == HookStatusChanged) {
+		emit this->bindsChanged();
+		return;
+	}
 	if (event == HookReset) {
 		if (serial == this->serial) this->onInputLifecycleLost();
 		return;
@@ -1441,6 +1404,10 @@ void HotkeyManager::runDispatch(const Bind& bind) {
 	}
 }
 
+bool shouldTryNextAlternative(process::LaunchStatus status) {
+	return status == process::LaunchStatus::Failed;
+}
+
 void HotkeyManager::runExec(const Bind& bind) const {
 	auto commands = QStringList();
 
@@ -1459,13 +1426,17 @@ void HotkeyManager::runExec(const Bind& bind) const {
 		commands.append(command);
 	}
 
-	runLauncher([commands, argument = bind.argument]() {
+	runLauncher([commands, argument = bind.argument, elevate = bind.elevate]() {
+		auto lastError = DWORD(ERROR_SUCCESS);
 		for (const auto& command: commands) {
-			if (tryStartDetached(command)) return;
+			const auto result = elevate ? process::launchElevatedCommand(command)
+			                            : process::launchCommand(command);
+			if (!shouldTryNextAlternative(result.status)) return;
+			lastError = result.error;
 		}
 
 		qCWarning(logHotkeys) << "Failed to start any alternative of"
-		                      << qs::windows::logId(argument);
+		                      << qs::windows::logId(argument) << "error" << lastError;
 	});
 }
 

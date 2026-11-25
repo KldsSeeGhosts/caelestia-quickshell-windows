@@ -1,4 +1,6 @@
+#include <atomic>
 #include <cstring>
+#include <thread>
 #include <functional>
 #include <memory>
 #include <utility>
@@ -1537,6 +1539,145 @@ private slots:
 		QCOMPARE(fake.writtenMethods(), QList<BrightnessMethod>({BrightnessMethod::Wmi}));
 		QCOMPARE(brightness.methodFor(SCREEN), QStringLiteral("software"));
 	}
+
+	void eventWatchFailurePolicyResetsAfterAHealthyRun() {
+		using namespace brightness_detail;
+		QVERIFY(!healthyRunResetsFailures(std::chrono::milliseconds(29999)));
+		QVERIFY(healthyRunResetsFailures(std::chrono::seconds(30)));
+		QCOMPARE(eventRetryDelayMs(1), DWORD(5000));
+		QCOMPARE(eventRetryDelayMs(5), DWORD(25000));
+		// Backoff is capped even though the watcher never gives up permanently.
+		QCOMPARE(eventRetryDelayMs(99), DWORD(25000));
+	}
+
+	void eventWatchThreadStopsAndJoinsAFinitePollingWorker() {
+		brightness_detail::EventWatchThread watch;
+		std::atomic<bool> entered = false;
+		std::atomic<bool> sawStop = false;
+		QVERIFY(watch.start([&](HANDLE stop, const brightness_detail::EventWatchThread::Cancelled& cancelled) {
+			entered = true;
+			while (WaitForSingleObject(stop, 5) == WAIT_TIMEOUT) {}
+			sawStop = cancelled->load(std::memory_order_acquire);
+		}));
+		QVERIFY(watch.running());
+
+		QElapsedTimer elapsed;
+		elapsed.start();
+		watch.stop();
+		QVERIFY(elapsed.elapsed() < brightness_detail::EVENT_JOIN_TIMEOUT_MS);
+		QVERIFY(!watch.running());
+		QVERIFY(entered.load());
+		QVERIFY(sawStop.load());
+
+		// A second lifecycle is independent and starts cleanly after the first join.
+		QVERIFY(watch.start([](HANDLE stop, const brightness_detail::EventWatchThread::Cancelled&) {
+			WaitForSingleObject(stop, 50);
+		}));
+		watch.stop();
+	}
+
+	void sharedWmiQueueIsPureCppAndSafeAfterOwnerTeardown() {
+		auto state = brightness_detail::createSharedWmiState();
+		QVERIFY(state != nullptr);
+		QVERIFY(brightness_detail::queueWmiBrightnessEvent(state, L"DISPLAYTEST", 42));
+		brightness_detail::WmiBrightnessEvent event;
+		QVERIFY(brightness_detail::popWmiBrightnessEvent(state, event));
+		QCOMPARE(event.instanceName, std::wstring(L"DISPLAYTEST"));
+		QCOMPARE(event.percent, 42);
+
+		// The test audit reference is neither the GUI owner nor the worker; it only
+		// lets the fixture inspect the plain queue after both sides finish.
+		auto audit = state;
+		std::atomic<bool> release = false;
+		std::atomic<bool> done = false;
+		std::atomic<bool> queuedAfterCancel = false;
+		std::thread worker([state, &release, &done, &queuedAfterCancel] {
+			// The owner cancels and destroys its side while this detachable worker
+			// is still inside the gate. Shared ownership keeps only plain C++ state
+			// alive; queueing after cancellation is refused without Qt access.
+			while (!release.load(std::memory_order_acquire)) Sleep(1);
+			queuedAfterCancel =
+			    brightness_detail::queueWmiBrightnessEvent(state, L"LATE", 10)
+			    || brightness_detail::queueWmiWarning(state, L"late warning");
+			state->finished.store(true, std::memory_order_release);
+			done.store(true, std::memory_order_release);
+		});
+
+		state->cancelled.store(true, std::memory_order_release);
+		SetEvent(state->stopEvent.get());
+		brightness_detail::clearWmiWakeWindow(state);
+		state.reset();
+		release.store(true, std::memory_order_release);
+		worker.detach();
+		QTRY_VERIFY(done.load(std::memory_order_acquire));
+		QVERIFY(!queuedAfterCancel.load(std::memory_order_acquire));
+
+		QVERIFY(audit->events.empty());
+		QVERIFY(audit->warnings.empty());
+		QVERIFY(audit->finished.load(std::memory_order_acquire));
+	}
+
+	void wmiEventDrainStopsAfterCallbackTeardown_data() {
+		QTest::addColumn<int>("teardown");
+		QTest::newRow("cancel-mailbox") << 0;
+		QTest::newRow("stop-pump") << 1;
+		QTest::newRow("destroy-pump") << 2;
+	}
+
+	void wmiEventDrainStopsAfterCallbackTeardown() {
+		QFETCH(int, teardown);
+		auto state = brightness_detail::createSharedWmiState();
+		QVERIFY(state != nullptr);
+		QVERIFY(brightness_detail::queueWmiBrightnessEvent(state, L"FIRST", 20));
+		QVERIFY(brightness_detail::queueWmiBrightnessEvent(state, L"SECOND", 80));
+
+		auto drain = std::make_unique<brightness_detail::WmiEventDrain>();
+		auto delivered = 0;
+		QStringList names;
+		drain->start(state, [&](const QString& instanceName, int) {
+			++delivered;
+			names.append(instanceName);
+			if (teardown == 0) state->cancelled.store(true, std::memory_order_release);
+			else if (teardown == 1) drain->stop();
+			else drain.reset();
+		});
+
+		auto warnings = 0;
+		drain->drain([&](const std::wstring&) { ++warnings; });
+		QCOMPARE(warnings, 0);
+		QCOMPARE(delivered, 1);
+		QCOMPARE(names, QStringList({QStringLiteral("FIRST")}));
+
+		brightness_detail::WmiBrightnessEvent leftover;
+		QVERIFY(brightness_detail::popWmiBrightnessEvent(state, leftover));
+		QCOMPARE(leftover.instanceName, std::wstring(L"SECOND"));
+		QCOMPARE(leftover.percent, 80);
+		QVERIFY(!brightness_detail::popWmiBrightnessEvent(state, leftover));
+	}
+
+	void eventWatchThreadDetachKeepsTheStopEventAlive() {
+		brightness_detail::EventWatchThread watch;
+		std::atomic<bool> release = false;
+		std::atomic<bool> completed = false;
+		std::atomic<bool> cancelledSeen = false;
+		std::atomic<bool> handleStillValid = false;
+		QVERIFY(watch.start([&](HANDLE stop, const brightness_detail::EventWatchThread::Cancelled& cancelled) {
+			while (!release.load(std::memory_order_acquire)) Sleep(5);
+			cancelledSeen = cancelled->load(std::memory_order_acquire);
+			// stop() times out and detaches while this worker is still inside the
+			// gate. Shared RAII ownership keeps the signaled event valid here.
+			handleStillValid = WaitForSingleObject(stop, 0) == WAIT_OBJECT_0;
+			completed = true;
+		}));
+
+		watch.stop();
+		QVERIFY(!watch.running());
+		release = true;
+		QTRY_VERIFY(completed.load(std::memory_order_acquire));
+		QVERIFY(cancelledSeen.load(std::memory_order_acquire));
+		QVERIFY(handleStillValid.load(std::memory_order_acquire));
+	}
+
 };
 
 QTEST_GUILESS_MAIN(BrightnessRouteTest)

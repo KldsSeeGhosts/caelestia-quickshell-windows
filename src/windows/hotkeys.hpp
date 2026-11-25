@@ -4,6 +4,7 @@
 
 #include <qcontainerfwd.h>
 #include <qfilesystemwatcher.h>
+#include <qhash.h>
 #include <qlist.h>
 #include <qobject.h>
 #include <qpointer.h>
@@ -56,6 +57,7 @@ struct Bind {
 	bool onRelease = false;
 	bool repeat = false;
 	bool preferRegister = false;
+	bool elevate = false;
 	QString description;
 	Mechanism mechanism = Mechanism::None;
 };
@@ -110,6 +112,7 @@ private:
 		KeyCombo combo;
 		Bind::Mechanism mechanism = Bind::Mechanism::None;
 		QList<qsizetype> binds;
+		int hotkeyId = 0;
 		bool repeat = false;
 		bool preferRegister = false;
 		bool down = false;
@@ -119,6 +122,7 @@ private:
 	void parse(const QByteArray& data, const QString& path);
 	void unregisterAll(bool resetSubmap = true);
 	void registerAll();
+	[[nodiscard]] int allocateHotkeyId();
 	qsizetype addToTrigger(qsizetype index);
 	void resetTrigger(qsizetype index);
 	void registerTriggers();
@@ -161,8 +165,10 @@ private:
 	QList<Bind> binds;
 	QString mActiveSubmap;
 	QList<Trigger> triggers;
+	QHash<int, qsizetype> hotkeyTriggers;
+	int nextHotkeyId = 1;
 	quint32 serial = 0;
-	bool hookRunning = false;
+	bool hookRequested = false;
 	bool dispatching = false;
 	bool gateActive = false;
 	bool gateButtonEvents = false;
