@@ -833,18 +833,21 @@ private slots:
 		auto snapshot = sessionSnapshotFromInfoEx(info);
 		QVERIFY(snapshot.connected);
 		QVERIFY(!snapshot.locked);
+		QVERIFY(snapshot.lockKnown);
 
 		info.SessionState = WTSDisconnected;
 		info.SessionFlags = WTS_SESSIONSTATE_LOCK;
 		snapshot = sessionSnapshotFromInfoEx(info);
 		QVERIFY(!snapshot.connected);
 		QVERIFY(snapshot.locked);
+		QVERIFY(snapshot.lockKnown);
 
 		info.SessionState = WTSActive;
 		info.SessionFlags = static_cast<LONG>(WTS_SESSIONSTATE_UNKNOWN);
 		snapshot = sessionSnapshotFromInfoEx(info);
 		QVERIFY(snapshot.connected);
 		QVERIFY(snapshot.locked);
+		QVERIFY(!snapshot.lockKnown);
 	}
 
 	void wtsRegistrationRetriesAndImmediatelyRequeriesSessionState() {
@@ -855,10 +858,11 @@ private slots:
 			++registrationAttempts;
 			return registrationAttempts >= 2;
 		};
-		auto querySnapshot = [&](bool& connected, bool& locked) {
+		auto querySnapshot = [&](SessionSnapshot& snapshot) {
 			++queries;
-			connected = queries >= 2;
-			locked = queries < 2;
+			snapshot.connected = queries >= 2;
+			snapshot.locked = queries < 2;
+			snapshot.lockKnown = true;
 			return true;
 		};
 
@@ -896,11 +900,12 @@ private slots:
 			++registrationAttempts;
 			return false;
 		};
-		auto querySnapshot = [&](bool& connected, bool& locked) {
+		auto querySnapshot = [&](SessionSnapshot& snapshot) {
 			const auto index = std::min<size_t>(queries, snapshots.size() - 1);
 			++queries;
-			connected = snapshots[index].first;
-			locked = snapshots[index].second;
+			snapshot.connected = snapshots[index].first;
+			snapshot.locked = snapshots[index].second;
+			snapshot.lockKnown = true;
 			return true;
 		};
 
@@ -917,6 +922,100 @@ private slots:
 		QCOMPARE(recovery.pendingAt, now + SESSION_SETTLE_MS);
 		QVERIFY(recovery.take(now + SESSION_SETTLE_MS, state.safe()));
 		QCOMPARE(registrationAttempts, 3);
+		QCOMPARE(queries, 3);
+	}
+
+	void unknownLockStateKeepsPollingUntilAnUnlockedSnapshot() {
+		SessionNotificationState state;
+		SessionRecovery recovery;
+		auto registrationAttempts = 0;
+		auto queries = 0;
+		auto tryRegister = [&] {
+			++registrationAttempts;
+			return true;
+		};
+		auto querySnapshot = [&](SessionSnapshot& snapshot) {
+			++queries;
+			WTSINFOEX_LEVEL1_W info {};
+			info.SessionState = WTSActive;
+			info.SessionFlags = queries == 1 ? static_cast<LONG>(WTS_SESSIONSTATE_UNKNOWN)
+			                                 : static_cast<LONG>(WTS_SESSIONSTATE_UNLOCK);
+			snapshot = sessionSnapshotFromInfoEx(info);
+			return true;
+		};
+
+		QVERIFY(!state.poll(tryRegister, querySnapshot));
+		QVERIFY(state.registered);
+		QCOMPARE(registrationAttempts, 1);
+		QCOMPARE(queries, 1);
+		QVERIFY(!state.safe());
+		QVERIFY(!state.complete());
+		QVERIFY(!state.lockKnown);
+
+		// Registration alone does not stop polling while the lock flag is
+		// unknown. The next unlocked snapshot is a transition even if Windows
+		// never sends WTS_SESSION_UNLOCK.
+		QVERIFY(state.poll(tryRegister, querySnapshot));
+		QCOMPARE(registrationAttempts, 1);
+		QCOMPARE(queries, 2);
+		QVERIFY(state.safe());
+		QVERIFY(state.complete());
+		constexpr uint64_t now = 1000;
+		QVERIFY(recovery.request(now));
+		QCOMPARE(recovery.pendingAt, now + SESSION_SETTLE_MS);
+
+		QVERIFY(!state.poll(tryRegister, querySnapshot));
+		QCOMPARE(queries, 2);
+	}
+
+	void recoveryTriggerWhileSessionStateIsUnknownSurvivesUntilSnapshot_data() {
+		QTest::addColumn<quintptr>("event");
+		QTest::newRow("unlock") << quintptr(WTS_SESSION_UNLOCK);
+		QTest::newRow("console reconnect") << quintptr(WTS_CONSOLE_CONNECT);
+		QTest::newRow("remote reconnect") << quintptr(WTS_REMOTE_CONNECT);
+	}
+
+	void recoveryTriggerWhileSessionStateIsUnknownSurvivesUntilSnapshot() {
+		QFETCH(quintptr, event);
+		SessionNotificationState state;
+		SessionRecovery recovery;
+		auto queries = 0;
+		auto tryRegister = [] { return true; };
+		auto querySnapshot = [&](SessionSnapshot& snapshot) {
+			++queries;
+			if (queries == 1) return false;
+			WTSINFOEX_LEVEL1_W info {};
+			info.SessionState = WTSActive;
+			info.SessionFlags = queries == 2 ? static_cast<LONG>(WTS_SESSIONSTATE_UNKNOWN)
+			                                 : static_cast<LONG>(WTS_SESSIONSTATE_UNLOCK);
+			snapshot = sessionSnapshotFromInfoEx(info);
+			return true;
+		};
+
+		QVERIFY(!state.poll(tryRegister, querySnapshot));
+		QVERIFY(state.registered);
+		QCOMPARE(queries, 1);
+		QVERIFY(!state.complete());
+		QVERIFY(!state.applyEvent(event));
+		QVERIFY(!state.safe());
+		QVERIFY(state.recoveryTriggerPending);
+
+		// Even an active session and a later unlock notification cannot
+		// consume the latch while the queried lock state is unknown.
+		QVERIFY(!state.poll(tryRegister, querySnapshot));
+		QCOMPARE(queries, 2);
+		QVERIFY(!state.applyEvent(WTS_SESSION_UNLOCK));
+		QVERIFY(!state.safe());
+		QVERIFY(state.recoveryTriggerPending);
+
+		QVERIFY(state.poll(tryRegister, querySnapshot));
+		QCOMPARE(queries, 3);
+		QVERIFY(state.safe());
+		QVERIFY(!state.recoveryTriggerPending);
+		constexpr uint64_t now = 1000;
+		QVERIFY(recovery.request(now));
+		QCOMPARE(recovery.pendingAt, now + SESSION_SETTLE_MS);
+		QVERIFY(!state.poll(tryRegister, querySnapshot));
 		QCOMPARE(queries, 3);
 	}
 

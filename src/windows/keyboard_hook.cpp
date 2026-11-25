@@ -215,61 +215,91 @@ constexpr auto HOOK_MONITOR_CLASS = L"QuickshellLowLevelHookMonitor";
 struct SessionSnapshot {
 	bool connected = false;
 	bool locked = true;
+	bool lockKnown = false;
 };
 
 [[nodiscard]] constexpr SessionSnapshot sessionSnapshotFromInfoEx(const WTSINFOEX_LEVEL1_W& info) {
+	const auto lockKnown = info.SessionFlags == WTS_SESSIONSTATE_LOCK
+	                    || info.SessionFlags == WTS_SESSIONSTATE_UNLOCK;
 	return {
 	    .connected = info.SessionState == WTSActive,
 	    // Treat unknown as locked so recovery stays fail-closed until the
 	    // session is explicitly usable.
 	    .locked = info.SessionFlags != WTS_SESSIONSTATE_UNLOCK,
+	    .lockKnown = lockKnown,
 	};
+}
+
+[[nodiscard]] constexpr bool sessionRecoveryTriggerEvent(WPARAM event) {
+	return event == WTS_SESSION_UNLOCK || event == WTS_CONSOLE_CONNECT || event == WTS_REMOTE_CONNECT;
 }
 
 struct SessionNotificationState {
 	bool registered = false;
 	bool connected = false;
-	bool locked = false;
-	bool stateKnown = false;
+	bool locked = true;
+	bool connectKnown = false;
+	bool lockKnown = false;
 	bool snapshotObserved = false;
+	bool recoveryTriggerPending = false;
 
-	[[nodiscard]] bool safe() const { return this->stateKnown && this->connected && !this->locked; }
-
-	void applyEvent(WPARAM event) {
-		this->connected = sessionConnectedAfterEvent(this->connected, event);
-		this->locked = sessionLockedAfterEvent(this->locked, event);
+	[[nodiscard]] bool safe() const {
+		return this->complete() && this->connected && !this->locked && !this->recoveryTriggerPending;
 	}
 
-	bool applySnapshot(bool nextConnected, bool nextLocked) {
+	[[nodiscard]] bool complete() const { return this->connectKnown && this->lockKnown; }
+
+	void markUnknown() {
+		this->connectKnown = false;
+		this->lockKnown = false;
+	}
+
+	bool applyEvent(WPARAM event) {
+		const auto trigger = sessionRecoveryTriggerEvent(event);
+		// Notifications can arrive between failed queries. They are enough
+		// to request recovery but cannot replace a complete snapshot.
+		if (!this->complete() || this->recoveryTriggerPending) {
+			this->recoveryTriggerPending |= trigger;
+			return false;
+		}
+		this->connected = sessionConnectedAfterEvent(this->connected, event);
+		this->locked = sessionLockedAfterEvent(this->locked, event);
+		return trigger && this->safe();
+	}
+
+	bool applySnapshot(const SessionSnapshot& snapshot) {
 		const auto wasObserved = this->snapshotObserved;
 		const auto wasSafe = this->connected && !this->locked;
-		this->connected = nextConnected;
-		this->locked = nextLocked;
-		this->stateKnown = true;
+		this->connected = snapshot.connected;
+		this->locked = snapshot.locked;
+		this->connectKnown = true;
+		this->lockKnown = snapshot.lockKnown;
 		this->snapshotObserved = true;
-		return wasObserved && !wasSafe && this->safe();
+		if (!this->complete() || !this->connected || this->locked) return false;
+		const auto triggered = std::exchange(this->recoveryTriggerPending, false);
+		return triggered || (wasObserved && !wasSafe);
 	}
 
 	// Registration is retried until Remote Desktop Services can accept it. While
-	// notifications are unavailable, every poll needs a fresh snapshot because
-	// connect and lock changes cannot arrive as messages.
+	// notifications or parts of the session state are unavailable, every poll
+	// needs a fresh snapshot because changes cannot arrive as messages.
 	bool poll(auto&& tryRegister, auto&& querySnapshot) {
 		auto registeredNow = false;
 		if (!this->registered) {
 			this->registered = tryRegister();
 			registeredNow = this->registered;
 		}
-		// A successful retry still needs an immediate snapshot, but the prior
-		// polled state remains valid transition evidence.
-		if (this->registered && this->stateKnown && !registeredNow) return false;
+		// A successful retry still needs an immediate snapshot. Unknown lock
+		// state and latched recovery triggers also keep polling alive.
+		if (this->registered && this->complete() && !this->recoveryTriggerPending && !registeredNow)
+			return false;
 
-		auto nextConnected = false;
-		auto nextLocked = true;
-		if (!querySnapshot(nextConnected, nextLocked)) {
-			this->stateKnown = false;
+		SessionSnapshot snapshot;
+		if (!querySnapshot(snapshot)) {
+			this->markUnknown();
 			return false;
 		}
-		return this->applySnapshot(nextConnected, nextLocked);
+		return this->applySnapshot(snapshot);
 	}
 };
 
@@ -436,7 +466,7 @@ private:
 		return this->registerSession(this->window, NOTIFY_FOR_THIS_SESSION) != 0;
 	}
 
-	bool querySessionSnapshot(bool& connected, bool& locked) {
+	bool querySessionSnapshot(SessionSnapshot& snapshot) {
 		if (this->querySessionInformation == nullptr || this->freeWtsMemory == nullptr) return false;
 		WTSINFOEXW* info = nullptr;
 		DWORD bytes = 0;
@@ -450,36 +480,25 @@ private:
 		    || info == nullptr)
 			return false;
 
-		const auto valid = info->Level == 1 && bytes >= sizeof(WTSINFOEXW);
-		auto nextConnected = false;
-		auto nextLocked = true;
-		if (valid) {
-			const auto& level1 = info->Data.WTSInfoExLevel1;
-			const auto snapshot = sessionSnapshotFromInfoEx(level1);
-			nextConnected = snapshot.connected;
-			nextLocked = snapshot.locked;
-		}
+		const auto valid = bytes >= sizeof(WTSINFOEXW) && info->Level == 1;
+		if (valid) snapshot = sessionSnapshotFromInfoEx(info->Data.WTSInfoExLevel1);
 		this->freeWtsMemory(info);
-		if (!valid) return false;
-		connected = nextConnected;
-		locked = nextLocked;
-		return true;
+		return valid;
 	}
 
 	bool applyQueriedSessionState() {
-		auto connected = false;
-		auto locked = true;
-		if (!this->querySessionSnapshot(connected, locked)) {
-			this->sessionState.stateKnown = false;
+		SessionSnapshot snapshot;
+		if (!this->querySessionSnapshot(snapshot)) {
+			this->sessionState.markUnknown();
 			return false;
 		}
-		return this->sessionState.applySnapshot(connected, locked);
+		return this->sessionState.applySnapshot(snapshot);
 	}
 
 	bool pollSessionState() {
 		return this->sessionState.poll(
 		    [this] { return this->tryRegisterSessionNotifications(); },
-		    [this](bool& connected, bool& locked) { return this->querySessionSnapshot(connected, locked); }
+		    [this](SessionSnapshot& snapshot) { return this->querySessionSnapshot(snapshot); }
 		);
 	}
 
@@ -543,7 +562,8 @@ private:
 		if (!this->sessionState.registered) {
 			qCWarning(logKeyboardHook) << "Could not observe session changes for hook recovery:" << GetLastError();
 		}
-		(void)this->applyQueriedSessionState();
+		if (this->applyQueriedSessionState() && this->sessionRecovery.request(GetTickCount64()))
+			this->sessionTimer.start();
 	}
 
 	static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -565,11 +585,7 @@ private:
 					self->sessionTimer.start();
 				return TRUE;
 			} else if (message == WM_WTSSESSION_CHANGE) {
-				self->sessionState.applyEvent(wParam);
-				if (self->sessionState.safe()
-				    && (wParam == WTS_SESSION_UNLOCK || wParam == WTS_CONSOLE_CONNECT
-				        || wParam == WTS_REMOTE_CONNECT)
-				    && self->sessionRecovery.request(GetTickCount64()))
+				if (self->sessionState.applyEvent(wParam) && self->sessionRecovery.request(GetTickCount64()))
 					self->sessionTimer.start();
 				return 0;
 			}
