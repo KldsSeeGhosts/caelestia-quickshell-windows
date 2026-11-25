@@ -23,12 +23,14 @@ namespace qs::hyprland::ipc {
 
 template <typename Tracker>
 void reportPinRefusal(Tracker* tracker, PinDispatchResult result, bool elevated) {
+	if (tracker == nullptr) return;
 	const auto reason = pinRefusalReason(result, elevated);
 	if (!reason.isEmpty()) tracker->reportActionRefusal(QStringLiteral("pin"), reason, elevated);
 }
 
 template <typename Tracker>
 void reportToggleFloatingDisabled(Tracker* tracker, bool elevated) {
+	if (tracker == nullptr) return;
 	tracker->reportActionRefusal(
 	    QStringLiteral("togglefloating"), QStringLiteral("Tiling is disabled"), elevated
 	);
@@ -38,9 +40,6 @@ void reportToggleFloatingDisabled(Tracker* tracker, bool elevated) {
 toggleFloatingRefusalReason(qs::windows::FloatingChangeResult result, bool elevated) {
 	if (result == qs::windows::FloatingChangeResult::ScopeExcluded) {
 		return QStringLiteral("Window is excluded from tiling");
-	}
-	if (result == qs::windows::FloatingChangeResult::Deferred) {
-		return QStringLiteral("Tiling is deferred until the window can be placed");
 	}
 	return elevated ? QStringLiteral("Windows prevents tiling an elevated window")
 	                : QStringLiteral("Window cannot change floating state");
@@ -52,13 +51,60 @@ void reportToggleFloatingResult(
     qs::windows::FloatingChangeResult result,
     bool elevated
 ) {
+	if (tracker == nullptr) return;
 	if (result == qs::windows::FloatingChangeResult::Changed
-	    || result == qs::windows::FloatingChangeResult::Noop)
+	    || result == qs::windows::FloatingChangeResult::Noop
+	    || result == qs::windows::FloatingChangeResult::Deferred)
 	{
 		return;
 	}
 	tracker->reportActionRefusal(
 	    QStringLiteral("togglefloating"), toggleFloatingRefusalReason(result, elevated), elevated
+	);
+}
+
+[[nodiscard]] inline bool isWindowRejectionMoveCode(const QString& code) {
+	return code.isEmpty() || code == QStringLiteral("permission-denied")
+	    || code == QStringLiteral("command-rejected");
+}
+
+[[nodiscard]] inline QString moveRefusalReason(const QString& code, bool elevated) {
+	if (elevated && isWindowRejectionMoveCode(code)) {
+		return QStringLiteral("Windows refused to move an elevated window");
+	}
+	if (code == QStringLiteral("permission-denied")) {
+		return QStringLiteral("Windows denied permission to move this window");
+	}
+	if (code == QStringLiteral("invalid-window")) {
+		return QStringLiteral("The target window is no longer available");
+	}
+	if (code == QStringLiteral("invalid-target")) {
+		return QStringLiteral("The target workspace is not available");
+	}
+	if (code == QStringLiteral("workspace-limit")) {
+		return QStringLiteral("Workspace limit reached");
+	}
+	if (code == QStringLiteral("provider-timeout") || code == QStringLiteral("provider-busy")) {
+		return QStringLiteral("Windows desktop control did not respond in time");
+	}
+	if (code == QStringLiteral("provider-disconnected")) {
+		return QStringLiteral("Windows desktop control is restarting");
+	}
+	if (code == QStringLiteral("provider-unavailable")
+	    || code == QStringLiteral("unsupported-build")
+	    || code == QStringLiteral("operation-unsupported"))
+	{
+		return QStringLiteral("Moving windows between workspaces is not available on this system");
+	}
+	return QStringLiteral("Windows refused to move this window to that workspace");
+}
+
+template <typename Tracker>
+void reportMoveRefusal(Tracker* tracker, const QString& code, bool elevated) {
+	if (tracker == nullptr) return;
+	const auto reportElevated = elevated && isWindowRejectionMoveCode(code);
+	tracker->reportActionRefusal(
+	    QStringLiteral("move"), moveRefusalReason(code, reportElevated), reportElevated
 	);
 }
 

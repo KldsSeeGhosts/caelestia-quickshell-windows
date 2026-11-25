@@ -32,6 +32,7 @@
 #include "activation_policy.hpp"
 #include "desktopentry_backend.hpp"
 #include "fullscreen_geometry.hpp"
+#include "hyprland/dispatch_refusals.hpp"
 #include "process_image_name.hpp"
 #include "redact.hpp"
 #include "startup.hpp"
@@ -512,6 +513,14 @@ bool TrackedWindow::activate() {
 void TrackedWindow::reportActionRefused(const QString& action, const QString& reason) {
 	auto elevated = isMoreElevated(this->mHwnd);
 	this->bElevated = elevated;
+	this->reportActionRefused(action, reason, elevated);
+}
+
+void TrackedWindow::reportActionRefused(
+    const QString& action,
+    const QString& reason,
+    bool elevated
+) {
 	auto text = window_action_detail::errorText(action, reason);
 	if (this->mLastActionError != text) {
 		this->mLastActionError = text;
@@ -623,8 +632,21 @@ void TrackedWindow::fullscreenOn(QScreen* screen) {
 }
 
 bool TrackedWindow::moveToDesktop(qsizetype index) {
-	if (!this->ensureCurrentOwner(QStringLiteral("move-to-desktop"))) return false;
-	if (!this->tracker->desktops()->moveWindow(this->mHwnd, index)) return false;
+	if (!this->ensureCurrentOwner(QStringLiteral("move"))) return false;
+	if (!this->tracker->desktops()->moveWindow(this->mHwnd, index)) {
+		const auto code =
+		    this->tracker->desktops()->lastCommand().value(QStringLiteral("reason")).toString();
+		const auto elevated = isMoreElevated(this->mHwnd);
+		this->bElevated = elevated;
+		const auto reportElevated = elevated && qs::hyprland::ipc::isWindowRejectionMoveCode(code);
+		this->reportActionRefused(
+		    QStringLiteral("move"),
+		    qs::hyprland::ipc::moveRefusalReason(code, reportElevated),
+		    reportElevated
+		);
+		return false;
+	}
+	this->clearActionError();
 	this->refreshDesktop(true);
 	return true;
 }

@@ -550,14 +550,16 @@ void Dispatcher::focusWorkspace(const QString& arg) {
 
 void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool follow) {
 	auto* desktops = this->ipc->desktops();
+	auto* tracker = this->actionTracker();
 	desktops->retryAccessor();
 	if (qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR") != "1"
 	    || qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR_DISPATCH") != "1"
 	    || !desktops->supports(DesktopOperation::Move)) {
-		desktops->refuseCommand(QStringLiteral("move"),
-		    desktops->availability() == DesktopAvailability::Available
-		        ? QStringLiteral("operation-unsupported")
-		        : desktopAvailabilityReason(desktops->availability()));
+		const auto code = desktops->availability() == DesktopAvailability::Available
+		    ? QStringLiteral("operation-unsupported")
+		    : desktopAvailabilityReason(desktops->availability());
+		desktops->refuseCommand(QStringLiteral("move"), code);
+		reportMoveRefusal(tracker, code, false);
 		this->unsupported(
 		    "movetoworkspace " + arg.trimmed() + " (dispatch disabled or native control unavailable)"
 		);
@@ -566,12 +568,14 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 
 	if (window == nullptr) {
 		desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-window"));
+		reportMoveRefusal(tracker, QStringLiteral("invalid-window"), false);
 		return;
 	}
 
 	auto target = parseWorkspaceTarget(arg);
 	if (target.kind == WorkspaceTarget::Kind::Special) {
 		desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("operation-unsupported"));
+		reportMoveRefusal(tracker, QStringLiteral("operation-unsupported"), false);
 		this->unsupported("movetoworkspace " + arg.trimmed() + " (Windows has no special workspaces)");
 		return;
 	}
@@ -581,6 +585,7 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 
 	if (index < 0) {
 		desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-target"));
+		reportMoveRefusal(tracker, QStringLiteral("invalid-target"), false);
 		if (target.kind != WorkspaceTarget::Kind::Previous) {
 			this->unsupported("movetoworkspace " + arg.trimmed());
 		}
@@ -590,12 +595,34 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 	if (index >= desktops->count()) {
 		if (!create) {
 			desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-target"));
+			reportMoveRefusal(tracker, QStringLiteral("invalid-target"), false);
 			return;
 		}
 
-		desktops->ensureCount(index + 1, [window = QPointer(window), index, follow](bool ok) {
-			if (ok && window) moveWindowTo(window, index, follow);
-		});
+		desktops->ensureCount(
+		    index + 1,
+		    [tracker = QPointer(tracker),
+		     desktops = QPointer(desktops),
+		     window = QPointer(window),
+		     index,
+		     follow](bool ok) {
+			    if (ok && window) {
+				    moveWindowTo(window, index, follow);
+				    return;
+			    }
+			    if (!ok) {
+				    const auto code = desktops
+				        ? desktops->lastCommand().value(QStringLiteral("reason")).toString()
+				        : QString();
+				    reportMoveRefusal(tracker.data(), code, false);
+				    return;
+			    }
+			    if (desktops) {
+				    desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-window"));
+			    }
+			    reportMoveRefusal(tracker.data(), QStringLiteral("invalid-window"), false);
+		    }
+		);
 
 		return;
 	}

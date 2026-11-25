@@ -5,6 +5,7 @@
 #include <qsignalspy.h>
 #include <qtest.h>
 
+#include "../hyprland/dispatch_refusals.hpp"
 #include "../hyprland/dispatcher.hpp"
 #include "../tiling_result.hpp"
 #include "../window_tracker.hpp"
@@ -271,43 +272,79 @@ private slots:
 		QCOMPARE(fixture.floating.calls, 1);
 	}
 
-	void acceptedAndNoopFloatingReportNothing_data() {
+	void acceptedNoopAndDeferredFloatingReportNothing_data() {
 		QTest::addColumn<int>("result");
 		QTest::newRow("changed") << static_cast<int>(FloatingChangeResult::Changed);
 		QTest::newRow("noop") << static_cast<int>(FloatingChangeResult::Noop);
+		QTest::newRow("deferred") << static_cast<int>(FloatingChangeResult::Deferred);
 	}
 
-	void acceptedAndNoopFloatingReportNothing() {
+	void acceptedNoopAndDeferredFloatingReportNothing() {
 		QFETCH(int, result);
 		DispatcherFixture fixture;
 		fixture.floating.result = static_cast<FloatingChangeResult>(result);
 		QSignalSpy refused(fixture.tracker, &WindowTracker::windowActionRefused);
 
-		fixture.dispatcher->toggleFloatingForTest(fixture.window, QStringLiteral("toggle"));
+		fixture.dispatcher->toggleFloatingForTest(fixture.window, QStringLiteral("tile"));
 
 		QCOMPARE(refused.size(), 0);
 		QCOMPARE(fixture.tracker->lastActionError(), QString());
 		QCOMPARE(fixture.floating.calls, 1);
 	}
 
-	void deferredFloatingReportsDeferredRefusal() {
+	void moveRefusalReportsReasonAndElevation_data() {
+		QTest::addColumn<QString>("code");
+		QTest::addColumn<bool>("elevated");
+		QTest::addColumn<bool>("expectedElevated");
+		QTest::addColumn<QString>("expectedReason");
+
+		QTest::newRow("command rejected plain")
+		    << QStringLiteral("command-rejected") << false << false
+		    << QStringLiteral("Windows refused to move this window to that workspace");
+		QTest::newRow("command rejected elevated")
+		    << QStringLiteral("command-rejected") << true << true
+		    << QStringLiteral("Windows refused to move an elevated window");
+		QTest::newRow("permission denied plain")
+		    << QStringLiteral("permission-denied") << false << false
+		    << QStringLiteral("Windows denied permission to move this window");
+		QTest::newRow("permission denied elevated")
+		    << QStringLiteral("permission-denied") << true << true
+		    << QStringLiteral("Windows refused to move an elevated window");
+		QTest::newRow("invalid target does not blame elevation")
+		    << QStringLiteral("invalid-target") << true << false
+		    << QStringLiteral("The target workspace is not available");
+		QTest::newRow("workspace limit")
+		    << QStringLiteral("workspace-limit") << true << false
+		    << QStringLiteral("Workspace limit reached");
+		QTest::newRow("provider timeout")
+		    << QStringLiteral("provider-timeout") << false << false
+		    << QStringLiteral("Windows desktop control did not respond in time");
+		QTest::newRow("provider unavailable")
+		    << QStringLiteral("provider-unavailable") << false << false
+		    << QStringLiteral("Moving windows between workspaces is not available on this system");
+		QTest::newRow("invalid window")
+		    << QStringLiteral("invalid-window") << false << false
+		    << QStringLiteral("The target window is no longer available");
+	}
+
+	void moveRefusalReportsReasonAndElevation() {
+		QFETCH(QString, code);
+		QFETCH(bool, elevated);
+		QFETCH(bool, expectedElevated);
+		QFETCH(QString, expectedReason);
 		DispatcherFixture fixture;
-		fixture.floating.result = FloatingChangeResult::Deferred;
 		QSignalSpy refused(fixture.tracker, &WindowTracker::windowActionRefused);
 
-		fixture.dispatcher->toggleFloatingForTest(fixture.window, QStringLiteral("tile"));
+		qs::hyprland::ipc::reportMoveRefusal(fixture.tracker, code, elevated);
 
 		QCOMPARE(refused.size(), 1);
-		QCOMPARE(refused.first().at(0).toString(), QStringLiteral("togglefloating"));
-		QCOMPARE(
-		    refused.first().at(1).toString(),
-		    QStringLiteral("Tiling is deferred until the window can be placed")
-		);
+		QCOMPARE(refused.first().at(0).toString(), QStringLiteral("move"));
+		QCOMPARE(refused.first().at(1).toString(), expectedReason);
+		QCOMPARE(refused.first().at(2).toBool(), expectedElevated);
 		QCOMPARE(
 		    fixture.tracker->lastActionError(),
-		    QStringLiteral("togglefloating:Tiling is deferred until the window can be placed")
+		    QStringLiteral("move:") + expectedReason
 		);
-		QCOMPARE(fixture.floating.calls, 1);
 	}
 };
 

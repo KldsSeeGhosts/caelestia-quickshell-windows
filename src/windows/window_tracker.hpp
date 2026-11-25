@@ -255,6 +255,7 @@ private:
 	[[nodiscard]] bool hasCurrentOwner() const;
 	bool ensureCurrentOwner(const QString& action);
 	void reportActionRefused(const QString& action, const QString& reason);
+	void reportActionRefused(const QString& action, const QString& reason, bool elevated);
 	void reportActionFailure(const QString& action, DWORD error);
 	void clearActionError();
 
