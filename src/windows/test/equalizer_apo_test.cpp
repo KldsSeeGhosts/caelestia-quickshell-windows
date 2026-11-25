@@ -35,10 +35,48 @@ bool writeUtf8(const QString& path, const QString& text) {
 	return file.write(text.toUtf8()) == text.toUtf8().size();
 }
 
-QString readUtf8(const QString& path) {
+QByteArray readBytes(const QString& path) {
 	QFile file(path);
-	if (!file.open(QIODevice::ReadOnly)) return QString();
-	return QString::fromUtf8(file.readAll());
+	if (!file.open(QIODevice::ReadOnly)) return {};
+	return file.readAll();
+}
+
+QString readUtf8(const QString& path) {
+	return QString::fromUtf8(readBytes(path));
+}
+
+struct PowerShellRun {
+	bool started = false;
+	bool finished = false;
+	int exitCode = -1;
+	QString error;
+	QString standardError;
+};
+
+PowerShellRun runPowerShellEncoded(const QString& script) {
+	const auto utf16 = reinterpret_cast<const char*>(script.utf16());
+	const auto encoded = QByteArray(utf16, static_cast<qsizetype>(script.size() * sizeof(char16_t)))
+	                         .toBase64();
+	QProcess process;
+	process.start(
+	    QStringLiteral("powershell.exe"),
+	    QStringList({
+	        QStringLiteral("-NoLogo"),
+	        QStringLiteral("-NoProfile"),
+	        QStringLiteral("-NonInteractive"),
+	        QStringLiteral("-EncodedCommand"),
+	        QString::fromLatin1(encoded),
+	    })
+	);
+	PowerShellRun result;
+	result.started = process.waitForStarted(5000);
+	result.error = process.errorString();
+	if (!result.started) return result;
+	result.finished = process.waitForFinished(10000);
+	result.error = process.errorString();
+	result.standardError = QString::fromLocal8Bit(process.readAllStandardError());
+	result.exitCode = process.exitCode();
+	return result;
 }
 
 class EqualizerApoTest: public QObject {
@@ -244,7 +282,8 @@ private slots:
 
 		const auto script = equalizer_apo_detail::elevatedHookScript(configPath, includePath);
 		QVERIFY(script.contains(QStringLiteral("$entry.StartsWith('#')")));
-		QVERIFY(script.contains(QStringLiteral("foreach ($rawLine in ($text -split")));
+		QVERIFY(script.contains(QStringLiteral("[IO.File]::ReadAllLines($configPath")));
+		QVERIFY(script.contains(QStringLiteral("foreach ($rawLine in $configLines)")));
 		QVERIFY(script.contains(QStringLiteral("[System.IO.Path]::GetFullPath")));
 		QVERIFY(script.contains(QStringLiteral("$targetFullPath -ieq $includeFullPath")));
 		QVERIFY(!script.contains(QStringLiteral("$includeName")));
@@ -270,8 +309,9 @@ private slots:
 			QTemporaryDir root;
 			QVERIFY(root.isValid());
 			QDir rootDir(root.path());
-			QVERIFY(rootDir.mkpath(QStringLiteral("config")));
-			const auto configDir = rootDir.filePath(QStringLiteral("config"));
+			const auto configSubdir = QStringLiteral("Caf\u00e9/config");
+			QVERIFY(rootDir.mkpath(configSubdir));
+			const auto configDir = rootDir.filePath(configSubdir);
 			const auto configPath = QDir::toNativeSeparators(
 			    QDir(configDir).filePath(QStringLiteral("config.txt"))
 			);
@@ -285,37 +325,30 @@ private slots:
 			    testCase.active
 			);
 
-			const auto scriptPath = root.filePath(QStringLiteral("hook.ps1"));
-			QVERIFY(writeUtf8(
-			    scriptPath,
-			    equalizer_apo_detail::elevatedHookScript(configPath, includePath)
-			));
-			QProcess process;
-			process.start(
-			    QStringLiteral("powershell.exe"),
-			    QStringList({
-			        QStringLiteral("-NoLogo"),
-			        QStringLiteral("-NoProfile"),
-			        QStringLiteral("-NonInteractive"),
-			        QStringLiteral("-ExecutionPolicy"),
-			        QStringLiteral("Bypass"),
-			        QStringLiteral("-File"),
-			        scriptPath,
-			    })
-			);
-			QVERIFY2(process.waitForStarted(5000), qPrintable(process.errorString()));
-			QVERIFY2(process.waitForFinished(10000), qPrintable(process.errorString()));
-			const auto standardError = QString::fromLocal8Bit(process.readAllStandardError());
-			QVERIFY2(process.exitCode() == 0, qPrintable(standardError));
+			const auto script = equalizer_apo_detail::elevatedHookScript(configPath, includePath);
+			const auto firstRun = runPowerShellEncoded(script);
+			QVERIFY2(firstRun.started, qPrintable(firstRun.error));
+			QVERIFY2(firstRun.finished, qPrintable(firstRun.error));
+			QVERIFY2(firstRun.exitCode == 0, qPrintable(firstRun.standardError));
 
-			const auto finalText = readUtf8(configPath);
+			const auto finalBytes = readBytes(configPath);
+			const auto finalText = QString::fromUtf8(finalBytes);
 			if (testCase.active) {
 				QCOMPARE(finalText, initial);
 			} else {
-				QVERIFY(finalText.startsWith(initial));
+				QVERIFY(finalBytes.startsWith(initial.toUtf8()));
 				QCOMPARE(finalText.count(includePath), 1);
 				QVERIFY(equalizer_apo_detail::hasActiveIncludeDirective(finalText, configPath, includePath));
 			}
+
+			// The first run appends UTF-8 without a BOM. A second Windows PowerShell
+			// 5.1 run must read that text as UTF-8, including the non-ASCII Cafe path,
+			// recognize the existing directive, and leave the file byte-for-byte intact.
+			const auto secondRun = runPowerShellEncoded(script);
+			QVERIFY2(secondRun.started, qPrintable(secondRun.error));
+			QVERIFY2(secondRun.finished, qPrintable(secondRun.error));
+			QVERIFY2(secondRun.exitCode == 0, qPrintable(secondRun.standardError));
+			QCOMPARE(readBytes(configPath), finalBytes);
 		}
 	}
 
