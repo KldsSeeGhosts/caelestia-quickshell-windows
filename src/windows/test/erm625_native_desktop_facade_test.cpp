@@ -695,6 +695,40 @@ private slots:
 		QCOMPARE(moveCompleted.first().at(3).toString(), QString());
 		this->old.manager.beforeMove = {};
 	}
+
+	void reentrantMoveDuringCommandResultReportsEachSequenceSeparately() {
+		const auto windowA = reinterpret_cast<HWND>(ULONG_PTR(0xb5));
+		const auto windowB = reinterpret_cast<HWND>(ULONG_PTR(0xb6));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		this->old.manager.moveResult = S_OK;
+		this->old.manager.beforeMove = {};
+
+		quint64 sequenceB = 0;
+		bool startedB = false;
+		auto conn = QObject::connect(
+		    this->desktops,
+		    &VirtualDesktops::commandResult,
+		    this->desktops,
+		    [this, windowB, &sequenceB, &startedB](const QVariantMap&) {
+			    if (startedB) return;
+			    startedB = true;
+			    this->old.manager.beforeMove = [] { QThread::msleep(150); };
+			    QVERIFY(this->desktops->moveWindow(windowB, 1, &sequenceB));
+		    }
+		);
+
+		quint64 sequenceA = 999;
+		QVERIFY(this->desktops->moveWindow(windowA, 1, &sequenceA));
+		QObject::disconnect(conn);
+		QVERIFY(startedB);
+		QCOMPARE(sequenceA, quint64(0));
+		QVERIFY(sequenceB != 0);
+		QCOMPARE(nativeDesktopPendingMoveSequence(windowB), sequenceB);
+		QCOMPARE(nativeDesktopPendingMoveSequence(windowA), quint64(0));
+
+		QVERIFY(waitUntil([] { return !nativeDesktopCommandPending(); }, 1000));
+		this->old.manager.beforeMove = {};
+	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)
 #include "erm625_native_desktop_facade_test.moc"

@@ -91,7 +91,7 @@ public:
 	bool switchTo(qsizetype index);
 	void ensureCount(qsizetype count, std::function<void(bool)> done);
 	bool removeDesktop(qsizetype index, qsizetype fallback);
-	bool moveWindow(HWND hwnd, qsizetype index);
+	bool moveWindow(HWND hwnd, qsizetype index, quint64* pendingSequence = nullptr);
 	bool pinWindow(HWND hwnd, bool pinned);
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;
 	[[nodiscard]] DesktopAvailability availability() const;

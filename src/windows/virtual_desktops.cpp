@@ -864,7 +864,8 @@ bool VirtualDesktops::removeDesktop(qsizetype index, qsizetype fallback) {
 	return true;
 }
 
-bool VirtualDesktops::moveWindow(HWND hwnd, qsizetype index) {
+bool VirtualDesktops::moveWindow(HWND hwnd, qsizetype index, quint64* pendingSequence) {
+	if (pendingSequence != nullptr) *pendingSequence = 0;
 	this->retryAccessor();
 	if (hwnd == nullptr || index < 0 || index >= this->count()) {
 		this->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-target"));
@@ -879,6 +880,9 @@ bool VirtualDesktops::moveWindow(HWND hwnd, qsizetype index) {
 	if (isOwnWindow(hwnd)) {
 		const auto ok = moveNativeDesktopOwnWindow(hwnd, this->mDesktops[index].id);
 		if (ok) {
+			if (*ok && pendingSequence != nullptr) {
+				*pendingSequence = nativeDesktopPendingMoveSequence(hwnd);
+			}
 			const auto error = nativeDesktopLastError();
 			auto reason = error == E_ACCESSDENIED ? QStringLiteral("permission-denied")
 			                                     : QStringLiteral("command-rejected");
@@ -889,7 +893,11 @@ bool VirtualDesktops::moveWindow(HWND hwnd, qsizetype index) {
 	}
 
 	if (this->accessorLoaded()) {
-		const auto ok = this->call(-1, this->accessor.moveWindowToDesktopNumber, hwnd, static_cast<int>(index)) != -1;
+		const auto ok =
+		    this->call(-1, this->accessor.moveWindowToDesktopNumber, hwnd, static_cast<int>(index)) != -1;
+		if (ok && this->nativeAccessor && pendingSequence != nullptr) {
+			*pendingSequence = nativeDesktopPendingMoveSequence(hwnd);
+		}
 		return result(ok, this->commandFailureReason());
 	}
 

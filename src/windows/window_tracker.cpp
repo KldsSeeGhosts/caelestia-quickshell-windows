@@ -619,7 +619,8 @@ bool TrackedWindow::moveToDesktop(qsizetype index) {
 		);
 		return false;
 	}
-	if (!this->tracker->desktops()->moveWindow(this->mHwnd, index)) {
+	quint64 pendingSequence = 0;
+	if (!this->tracker->desktops()->moveWindow(this->mHwnd, index, &pendingSequence)) {
 		const auto code =
 		    this->tracker->desktops()->lastCommand().value(QStringLiteral("reason")).toString();
 		const auto elevated = isMoreElevated(this->mHwnd);
@@ -632,8 +633,8 @@ bool TrackedWindow::moveToDesktop(qsizetype index) {
 		);
 		return false;
 	}
-	if (const auto sequence = nativeDesktopPendingMoveSequence(); sequence != 0) {
-		this->tracker->notePendingUserMove(sequence, this);
+	if (pendingSequence != 0) {
+		this->tracker->notePendingUserMove(pendingSequence, this);
 	} else {
 		this->clearActionError();
 	}

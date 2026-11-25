@@ -608,11 +608,11 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 		     errorGeneration,
 		     index,
 		     follow](bool ok) {
+			    if (tracker && tracker->actionErrorGeneration() != errorGeneration) return;
 			    if (ok && window) {
 				    moveWindowTo(window, index, follow);
 				    return;
 			    }
-			    if (tracker && tracker->actionErrorGeneration() != errorGeneration) return;
 			    if (!ok) {
 				    const auto code = desktops
 				        ? desktops->lastCommand().value(QStringLiteral("reason")).toString()

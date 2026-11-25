@@ -1104,9 +1104,10 @@ bool nativeDesktopCommandPending() {
 	const auto& c = channel();
 	return c.waiting || (c.pending && c.pending->kind == Channel::Kind::Command);
 }
-quint64 nativeDesktopPendingMoveSequence() {
+quint64 nativeDesktopPendingMoveSequence(HWND hwnd) {
 	const auto& c = channel();
 	if (!c.pending || c.pending->moveTarget == nullptr || !c.pending->request) return 0;
+	if (hwnd != nullptr && c.pending->moveTarget != hwnd) return 0;
 	return c.pending->request->sequence;
 }
 bool nativeDesktopRequestPending() {
