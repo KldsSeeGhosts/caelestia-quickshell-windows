@@ -974,9 +974,6 @@ void SuperDragManager::setEnabled(bool enabled) {
 
 	if (enabled) {
 		tracker->acquireHook();
-		if (!tracker->hookActive()) {
-			qCWarning(logSuperDrag) << "Mouse hook unavailable, Super drags won't work.";
-		}
 
 		// Esc cancels an active drag from the keyboard hook's filter, so the
 		// drag holds the hook while it is enabled. The reference is independent

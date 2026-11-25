@@ -7,9 +7,13 @@
 #include <utility>
 #include <vector>
 
+#include <qcoreapplication.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
+#include <qpointer.h>
+#include <qtimer.h>
 #include <windows.h>
+#include <wtsapi32.h>
 
 #include "input_mask.hpp"
 #include "util.hpp"
@@ -26,12 +30,20 @@ std::atomic<UINT> gMessageBase = 0;                          // NOLINT
 std::atomic<DWORD> gThreadId = 0;                            // NOLINT
 std::atomic<bool> gStopRequested = false;                    // NOLINT
 std::atomic<bool> gFailed = false;                           // NOLINT
+// Compatibility mirror for tests and for the brief period before the keyboard
+// hook thread starts. The running hook reads the sequenced publication below.
 std::atomic<bool> gForegroundBlocked = false; // NOLINT
 std::atomic<bool> gSuppressLoneSuperTap = false; // NOLINT
 std::atomic<bool (*)()> gEscapeFilter = nullptr; // NOLINT
 std::atomic<void (*)()> gSuperPressed = nullptr; // NOLINT
 
+using hookwatch::detail::keyboardHookState;
+using hookwatch::detail::mouseHookState;
+
 std::thread* gThread = nullptr; // NOLINT
+std::atomic<uint64_t> gHookGeneration = 1; // NOLINT
+std::atomic<bool> gHookGenerationLive = false;     // NOLINT
+thread_local uint64_t tHookGeneration = 0;         // NOLINT
 
 struct HeldKey {
 	uint32_t id = 0;
@@ -97,22 +109,567 @@ struct InputObserverRequest {
 	std::atomic<State> state = State::Pending;
 };
 std::atomic<std::shared_ptr<InputObserverRequest>> gObserverRequest; // NOLINT
-HWINEVENTHOOK gForegroundHook = nullptr; // NOLINT
-std::atomic<HWND> gCheckedForeground = nullptr; // NOLINT
 
-bool foregroundIsBlocked() {
-	// Check that a foreground event was processed before consuming a new
-	// sequence. The UI thread can lag behind input, so unknown means blocked.
-	if (gThreadId.load() == 0) return gForegroundBlocked.load();
-	auto* foreground = GetForegroundWindow();
-	if (foreground == nullptr) return false;
-	if (gCheckedForeground.load() == foreground) {
-		auto blocked = gForegroundBlocked.load();
-		if (gCheckedForeground.load() == foreground) return blocked;
+struct ForegroundIntegritySnapshot {
+	HWND hwnd = nullptr;
+	bool blocked = false;
+	bool valid = false;
+};
+
+// A sequence lock around the two foreground fields. The worker publishes both
+// as one consistent state with three always-lock-free atomics, while the
+// low-level hook never takes a mutex or waits on the worker's message loop.
+class ForegroundIntegrityPublication {
+public:
+	void publish(HWND hwnd, bool blocked) { this->publish(hwnd, blocked, [] {}); }
+
+	void publish(HWND hwnd, bool blocked, auto midway) {
+		this->sequence.fetch_add(1); // odd: a write is in progress
+		this->blockedValue.store(blocked);
+		midway();
+		this->hwndValue.store(hwnd);
+		this->sequence.fetch_add(1); // even: the pair is consistent again
 	}
+
+	[[nodiscard]] ForegroundIntegritySnapshot load() const {
+		for (auto attempt = 0; attempt < 3; ++attempt) {
+			auto before = this->sequence.load();
+			if ((before & 1) != 0) continue;
+			auto snapshot = ForegroundIntegritySnapshot {
+				.hwnd = this->hwndValue.load(),
+				.blocked = this->blockedValue.load(),
+				.valid = true,
+			};
+			if (before == this->sequence.load()) return snapshot;
+		}
+		return {};
+	}
+
+private:
+	std::atomic<uint32_t> sequence = 0;
+	std::atomic<HWND> hwndValue = nullptr;
+	std::atomic<bool> blockedValue = false;
+};
+
+static_assert(std::atomic<uint32_t>::is_always_lock_free);
+static_assert(std::atomic<HWND>::is_always_lock_free);
+static_assert(std::atomic<bool>::is_always_lock_free);
+
+ForegroundIntegrityPublication gForegroundIntegrity; // NOLINT
+
+void publishForegroundIntegrity(HWND hwnd, bool blocked) {
+	gForegroundIntegrity.publish(hwnd, blocked);
+	// Keep the fallback state coherent for callers before the hook thread is
+	// up. These mirrors are never used together by the hook callback.
+	gForegroundBlocked.store(blocked);
+}
+
+std::thread* gForegroundThread = nullptr;                // NOLINT
+std::atomic<DWORD> gForegroundThreadId = 0;              // NOLINT
+std::atomic<HANDLE> gForegroundReadyEvent = nullptr;     // NOLINT
+std::atomic<HANDLE> gForegroundExitEvent = nullptr;      // NOLINT
+std::atomic<bool> gForegroundStopRequested = false;     // NOLINT
+std::atomic<bool> gForegroundRunning = false;           // NOLINT
+constexpr DWORD FOREGROUND_WORKER_START_TIMEOUT_MS = 1000;
+constexpr DWORD FOREGROUND_WORKER_STOP_TIMEOUT_MS = 2000;
+bool gInputHooksQuitting = false;                       // NOLINT
+
+bool startForegroundIntegrityWorker();
+void stopForegroundIntegrityWorker(DWORD timeout = FOREGROUND_WORKER_STOP_TIMEOUT_MS);
+void stopHookThread(bool notifyReset = false);
+void restartKeyboardHookThread();
+bool inputDesktopIsForeign();
+bool isHiddenFromUs(HWND hwnd);
+bool foregroundAllowsReplay();
+
+constexpr int HOOK_WATCHDOG_INTERVAL_MS = 2000;
+constexpr uint64_t HOOK_STALE_INPUT_MS = 1500;
+constexpr uint64_t HOOK_MAX_RETRY_MS = 16000;
+constexpr uint64_t HOOK_UNMATCHED_GRACE_MS = HOOK_WATCHDOG_INTERVAL_MS;
+constexpr int SESSION_SETTLE_MS = 500;
+constexpr auto HOOK_MONITOR_CLASS = L"QuickshellLowLevelHookMonitor";
+
+[[nodiscard]] constexpr bool hookMissedInput(uint64_t rawTick, uint64_t callbackTick, uint64_t installTick) {
+	return rawTick > installTick && rawTick > callbackTick && rawTick - callbackTick > HOOK_STALE_INPUT_MS;
+}
+
+// GetMessageTime is a 32-bit tick. Choose the 64-bit tick closest to now so
+// queued input keeps its original timestamp across a zero crossing.
+[[nodiscard]] constexpr uint64_t tick64FromMessageTime(DWORD messageTime, uint64_t now) {
+	const auto delta = static_cast<int32_t>(messageTime - static_cast<DWORD>(now));
+	return static_cast<uint64_t>(static_cast<int64_t>(now) + delta);
+}
+
+[[nodiscard]] constexpr bool sessionConnectedAfterEvent(bool connected, WPARAM event) {
+	if (event == WTS_CONSOLE_DISCONNECT || event == WTS_REMOTE_DISCONNECT) return false;
+	if (event == WTS_CONSOLE_CONNECT || event == WTS_REMOTE_CONNECT) return true;
+	return connected;
+}
+
+[[nodiscard]] constexpr bool sessionLockedAfterEvent(bool locked, WPARAM event) {
+	if (event == WTS_SESSION_LOCK) return true;
+	if (event == WTS_SESSION_UNLOCK) return false;
+	return locked;
+}
+
+struct SessionSnapshot {
+	bool connected = false;
+	bool locked = true;
+	bool lockKnown = false;
+};
+
+[[nodiscard]] constexpr SessionSnapshot sessionSnapshotFromInfoEx(const WTSINFOEX_LEVEL1_W& info) {
+	const auto lockKnown = info.SessionFlags == WTS_SESSIONSTATE_LOCK
+	                    || info.SessionFlags == WTS_SESSIONSTATE_UNLOCK;
+	return {
+	    .connected = info.SessionState == WTSActive,
+	    // Treat unknown as locked so recovery stays fail-closed until the
+	    // session is explicitly usable.
+	    .locked = info.SessionFlags != WTS_SESSIONSTATE_UNLOCK,
+	    .lockKnown = lockKnown,
+	};
+}
+
+[[nodiscard]] constexpr bool sessionRecoveryTriggerEvent(WPARAM event) {
+	return event == WTS_SESSION_UNLOCK || event == WTS_CONSOLE_CONNECT || event == WTS_REMOTE_CONNECT;
+}
+
+struct SessionNotificationState {
+	bool registered = false;
+	bool connected = false;
+	bool locked = true;
+	bool connectKnown = false;
+	bool lockKnown = false;
+	bool snapshotObserved = false;
+	bool recoveryTriggerPending = false;
+
+	[[nodiscard]] bool safe() const {
+		return this->complete() && this->connected && !this->locked && !this->recoveryTriggerPending;
+	}
+
+	[[nodiscard]] bool complete() const { return this->connectKnown && this->lockKnown; }
+
+	void markUnknown() {
+		this->connectKnown = false;
+		this->lockKnown = false;
+	}
+
+	bool applyEvent(WPARAM event) {
+		const auto trigger = sessionRecoveryTriggerEvent(event);
+		// Notifications can arrive between failed queries. They are enough
+		// to request recovery but cannot replace a complete snapshot.
+		if (!this->complete() || this->recoveryTriggerPending) {
+			this->recoveryTriggerPending |= trigger;
+			return false;
+		}
+		this->connected = sessionConnectedAfterEvent(this->connected, event);
+		this->locked = sessionLockedAfterEvent(this->locked, event);
+		return trigger && this->safe();
+	}
+
+	bool applySnapshot(const SessionSnapshot& snapshot) {
+		const auto wasObserved = this->snapshotObserved;
+		const auto wasSafe = this->connected && !this->locked;
+		this->connected = snapshot.connected;
+		this->locked = snapshot.locked;
+		this->connectKnown = true;
+		this->lockKnown = snapshot.lockKnown;
+		this->snapshotObserved = true;
+		if (!this->complete() || !this->connected || this->locked) return false;
+		const auto triggered = std::exchange(this->recoveryTriggerPending, false);
+		return triggered || (wasObserved && !wasSafe);
+	}
+
+	// Registration is retried until Remote Desktop Services can accept it. While
+	// notifications or parts of the session state are unavailable, every poll
+	// needs a fresh snapshot because changes cannot arrive as messages.
+	bool poll(auto&& tryRegister, auto&& querySnapshot) {
+		auto registeredNow = false;
+		if (!this->registered) {
+			this->registered = tryRegister();
+			registeredNow = this->registered;
+		}
+		// A successful retry still needs an immediate snapshot. Unknown lock
+		// state and latched recovery triggers also keep polling alive.
+		if (this->registered && this->complete() && !this->recoveryTriggerPending && !registeredNow)
+			return false;
+
+		SessionSnapshot snapshot;
+		if (!querySnapshot(snapshot)) {
+			this->markUnknown();
+			return false;
+		}
+		return this->applySnapshot(snapshot);
+	}
+};
+
+struct HookRecovery {
+	uint64_t rawTick = 0;
+	uint64_t unmatchedSince = 0;
+	uint64_t unmatchedCallbackTick = 0;
+	uint64_t nextAttempt = 0;
+	uint64_t retryDelay = HOOK_WATCHDOG_INTERVAL_MS;
+	bool sessionPending = false;
+
+	bool poll(const hookwatch::detail::HookState& hook, uint64_t now, bool safe, auto attempt) {
+		if (!hook.needed) {
+			*this = {};
+			return false;
+		}
+		if (!safe) {
+			// Input while a protected window has focus is not evidence of eviction.
+			this->rawTick = 0;
+			this->unmatchedSince = 0;
+			this->unmatchedCallbackTick = 0;
+			return false;
+		}
+		if (hook.active) {
+			this->nextAttempt = 0;
+			this->retryDelay = HOOK_WATCHDOG_INTERVAL_MS;
+			if (!this->sessionPending) {
+				const auto callbackTick = hook.callbackTick.load();
+				const auto missed = hookMissedInput(this->rawTick, callbackTick, hook.installTick.load());
+				if (!missed) {
+					this->unmatchedSince = 0;
+					this->unmatchedCallbackTick = 0;
+					return false;
+				}
+				// A stalled GUI can deliver old raw input long after the hook saw
+				// it. Require the unmatched evidence to survive a watchdog grace
+				// window before reinstalling either hook. If a callback supersedes
+				// the original evidence, unmatched input after it starts a fresh
+				// grace window instead of inheriting the expired one.
+				if (this->unmatchedSince == 0 || this->unmatchedCallbackTick != callbackTick) {
+					this->unmatchedSince = now;
+					this->unmatchedCallbackTick = callbackTick;
+					return false;
+				}
+				if (now - this->unmatchedSince < HOOK_UNMATCHED_GRACE_MS) return false;
+			}
+		}
+		if (now < this->nextAttempt) return false;
+		this->sessionPending = false;
+		this->rawTick = 0;
+		this->unmatchedSince = 0;
+		this->unmatchedCallbackTick = 0;
+		this->nextAttempt = attempt() + this->retryDelay;
+		if (this->retryDelay < HOOK_MAX_RETRY_MS) this->retryDelay *= 2;
+		return true;
+	}
+};
+
+struct SessionRecovery {
+	uint64_t pendingAt = 0;
+	uint64_t completedAt = 0;
+	bool resumed = false;
+
+	bool request(uint64_t now) {
+		if (this->pendingAt != 0 || (this->completedAt != 0 && now - this->completedAt < SESSION_SETTLE_MS))
+			return false;
+		this->pendingAt = now + SESSION_SETTLE_MS;
+		return true;
+	}
+
+	bool resume(uint64_t now, bool automatic) {
+		// The user-present broadcast can follow the automatic resume much later.
+		auto alreadyResumed = std::exchange(this->resumed, true);
+		return (automatic || !alreadyResumed) && this->request(now);
+	}
+
+	bool take(uint64_t now, bool safe) {
+		if (!safe || this->pendingAt == 0 || now < this->pendingAt) return false;
+		this->pendingAt = 0;
+		this->completedAt = now;
+		return true;
+	}
+};
+
+class LowLevelHookMonitor: public QObject {
+public:
+	explicit LowLevelHookMonitor(QObject* parent): QObject(parent) {
+		this->timer.setInterval(HOOK_WATCHDOG_INTERVAL_MS);
+		this->sessionTimer.setSingleShot(true);
+		this->sessionTimer.setTimerType(Qt::PreciseTimer);
+		this->sessionTimer.setInterval(SESSION_SETTLE_MS);
+		QObject::connect(&this->timer, &QTimer::timeout, this, &LowLevelHookMonitor::poll);
+		QObject::connect(&this->sessionTimer, &QTimer::timeout, this, &LowLevelHookMonitor::poll);
+		this->createListener();
+	}
+
+	~LowLevelHookMonitor() override {
+		if (this->sessionState.registered) this->unregisterSession(this->window);
+		if (this->wtsModule != nullptr) FreeLibrary(this->wtsModule);
+		if (this->rawRegistered) this->registerRawInput(RIDEV_REMOVE, nullptr);
+		if (this->window != nullptr) DestroyWindow(this->window);
+		if (this->classRegistered) UnregisterClassW(HOOK_MONITOR_CLASS, GetModuleHandleW(nullptr));
+	}
+
+	Q_DISABLE_COPY_MOVE(LowLevelHookMonitor);
+
+	void updateDemand() {
+		if (!keyboardHookState.needed) this->keyboardRecovery = {};
+		if (!mouseHookState.needed) this->mouseRecovery = {};
+		if (!this->timer.isActive()) this->timer.start();
+	}
+
+private:
+	bool safeToRearm() const {
+		if (!this->sessionState.safe() || inputDesktopIsForeign()) return false;
+		auto* foreground = GetForegroundWindow();
+		return foreground != nullptr && !isHiddenFromUs(foreground);
+	}
+
+	void poll() {
+		startForegroundIntegrityWorker();
+		const auto now = GetTickCount64();
+		if (this->pollSessionState() && this->sessionRecovery.request(now)) this->sessionTimer.start();
+		auto safe = safeToRearm();
+		if (this->sessionRecovery.take(now, safe)) {
+			this->keyboardRecovery.sessionPending = keyboardHookState.needed;
+			this->mouseRecovery.sessionPending = mouseHookState.needed;
+		}
+		auto triedKeyboard = this->keyboardRecovery.poll(keyboardHookState, now, safe, [] {
+			restartKeyboardHookThread();
+			return GetTickCount64();
+		});
+		// A keyboard install can wait on a thread. Recheck before touching
+		// the mouse hook and preserve its session request if focus changed.
+		if (triedKeyboard && mouseHookState.needed) safe = safeToRearm();
+		this->mouseRecovery.poll(mouseHookState, GetTickCount64(), safe, [] {
+			InputMaskTracker::recoverMouseHook();
+			return GetTickCount64();
+		});
+	}
+
+	static bool registerRawInput(DWORD flags, HWND target) {
+		// Generic desktop mouse and keyboard. The flags leave legacy input on.
+		const RAWINPUTDEVICE devices[] {{0x01, 0x02, flags, target}, {0x01, 0x06, flags, target}};
+		return RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE)) != 0;
+	}
+
+	void noteRawInput(HRAWINPUT input, uint64_t messageTick) {
+		RAWINPUTHEADER header {};
+		UINT size = sizeof(header);
+		if (GetRawInputData(input, RID_HEADER, &header, &size, sizeof(header)) != sizeof(header))
+			return;
+		// Never read the payload. Without raw input, use session recovery and
+		// failed-install retries alone. LASTINPUTINFO cannot identify a device.
+		if (header.dwType == RIM_TYPEKEYBOARD && keyboardHookState.needed && foregroundAllowsReplay())
+			this->keyboardRecovery.rawTick = messageTick;
+		else if (header.dwType == RIM_TYPEMOUSE && mouseHookState.needed && foregroundAllowsReplay())
+			this->mouseRecovery.rawTick = messageTick;
+	}
+
+	bool tryRegisterSessionNotifications() {
+		if (this->registerSession == nullptr || this->unregisterSession == nullptr || this->window == nullptr)
+			return false;
+		return this->registerSession(this->window, NOTIFY_FOR_THIS_SESSION) != 0;
+	}
+
+	bool querySessionSnapshot(SessionSnapshot& snapshot) {
+		if (this->querySessionInformation == nullptr || this->freeWtsMemory == nullptr) return false;
+		WTSINFOEXW* info = nullptr;
+		DWORD bytes = 0;
+		if (!this->querySessionInformation(
+		        WTS_CURRENT_SERVER_HANDLE,
+		        WTS_CURRENT_SESSION,
+		        WTSSessionInfoEx,
+		        reinterpret_cast<LPWSTR*>(&info),
+		        &bytes
+		    )
+		    || info == nullptr)
+			return false;
+
+		const auto valid = bytes >= sizeof(WTSINFOEXW) && info->Level == 1;
+		if (valid) snapshot = sessionSnapshotFromInfoEx(info->Data.WTSInfoExLevel1);
+		this->freeWtsMemory(info);
+		return valid;
+	}
+
+	bool applyQueriedSessionState() {
+		SessionSnapshot snapshot;
+		if (!this->querySessionSnapshot(snapshot)) {
+			this->sessionState.markUnknown();
+			return false;
+		}
+		return this->sessionState.applySnapshot(snapshot);
+	}
+
+	bool pollSessionState() {
+		return this->sessionState.poll(
+		    [this] { return this->tryRegisterSessionNotifications(); },
+		    [this](SessionSnapshot& snapshot) { return this->querySessionSnapshot(snapshot); }
+		);
+	}
+
+	void createListener() {
+		auto* instance = GetModuleHandleW(nullptr);
+		WNDCLASSW windowClass {};
+		windowClass.lpfnWndProc = &LowLevelHookMonitor::windowProc;
+		windowClass.hInstance = instance;
+		windowClass.lpszClassName = HOOK_MONITOR_CLASS;
+		this->classRegistered = RegisterClassW(&windowClass) != 0;
+		if (!this->classRegistered) {
+			qCWarning(logKeyboardHook) << "Could not register the low-level hook monitor window class:"
+			                           << GetLastError();
+			return;
+		}
+
+		// Power broadcasts do not reach message-only windows. A hidden top-level
+		// window receives them without becoming visible or taking input.
+		this->window = CreateWindowExW(
+		    0,
+		    HOOK_MONITOR_CLASS,
+		    L"",
+		    WS_POPUP,
+		    0,
+		    0,
+		    0,
+		    0,
+		    nullptr,
+		    nullptr,
+		    instance,
+		    this
+		);
+		if (this->window == nullptr) {
+			qCWarning(logKeyboardHook) << "Could not create the low-level hook monitor window:" << GetLastError();
+			return;
+		}
+
+		this->rawRegistered = this->registerRawInput(RIDEV_INPUTSINK, this->window);
+		if (!this->rawRegistered)
+			qCWarning(logKeyboardHook) << "Could not register device activity for hook recovery:" << GetLastError();
+
+		this->wtsModule = LoadLibraryExW(L"wtsapi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+		if (this->wtsModule == nullptr) {
+			qCWarning(logKeyboardHook) << "Could not load session notifications for hook recovery:" << GetLastError();
+			return;
+		}
+		this->registerSession = reinterpret_cast<BOOL(WINAPI*)(HWND, DWORD)>(
+		    GetProcAddress(this->wtsModule, "WTSRegisterSessionNotification")
+		);
+		this->unregisterSession = reinterpret_cast<BOOL(WINAPI*)(HWND)>(
+		    GetProcAddress(this->wtsModule, "WTSUnRegisterSessionNotification")
+		);
+		this->querySessionInformation = reinterpret_cast<BOOL(WINAPI*)(HANDLE, DWORD, WTS_INFO_CLASS, LPWSTR*, DWORD*)>(
+		    GetProcAddress(this->wtsModule, "WTSQuerySessionInformationW")
+		);
+		this->freeWtsMemory = reinterpret_cast<void(WINAPI*)(PVOID)>(
+		    GetProcAddress(this->wtsModule, "WTSFreeMemory")
+		);
+		// Register before querying so a reconnect cannot slip between the two.
+		this->sessionState.registered = this->tryRegisterSessionNotifications();
+		if (!this->sessionState.registered) {
+			qCWarning(logKeyboardHook) << "Could not observe session changes for hook recovery:" << GetLastError();
+		}
+		if (this->applyQueriedSessionState() && this->sessionRecovery.request(GetTickCount64()))
+			this->sessionTimer.start();
+	}
+
+	static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+		if (message == WM_NCCREATE) {
+			auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+			SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+		}
+		auto* self = reinterpret_cast<LowLevelHookMonitor*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+		if (self != nullptr) {
+			if (message == WM_INPUT) {
+				self->noteRawInput(
+				    reinterpret_cast<HRAWINPUT>(lParam),
+				    tick64FromMessageTime(static_cast<DWORD>(GetMessageTime()), GetTickCount64())
+				);
+			} else if (message == WM_POWERBROADCAST) {
+				if (wParam == PBT_APMSUSPEND) self->sessionRecovery.resumed = false;
+				else if ((wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND)
+				         && self->sessionRecovery.resume(GetTickCount64(), wParam == PBT_APMRESUMEAUTOMATIC))
+					self->sessionTimer.start();
+				return TRUE;
+			} else if (message == WM_WTSSESSION_CHANGE) {
+				if (self->sessionState.applyEvent(wParam) && self->sessionRecovery.request(GetTickCount64()))
+					self->sessionTimer.start();
+				return 0;
+			}
+		}
+		return DefWindowProcW(hwnd, message, wParam, lParam);
+	}
+
+	QTimer timer;
+	QTimer sessionTimer;
+	HookRecovery keyboardRecovery;
+	HookRecovery mouseRecovery;
+	SessionRecovery sessionRecovery;
+	HWND window = nullptr;
+	HMODULE wtsModule = nullptr;
+	BOOL (WINAPI* registerSession)(HWND, DWORD) = nullptr;
+	BOOL (WINAPI* unregisterSession)(HWND) = nullptr;
+	BOOL (WINAPI* querySessionInformation)(HANDLE, DWORD, WTS_INFO_CLASS, LPWSTR*, DWORD*) = nullptr;
+	void (WINAPI* freeWtsMemory)(PVOID) = nullptr;
+	SessionNotificationState sessionState;
+	bool classRegistered = false;
+	bool rawRegistered = false;
+};
+
+QPointer<LowLevelHookMonitor> gHookMonitor; // NOLINT
+
+void hookwatchDemandChanged() {
+#ifndef QS_TEST
+	if (gInputHooksQuitting) return;
+	auto* app = QCoreApplication::instance();
+	if (app == nullptr) return;
+	static const auto quitConnection = QObject::connect(app, &QCoreApplication::aboutToQuit, app, [] {
+		gInputHooksQuitting = true;
+		delete gHookMonitor.data();
+		stopHookThread();
+		stopForegroundIntegrityWorker(INFINITE);
+	});
+	static const bool offscreen = qEnvironmentVariable("QT_QPA_PLATFORM").startsWith("offscreen");
+	if (keyboardHookState.needed || mouseHookState.needed) {
+		startForegroundIntegrityWorker();
+		if (!offscreen && gHookMonitor == nullptr) gHookMonitor = new LowLevelHookMonitor(app);
+		if (gHookMonitor != nullptr) gHookMonitor->updateDemand();
+	} else {
+		delete gHookMonitor.data();
+		stopForegroundIntegrityWorker();
+	}
+#endif
+}
+
+// input_mask.cpp can be linked without this implementation. The inline
+// hookwatch state stays inert there, while the full keyboard implementation
+// registers the worker/watchdog activation callback when it is present.
+struct HookwatchCallbackRegistration {
+	HookwatchCallbackRegistration() { hookwatch::detail::stateChanged = &hookwatchDemandChanged; }
+};
+
+const HookwatchCallbackRegistration gHookwatchCallbackRegistration; // NOLINT
+
+bool foregroundIntegrityBlocked(HWND foreground) {
+	if (foreground == nullptr) return false;
+	auto state = gForegroundIntegrity.load();
+	if (state.valid && state.hwnd == foreground) return state.blocked;
+
+	// A foreground change can reach input before the worker's WinEvent callback.
+	// Unknown foreign windows fail closed; our own windows cannot be elevated
+	// relative to this process and fail open.
 	DWORD pid = 0;
 	GetWindowThreadProcessId(foreground, &pid);
 	return pid != GetCurrentProcessId();
+}
+
+bool foregroundIsBlocked() {
+	// Tests and callers before the hook thread starts historically use the
+	// mirror. Once the hook runs, read one consistent worker publication.
+	if (gThreadId.load() == 0) return gForegroundBlocked.load();
+	return foregroundIntegrityBlocked(GetForegroundWindow());
+}
+
+bool foregroundAllowsReplay() {
+	// A null foreground is unknown, including during desktop transitions.
+#ifdef QS_TEST
+	if (gThreadId.load() == 0) return !gForegroundBlocked.load();
+#endif
+	auto* foreground = GetForegroundWindow();
+	return foreground != nullptr && !foregroundIntegrityBlocked(foreground);
 }
 
 // Signalled once the hook is installed (or failed), and once the thread has
@@ -241,14 +798,35 @@ bool injectMaskedRelease(const KBDLLHOOKSTRUCT* original) {
 	};
 	// A swallowed release whose replay did not make it in would leave the
 	// modifier logically down, so the caller has to know.
-	return SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT))
-	    == inputs.size();
+	return foregroundAllowsReplay()
+	    && SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT)) == inputs.size();
+}
+
+uint64_t postGeneration() {
+	return tHookGeneration != 0 ? tHookGeneration : gHookGeneration.load();
 }
 
 void post(HookEvent event, uint32_t id, uint32_t serial) {
+	if (gStopRequested.load() && event != HookReset && event != HookStatusChanged) return;
 	auto* target = gTarget.load();
 	if (target == nullptr) return;
-	PostMessageW(target, gMessageBase.load() + event, id, static_cast<LPARAM>(serial));
+	const auto generation = postGeneration();
+	PostMessageW(
+	    target,
+	    gMessageBase.load() + event,
+	    hookEventWParam(id, generation),
+	    hookEventLParam(serial, generation)
+	);
+}
+
+void postObserverMessage(HWND observer, UINT message, uint8_t vk, bool up) {
+	const auto generation = postGeneration();
+	PostMessageW(
+	    observer,
+	    message,
+	    inputObserverWParam(vk, up, generation),
+	    hookEventLParam(0, generation)
+	);
 }
 
 void postAll(
@@ -273,7 +851,7 @@ void cancelWin(const HookSnapshot* snapshot) {
 	for (size_t i = 0; i < gWin.size(); i++) {
 		if (gWin[i].forwarded) {
 			auto input = chordInput(i == 0 ? VK_LWIN : VK_RWIN, true);
-			SendInput(1, &input, sizeof(INPUT));
+			if (foregroundAllowsReplay()) SendInput(1, &input, sizeof(INPUT));
 		}
 		gWin[i] = {};
 	}
@@ -359,7 +937,7 @@ void resetPhysicalState() {
 	for (size_t vk = 0; vk < std::size(gReplayed); vk++) {
 		if (!gReplayed[vk]) continue;
 		auto input = chordInput(static_cast<uint8_t>(vk), true);
-		SendInput(1, &input, sizeof(INPUT));
+		if (foregroundAllowsReplay()) SendInput(1, &input, sizeof(INPUT));
 		gReplayed[vk] = false;
 	}
 
@@ -383,6 +961,16 @@ void armObserver(InputObserverRequest& request) {
 	if (request.done != nullptr) SetEvent(request.done);
 }
 
+void notifyInputReset() {
+	if (auto snapshot = gSnapshot.load(std::memory_order_acquire)) {
+		post(HookReset, 0, snapshot->serial);
+	}
+
+	if (auto* observer = gInputObserver.load(std::memory_order_acquire); observer != nullptr) {
+		postObserverMessage(observer, gInputObserverResetMessage.load(std::memory_order_relaxed), 0, false);
+	}
+}
+
 void CALLBACK inputDesktopChanged(
     HWINEVENTHOOK /*hook*/,
     DWORD event,
@@ -392,21 +980,10 @@ void CALLBACK inputDesktopChanged(
     DWORD /*thread*/,
     DWORD /*time*/
 ) {
-	if (event != EVENT_SYSTEM_DESKTOPSWITCH) return;
+	if (event != EVENT_SYSTEM_DESKTOPSWITCH || gStopRequested.load()) return;
 
 	resetPhysicalState();
-	if (auto snapshot = gSnapshot.load(std::memory_order_acquire)) {
-		post(HookReset, 0, snapshot->serial);
-	}
-
-	if (auto* observer = gInputObserver.load(std::memory_order_acquire); observer != nullptr) {
-		PostMessageW(
-		    observer,
-		    gInputObserverResetMessage.load(std::memory_order_relaxed),
-		    0,
-		    0
-		);
-	}
+	notifyInputReset();
 }
 
 // Replay the deferred downs AND this event in one batch. Passing the physical
@@ -428,6 +1005,7 @@ LRESULT forwardWin(const KBDLLHOOKSTRUCT* info, bool mask) {
 		inputs[total++] = keyInput(KeyboardHook::MASK_KEY, false);
 		inputs[total++] = keyInput(KeyboardHook::MASK_KEY, true);
 	}
+	if (!foregroundAllowsReplay()) return 0;
 	auto sent = SendInput(total, inputs.data(), sizeof(INPUT));
 	// Even a partial insertion may have sent a modifier down. Its release
 	// must be replayed (or passed if that fails); cancellation releases it too.
@@ -501,12 +1079,26 @@ LRESULT onWin(
 	auto chordConsumed = gSuperChordConsumed;
 	key = {};
 	gWinDown.store(other.down);
+	// Decide how Windows gets the release before posting our own notifications.
+	// If the foreground changed, pass the original release through instead.
+	auto swallow = false;
+	if (taskbarMaskedRelease && (forwarded || !consumed)) {
+		swallow = injectMaskedRelease(info);
+	} else if (forwarded && chordConsumed && !other.down) {
+		swallow = injectMaskedRelease(info);
+	} else if (forwarded) {
+		// Queue after any pending replay of the Win-down.
+		auto input = replayInput(info);
+		swallow = foregroundAllowsReplay() && SendInput(1, &input, sizeof(INPUT)) == 1;
+	} else {
+		swallow = consumed && foregroundAllowsReplay();
+	}
 	if (!other.down) {
 		if ((gHoldActive & ModSuper) != 0) {
 			gHoldActive &= ~ModSuper;
 			postAll(snapshot, HookTrigger::Hold, ModSuper, HookReleased);
 		}
-		if (gTapCandidate == ModSuper && !gSuppressLoneSuperTap.load() && !blocked
+		if (gTapCandidate == ModSuper && !gSuppressLoneSuperTap.load() && foregroundAllowsReplay()
 		    && info->time - gTapStart <= snapshot.tapTimeoutMs)
 		{
 			postAll(snapshot, HookTrigger::Tap, ModSuper, HookTapped);
@@ -515,25 +1107,7 @@ LRESULT onWin(
 		gSuppressLoneSuperTap.store(false);
 		gSuperChordConsumed = false;
 	}
-	// A local tap, hold or shell chord never exposed a Win-down to Explorer.
-	// No mask or replayed release exists for another hook to corrupt.
-	// The taskbar policy also masks a down that passed directly through,
-	// including over an elevated foreground. On failure pass the physical up.
-	if (taskbarMaskedRelease && (forwarded || !consumed)) {
-		return injectMaskedRelease(info) ? 1 : 0;
-	}
-	if (forwarded && chordConsumed && !other.down && !blocked) {
-		return injectMaskedRelease(info) ? 1 : 0;
-	}
-	if (forwarded) {
-		// Queue after any pending chord replay, even if a fast physical up
-		// was already in the hook queue ahead of that replay.
-		auto input = replayInput(info);
-		return SendInput(1, &input, sizeof(INPUT)) == 1 ? 1 : 0;
-	}
-	// A down that passed through must let its release through too, or Windows
-	// is left with a modifier it believes is held.
-	return consumed ? 1 : 0;
+	return swallow ? 1 : 0;
 }
 
 DWORD integrityLevel(HANDLE token) {
@@ -566,7 +1140,8 @@ bool isHiddenFromUs(HWND hwnd) {
 
 	DWORD pid = 0;
 	GetWindowThreadProcessId(hwnd, &pid);
-	if (pid == 0 || pid == GetCurrentProcessId()) return false;
+	if (pid == 0) return true;
+	if (pid == GetCurrentProcessId()) return false;
 
 	auto* process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
 	if (process == nullptr) return true;
@@ -583,12 +1158,8 @@ bool isHiddenFromUs(HWND hwnd) {
 	return hidden;
 }
 
-// This WinEvent hook is installed on the GUI thread. Token and process
-// queries must not delay the low-level keyboard hook's message pump.
 void checkForeground(HWND hwnd) {
-	gCheckedForeground.store(nullptr);
-	gForegroundBlocked.store(isHiddenFromUs(hwnd));
-	gCheckedForeground.store(hwnd);
+	publishForegroundIntegrity(hwnd, isHiddenFromUs(hwnd));
 }
 
 void CALLBACK foregroundChanged(
@@ -602,6 +1173,113 @@ void CALLBACK foregroundChanged(
 ) {
 	if (idObject != OBJID_WINDOW) return;
 	checkForeground(GetForegroundWindow());
+}
+
+void runForegroundIntegrityWorker(auto createQueue) {
+	MSG msg {};
+	createQueue(&msg);
+	// Publish the id only after the queue exists. If stop raced queue
+	// creation, either it posts WM_QUIT or the worker observes the request.
+	gForegroundThreadId.store(GetCurrentThreadId());
+
+	HWINEVENTHOOK foregroundHook = nullptr;
+	if (!gForegroundStopRequested.load()) {
+		foregroundHook = SetWinEventHook(
+		    EVENT_SYSTEM_FOREGROUND,
+		    EVENT_SYSTEM_FOREGROUND,
+		    nullptr,
+		    &foregroundChanged,
+		    0,
+		    0,
+		    WINEVENT_OUTOFCONTEXT
+		);
+		if (foregroundHook == nullptr) {
+			qCWarning(logKeyboardHook) << "Could not observe foreground integrity:" << GetLastError();
+		} else {
+			checkForeground(GetForegroundWindow());
+			gForegroundRunning.store(!gForegroundStopRequested.load());
+		}
+	}
+
+	if (auto ready = gForegroundReadyEvent.load(); ready != nullptr) SetEvent(ready);
+
+	while (foregroundHook != nullptr && !gForegroundStopRequested.load()
+	       && GetMessageW(&msg, nullptr, 0, 0) > 0)
+	{
+		TranslateMessage(&msg);
+		DispatchMessageW(&msg);
+	}
+
+	gForegroundRunning.store(false);
+	if (foregroundHook != nullptr) UnhookWinEvent(foregroundHook);
+	publishForegroundIntegrity(nullptr, false);
+	gForegroundThreadId.store(0);
+	if (auto exited = gForegroundExitEvent.load(); exited != nullptr) SetEvent(exited);
+}
+
+void foregroundIntegrityWorkerMain() {
+	runForegroundIntegrityWorker([](MSG* msg) {
+		PeekMessageW(msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+	});
+}
+
+bool reapForegroundIntegrityWorker(DWORD timeout) {
+	if (gForegroundThread == nullptr) return true;
+	auto exited = gForegroundExitEvent.load();
+	if (exited == nullptr || WaitForSingleObject(exited, timeout) != WAIT_OBJECT_0) return false;
+	gForegroundThread->join();
+	delete gForegroundThread;
+	gForegroundThread = nullptr;
+	CloseHandle(gForegroundExitEvent.exchange(nullptr));
+	CloseHandle(gForegroundReadyEvent.exchange(nullptr));
+	return true;
+}
+
+bool startForegroundIntegrityWorker() {
+	if (gForegroundRunning.load() && !gForegroundStopRequested.load()) return true;
+	if (!reapForegroundIntegrityWorker(0)) return false;
+
+	auto ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	auto exited = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if (ready == nullptr || exited == nullptr) {
+		if (ready != nullptr) CloseHandle(ready);
+		if (exited != nullptr) CloseHandle(exited);
+		return false;
+	}
+
+	gForegroundReadyEvent.store(ready);
+	gForegroundExitEvent.store(exited);
+	gForegroundThreadId.store(0);
+	gForegroundStopRequested.store(false);
+	try {
+		gForegroundThread = new std::thread(&foregroundIntegrityWorkerMain);
+	} catch (...) {
+		CloseHandle(gForegroundReadyEvent.exchange(nullptr));
+		CloseHandle(gForegroundExitEvent.exchange(nullptr));
+		return false;
+	}
+
+	if (WaitForSingleObject(ready, FOREGROUND_WORKER_START_TIMEOUT_MS) != WAIT_OBJECT_0
+	    || !gForegroundRunning.load())
+	{
+		stopForegroundIntegrityWorker();
+		return false;
+	}
+	return true;
+}
+
+void stopForegroundIntegrityWorker(DWORD timeout) {
+	if (gForegroundThread == nullptr) {
+		publishForegroundIntegrity(nullptr, false);
+		return;
+	}
+	gForegroundStopRequested.store(true);
+	if (auto threadId = gForegroundThreadId.load(); threadId != 0) {
+		PostThreadMessageW(threadId, WM_QUIT, 0, 0);
+	}
+	if (!reapForegroundIntegrityWorker(timeout) && timeout != 0) {
+		qCWarning(logKeyboardHook) << "Foreground integrity worker did not stop within its deadline";
+	}
 }
 
 LRESULT onModifier(
@@ -628,20 +1306,16 @@ LRESULT onModifier(
 		return 0;
 	}
 
+	auto tap = gTapCandidate == bit;
+	auto plan = planModifierRelease(bit, false, otherDown, tap, blocked || !foregroundAllowsReplay(), false);
+	if (tap) gTapCandidate = 0;
+	auto replayed = plan.maskAndReplay && injectMaskedRelease(info);
+
 	if ((gHoldActive & bit) != 0 && !otherDown) {
 		gHoldActive &= ~bit;
 		postAll(snapshot, HookTrigger::Hold, bit, HookReleased);
 	}
-
-	auto tap = gTapCandidate == bit;
-	auto plan = planModifierRelease(bit, false, otherDown, tap, blocked, false);
-
-	if (tap) gTapCandidate = 0;
-	if (!plan.maskAndReplay && !plan.postTap) return 0;
-
-	auto replayed = plan.maskAndReplay && injectMaskedRelease(info);
-
-	if (plan.postTap && info->time - gTapStart <= snapshot.tapTimeoutMs) {
+	if (plan.postTap && foregroundAllowsReplay() && info->time - gTapStart <= snapshot.tapTimeoutMs) {
 		postAll(snapshot, HookTrigger::Tap, bit, HookTapped);
 	}
 
@@ -666,7 +1340,7 @@ LRESULT onKey(
 	if (gReplayed[vk]) {
 		auto input = replayInput(info);
 		if (up) gReplayed[vk] = false;
-		return SendInput(1, &input, sizeof(INPUT)) == 1 ? 1 : 0;
+		return foregroundAllowsReplay() && SendInput(1, &input, sizeof(INPUT)) == 1 ? 1 : 0;
 	}
 
 	if (up) {
@@ -732,10 +1406,11 @@ LRESULT onKey(
 }
 
 LRESULT CALLBACK hookProc(int code, WPARAM wParam, LPARAM lParam) {
-	if (code != HC_ACTION) return CallNextHookEx(nullptr, code, wParam, lParam);
+	if (code != HC_ACTION || gStopRequested.load()) return CallNextHookEx(nullptr, code, wParam, lParam);
 
 	auto* info = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam); // NOLINT(performance-no-int-to-ptr)
 	qs::windows::noteHookDelay(true, info->time);
+	if ((info->flags & LLKHF_INJECTED) == 0) hookwatch::noteInput(keyboardHookState);
 
 	if ((info->flags & LLKHF_INJECTED) != 0 && info->dwExtraInfo == KeyboardHook::INJECTION_MARKER) {
 		if (taskbarShortcutFilterEnabled()) {
@@ -825,12 +1500,14 @@ LRESULT CALLBACK hookProc(int code, WPARAM wParam, LPARAM lParam) {
 		gPhysicalDown[vk].store(!up, std::memory_order_release);
 		gPhysicalSwallowed[vk] = !up && swallow != 0;
 
-		if (auto* observer = gInputObserver.load(std::memory_order_acquire); observer != nullptr) {
-			PostMessageW(
+		if (auto* observer = gInputObserver.load(std::memory_order_acquire);
+		    observer != nullptr && !gStopRequested.load())
+		{
+			postObserverMessage(
 			    observer,
 			    gInputObserverMessage.load(std::memory_order_relaxed),
-			    info->vkCode,
-			    up ? 1 : 0
+			    static_cast<uint8_t>(info->vkCode),
+			    up
 			);
 		}
 	}
@@ -844,10 +1521,11 @@ void signalReady() {
 	if (auto ready = gReadyEvent.load(); ready != nullptr) SetEvent(ready);
 }
 
-void hookThreadMain() {
+void hookThreadMain(uint64_t generation) {
 	MSG msg {};
 	PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 	gThreadId.store(GetCurrentThreadId());
+	tHookGeneration = generation;
 
 	if (gStopRequested.load()) {
 		gThreadId.store(0);
@@ -871,6 +1549,9 @@ void hookThreadMain() {
 		return;
 	}
 
+	gHookGenerationLive.store(true, std::memory_order_release);
+	hookwatch::noteInstalled(keyboardHookState);
+
 	// A secure desktop (lock screen, UAC, switch user) takes every hold away
 	// without a release. Reset on the switch instead of retaining stale keys.
 	auto* desktopHook = SetWinEventHook(
@@ -886,9 +1567,10 @@ void hookThreadMain() {
 	seedPhysicalState();
 	signalReady();
 
-	while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+	while (!gStopRequested.load() && GetMessageW(&msg, nullptr, 0, 0) > 0) {
 		if (msg.message == WM_QS_ARM_OBSERVER) {
-			if (auto request = gObserverRequest.exchange(nullptr)) armObserver(*request);
+			if (auto request = gObserverRequest.exchange(nullptr); request && !gStopRequested.load())
+				armObserver(*request);
 			continue;
 		}
 		if (msg.message == WM_TIMER && gWinLeaseTimer != 0 && msg.wParam == gWinLeaseTimer) {
@@ -901,8 +1583,6 @@ void hookThreadMain() {
 	if (desktopHook != nullptr) UnhookWinEvent(desktopHook);
 	resetPhysicalState();
 	UnhookWindowsHookEx(hook);
-
-	gInputObserver.store(nullptr);
 
 	// Last write to the thread id: a request that observes this event knows the
 	// thread will not touch physical state or its request any more.
@@ -922,29 +1602,32 @@ bool reapHookThread(DWORD timeout) {
 	return true;
 }
 
-void stopHookThread() {
-	if (gForegroundHook != nullptr) UnhookWinEvent(std::exchange(gForegroundHook, nullptr));
-	gCheckedForeground.store(nullptr);
-	gInputObserver.store(nullptr);
-	gObserverRequest.store(nullptr);
-	gTarget.store(nullptr);
-	if (gThread == nullptr) return;
+void setKeyboardActive(bool active) {
+	if (std::exchange(keyboardHookState.active, active) != active) post(HookStatusChanged, 0, 0);
+}
+
+void stopHookThread(bool notifyReset) {
 	gStopRequested.store(true);
+	// Invalidate queued hook input before publishing the reset. Events posted
+	// by a thread that outlives its join deadline keep its older generation.
+	// Repeated teardown of the same hook must not invalidate the reset itself.
+	if (gHookGenerationLive.exchange(false, std::memory_order_acq_rel))
+		gHookGeneration.fetch_add(1, std::memory_order_acq_rel);
 	auto threadId = gThreadId.load();
 	if (threadId != 0) PostThreadMessageW(threadId, WM_QUIT, 0, 0);
 	if (!reapHookThread(HOOK_STOP_TIMEOUT_MS))
 		qCWarning(logKeyboardHook) << "Keyboard hook did not stop within its deadline";
+	if (notifyReset) notifyInputReset();
+	gInputObserver.store(nullptr);
+	gObserverRequest.store(nullptr);
+	setKeyboardActive(false);
 }
 
 // Installs the thread unless it is already up. Routing target and message base
 // stay whatever the last start()/retain() set, so a hook kept alive by another
 // owner keeps answering the hotkey manager until it stops routing.
 bool startHookThread() {
-	if (gThread != nullptr && !gFailed.load() && !gStopRequested.load()) {
-		auto exited = gExitEvent.load();
-		if (exited == nullptr || WaitForSingleObject(exited, 0) != WAIT_OBJECT_0) return true;
-	}
-
+	if (KeyboardHook::isRunning()) return true;
 	if (!reapHookThread(0)) return false;
 
 	auto ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -960,17 +1643,8 @@ bool startHookThread() {
 	gThreadId.store(0);
 	gStopRequested.store(false);
 	gFailed.store(false);
-	if (gForegroundHook == nullptr) {
-		gForegroundHook = SetWinEventHook(
-		    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
-		    nullptr, &foregroundChanged, 0, 0, WINEVENT_OUTOFCONTEXT
-		);
-		if (gForegroundHook == nullptr)
-			qCWarning(logKeyboardHook) << "Could not observe foreground integrity:" << GetLastError();
-	}
-	checkForeground(GetForegroundWindow());
 	try {
-		gThread = new std::thread(&hookThreadMain);
+		gThread = new std::thread(&hookThreadMain, gHookGeneration.load());
 	} catch (...) {
 		CloseHandle(gReadyEvent.exchange(nullptr));
 		CloseHandle(gExitEvent.exchange(nullptr));
@@ -979,9 +1653,39 @@ bool startHookThread() {
 	}
 
 	auto answered = WaitForSingleObject(ready, HOOK_START_TIMEOUT_MS) == WAIT_OBJECT_0;
-	auto started = answered && !gFailed.load();
-	if (!started) stopHookThread();
+	auto started = answered && !gFailed.load() && gThreadId.load() != 0;
+	if (!started) {
+		stopHookThread();
+	} else {
+		setKeyboardActive(true);
+	}
 	return started;
+}
+
+void restartKeyboardHookThread() {
+	if (keyboardHookState.active) {
+		qCWarning(logKeyboardHook) << "Re-arming the keyboard low-level hook";
+		stopHookThread(true);
+	}
+	// Keep the routing target and owner demand even when the old thread has
+	// not exited or installation of the replacement fails.
+	if (!startHookThread()) qCWarning(logKeyboardHook) << "Could not re-arm the keyboard low-level hook";
+}
+
+bool inputDesktopIsForeign() {
+	auto* input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+	if (input == nullptr) return true;
+	auto* thread = GetThreadDesktop(GetCurrentThreadId());
+
+	wchar_t inputName[256] {};
+	wchar_t threadName[256] {};
+	DWORD needed = 0;
+	auto inputNamed = GetUserObjectInformationW(input, UOI_NAME, inputName, sizeof(inputName), &needed) != 0;
+	needed = 0;
+	auto threadNamed = thread != nullptr
+	                 && GetUserObjectInformationW(thread, UOI_NAME, threadName, sizeof(threadName), &needed) != 0;
+	CloseDesktop(input);
+	return !inputNamed || !threadNamed || wcscmp(inputName, threadName) != 0;
 }
 
 } // namespace
@@ -1004,13 +1708,12 @@ uint8_t modifierBit(DWORD vk) {
 }
 
 bool KeyboardHook::start(HWND target, UINT messageBase) {
+	if (gInputHooksQuitting) return false;
 	gTarget.store(target);
 	gMessageBase.store(messageBase);
 	gOwnership.setRouting(true);
-
-	auto started = startHookThread();
-	if (!started) gOwnership.setRouting(false);
-	return started;
+	hookwatch::setNeeded(keyboardHookState, true);
+	return startHookThread();
 }
 
 void KeyboardHook::stop() {
@@ -1022,18 +1725,22 @@ void KeyboardHook::stop() {
 	// physical state tracking continues, but no stale bind may match a key.
 	setSnapshot(nullptr);
 	gRoutingStopped.store(true, std::memory_order_release);
+	gTarget.store(nullptr);
 
 	// Opted-in taskbar filtering owns the hook for the process lifetime.
 	if (gOwnership.needed() || taskbarShortcutFilterEnabled()) return;
 
 	stopHookThread();
+	hookwatch::setNeeded(keyboardHookState, false);
 }
 
 bool KeyboardHook::retain() {
 	gOwnership.hold();
+	if (gInputHooksQuitting) return false;
 
 	// A feature's reference is independent of the hotkey manager's routing, so
 	// it is enough on its own for the hook to be installed.
+	hookwatch::setNeeded(keyboardHookState, true);
 	return startHookThread();
 }
 
@@ -1042,10 +1749,14 @@ void KeyboardHook::release() {
 	if (gOwnership.needed() || taskbarShortcutFilterEnabled()) return;
 
 	stopHookThread();
+	hookwatch::setNeeded(keyboardHookState, false);
 }
 
-bool KeyboardHook::isRunning() { return gThread != nullptr && !gFailed.load() && !gStopRequested.load(); }
+bool KeyboardHook::isRunning() {
+	return keyboardHookState.active && gThreadId.load() != 0 && !gStopRequested.load();
+}
 bool KeyboardHook::foregroundBlocked() { return foregroundIsBlocked(); }
+uint64_t KeyboardHook::activeHookGeneration() { return gHookGeneration.load(); }
 bool KeyboardHook::superDown() {
 	return gWinDown.load() || isDown(VK_LWIN) || isDown(VK_RWIN);
 }

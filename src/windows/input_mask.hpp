@@ -44,7 +44,10 @@ public:
 
 	void acquireHook();
 	void releaseHook();
-	[[nodiscard]] bool hookActive() const { return this->hookRunning; }
+
+	// Reinstalls the mouse hook while a tracker owner still needs it.
+	// Unlike instance(), never creates a tracker.
+	static void recoverMouseHook();
 
 	// Records that a hook saw input late and arms the report window. Called from
 	// both input hook threads, so it only posts a wakeup for the tracker's
@@ -85,8 +88,11 @@ private:
 	void emitCursor(QPoint position);
 	void onCursorTrail();
 	void updateHookState();
+	void updateCursorFallback();
 	bool startHook();
-	void stopHook();
+	void stopHook(DWORD wait = 250);
+	bool reapHook(DWORD wait);
+	void onHookReady(quint32 generation);
 	void onHookFailed(DWORD error, quint32 generation);
 	void onCursorMoved();
 	void onButtonPressed(QPoint position, quint32 time);
@@ -101,8 +107,8 @@ private:
 	HWND messageWindow = nullptr;
 	std::thread hookThread;
 	bool hookRunning = false;
-	bool hookFailed = false;
 	quint32 hookGeneration = 0;
+	quint64 hookStartTick = 0;
 	int cursorWatchers = 0;
 	int monitorWatchers = 0;
 	int hookHolders = 0;

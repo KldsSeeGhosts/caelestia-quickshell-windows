@@ -1,8 +1,10 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include <windows.h>
@@ -248,7 +250,8 @@ enum HookEvent : UINT {
 	HookReleased = 2,
 	HookTapped = 3,
 	HookReset = 4,
-	HookEventCount = 5,
+	HookStatusChanged = 5,
+	HookEventCount = 6,
 };
 
 /// Shared ownership of the one WH_KEYBOARD_LL hook.
@@ -283,18 +286,90 @@ private:
 	bool mRouting = false;
 };
 
+
+// Hook events split the monotonic 64-bit hook generation across both message
+// parameters. Trigger id and serial each keep their low 32 bits.
+[[nodiscard]] constexpr WPARAM hookEventWParam(uint32_t triggerId, uint64_t generation) {
+	return static_cast<WPARAM>((generation << 32) | triggerId);
+}
+[[nodiscard]] constexpr LPARAM hookEventLParam(uint32_t serial, uint64_t generation) {
+	return static_cast<LPARAM>(((generation >> 32) << 32) | serial);
+}
+[[nodiscard]] constexpr uint32_t hookEventTriggerId(WPARAM wParam) {
+	return static_cast<uint32_t>(wParam);
+}
+[[nodiscard]] constexpr uint32_t hookEventSerial(LPARAM lParam) {
+	return static_cast<uint32_t>(lParam);
+}
+[[nodiscard]] constexpr uint64_t hookEventGeneration(WPARAM wParam, LPARAM lParam) {
+	const auto low = static_cast<uint64_t>(wParam) >> 32;
+	const auto high = static_cast<uint64_t>(lParam) >> 32;
+	return (high << 32) | low;
+}
+
+constexpr uint32_t INPUT_OBSERVER_UP = 0x100;
+
+[[nodiscard]] constexpr WPARAM inputObserverWParam(uint8_t vk, bool up, uint64_t generation) {
+	return hookEventWParam(static_cast<uint32_t>(vk) | (up ? INPUT_OBSERVER_UP : 0), generation);
+}
+[[nodiscard]] constexpr uint8_t inputObserverKey(WPARAM wParam) {
+	return static_cast<uint8_t>(hookEventTriggerId(wParam) & 0xff);
+}
+[[nodiscard]] constexpr bool inputObserverUp(WPARAM wParam) {
+	return (hookEventTriggerId(wParam) & INPUT_OBSERVER_UP) != 0;
+}
+
+namespace hookwatch {
+
+namespace detail {
+
+// Only the timestamps are written by the hook threads. Demand and readiness
+// belong to the GUI thread. Keep this inline for fixtures that stub out the
+// keyboard hook but still compile input_mask.cpp.
+struct HookState {
+	std::atomic<uint64_t> callbackTick = 0;
+	std::atomic<uint64_t> installTick = 0;
+	bool needed = false;
+	bool active = false;
+};
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
+inline HookState keyboardHookState; // NOLINT
+inline HookState mouseHookState;    // NOLINT
+inline void (*stateChanged)() = nullptr; // NOLINT
+
+} // namespace detail
+
+inline void noteInput(detail::HookState& hook) {
+	hook.callbackTick.store(GetTickCount64(), std::memory_order_relaxed);
+}
+
+inline void noteInstalled(detail::HookState& hook) {
+	const auto now = GetTickCount64();
+	hook.installTick.store(now, std::memory_order_relaxed);
+	hook.callbackTick.store(now, std::memory_order_relaxed);
+}
+
+inline void setNeeded(detail::HookState& hook, bool needed) {
+	if (std::exchange(hook.needed, needed) != needed && detail::stateChanged != nullptr)
+		detail::stateChanged();
+}
+
+} // namespace hookwatch
+
 class KeyboardHook {
 public:
+	// Keeps routing requested until stop(), even if installation must retry.
 	static bool start(HWND target, UINT messageBase);
 	static void stop();
 	[[nodiscard]] static bool isRunning();
 	[[nodiscard]] static bool foregroundBlocked();
+	[[nodiscard]] static uint64_t activeHookGeneration();
 	// Physical Win state also includes downs deferred by the keyboard hook.
 	[[nodiscard]] static bool superDown();
 
 	// Shared ownership independent of the hotkey manager's binds. `retain`
 	// starts the hook when nothing else has it running, `release` stops it only
-	// when no owner is left. Both are safe to call regardless of start/stop.
+	// when no owner is left. Pair retain() with release() even on failure.
 	static bool retain();
 	static void release();
 
@@ -302,8 +377,9 @@ public:
 	// the physical keys that are down (excluding mouse buttons and the generic
 	// modifier aliases) and subscribes `target` to every later transition.
 	// `keyMessage` carries wParam = virtual key and lParam = 1 for key-up;
-	// `resetMessage` is posted when the input desktop changes and every hold is
-	// gone. Returns false when the hook did not answer.
+	// `resetMessage` is posted when the desktop changes or the hook re-arms,
+	// because the observer can no longer rely on receiving releases.
+	// Returns false when the hook did not answer.
 	static bool armInputObserver(
 	    HWND target,
 	    UINT keyMessage,

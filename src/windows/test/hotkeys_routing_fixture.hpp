@@ -18,6 +18,7 @@ inline bool canStart = true;
 inline bool registerChords = false;
 inline int registrations = 0;
 inline int unregistrations = 0;
+inline uint64_t generation = 1;
 inline BOOL WINAPI registerHotkey(HWND, int, UINT, UINT) {
 	registrations++;
 	return registerChords;
@@ -83,7 +84,10 @@ bool KeyboardHook::start(HWND, UINT) {
 	return hotkey_fixture::running = hotkey_fixture::canStart;
 }
 void KeyboardHook::stop() { hotkey_fixture::running = false; }
+bool KeyboardHook::retain() { return hotkey_fixture::running; }
+void KeyboardHook::release() {}
 bool KeyboardHook::isRunning() { return hotkey_fixture::running; }
+uint64_t KeyboardHook::activeHookGeneration() { return hotkey_fixture::generation; }
 void KeyboardHook::setSnapshot(std::shared_ptr<const HookSnapshot> value) {
 	hotkey_fixture::snapshot = std::move(value);
 }
