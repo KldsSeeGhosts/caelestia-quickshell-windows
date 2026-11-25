@@ -1208,6 +1208,33 @@ private slots:
 		QVERIFY(startedNewerMove);
 		QCOMPARE(trackerRefused.size(), 0);
 	}
+
+	void deferredWorkspaceCreationFailureSupersededDuringTrackerSignalSuppressesRefusal() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		const auto moveSeq = fixture.window->beginMoveRequest();
+		const auto actionOrder = fixture.window->actionOrderState();
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+		bool startedNewerMove = false;
+		QObject::connect(
+		    fixture.tracker,
+		    &WindowTracker::lastActionErrorChanged,
+		    fixture.tracker,
+		    [&fixture, &startedNewerMove] {
+			    if (startedNewerMove) return;
+			    startedNewerMove = true;
+			    (void)fixture.window->beginMoveRequest();
+		    }
+		);
+
+		Dispatcher::refuseDeferredMoveForTest(
+		    fixture.tracker, moveSeq, actionOrder, QStringLiteral("workspace-limit")
+		);
+
+		QVERIFY(startedNewerMove);
+		QCOMPARE(trackerRefused.size(), 0);
+	}
 };
 
 } // namespace

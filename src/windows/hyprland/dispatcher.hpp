@@ -49,6 +49,17 @@ public:
 		    target, code, publishCommandResult, existingMoveSequence, existingActionOrder
 		);
 	}
+	static void refuseDeferredMoveForTest(
+	    qs::windows::WindowTracker* tracker,
+	    quint64 moveSequence,
+	    const std::shared_ptr<qs::windows::WindowActionOrderState>& actionOrder,
+	    const QString& code,
+	    const std::function<void()>& publishCommandResult = {}
+	) {
+		Dispatcher::refuseDeferredMove(
+		    tracker, moveSequence, actionOrder, code, publishCommandResult
+		);
+	}
 #endif
 
 	void dispatch(const QString& request);
@@ -74,6 +85,13 @@ private:
 	void focusWorkspace(const QString& arg);
 	void focusMonitor(const QString& arg);
 	void cycleWindow(std::optional<bool> backward);
+	static void refuseDeferredMove(
+	    qs::windows::WindowTracker* tracker,
+	    quint64 moveSequence,
+	    const std::shared_ptr<qs::windows::WindowActionOrderState>& actionOrder,
+	    const QString& code,
+	    const std::function<void()>& publishCommandResult
+	);
 	void refuseImmediateMove(
 	    qs::windows::TrackedWindow* target,
 	    const QString& code,

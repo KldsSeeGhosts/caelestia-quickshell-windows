@@ -653,7 +653,8 @@ bool TrackedWindow::moveToDesktop(
 			    moveSequence,
 			    QStringLiteral("move"),
 			    qs::hyprland::ipc::moveRefusalReason(QStringLiteral("invalid-window"), false),
-			    false
+			    false,
+			    actionOrder
 			);
 		}
 		return false;
@@ -741,7 +742,8 @@ bool TrackedWindow::moveToDesktop(
 			    moveSequence,
 			    QStringLiteral("move"),
 			    qs::hyprland::ipc::moveRefusalReason(failureCode, false),
-			    false
+			    false,
+			    actionOrder
 			);
 		}
 		return false;

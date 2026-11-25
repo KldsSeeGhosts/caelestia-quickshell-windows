@@ -124,22 +124,14 @@ void Dispatcher::toggleFloating(TrackedWindow* window, const QString& action) {
 	reportToggleFloatingResult(this->actionTracker(), *result, window->elevated());
 }
 
-void Dispatcher::refuseImmediateMove(
-    TrackedWindow* target,
+void Dispatcher::refuseDeferredMove(
+    WindowTracker* tracker,
+    quint64 moveSequence,
+    const std::shared_ptr<WindowActionOrderState>& actionOrder,
     const QString& code,
-    const std::function<void()>& publishCommandResult,
-    quint64 existingMoveSequence,
-    const std::shared_ptr<WindowActionOrderState>& existingActionOrder
+    const std::function<void()>& publishCommandResult
 ) {
-	auto* tracker = this->actionTracker();
 	QPointer<WindowTracker> guardedTracker(tracker);
-	const auto actionOrder = existingActionOrder != nullptr
-	    ? existingActionOrder
-	    : (target != nullptr ? target->actionOrderState() : nullptr);
-	const auto moveSequence = existingMoveSequence != 0
-	    ? existingMoveSequence
-	    : (target != nullptr ? target->beginMoveRequest()
-	                         : (tracker != nullptr ? tracker->nextActionSequence() : 0));
 	auto orderSuperseded = [&] {
 		return actionOrder != nullptr
 		    && (actionOrder->latestMoveSequence != moveSequence
@@ -151,6 +143,26 @@ void Dispatcher::refuseImmediateMove(
 	if (!guardedTracker || guardedTracker->lastActionErrorSequence() >= moveSequence) return;
 	guardedTracker->reportActionRefusalWithSequence(
 	    moveSequence, QStringLiteral("move"), moveRefusalReason(code, false), false, actionOrder
+	);
+}
+
+void Dispatcher::refuseImmediateMove(
+    TrackedWindow* target,
+    const QString& code,
+    const std::function<void()>& publishCommandResult,
+    quint64 existingMoveSequence,
+    const std::shared_ptr<WindowActionOrderState>& existingActionOrder
+) {
+	auto* tracker = this->actionTracker();
+	const auto actionOrder = existingActionOrder != nullptr
+	    ? existingActionOrder
+	    : (target != nullptr ? target->actionOrderState() : nullptr);
+	const auto moveSequence = existingMoveSequence != 0
+	    ? existingMoveSequence
+	    : (target != nullptr ? target->beginMoveRequest()
+	                         : (tracker != nullptr ? tracker->nextActionSequence() : 0));
+	Dispatcher::refuseDeferredMove(
+	    tracker, moveSequence, actionOrder, code, publishCommandResult
 	);
 }
 

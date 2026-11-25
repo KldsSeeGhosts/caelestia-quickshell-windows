@@ -783,36 +783,25 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 				    );
 				    return;
 			    }
-			    if (tracker && tracker->lastActionErrorSequence() >= moveSequence) return;
 			    if (!ok) {
-				    if (tracker) {
-					    tracker->reportActionRefusalWithSequence(
-					        moveSequence,
-					        QStringLiteral("move"),
-					        moveRefusalReason(reason, false),
-					        false
-					    );
-				    }
-				    return;
-			    }
-			    if (desktops) {
-				    desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-window"));
-			    }
-			    if (actionOrder
-			        && (actionOrder->latestMoveSequence != moveSequence
-			            || actionOrder->lastActionErrorSequence >= moveSequence))
-			    {
-				    return;
-			    }
-			    if (tracker && tracker->lastActionErrorSequence() >= moveSequence) return;
-			    if (tracker) {
-				    tracker->reportActionRefusalWithSequence(
-				        moveSequence,
-				        QStringLiteral("move"),
-				        moveRefusalReason(QStringLiteral("invalid-window"), false),
-				        false
+				    Dispatcher::refuseDeferredMove(
+				        tracker.data(), moveSequence, actionOrder, reason, {}
 				    );
+				    return;
 			    }
+			    Dispatcher::refuseDeferredMove(
+			        tracker.data(),
+			        moveSequence,
+			        actionOrder,
+			        QStringLiteral("invalid-window"),
+			        [desktops] {
+				        if (desktops) {
+					        desktops->refuseCommand(
+					            QStringLiteral("move"), QStringLiteral("invalid-window")
+					        );
+				        }
+			        }
+			    );
 		    }
 		);
 
