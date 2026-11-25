@@ -14,6 +14,8 @@ LRESULT WINAPI fakeCallNextHookEx(HHOOK hook, int code, WPARAM message, LPARAM d
 BOOL WINAPI fakePostMessageW(HWND target, UINT message, WPARAM id, LPARAM serial);
 UINT_PTR WINAPI fakeSetTimer(HWND, UINT_PTR, UINT, TIMERPROC);
 BOOL WINAPI fakeKillTimer(HWND, UINT_PTR);
+HWND WINAPI fakeGetForegroundWindow();
+DWORD WINAPI fakeGetWindowThreadProcessId(HWND hwnd, LPDWORD processId);
 } // namespace
 
 // Exercise the actual callbacks and replay path, without installing a hook,
@@ -24,6 +26,8 @@ BOOL WINAPI fakeKillTimer(HWND, UINT_PTR);
 #define PostMessageW fakePostMessageW
 #define SetTimer fakeSetTimer
 #define KillTimer fakeKillTimer
+#define GetForegroundWindow fakeGetForegroundWindow
+#define GetWindowThreadProcessId fakeGetWindowThreadProcessId
 #include "../keyboard_hook.cpp"
 #include "../input_mask.cpp"
 #undef SendInput
@@ -32,6 +36,8 @@ BOOL WINAPI fakeKillTimer(HWND, UINT_PTR);
 #undef PostMessageW
 #undef SetTimer
 #undef KillTimer
+#undef GetForegroundWindow
+#undef GetWindowThreadProcessId
 
 namespace qs::windows {
 void prioritizeInputThread(int) {}
@@ -75,6 +81,8 @@ struct FakeDesktop {
 	int otherChainCalls = 0;
 	int timersArmed = 0;
 	int timersKilled = 0;
+	HWND foreground = nullptr;
+	DWORD foregroundPid = 0;
 };
 
 FakeDesktop desktop;
@@ -88,6 +96,13 @@ BOOL WINAPI fakeKillTimer(HWND, UINT_PTR timer) {
 	desktop.timersKilled++;
 	Q_ASSERT(timer == 42);
 	return TRUE;
+}
+
+HWND WINAPI fakeGetForegroundWindow() { return desktop.foreground; }
+
+DWORD WINAPI fakeGetWindowThreadProcessId(HWND, LPDWORD processId) {
+	if (processId != nullptr) *processId = desktop.foregroundPid;
+	return 1;
 }
 
 UINT WINAPI fakeSendInput(UINT count, LPINPUT inputs, int size) {
@@ -577,6 +592,129 @@ private slots:
 		QVERIFY(!desktop.down[VK_LCONTROL]);
 	}
 
+	void watchdogDecisionHandlesWraparoundAndInstallIdlePeriods() {
+		constexpr DWORD install = 0xfffff000;
+		auto reading = HookWatchdogReading {
+			.active = true,
+			.lastInputTime = install,
+			.lastHookTick = install,
+			.hookInstallTick = install,
+		};
+
+		QCOMPARE(static_cast<int>(evaluateHookWatchdog(reading)), static_cast<int>(HookWatchdogDecision::Waiting));
+		reading.lastInputTime = static_cast<DWORD>(install + HOOK_STALE_INPUT_MS);
+		QCOMPARE(static_cast<int>(evaluateHookWatchdog(reading)), static_cast<int>(HookWatchdogDecision::Waiting));
+		reading.lastInputTime = static_cast<DWORD>(install + HOOK_STALE_INPUT_MS + 1);
+		QCOMPARE(static_cast<int>(evaluateHookWatchdog(reading)), static_cast<int>(HookWatchdogDecision::Rearm));
+
+		reading.lastInputTime = static_cast<DWORD>(install - 1);
+		QCOMPARE(static_cast<int>(evaluateHookWatchdog(reading)), static_cast<int>(HookWatchdogDecision::NoInputSinceInstall));
+
+		reading.lastInputTime = static_cast<DWORD>(install + HOOK_STALE_INPUT_MS + 1);
+		reading.foregroundHidden = true;
+		QCOMPARE(static_cast<int>(evaluateHookWatchdog(reading)), static_cast<int>(HookWatchdogDecision::Protected));
+		reading.foregroundHidden = false;
+		reading.foreignDesktop = true;
+		QCOMPARE(static_cast<int>(evaluateHookWatchdog(reading)), static_cast<int>(HookWatchdogDecision::Protected));
+		reading.foreignDesktop = false;
+		reading.active = false;
+		QCOMPARE(static_cast<int>(evaluateHookWatchdog(reading)), static_cast<int>(HookWatchdogDecision::Inactive));
+	}
+
+	void watchdogActivityBaselineStartsAtHookInstallation() {
+		hookwatch::setKeyboardActive(true);
+		QVERIFY(gKeyboardHookActive.load());
+		QCOMPARE(gHookTick.load(), gKeyboardHookInstallTick.load());
+		hookwatch::setKeyboardActive(false);
+		QVERIFY(!gKeyboardHookActive.load());
+
+		hookwatch::setMouseActive(true);
+		QVERIFY(gMouseHookActive.load());
+		QCOMPARE(gHookTick.load(), gMouseHookInstallTick.load());
+		hookwatch::setMouseActive(false);
+		QVERIFY(!gMouseHookActive.load());
+	}
+
+	void foregroundIntegrityPublicationSuppliesConsistentStateToHook() {
+		auto* published = reinterpret_cast<HWND>(0x1000);
+		auto* foreign = reinterpret_cast<HWND>(0x2000);
+		desktop.foreground = published;
+		gThreadId.store(123);
+
+		publishForegroundIntegrity(published, true);
+		auto state = gForegroundIntegrity.load();
+		QVERIFY(state.valid);
+		QCOMPARE(state.hwnd, published);
+		QVERIFY(state.blocked);
+		QVERIFY(foregroundIsBlocked());
+
+		publishForegroundIntegrity(published, false);
+		state = gForegroundIntegrity.load();
+		QCOMPARE(state.hwnd, published);
+		QVERIFY(!state.blocked);
+		QVERIFY(!foregroundIsBlocked());
+
+		publishForegroundIntegrity(published, false);
+		desktop.foreground = foreign;
+		desktop.foregroundPid = 12345;
+		QVERIFY(foregroundIsBlocked());
+		desktop.foregroundPid = GetCurrentProcessId();
+		QVERIFY(!foregroundIsBlocked());
+
+		desktop.foreground = published;
+		foregroundChanged(nullptr, 0, nullptr, OBJID_WINDOW, 0, 0, 0);
+		state = gForegroundIntegrity.load();
+		QCOMPARE(state.hwnd, published);
+		QVERIFY(!state.blocked);
+	}
+
+	void elevatedForegroundPassesForwardedWinReleaseThrough() {
+		physical(VK_LWIN, false, 100);
+		physical('E', false, 120);
+		physical('E', true, 150);
+		QVERIFY(desktop.down[VK_LWIN]);
+
+		gForegroundBlocked.store(true);
+		const auto injections = desktop.injections;
+		physical(VK_LWIN, true, 200);
+
+		QCOMPARE(desktop.injections, injections);
+		QVERIFY(!desktop.down[VK_LWIN]);
+		QVERIFY(!KeyboardHook::superDown());
+		QVERIFY(!gWin[0].down);
+		QCOMPARE(desktop.delivered.back().vkCode, DWORD(VK_LWIN));
+		QVERIFY((desktop.delivered.back().flags & LLKHF_UP) != 0);
+		QVERIFY((desktop.delivered.back().flags & LLKHF_INJECTED) == 0);
+	}
+
+	void elevatedForegroundDoesNotMaskAnUntrackedWinRelease() {
+		gForegroundBlocked.store(true);
+		KBDLLHOOKSTRUCT up {
+			.vkCode = VK_LWIN,
+			.flags = LLKHF_UP,
+			.time = 100,
+		};
+		QCOMPARE(onWin(gNoRouting, &up, true, true), LRESULT(0));
+		QCOMPARE(desktop.injections, 0);
+	}
+
+	void elevatedForegroundPassesAltTapReleaseThrough() {
+		auto snapshot = std::make_shared<HookSnapshot>();
+		snapshot->triggers.push_back({.kind = HookTrigger::Tap, .combo = {.lone = ModAlt}, .id = 31});
+		KeyboardHook::setSnapshot(snapshot);
+
+		physical(VK_LMENU, false, 100);
+		gForegroundBlocked.store(true);
+		const auto injections = desktop.injections;
+		physical(VK_LMENU, true, 200);
+
+		QCOMPARE(desktop.injections, injections);
+		QCOMPARE(taps(), 0);
+		QCOMPARE(gTapCandidate, uint8_t(0));
+		QVERIFY(!desktop.down[VK_LMENU]);
+		QCOMPARE(desktop.delivered.size(), size_t(2));
+	}
+
 	void init() {
 		desktop = {};
 		gTaskbarFilter.reset();
@@ -591,7 +729,13 @@ private slots:
 		gWin = {};
 		gWinDown.store(false);
 		gSuppressLoneSuperTap.store(false);
-		gForegroundBlocked.store(false);
+		publishForegroundIntegrity(nullptr, false);
+		gThreadId.store(0);
+		gHookTick.store(0);
+		gKeyboardHookInstallTick.store(0);
+		gMouseHookInstallTick.store(0);
+		gKeyboardHookActive.store(false);
+		gMouseHookActive.store(false);
 		gThread = nullptr;
 		gFailed.store(false);
 		for (auto& down: gPhysicalDown) down.store(false);

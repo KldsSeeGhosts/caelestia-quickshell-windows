@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -282,6 +283,68 @@ private:
 	int mHolders = 0;
 	bool mRouting = false;
 };
+
+namespace hookwatch {
+
+namespace detail {
+
+// Low-level input activity shared by the keyboard and mouse hook threads. The
+// GUI-thread watchdog uses these atomics; hook callbacks must stay lock-free.
+// LASTINPUTINFO has no device-type field, so separate keyboard and mouse input
+// ticks would mistake input on the other device for a dead hook. Both hook
+// procs therefore update one shared activity tick. These variables live in the
+// header because input_mask.cpp can be linked in contexts that stub out the
+// keyboard implementation; inline variables keep one process-wide state
+// without adding a link dependency in the opposite direction.
+inline std::atomic<DWORD> hookTick = 0;                // NOLINT
+inline std::atomic<DWORD> keyboardHookInstallTick = 0; // NOLINT
+inline std::atomic<DWORD> mouseHookInstallTick = 0;    // NOLINT
+inline std::atomic<bool> keyboardHookActive = false;   // NOLINT
+inline std::atomic<bool> mouseHookActive = false;      // NOLINT
+inline std::atomic<void (*)()> activeStateChanged = nullptr; // NOLINT
+
+} // namespace detail
+
+inline void noteKeyboardInput() { detail::hookTick.store(GetTickCount(), std::memory_order_relaxed); }
+inline void noteMouseInput() { detail::hookTick.store(GetTickCount(), std::memory_order_relaxed); }
+
+inline void noteKeyboardInstalled() {
+	const auto now = GetTickCount();
+	detail::keyboardHookInstallTick.store(now, std::memory_order_relaxed);
+	detail::hookTick.store(now, std::memory_order_relaxed);
+	detail::keyboardHookActive.store(true, std::memory_order_release);
+}
+
+inline void noteMouseInstalled() {
+	const auto now = GetTickCount();
+	detail::mouseHookInstallTick.store(now, std::memory_order_relaxed);
+	detail::hookTick.store(now, std::memory_order_relaxed);
+	detail::mouseHookActive.store(true, std::memory_order_release);
+}
+
+inline void notifyActiveStateChanged() {
+	if (auto* callback = detail::activeStateChanged.load(std::memory_order_acquire)) callback();
+}
+
+inline void setKeyboardActive(bool active) {
+	if (active) {
+		if (!detail::keyboardHookActive.load(std::memory_order_acquire)) noteKeyboardInstalled();
+	} else {
+		detail::keyboardHookActive.store(false, std::memory_order_release);
+	}
+	notifyActiveStateChanged();
+}
+
+inline void setMouseActive(bool active) {
+	if (active) {
+		if (!detail::mouseHookActive.load(std::memory_order_acquire)) noteMouseInstalled();
+	} else {
+		detail::mouseHookActive.store(false, std::memory_order_release);
+	}
+	notifyActiveStateChanged();
+}
+
+} // namespace hookwatch
 
 class KeyboardHook {
 public:

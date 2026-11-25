@@ -46,6 +46,10 @@ public:
 	void releaseHook();
 	[[nodiscard]] bool hookActive() const { return this->hookRunning; }
 
+	// Reinstalls the mouse low-level hook on the GUI thread. Returns false when
+	// no tracker-owned hook is active; unlike instance(), never creates one.
+	static bool restartActiveMouseHook();
+
 	// Records that a hook saw input late and arms the report window. Called from
 	// both input hook threads, so it only posts a wakeup for the tracker's
 	// thread. While nothing is late no report timer runs at all.
@@ -86,7 +90,7 @@ private:
 	void onCursorTrail();
 	void updateHookState();
 	bool startHook();
-	void stopHook();
+	void stopHook(bool deactivate = true);
 	void onHookFailed(DWORD error, quint32 generation);
 	void onCursorMoved();
 	void onButtonPressed(QPoint position, quint32 time);

@@ -33,6 +33,7 @@ constexpr UINT WM_QS_CURSOR_MOVED = WM_APP + 1;
 constexpr UINT WM_QS_BUTTON_PRESSED = WM_APP + 2;
 constexpr UINT WM_QS_HOOK_FAILED = WM_APP + 3;
 constexpr UINT WM_QS_MONITOR_CHANGED = WM_APP + 4;
+constexpr UINT WM_QS_HOOK_READY = WM_APP + 5;
 constexpr auto MESSAGE_WINDOW_CLASS = L"QuickshellInputMaskTracker";
 constexpr int CURSOR_INTERVAL_MS = 33;
 
@@ -167,6 +168,11 @@ void wakeTracker() {
 	if (target == nullptr || !PostMessageW(target, WM_QS_CURSOR_MOVED, 0, 0)) wakePending.store(false);
 }
 
+QPointer<InputMaskTracker>& trackerInstanceRef() {
+	static QPointer<InputMaskTracker> tracker; // NOLINT
+	return tracker;
+}
+
 } // namespace
 
 void noteHookDelay(bool keyboard, DWORD eventTime) {
@@ -244,13 +250,26 @@ InputMaskTracker::LateReportState InputMaskTracker::lateReportStateForTesting() 
 #endif
 
 InputMaskTracker* InputMaskTracker::instance() {
-	static QPointer<InputMaskTracker> tracker; // NOLINT
-
+	auto& tracker = trackerInstanceRef();
 	if (tracker.isNull()) {
 		tracker = new InputMaskTracker(QCoreApplication::instance());
 	}
 
 	return tracker.data();
+}
+
+bool InputMaskTracker::restartActiveMouseHook() {
+	auto* tracker = trackerInstanceRef().data();
+	if (tracker == nullptr || !tracker->hookRunning) return false;
+
+	tracker->stopHook(false);
+	tracker->hookFailed = false;
+	if (!tracker->startHook()) {
+		hotkeys::hookwatch::setMouseActive(false);
+		return false;
+	}
+	tracker->updateHookState();
+	return true;
 }
 
 InputMaskTracker::InputMaskTracker(QObject* parent): QObject(parent) {
@@ -566,9 +585,10 @@ bool InputMaskTracker::startHook() {
 	return true;
 }
 
-void InputMaskTracker::stopHook() {
+void InputMaskTracker::stopHook(bool deactivate) {
 	if (!this->hookRunning) return;
 
+	if (deactivate) hotkeys::hookwatch::setMouseActive(false);
 	hookStopRequested.store(true);
 	auto threadId = hookThreadId.load();
 	if (threadId != 0) PostThreadMessageW(threadId, WM_QUIT, 0, 0);
@@ -583,6 +603,7 @@ void InputMaskTracker::stopHook() {
 void InputMaskTracker::onHookFailed(DWORD error, quint32 generation) {
 	if (!this->hookRunning || generation != this->hookGeneration) return;
 
+	hotkeys::hookwatch::setMouseActive(false);
 	this->hookThread.join();
 	this->hookRunning = false;
 	this->hookFailed = true;
@@ -617,6 +638,11 @@ void InputMaskTracker::hookThreadMain(quint32 generation) {
 		return;
 	}
 
+	hotkeys::hookwatch::noteMouseInstalled();
+	if (auto* target = hookTarget.load()) {
+		PostMessageW(target, WM_QS_HOOK_READY, 0, static_cast<LPARAM>(generation));
+	}
+
 	while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
 		TranslateMessage(&msg);
 		DispatchMessageW(&msg);
@@ -630,6 +656,7 @@ LRESULT CALLBACK InputMaskTracker::mouseHookProc(int code, WPARAM wParam, LPARAM
 	if (code == HC_ACTION) {
 		auto* info = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam); // NOLINT(performance-no-int-to-ptr)
 		noteHookDelay(false, info->time);
+		hotkeys::hookwatch::noteMouseInput();
 		cursorX.store(info->pt.x);
 		cursorY.store(info->pt.y);
 
@@ -677,6 +704,14 @@ InputMaskTracker::messageWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
 	if (msg == WM_QS_MONITOR_CHANGED) {
 		emit InputMaskTracker::instance()->cursorMonitorChanged(static_cast<quintptr>(wParam));
+		return 0;
+	}
+
+	if (msg == WM_QS_HOOK_READY) {
+		auto* tracker = InputMaskTracker::instance();
+		if (tracker->hookRunning && static_cast<quint32>(lParam) == tracker->hookGeneration) {
+			hotkeys::hookwatch::setMouseActive(true);
+		}
 		return 0;
 	}
 
