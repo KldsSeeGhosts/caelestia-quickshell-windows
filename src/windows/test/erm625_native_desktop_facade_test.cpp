@@ -855,6 +855,7 @@ private slots:
 	}
 
 	void switchToRevalidatesAfterSupersededPublicationBeforeNativeSwitch() {
+		NativeDesktopFacadeTestHook::setObservationBudget(*this->desktops, 150);
 		{
 			auto blocked = std::make_shared<BlockingCall>();
 			Unblock unblock {blocked};
@@ -884,6 +885,12 @@ private slots:
 		this->old.manager.beforeSwitch = {};
 		QVERIFY(!stillValid);
 		QCOMPARE(nativeSwitches, 0);
+		// Guard remains active immediately after the failed replacement, then recovers via DeadlineGuard.
+		QVERIFY(!this->desktops->isDesktopCurrentlyActive(0, this->old.one.id));
+		QVERIFY(waitUntil(
+		    [this] { return this->desktops->isDesktopCurrentlyActive(0, this->old.one.id); },
+		    1000
+		));
 	}
 
 	void reentrantSwitchDuringSupersededDoesNotOverrideNewerSwitch() {
@@ -1487,6 +1494,7 @@ private slots:
 		    this->old.one.id
 		));
 		QVERIFY(nativeDesktopCommandPending());
+		QCOMPARE(WaitForSingleObject(blocked->entered, 1000), WAIT_OBJECT_0);
 
 		// User switched directly to destination B in Task View while the origin check was slow.
 		this->old.manager.current = &this->old.two;
@@ -1535,6 +1543,7 @@ private slots:
 		    this->old.one.id
 		));
 		QVERIFY(nativeDesktopCommandPending());
+		QCOMPARE(WaitForSingleObject(blocked->entered, 1000), WAIT_OBJECT_0);
 
 		// Origin check on A passed and SwitchDesktop(B) is in flight; Task View moves to C.
 		this->old.manager.current = &this->old.three;
@@ -1577,6 +1586,7 @@ private slots:
 	}
 
 	void moveAndFollowSucceedsAfterObservationTimeout() {
+		NativeDesktopFacadeTestHook::setObservationBudget(*this->desktops, 150);
 		this->old.manager.array.desktops = {&this->old.one, &this->old.two};
 		this->old.manager.current = &this->old.one;
 		this->old.manager.publishSwitch = false;
@@ -1585,22 +1595,32 @@ private slots:
 		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
 		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));
 
-		// Explicit switch accepted synchronously, never observed -> times out after 1500 ms.
+		// Explicit switch accepted synchronously, never observed -> times out.
 		QVERIFY(this->desktops->switchTo(1));
 		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("accepted"));
 		QVERIFY(!this->desktops->isDesktopCurrentlyActive(0, this->old.one.id));
+
+		// Block the post-timeout refresh to verify the stale-cache guard holds until it lands.
+		auto refreshBlocked = std::make_shared<BlockingCall>();
+		Unblock unblockRefresh {refreshBlocked};
+		this->old.manager.beforeEnumeration = [refreshBlocked] { (*refreshBlocked)(); };
 		QVERIFY(waitUntil(
 		    [this] {
 			    return this->desktops->lastCommand().value("outcome").toString()
 			        == QStringLiteral("timed-out");
 		    },
-		    2500
+		    1000
 		));
 		QCOMPARE(
 		    this->desktops->lastCommand().value("reason").toString(),
 		    QStringLiteral("observation-timeout")
 		);
+		QCOMPARE(WaitForSingleObject(refreshBlocked->entered, 1000), WAIT_OBJECT_0);
+		QVERIFY(!this->desktops->isDesktopCurrentlyActive(0, this->old.one.id));
+
+		refreshBlocked->release();
 		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		this->old.manager.beforeEnumeration = {};
 		QVERIFY(this->desktops->isDesktopCurrentlyActive(0, this->old.one.id));
 
 		// A subsequent conditional move-and-follow from A to B must succeed after timeout recovery.
@@ -1646,6 +1666,7 @@ private slots:
 		    this->old.one.id
 		));
 		QVERIFY(nativeDesktopCommandPending());
+		QCOMPARE(WaitForSingleObject(blocked->entered, 1000), WAIT_OBJECT_0);
 
 		// Origin check on A passed; SwitchDesktop(B) will return E_ACCESSDENIED after 100 ms,
 		// while Task View independently switches directly to destination B.

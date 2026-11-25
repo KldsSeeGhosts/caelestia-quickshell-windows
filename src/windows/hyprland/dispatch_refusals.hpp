@@ -84,7 +84,9 @@ void reportToggleFloatingResult(
 	if (code == QStringLiteral("workspace-limit")) {
 		return QStringLiteral("Workspace limit reached");
 	}
-	if (code == QStringLiteral("provider-timeout") || code == QStringLiteral("provider-busy")) {
+	if (code == QStringLiteral("provider-timeout") || code == QStringLiteral("provider-busy")
+	    || code == QStringLiteral("observation-timeout"))
+	{
 		return QStringLiteral("Windows desktop control did not respond in time");
 	}
 	if (code == QStringLiteral("provider-disconnected")) {
@@ -92,7 +94,8 @@ void reportToggleFloatingResult(
 	}
 	if (code == QStringLiteral("provider-unavailable")
 	    || code == QStringLiteral("unsupported-build")
-	    || code == QStringLiteral("operation-unsupported"))
+	    || code == QStringLiteral("operation-unsupported")
+	    || code == QStringLiteral("dispatch-disabled"))
 	{
 		return QStringLiteral("Moving windows between workspaces is not available on this system");
 	}

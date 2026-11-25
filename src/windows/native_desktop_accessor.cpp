@@ -703,8 +703,10 @@ struct Channel {
 	    bool publicOperation = false,
 	    Kind kind = Kind::Command,
 	    HWND moveTarget = nullptr,
-	    bool switchCommand = false
+	    bool switchCommand = false,
+	    quint64* outSequence = nullptr
 	) {
+		if (outSequence) *outSequence = 0;
 		if (this->waiting) {
 			this->snapshot.error = HRESULT_FROM_WIN32(ERROR_BUSY);
 			return -1;
@@ -723,6 +725,7 @@ struct Channel {
 			return -1;
 		}
 		request->sequence = ++this->sequence;
+		if (outSequence) *outSequence = request->sequence;
 		request->operation = std::move(operation);
 		request->completed = [this] { this->wakeOnCompletion(); };
 		if (queryWindows) request->windows = this->watchedWindows.values();
@@ -1148,17 +1151,22 @@ HRESULT nativeDesktopFailedSwitchError() { return channel().failedSwitchError; }
 quint64 nativeDesktopWindowSnapshotRevision() { return channel().windowRevision; }
 GUID nativeWindowDesktopId(HWND hwnd) { return channel().window(hwnd).id; }
 int nativeWindowOnCurrentDesktop(HWND hwnd) { return channel().window(hwnd).onCurrent; }
-int switchNativeDesktopById(GUID desktop) {
+int switchNativeDesktopById(GUID desktop, quint64* outSequence) {
 	return channel().execute(
 	    [desktop] { return switchDesktop(workerIndex(desktop)); },
 	    false,
 	    false,
 	    Channel::Kind::Command,
 	    nullptr,
-	    true
+	    true,
+	    outSequence
 	);
 }
-int switchNativeDesktopByIdIfCurrent(GUID desktop, GUID expectedCurrent) {
+int switchNativeDesktopByIdIfCurrent(
+    GUID desktop,
+    GUID expectedCurrent,
+    quint64* outSequence
+) {
 	return channel().execute(
 	    [desktop, expectedCurrent] {
 		    auto& p = provider();
@@ -1178,7 +1186,8 @@ int switchNativeDesktopByIdIfCurrent(GUID desktop, GUID expectedCurrent) {
 	    false,
 	    Channel::Kind::Command,
 	    nullptr,
-	    true
+	    true,
+	    outSequence
 	);
 }
 int moveNativeDesktopWindowById(HWND hwnd, GUID desktop) {

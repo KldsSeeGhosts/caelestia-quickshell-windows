@@ -34,8 +34,12 @@ void requestNativeDesktopRefresh();
 [[nodiscard]] quint64 nativeDesktopWindowSnapshotRevision();
 [[nodiscard]] GUID nativeWindowDesktopId(HWND hwnd);
 [[nodiscard]] int nativeWindowOnCurrentDesktop(HWND hwnd);
-int switchNativeDesktopById(GUID desktop);
-int switchNativeDesktopByIdIfCurrent(GUID desktop, GUID expectedCurrent);
+int switchNativeDesktopById(GUID desktop, quint64* outSequence = nullptr);
+int switchNativeDesktopByIdIfCurrent(
+    GUID desktop,
+    GUID expectedCurrent,
+    quint64* outSequence = nullptr
+);
 int moveNativeDesktopWindowById(HWND hwnd, GUID desktop);
 std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop);
 void shutdownNativeDesktopAccessor();

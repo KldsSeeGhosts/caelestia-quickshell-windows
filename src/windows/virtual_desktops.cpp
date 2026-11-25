@@ -937,12 +937,17 @@ bool VirtualDesktops::switchTo(
 		return true;
 	}
 
+	quint64 submittedSwitchSequence = 0;
 	const auto switchResult = (this->nativeAccessor && !guidIsNull(targetGuid))
 	    ? (hasExpectedOrigin
 	           ? this->call(
-	                 -1, &switchNativeDesktopByIdIfCurrent, targetGuid, *expectedOriginDesktopId
+	                 -1,
+	                 &switchNativeDesktopByIdIfCurrent,
+	                 targetGuid,
+	                 *expectedOriginDesktopId,
+	                 &submittedSwitchSequence
 	             )
-	           : this->call(-1, &switchNativeDesktopById, targetGuid))
+	           : this->call(-1, &switchNativeDesktopById, targetGuid, &submittedSwitchSequence))
 	    : this->call(-1, this->accessor.goToDesktopNumber, static_cast<int>(index));
 	if (switchResult == -2) {
 		this->refresh();
@@ -955,8 +960,9 @@ bool VirtualDesktops::switchTo(
 	}
 
 	const auto id = ++this->nextRequest;
-	const auto minObservationSequence =
-	    this->nativeAccessor ? nativeDesktopSubmittedSequence() : quint64(0);
+	const auto minObservationSequence = this->nativeAccessor
+	    ? (submittedSwitchSequence != 0 ? submittedSwitchSequence : nativeDesktopSubmittedSequence())
+	    : quint64(0);
 	if (this->nativeAccessor) {
 		this->mHasUnobservedNativeSwitch = true;
 		if (minObservationSequence > this->mLastNativeSwitchSequence) {
