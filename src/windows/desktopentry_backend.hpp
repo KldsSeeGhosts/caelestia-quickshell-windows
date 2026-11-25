@@ -39,6 +39,11 @@ public:
 	static QString linkTargetForId(const QString& id);
 	static QString aliasForAppId(const QString& name);
 	static void launch(const QString& token, const QString& workingDirectory = QString());
+	static unsigned long launchSync(
+	    const QString& token,
+	    const QString& workingDirectory = QString(),
+	    const QString& arguments = QString()
+	);
 	static DesktopEntryAliasMaps buildAliasMaps(const QList<DesktopEntryAliasCandidate>& entries);
 
 	static void noteWindowExe(const QString& appId, const QString& exePath);

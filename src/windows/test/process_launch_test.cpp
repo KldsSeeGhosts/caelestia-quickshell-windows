@@ -651,6 +651,67 @@ private slots:
 		QCOMPARE(queued.value(QStringLiteral("requestId")).value<quint64>(), second);
 	}
 
+	void appsFolderFallbackPreservesActivationManagerRoute() {
+		using qs::windows::process::LaunchResult;
+		using qs::windows::process::LaunchStatus;
+		using qs::windows::sys::detail::launchAppsFolderTokenWithFallback;
+
+		// ShellExecute success skips activation fallback.
+		int activateCalls = 0;
+		const auto started = launchAppsFolderTokenWithFallback(
+		    [] { return LaunchResult {.status = LaunchStatus::Started, .error = ERROR_SUCCESS}; },
+		    [&] {
+			    ++activateCalls;
+			    return true;
+		    }
+		);
+		QCOMPARE(started, static_cast<DWORD>(ERROR_SUCCESS));
+		QCOMPARE(activateCalls, 0);
+
+		// ShellExecute failure falls back to IApplicationActivationManager and succeeds.
+		const auto activated = launchAppsFolderTokenWithFallback(
+		    [] { return LaunchResult {.status = LaunchStatus::Failed, .error = ERROR_FILE_NOT_FOUND}; },
+		    [&] {
+			    ++activateCalls;
+			    return true;
+		    }
+		);
+		QCOMPARE(activated, static_cast<DWORD>(ERROR_SUCCESS));
+		QCOMPARE(activateCalls, 1);
+
+		// Both routes failing preserves the shell error code.
+		const auto failed = launchAppsFolderTokenWithFallback(
+		    [] { return LaunchResult {.status = LaunchStatus::Failed, .error = ERROR_ACCESS_DENIED}; },
+		    [&] {
+			    ++activateCalls;
+			    return false;
+		    }
+		);
+		QCOMPARE(failed, static_cast<DWORD>(ERROR_ACCESS_DENIED));
+		QCOMPARE(activateCalls, 2);
+
+		// Cancelled and indeterminate launches do not retry activation.
+		const auto cancelled = launchAppsFolderTokenWithFallback(
+		    [] { return LaunchResult {.status = LaunchStatus::Cancelled, .error = ERROR_CANCELLED}; },
+		    [&] {
+			    ++activateCalls;
+			    return true;
+		    }
+		);
+		QCOMPARE(cancelled, static_cast<DWORD>(ERROR_CANCELLED));
+		QCOMPARE(activateCalls, 2);
+
+		const auto indeterminate = launchAppsFolderTokenWithFallback(
+		    [] { return LaunchResult {.status = LaunchStatus::Indeterminate, .error = ERROR_GEN_FAILURE}; },
+		    [&] {
+			    ++activateCalls;
+			    return true;
+		    }
+		);
+		QCOMPARE(indeterminate, static_cast<DWORD>(ERROR_GEN_FAILURE));
+		QCOMPARE(activateCalls, 2);
+	}
+
 };
 
 int main(int argc, char** argv) {
