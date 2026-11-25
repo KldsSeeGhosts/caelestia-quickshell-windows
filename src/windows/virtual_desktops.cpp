@@ -881,7 +881,8 @@ bool VirtualDesktops::moveWindow(
     HWND hwnd,
     qsizetype index,
     quint64* pendingSequence,
-    QString* failureReason
+    QString* failureReason,
+    const std::function<void(quint64)>& onPendingSequence
 ) {
 	if (pendingSequence != nullptr) *pendingSequence = 0;
 	if (failureReason != nullptr) failureReason->clear();
@@ -901,8 +902,10 @@ bool VirtualDesktops::moveWindow(
 	if (isOwnWindow(hwnd)) {
 		const auto ok = moveNativeDesktopOwnWindow(hwnd, this->mDesktops[index].id);
 		if (ok) {
-			if (*ok && pendingSequence != nullptr) {
-				*pendingSequence = nativeDesktopPendingMoveSequence(hwnd);
+			if (*ok) {
+				const auto seq = nativeDesktopPendingMoveSequence(hwnd);
+				if (pendingSequence != nullptr) *pendingSequence = seq;
+				if (seq != 0 && onPendingSequence) onPendingSequence(seq);
 			}
 			const auto error = nativeDesktopLastError();
 			auto reason = error == E_ACCESSDENIED ? QStringLiteral("permission-denied")
@@ -916,8 +919,10 @@ bool VirtualDesktops::moveWindow(
 	if (this->accessorLoaded()) {
 		const auto ok =
 		    this->call(-1, this->accessor.moveWindowToDesktopNumber, hwnd, static_cast<int>(index)) != -1;
-		if (ok && this->nativeAccessor && pendingSequence != nullptr) {
-			*pendingSequence = nativeDesktopPendingMoveSequence(hwnd);
+		if (ok && this->nativeAccessor) {
+			const auto seq = nativeDesktopPendingMoveSequence(hwnd);
+			if (pendingSequence != nullptr) *pendingSequence = seq;
+			if (seq != 0 && onPendingSequence) onPendingSequence(seq);
 		}
 		return result(ok, this->commandFailureReason());
 	}

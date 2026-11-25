@@ -96,7 +96,8 @@ public:
 	    HWND hwnd,
 	    qsizetype index,
 	    quint64* pendingSequence = nullptr,
-	    QString* failureReason = nullptr
+	    QString* failureReason = nullptr,
+	    const std::function<void(quint64)>& onPendingSequence = {}
 	);
 	bool pinWindow(HWND hwnd, bool pinned);
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;

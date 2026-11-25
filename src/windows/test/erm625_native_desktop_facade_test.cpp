@@ -775,6 +775,58 @@ private slots:
 		QCOMPARE(creationReason, QStringLiteral("workspace-limit"));
 		QCOMPARE(this->desktops->lastCommand().value("operation").toString(), QStringLiteral("switch"));
 	}
+
+	void pendingMoveCallbackRegistersBeforeCommandResultNestedLoop() {
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb8));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		this->old.manager.moveResult = E_ACCESSDENIED;
+		this->old.manager.beforeMove = [] { QThread::msleep(150); };
+
+		quint64 registeredSeq = 0;
+		bool sawRegisteredAtCompletion = false;
+		bool sawCompletionInsideCommandResult = false;
+		auto completionConn = QObject::connect(
+		    this->desktops,
+		    &VirtualDesktops::moveWindowCompleted,
+		    this->desktops,
+		    [&](quint64 sequence, quintptr, bool succeeded, const QString& reason) {
+			    if (sequence == registeredSeq && registeredSeq != 0) {
+				    sawRegisteredAtCompletion = true;
+				    QVERIFY(!succeeded);
+				    QCOMPARE(reason, QStringLiteral("permission-denied"));
+			    }
+		    }
+		);
+		auto resultConn = QObject::connect(
+		    this->desktops,
+		    &VirtualDesktops::commandResult,
+		    this->desktops,
+		    [&](const QVariantMap& result) {
+			    if (result.value("operation").toString() != QStringLiteral("move")) return;
+			    QVERIFY(registeredSeq != 0);
+			    sawCompletionInsideCommandResult = waitUntil(
+			        [&] { return sawRegisteredAtCompletion; }, 1000
+			    );
+		    }
+		);
+
+		quint64 pendingSeq = 0;
+		QVERIFY(this->desktops->moveWindow(
+		    window,
+		    1,
+		    &pendingSeq,
+		    nullptr,
+		    [&registeredSeq](quint64 seq) { registeredSeq = seq; }
+		));
+		QObject::disconnect(resultConn);
+		QObject::disconnect(completionConn);
+		this->old.manager.beforeMove = {};
+
+		QVERIFY(pendingSeq != 0);
+		QCOMPARE(registeredSeq, pendingSeq);
+		QVERIFY(sawCompletionInsideCommandResult);
+		QVERIFY(sawRegisteredAtCompletion);
+	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)
 #include "erm625_native_desktop_facade_test.moc"

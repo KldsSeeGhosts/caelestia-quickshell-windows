@@ -107,7 +107,10 @@ void launchCommandLine(const QString& line) {
 }
 
 void moveWindowTo(TrackedWindow* window, qsizetype index, bool follow) {
-	if (!window->moveToDesktop(index)) return;
+	QPointer<TrackedWindow> guardedWindow(window);
+	quint64 moveSequence = 0;
+	if (!window->moveToDesktop(index, &moveSequence)) return;
+	if (!guardedWindow || guardedWindow->latestMoveSequence() != moveSequence) return;
 
 	auto* behavior = WorkspaceBehavior::instance();
 	if (!follow) {
@@ -117,8 +120,9 @@ void moveWindowTo(TrackedWindow* window, qsizetype index, bool follow) {
 
 	behavior->prepareWarp(index, true);
 	if (!VirtualDesktops::instance()->switchTo(index)) return;
+	if (!guardedWindow || guardedWindow->latestMoveSequence() != moveSequence) return;
 	behavior->expectFocus(index);
-	window->activate();
+	guardedWindow->activate();
 }
 
 } // namespace
@@ -599,38 +603,44 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 			return;
 		}
 
-		const auto moveToken = window->beginMoveRequest();
-		const auto errorGeneration = tracker ? tracker->actionErrorGeneration() : 0;
+		const auto moveSequence = window->beginMoveRequest();
 		desktops->ensureCountWithReason(
 		    index + 1,
 		    [tracker = QPointer(tracker),
 		     desktops = QPointer(desktops),
 		     window = QPointer(window),
-		     moveToken,
-		     errorGeneration,
+		     moveSequence,
 		     index,
 		     follow](bool ok, const QString& reason) {
-			    if (window && window->moveRequestToken() != moveToken) return;
+			    if (window && window->latestMoveSequence() != moveSequence) return;
 			    if (ok && window) {
 				    moveWindowTo(window, index, follow);
 				    return;
 			    }
-			    if (tracker && tracker->actionErrorGeneration() != errorGeneration) return;
+			    if (tracker && tracker->lastActionErrorSequence() >= moveSequence) return;
 			    if (!ok) {
-				    reportMoveRefusal(tracker.data(), reason, false);
+				    if (tracker) {
+					    tracker->reportActionRefusalWithSequence(
+					        moveSequence,
+					        QStringLiteral("move"),
+					        moveRefusalReason(reason, false),
+					        false
+					    );
+				    }
 				    return;
 			    }
-			    const auto moveGeneration = tracker ? tracker->moveRequestGeneration() : 0;
 			    if (desktops) {
 				    desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-window"));
 			    }
-			    if (tracker
-			        && (tracker->actionErrorGeneration() != errorGeneration
-			            || tracker->moveRequestGeneration() != moveGeneration))
-			    {
-				    return;
+			    if (tracker && tracker->lastActionErrorSequence() >= moveSequence) return;
+			    if (tracker) {
+				    tracker->reportActionRefusalWithSequence(
+				        moveSequence,
+				        QStringLiteral("move"),
+				        moveRefusalReason(QStringLiteral("invalid-window"), false),
+				        false
+				    );
 			    }
-			    reportMoveRefusal(tracker.data(), QStringLiteral("invalid-window"), false);
 		    }
 		);
 

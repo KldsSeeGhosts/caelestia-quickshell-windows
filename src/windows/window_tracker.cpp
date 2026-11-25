@@ -610,36 +610,56 @@ void TrackedWindow::fullscreenOn(QScreen* screen) {
 	}
 }
 
-bool TrackedWindow::moveToDesktop(qsizetype index) {
-	const auto moveToken = this->beginMoveRequest();
+bool TrackedWindow::moveToDesktop(qsizetype index, quint64* requestSequence) {
+	const auto moveSequence = this->beginMoveRequest();
+	if (requestSequence != nullptr) *requestSequence = moveSequence;
 	if (!this->hasCurrentOwner()) {
-		this->reportActionRefused(
+		this->reportActionRefusedWithSequence(
+		    moveSequence,
 		    QStringLiteral("move"),
 		    qs::hyprland::ipc::moveRefusalReason(QStringLiteral("invalid-window"), false),
 		    false
 		);
 		return false;
 	}
-	const auto windowGeneration = this->actionErrorGeneration();
-	const auto trackerGeneration = this->tracker->actionErrorGeneration();
 	quint64 pendingSequence = 0;
+	bool pendingRegistered = false;
 	QString failureCode;
 	QPointer<TrackedWindow> self(this);
-	const auto accepted =
-	    this->tracker->desktops()->moveWindow(this->mHwnd, index, &pendingSequence, &failureCode);
+	auto* tracker = this->tracker;
+	const auto accepted = tracker->desktops()->moveWindow(
+	    this->mHwnd,
+	    index,
+	    &pendingSequence,
+	    &failureCode,
+	    [self, tracker, moveSequence, &pendingRegistered](quint64 sequence) {
+		    if (!self || sequence == 0) return;
+		    if (self->latestMoveSequence() != moveSequence
+		        || self->lastActionErrorSequence() >= moveSequence)
+		    {
+			    return;
+		    }
+		    tracker->notePendingUserMove(sequence, self.data(), moveSequence);
+		    pendingRegistered = true;
+	    }
+	);
 	if (!self) return false;
 	const auto ok = this->finishMoveRequest(
 	    accepted,
 	    pendingSequence,
+	    pendingRegistered,
 	    failureCode,
-	    moveToken,
-	    windowGeneration,
-	    trackerGeneration,
+	    moveSequence,
 	    [](const TrackedWindow* window) { return window->hasCurrentOwner(); },
 	    [](HWND hwnd) { return isMoreElevated(hwnd); }
 	);
-	if (ok && self && self->hasCurrentOwner()) this->refreshDesktop(true);
-	return ok;
+	if (!ok || !self || self->latestMoveSequence() != moveSequence
+	    || tracker->lastActionErrorSequence() == moveSequence)
+	{
+		return false;
+	}
+	if (self->hasCurrentOwner()) this->refreshDesktop(true);
+	return self && self->latestMoveSequence() == moveSequence;
 }
 
 void TrackedWindow::moveTo(const QPoint& logical) {
