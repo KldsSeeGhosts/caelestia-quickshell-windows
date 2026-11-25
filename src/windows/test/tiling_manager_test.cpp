@@ -2071,6 +2071,7 @@ private slots:
 	void tileRequestWithoutDesktopOrMonitorFails_data() {
 		QTest::addColumn<QString>("missing");
 		QTest::newRow("no desktop") << QStringLiteral("desktop");
+		QTest::newRow("out of range desktop") << QStringLiteral("out-of-range-desktop");
 		QTest::newRow("no monitor") << QStringLiteral("monitor");
 	}
 
@@ -2079,11 +2080,17 @@ private slots:
 		auto* window = add(1);
 		if (missing == "desktop") {
 			fakeWindow(window->hwnd()).desktop = -1;
+			enable();
+		} else if (missing == "out-of-range-desktop") {
+			enable();
+			QVERIFY(manager->setFloating(window, true, false));
+			manager->sync();
+			fakeWindow(window->hwnd()).desktop = manager->desktops->count();
 		} else {
 			fakeDesktop.screens = {QGuiApplication::primaryScreen(), nullptr};
 			fakeWindow(window->hwnd()).monitor = 1;
+			enable();
 		}
-		enable();
 		QVERIFY(!manager->isTiled(window));
 
 		QCOMPARE(manager->setFloatingDetailed(window, false, false), FloatingChangeResult::Failed);

@@ -3752,7 +3752,8 @@ TilingManager::setFloatingDetailed(TrackedWindow* window, bool floating, bool to
 	}
 
 	if (!floating && m.layout == nullptr
-	    && (window->desktop() < 0 || window->screen() == nullptr
+	    && (window->desktop() < 0 || this->desktops == nullptr
+	        || window->desktop() >= this->desktops->count() || window->screen() == nullptr
 	        || !QGuiApplication::screens().contains(window->screen())))
 	{
 		return FloatingChangeResult::Failed;
