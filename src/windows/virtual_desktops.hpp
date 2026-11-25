@@ -241,6 +241,7 @@ private:
 	quint64 nextRequest = 0;
 	quint64 mSwitchOrder = 0;
 	quint64 mWorkspaceIntentOrder = 0;
+	quint64 mLastNativeSwitchSequence = 0;
 };
 
 } // namespace qs::windows

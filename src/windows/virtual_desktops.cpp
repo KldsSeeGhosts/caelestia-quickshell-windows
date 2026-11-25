@@ -712,6 +712,12 @@ bool VirtualDesktops::isDesktopCurrentlyActive(qsizetype index, const GUID& targ
 	    : (index == this->mCurrent && index >= 0 && index < this->count());
 	if (!facadeMatches) return false;
 	if (!this->nativeAccessor || !this->accessorLoaded()) return true;
+	if (this->mLastNativeSwitchSequence != 0
+	    && (nativeDesktopCommandPending()
+	        || nativeDesktopReadSequence() <= this->mLastNativeSwitchSequence))
+	{
+		return false;
+	}
 	const auto nativeCurrent = this->accessor.getCurrentDesktopNumber != nullptr
 	    ? this->call(-1, this->accessor.getCurrentDesktopNumber)
 	    : -1;
@@ -848,6 +854,9 @@ bool VirtualDesktops::switchTo(
 	const auto id = ++this->nextRequest;
 	const auto minObservationSequence =
 	    this->nativeAccessor ? nativeDesktopSubmittedSequence() : quint64(0);
+	if (this->nativeAccessor && minObservationSequence > this->mLastNativeSwitchSequence) {
+		this->mLastNativeSwitchSequence = minObservationSequence;
+	}
 	this->pendingSwitch = PendingSwitch {
 	    id,
 	    index,

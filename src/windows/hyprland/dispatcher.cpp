@@ -575,7 +575,10 @@ TrackedWindow* Dispatcher::resolveWindow(const QString& arg) const {
 
 void Dispatcher::focusWorkspace(const QString& arg) {
 	auto* desktops = this->ipc->desktops();
+	QPointer<VirtualDesktops> guardedDesktops(desktops);
+	const auto entryIntent = desktops->workspaceIntentOrder();
 	desktops->retryAccessor();
+	if (!guardedDesktops || guardedDesktops->workspaceIntentOrder() != entryIntent) return;
 	if (qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR") != "1"
 	    || qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR_DISPATCH") != "1"
 	    || !desktops->supports(DesktopOperation::Switch)) {
