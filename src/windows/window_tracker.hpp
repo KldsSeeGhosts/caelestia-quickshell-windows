@@ -267,7 +267,8 @@ public:
 	bool moveToDesktop(
 	    qsizetype index,
 	    quint64 existingMoveSequence = 0,
-	    std::function<void(quint64, GUID)> onConfirmedSuccess = {}
+	    std::function<void(quint64, GUID)> onConfirmedSuccess = {},
+	    std::optional<GUID> requestedTargetId = std::nullopt
 	);
 	void moveTo(const QPoint& logical);
 

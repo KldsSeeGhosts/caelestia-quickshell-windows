@@ -101,11 +101,13 @@ struct FakeManager: FakeCom<DesktopManager> {
 	ApplicationView* expectedView = nullptr;
 	FakeDesktop* current = nullptr;
 	FakeDesktop* created = nullptr;
+	FakeDesktop* lastMovedDesktop = nullptr;
 	std::function<void()> beforeEnumeration, beforeSwitch, beforeCreate, beforeCanMove, beforeMove;
 	HRESULT STDMETHODCALLTYPE GetCount(UINT* out) override { return this->array.GetCount(out); }
-	HRESULT STDMETHODCALLTYPE MoveViewToDesktop(ApplicationView* view, Desktop*) override {
+	HRESULT STDMETHODCALLTYPE MoveViewToDesktop(ApplicationView* view, Desktop* desktop) override {
 		if (this->beforeMove) this->beforeMove();
 		++this->moves;
+		this->lastMovedDesktop = static_cast<FakeDesktop*>(desktop);
 		if (this->faultOnMove) fault();
 		return view == this->expectedView ? this->moveResult : E_INVALIDARG;
 	}

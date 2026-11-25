@@ -91,6 +91,7 @@ public:
 	[[nodiscard]] quint64 switchOrder() const { return this->mSwitchOrder; }
 	[[nodiscard]] quint64 workspaceIntentOrder() const { return this->mWorkspaceIntentOrder; }
 	[[nodiscard]] quint64 beginWorkspaceIntent() { return ++this->mWorkspaceIntentOrder; }
+	[[nodiscard]] bool isDesktopCurrentlyActive(qsizetype index, const GUID& targetGuid) const;
 	bool switchTo(
 	    qsizetype index,
 	    const std::function<bool()>& shouldProceed = {},
@@ -108,7 +109,8 @@ public:
 	    QString* failureReason = nullptr,
 	    const std::function<void(quint64)>& onPendingSequence = {},
 	    const std::function<bool()>& shouldProceed = {},
-	    GUID* targetDesktopId = nullptr
+	    GUID* targetDesktopId = nullptr,
+	    std::optional<GUID> requestedTargetId = std::nullopt
 	);
 	bool pinWindow(HWND hwnd, bool pinned);
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;

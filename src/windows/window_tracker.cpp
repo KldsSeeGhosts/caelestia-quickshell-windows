@@ -626,7 +626,8 @@ bool TrackedWindow::isTrackedAndOwned() const {
 bool TrackedWindow::moveToDesktop(
     qsizetype index,
     quint64 existingMoveSequence,
-    std::function<void(quint64, GUID)> onConfirmedSuccess
+    std::function<void(quint64, GUID)> onConfirmedSuccess,
+    std::optional<GUID> requestedTargetId
 ) {
 	const auto actionOrder = this->mActionOrder;
 	quint64 moveSequence = existingMoveSequence;
@@ -721,7 +722,8 @@ bool TrackedWindow::moveToDesktop(
 		    }
 		    return true;
 	    },
-	    targetDesktop.get()
+	    targetDesktop.get(),
+	    requestedTargetId
 	);
 	if (abortedBeforeMove) return false;
 	if (lostWindowDuringRecovery) {

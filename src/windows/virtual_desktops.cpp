@@ -705,6 +705,25 @@ void VirtualDesktops::refuseCommand(const QString& operation, const QString& rea
 	this->publishCommand(DesktopRefusal {operation, reason});
 }
 
+bool VirtualDesktops::isDesktopCurrentlyActive(qsizetype index, const GUID& targetGuid) const {
+	const auto facadeMatches = !guidIsNull(targetGuid)
+	    ? (this->mCurrent >= 0 && this->mCurrent < this->count()
+	       && IsEqualGUID(this->mDesktops[this->mCurrent].id, targetGuid) != FALSE)
+	    : (index == this->mCurrent && index >= 0 && index < this->count());
+	if (!facadeMatches) return false;
+	if (!this->nativeAccessor || !this->accessorLoaded()) return true;
+	const auto nativeCurrent = this->accessor.getCurrentDesktopNumber != nullptr
+	    ? this->call(-1, this->accessor.getCurrentDesktopNumber)
+	    : -1;
+	if (nativeCurrent < 0) return false;
+	if (!guidIsNull(targetGuid) && this->accessor.getDesktopIdByNumber != nullptr) {
+		const auto nativeCurrentId =
+		    this->call(GUID {}, this->accessor.getDesktopIdByNumber, nativeCurrent);
+		return !guidIsNull(nativeCurrentId) && IsEqualGUID(nativeCurrentId, targetGuid) != FALSE;
+	}
+	return nativeCurrent == index;
+}
+
 void VirtualDesktops::finishSwitch(DesktopCommandOutcome outcome, const QString& reason) {
 	if (!this->pendingSwitch) return;
 	QPointer<VirtualDesktops> self(this);
@@ -713,7 +732,8 @@ void VirtualDesktops::finishSwitch(DesktopCommandOutcome outcome, const QString&
 	this->switchDeadline.stop();
 	this->publishCommand(DesktopRequestResult {pending.id, QStringLiteral("switch"), outcome, reason});
 	if (self && outcome == DesktopCommandOutcome::Observed
-	    && self->mWorkspaceIntentOrder == pending.intentOrder && pending.onObserved)
+	    && self->mWorkspaceIntentOrder == pending.intentOrder && pending.onObserved
+	    && self->isDesktopCurrentlyActive(pending.index, pending.desktop))
 	{
 		pending.onObserved(pending.index);
 	}
@@ -795,15 +815,14 @@ bool VirtualDesktops::switchTo(
 	}
 	const auto targetGuid =
 	    (targetDesktopId && !guidIsNull(*targetDesktopId)) ? *targetDesktopId : this->mDesktops[index].id;
-	const auto alreadyCurrent = !guidIsNull(targetGuid)
-	    ? (this->mCurrent >= 0 && this->mCurrent < this->count()
-	       && IsEqualGUID(this->mDesktops[this->mCurrent].id, targetGuid) != FALSE)
-	    : (index == this->mCurrent);
+	const auto alreadyCurrent = this->isDesktopCurrentlyActive(index, targetGuid);
 	if (alreadyCurrent) {
 		this->publishCommand(DesktopRequestResult {++this->nextRequest, QStringLiteral("switch"),
 		                                         DesktopCommandOutcome::Observed, {}});
-		if (self && self->mWorkspaceIntentOrder == switchIntent && onObserved) {
-			onObserved(this->mCurrent);
+		if (self && self->mWorkspaceIntentOrder == switchIntent && onObserved
+		    && self->isDesktopCurrentlyActive(self->mCurrent, targetGuid))
+		{
+			onObserved(self->mCurrent);
 		}
 		return true;
 	}
@@ -964,18 +983,24 @@ bool VirtualDesktops::moveWindow(
     QString* failureReason,
     const std::function<void(quint64)>& onPendingSequence,
     const std::function<bool()>& shouldProceed,
-    GUID* targetDesktopId
+    GUID* targetDesktopId,
+    std::optional<GUID> requestedTargetId
 ) {
 	if (pendingSequence != nullptr) *pendingSequence = 0;
 	if (failureReason != nullptr) failureReason->clear();
 	if (targetDesktopId != nullptr) *targetDesktopId = GUID {};
 	this->retryAccessor();
 	if (shouldProceed && !shouldProceed()) return false;
+	if (requestedTargetId && !guidIsNull(*requestedTargetId)) {
+		index = this->indexOf(*requestedTargetId);
+	}
 	if (hwnd == nullptr || index < 0 || index >= this->count()) {
 		if (failureReason != nullptr) *failureReason = QStringLiteral("invalid-target");
 		this->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-target"));
 		return false;
 	}
+	const auto requestedGuid =
+	    (requestedTargetId && !guidIsNull(*requestedTargetId)) ? *requestedTargetId : this->mDesktops[index].id;
 	auto result = [this, failureReason](bool ok, const QString& reason) {
 		if (!ok && failureReason != nullptr) *failureReason = reason;
 		if (ok) this->publishCommand(DesktopUnobserved {QStringLiteral("move")});
@@ -984,7 +1009,7 @@ bool VirtualDesktops::moveWindow(
 	};
 
 	if (isOwnWindow(hwnd)) {
-		const auto desktopId = this->mDesktops[index].id;
+		const auto desktopId = requestedGuid;
 		if (targetDesktopId != nullptr) *targetDesktopId = desktopId;
 		const auto ok = moveNativeDesktopOwnWindow(hwnd, desktopId);
 		if (ok) {
@@ -1003,13 +1028,15 @@ bool VirtualDesktops::moveWindow(
 	}
 
 	if (this->accessorLoaded()) {
-		const auto desktopId =
-		    (this->nativeAccessor && this->accessor.getDesktopIdByNumber != nullptr)
-		        ? this->call(GUID {}, this->accessor.getDesktopIdByNumber, static_cast<int>(index))
-		        : this->mDesktops[index].id;
+		const auto desktopId = !guidIsNull(requestedGuid)
+		    ? requestedGuid
+		    : ((this->nativeAccessor && this->accessor.getDesktopIdByNumber != nullptr)
+		           ? this->call(GUID {}, this->accessor.getDesktopIdByNumber, static_cast<int>(index))
+		           : GUID {});
 		if (targetDesktopId != nullptr) *targetDesktopId = desktopId;
-		const auto ok =
-		    this->call(-1, this->accessor.moveWindowToDesktopNumber, hwnd, static_cast<int>(index)) != -1;
+		const auto ok = (this->nativeAccessor && !guidIsNull(desktopId))
+		    ? this->call(-1, &moveNativeDesktopWindowById, hwnd, desktopId) != -1
+		    : this->call(-1, this->accessor.moveWindowToDesktopNumber, hwnd, static_cast<int>(index)) != -1;
 		if (ok && this->nativeAccessor) {
 			const auto seq = nativeDesktopPendingMoveSequence(hwnd);
 			if (pendingSequence != nullptr) *pendingSequence = seq;

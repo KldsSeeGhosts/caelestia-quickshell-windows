@@ -169,6 +169,8 @@ private slots:
 		this->fresh.publicApi.desktopId = this->fresh.one.id;
 		this->old.manager.current = &this->old.one;
 		this->fresh.manager.current = &this->fresh.one;
+		this->old.manager.lastMovedDesktop = nullptr;
+		this->fresh.manager.lastMovedDesktop = nullptr;
 		QCOMPARE(this->old.manager.refs, 1UL);
 		QCOMPARE(this->old.one.refs, 1UL);
 		QCOMPARE(this->old.views.view.refs, 1UL);
@@ -1019,7 +1021,7 @@ private slots:
 		this->old.manager.current = &this->old.one;
 		QCOMPARE(refreshNativeDesktopForTest(), 3);
 		this->desktops->refresh();
-		QCoreApplication::processEvents();
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
 		QCOMPARE(this->desktops->count(), qsizetype(3));
 		QVERIFY(IsEqualGUID(this->desktops->desktops().at(1).id, this->old.two.id) != FALSE);
 
@@ -1052,6 +1054,71 @@ private slots:
 		QVERIFY(
 		    IsEqualGUID(this->desktops->desktops().at(observedIndex).id, this->old.two.id) != FALSE
 		);
+	}
+
+	void moveWindowUsesTargetGuidWhenNativeCacheReordered() {
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xbb));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		this->old.manager.moveResult = S_OK;
+		this->old.manager.beforeMove = {};
+		this->old.manager.array.desktops = {&this->old.one, &this->old.two, &this->old.three};
+		this->old.manager.current = &this->old.one;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		this->desktops->refresh();
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QVERIFY(IsEqualGUID(this->desktops->desktops().at(1).id, this->old.two.id) != FALSE);
+
+		// Reorder the provider and refresh native cache without updating the facade:
+		// facade has [A, B, C], native cache has [A, C, B].
+		this->old.manager.array.desktops = {&this->old.one, &this->old.three, &this->old.two};
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		QVERIFY(IsEqualGUID(this->accessor.getDesktopIdByNumber(1), this->old.three.id) != FALSE);
+
+		GUID targetGuid {};
+		QVERIFY(this->desktops->moveWindow(
+		    window, 1, nullptr, nullptr, {}, {}, &targetGuid, this->old.two.id
+		));
+		QCOMPARE(this->old.manager.lastMovedDesktop, &this->old.two);
+		QVERIFY(IsEqualGUID(targetGuid, this->old.two.id) != FALSE);
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+	}
+
+	void switchToDoesNotSkipSwitchWhenNativeCacheDisagreesWithStaleFacade() {
+		this->old.manager.array.desktops = {&this->old.one, &this->old.two, &this->old.three};
+		this->old.manager.current = &this->old.two;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		this->desktops->refresh();
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(1));
+
+		// Move native current to C without refreshing the facade: facade still says B, native cache says C.
+		this->old.manager.current = &this->old.three;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(1));
+		QCOMPARE(this->accessor.getCurrentDesktopNumber(), 2);
+
+		this->old.manager.publishSwitch = true;
+		this->old.manager.beforeSwitch = [] { QThread::msleep(150); };
+		int observedCalls = 0;
+		qsizetype observedIndex = -1;
+		QVERIFY(this->desktops->switchTo(
+		    1,
+		    {},
+		    [&observedCalls, &observedIndex](qsizetype idx) {
+			    ++observedCalls;
+			    observedIndex = idx;
+		    },
+		    std::nullopt,
+		    this->old.two.id
+		));
+		// Must not treat stale facade state as alreadyCurrent or run onObserved before observation.
+		QCOMPARE(observedCalls, 0);
+		QVERIFY(waitUntil([&observedCalls] { return observedCalls == 1; }, 1000));
+		this->old.manager.beforeSwitch = {};
+		QCOMPARE(this->old.manager.switches, 1);
+		QCOMPARE(this->old.manager.current, &this->old.two);
+		QCOMPARE(observedIndex, qsizetype(1));
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(1));
 	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)

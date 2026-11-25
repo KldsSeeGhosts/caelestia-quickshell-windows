@@ -139,10 +139,8 @@ void followMovedWindow(
 	if (!follow) {
 		const auto currentIndex = guardedDesktops->currentIndex();
 		if (currentIndex < 0 || currentIndex >= guardedDesktops->count()) return;
-		const auto originStillCurrent = !isNullDesktopGuid(originDesktopId)
-		    ? IsEqualGUID(desktopIdAt(guardedDesktops.data(), currentIndex), originDesktopId) != FALSE
-		    : currentIndex == originIndex;
-		if (!originStillCurrent) return;
+		const auto checkIndex = isNullDesktopGuid(originDesktopId) ? originIndex : currentIndex;
+		if (!guardedDesktops->isDesktopCurrentlyActive(checkIndex, originDesktopId)) return;
 		behavior->expectFocus(currentIndex, activationSource);
 		return;
 	}
@@ -165,12 +163,7 @@ void followMovedWindow(
 	     targetDesktopId,
 	     activationSource](qsizetype observedIndex) {
 		    if (!windowStillValid() || !guardedDesktops) return;
-		    if (guardedDesktops->currentIndex() != observedIndex) return;
-		    if (!isNullDesktopGuid(targetDesktopId)
-		        && !IsEqualGUID(desktopIdAt(guardedDesktops.data(), observedIndex), targetDesktopId))
-		    {
-			    return;
-		    }
+		    if (!guardedDesktops->isDesktopCurrentlyActive(observedIndex, targetDesktopId)) return;
 		    WorkspaceBehavior::instance()->expectFocus(observedIndex, activationSource);
 		    guardedWindow->activateOnCurrentDesktop(activationSource);
 	    },
@@ -188,7 +181,8 @@ void moveWindowTo(
     quint64 workspaceIntent,
     qsizetype originIndex,
     GUID originDesktopId,
-    ActivationSource activationSource
+    ActivationSource activationSource,
+    std::optional<GUID> requestedTargetId = std::nullopt
 ) {
 	QPointer<VirtualDesktops> guardedDesktops(desktops);
 	QPointer<TrackedWindow> guardedWindow(window);
@@ -215,7 +209,8 @@ void moveWindowTo(
 		        targetDesktopId,
 		        activationSource
 		    );
-	    }
+	    },
+	    requestedTargetId
 	);
 }
 
@@ -617,7 +612,14 @@ void Dispatcher::focusWorkspace(const QString& arg) {
 		if (!behavior->backAndForth() || target.kind == WorkspaceTarget::Kind::Relative || previous < 0
 		    || previous == index)
 		{
-			desktops->switchTo(index);
+			const auto targetId = desktopIdAt(desktops, index);
+			desktops->switchTo(
+			    index,
+			    {},
+			    {},
+			    std::nullopt,
+			    !isNullDesktopGuid(targetId) ? std::optional<GUID>(targetId) : std::nullopt
+			);
 			behavior->warpToActive();
 			return;
 		}
@@ -642,9 +644,16 @@ void Dispatcher::focusWorkspace(const QString& arg) {
 		return;
 	}
 
+	const auto targetId = desktopIdAt(desktops, index);
 	behavior->prepareWarp(index);
 	behavior->expectFocus(index);
-	desktops->switchTo(index);
+	desktops->switchTo(
+	    index,
+	    {},
+	    {},
+	    std::nullopt,
+	    !isNullDesktopGuid(targetId) ? std::optional<GUID>(targetId) : std::nullopt
+	);
 }
 
 void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool follow) {
@@ -805,6 +814,7 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 		return;
 	}
 
+	const auto requestedTargetId = desktopIdAt(guardedDesktops.data(), index);
 	const auto workspaceIntent = guardedDesktops->workspaceIntentOrder() == entryIntent
 	    ? guardedDesktops->beginWorkspaceIntent()
 	    : quint64(0);
@@ -817,7 +827,8 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 	    workspaceIntent,
 	    originIndex,
 	    originDesktopId,
-	    activationSource
+	    activationSource,
+	    !isNullDesktopGuid(requestedTargetId) ? std::optional<GUID>(requestedTargetId) : std::nullopt
 	);
 }
 

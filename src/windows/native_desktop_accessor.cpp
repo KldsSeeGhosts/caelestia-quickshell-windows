@@ -1006,16 +1006,7 @@ int boundedCreate() {
 	return channel().execute([] { return createDesktop(); });
 }
 int boundedMove(HWND hwnd, int index) {
-	const auto id = cachedId(index);
-	const auto result = channel().execute(
-	    [hwnd, id] { return moveWindow(hwnd, workerIndex(id)); },
-	    false,
-	    false,
-	    Channel::Kind::Command,
-	    hwnd
-	);
-	if (result == 0) channel().requestRefresh();
-	return result;
+	return moveNativeDesktopWindowById(hwnd, cachedId(index));
 }
 } // namespace
 
@@ -1118,6 +1109,17 @@ GUID nativeWindowDesktopId(HWND hwnd) { return channel().window(hwnd).id; }
 int nativeWindowOnCurrentDesktop(HWND hwnd) { return channel().window(hwnd).onCurrent; }
 int switchNativeDesktopById(GUID desktop) {
 	return channel().execute([desktop] { return switchDesktop(workerIndex(desktop)); });
+}
+int moveNativeDesktopWindowById(HWND hwnd, GUID desktop) {
+	const auto result = channel().execute(
+	    [hwnd, desktop] { return moveWindow(hwnd, workerIndex(desktop)); },
+	    false,
+	    false,
+	    Channel::Kind::Command,
+	    hwnd
+	);
+	if (result == 0) channel().requestRefresh();
+	return result;
 }
 
 std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop) {
