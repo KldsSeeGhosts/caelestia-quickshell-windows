@@ -534,6 +534,47 @@ private slots:
 		QCOMPARE(fixture.tracker->lastActionError(), otherError);
 	}
 
+	void reentrantSameWindowMoveDuringSuccessPreservesInnerPendingRefusal() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		// Outer move A captures generations before moveWindow(), then during A's
+		// synchronous commandResult publication, inner move B starts pending on
+		// the SAME window.
+		const auto outerWindowGen = fixture.window->actionErrorGeneration();
+		const auto outerTrackerGen = fixture.tracker->actionErrorGeneration();
+
+		const auto innerWindowGen = fixture.window->actionErrorGeneration();
+		const auto innerTrackerGen = fixture.tracker->actionErrorGeneration();
+		QVERIFY(fixture.window->finishMoveRequestForTest(
+		    true, 61, QString(), innerWindowGen, innerTrackerGen, [](HWND) { return false; }
+		));
+
+		// Outer move A now finishes its synchronous success without bumping
+		// generation or dropping B's pending registration.
+		QVERIFY(fixture.window->finishMoveRequestForTest(
+		    true, 0, QString(), outerWindowGen, outerTrackerGen, [](HWND) { return false; }
+		));
+
+		QSignalSpy windowRefused(fixture.window, &TrackedWindow::actionRefused);
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+		fixture.tracker->completePendingUserMoveForTest(
+		    61,
+		    reinterpret_cast<quintptr>(fixture.window->hwnd()),
+		    false,
+		    QStringLiteral("permission-denied"),
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; }
+		);
+
+		QCOMPARE(windowRefused.size(), 1);
+		QCOMPARE(trackerRefused.size(), 1);
+		QCOMPARE(
+		    fixture.window->lastActionError(),
+		    QStringLiteral("move:Windows denied permission to move this window")
+		);
+	}
+
 	void lateMoveCompletionIgnoresUntrackedMove() {
 		DispatcherFixture fixture;
 		fixture.tracker->registerWindowForTest(fixture.window);

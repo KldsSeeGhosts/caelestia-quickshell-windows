@@ -611,6 +611,7 @@ void TrackedWindow::fullscreenOn(QScreen* screen) {
 }
 
 bool TrackedWindow::moveToDesktop(qsizetype index) {
+	(void)this->beginMoveRequest();
 	if (!this->hasCurrentOwner()) {
 		this->reportActionRefused(
 		    QStringLiteral("move"),
@@ -619,27 +620,22 @@ bool TrackedWindow::moveToDesktop(qsizetype index) {
 		);
 		return false;
 	}
+	const auto windowGeneration = this->actionErrorGeneration();
+	const auto trackerGeneration = this->tracker->actionErrorGeneration();
 	quint64 pendingSequence = 0;
-	if (!this->tracker->desktops()->moveWindow(this->mHwnd, index, &pendingSequence)) {
-		const auto code =
-		    this->tracker->desktops()->lastCommand().value(QStringLiteral("reason")).toString();
-		const auto elevated = isMoreElevated(this->mHwnd);
-		this->bElevated = elevated;
-		const auto reportElevated = elevated && qs::hyprland::ipc::isWindowRejectionMoveCode(code);
-		this->reportActionRefused(
-		    QStringLiteral("move"),
-		    qs::hyprland::ipc::moveRefusalReason(code, reportElevated),
-		    reportElevated
-		);
-		return false;
-	}
-	if (pendingSequence != 0) {
-		this->tracker->notePendingUserMove(pendingSequence, this);
-	} else {
-		this->clearActionError();
-	}
-	this->refreshDesktop(true);
-	return true;
+	QString failureCode;
+	const auto accepted =
+	    this->tracker->desktops()->moveWindow(this->mHwnd, index, &pendingSequence, &failureCode);
+	const auto ok = this->finishMoveRequest(
+	    accepted,
+	    pendingSequence,
+	    failureCode,
+	    windowGeneration,
+	    trackerGeneration,
+	    [](HWND hwnd) { return isMoreElevated(hwnd); }
+	);
+	if (ok) this->refreshDesktop(true);
+	return ok;
 }
 
 void TrackedWindow::moveTo(const QPoint& logical) {

@@ -90,8 +90,14 @@ public:
 	void retryAccessor();
 	bool switchTo(qsizetype index);
 	void ensureCount(qsizetype count, std::function<void(bool)> done);
+	void ensureCountWithReason(qsizetype count, std::function<void(bool, const QString&)> done);
 	bool removeDesktop(qsizetype index, qsizetype fallback);
-	bool moveWindow(HWND hwnd, qsizetype index, quint64* pendingSequence = nullptr);
+	bool moveWindow(
+	    HWND hwnd,
+	    qsizetype index,
+	    quint64* pendingSequence = nullptr,
+	    QString* failureReason = nullptr
+	);
 	bool pinWindow(HWND hwnd, bool pinned);
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;
 	[[nodiscard]] DesktopAvailability availability() const;
@@ -195,7 +201,7 @@ private:
 	struct CreationWaiter {
 		qsizetype count;
 		quint64 id;
-		std::function<void(bool)> done;
+		std::function<void(bool, const QString&)> done;
 	};
 	QList<CreationWaiter> creationWaiters;
 

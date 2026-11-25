@@ -152,6 +152,23 @@ public:
 		this->reportActionRefused(action, reason, elevated);
 	}
 	void clearActionErrorForTest() { this->clearActionError(); }
+	bool finishMoveRequestForTest(
+	    bool accepted,
+	    quint64 pendingSequence,
+	    const QString& failureCode,
+	    quint64 windowErrorGenerationBefore,
+	    quint64 trackerErrorGenerationBefore,
+	    const std::function<bool(HWND)>& checkElevated
+	) {
+		return this->finishMoveRequest(
+		    accepted,
+		    pendingSequence,
+		    failureCode,
+		    windowErrorGenerationBefore,
+		    trackerErrorGenerationBefore,
+		    checkElevated
+		);
+	}
 #endif
 	[[nodiscard]] HWND hwnd() const { return this->mHwnd; }
 	[[nodiscard]] quint64 address() const;
@@ -187,6 +204,9 @@ public:
 	[[nodiscard]] QString aumid() const { return this->bAumid.value(); }
 	[[nodiscard]] bool elevated() const { return this->bElevated.value(); }
 	[[nodiscard]] QString lastActionError() const { return this->mLastActionError; }
+	[[nodiscard]] quint64 actionErrorGeneration() const { return this->mActionErrorGeneration; }
+	[[nodiscard]] quint64 beginMoveRequest() { return ++this->mMoveRequestToken; }
+	[[nodiscard]] quint64 moveRequestToken() const { return this->mMoveRequestToken; }
 	[[nodiscard]] quint32 pid() const { return this->bPid.value(); }
 	// Process and thread of the frame window itself, recorded when the tracker
 	// adopted it (pid() is the core process for a UWP frame). A consumer that
@@ -264,10 +284,19 @@ private:
 	void reportActionRefused(const QString& action, const QString& reason, bool elevated);
 	void reportActionFailure(const QString& action, DWORD error);
 	void clearActionError();
+	bool finishMoveRequest(
+	    bool accepted,
+	    quint64 pendingSequence,
+	    const QString& failureCode,
+	    quint64 windowErrorGenerationBefore,
+	    quint64 trackerErrorGenerationBefore,
+	    const std::function<bool(HWND)>& checkElevated
+	);
 
 	WindowTracker* tracker;
 	QString mLastActionError;
 	quint64 mActionErrorGeneration = 0;
+	quint64 mMoveRequestToken = 0;
 	HWND mHwnd;
 	bool uwpFrame = false;
 	quint32 mFrameProcessId = 0;

@@ -729,6 +729,52 @@ private slots:
 		QVERIFY(waitUntil([] { return !nativeDesktopCommandPending(); }, 1000));
 		this->old.manager.beforeMove = {};
 	}
+
+	void moveAndCreationReturnOwnFailureReasonDespiteReentrantCommand() {
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb7));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		this->old.manager.moveResult = E_ACCESSDENIED;
+		this->old.manager.beforeMove = {};
+
+		bool switched = false;
+		auto conn = QObject::connect(
+		    this->desktops,
+		    &VirtualDesktops::commandResult,
+		    this->desktops,
+		    [this, &switched](const QVariantMap& result) {
+			    if (switched || result.value("operation").toString() == QStringLiteral("switch")) return;
+			    switched = true;
+			    QVERIFY(this->desktops->switchTo(0));
+		    }
+		);
+
+		quint64 pendingSeq = 999;
+		QString moveReason;
+		QVERIFY(!this->desktops->moveWindow(window, 1, &pendingSeq, &moveReason));
+		QVERIFY(switched);
+		QCOMPARE(pendingSeq, quint64(0));
+		QCOMPARE(moveReason, QStringLiteral("permission-denied"));
+		QCOMPARE(this->desktops->lastCommand().value("operation").toString(), QStringLiteral("switch"));
+
+		switched = false;
+		bool creationCalled = false;
+		bool creationOk = true;
+		QString creationReason;
+		this->desktops->ensureCountWithReason(
+		    99,
+		    [&](bool ok, const QString& reason) {
+			    creationCalled = true;
+			    creationOk = ok;
+			    creationReason = reason;
+		    }
+		);
+		QObject::disconnect(conn);
+		QVERIFY(switched);
+		QVERIFY(creationCalled);
+		QVERIFY(!creationOk);
+		QCOMPARE(creationReason, QStringLiteral("workspace-limit"));
+		QCOMPARE(this->desktops->lastCommand().value("operation").toString(), QStringLiteral("switch"));
+	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)
 #include "erm625_native_desktop_facade_test.moc"

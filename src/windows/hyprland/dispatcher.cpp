@@ -574,6 +574,7 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 
 	auto target = parseWorkspaceTarget(arg);
 	if (target.kind == WorkspaceTarget::Kind::Special) {
+		(void)window->beginMoveRequest();
 		desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("operation-unsupported"));
 		reportMoveRefusal(tracker, QStringLiteral("operation-unsupported"), false);
 		this->unsupported("movetoworkspace " + arg.trimmed() + " (Windows has no special workspaces)");
@@ -584,6 +585,7 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 	auto index = this->resolveWorkspace(target, create);
 
 	if (index < 0) {
+		(void)window->beginMoveRequest();
 		desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-target"));
 		reportMoveRefusal(tracker, QStringLiteral("invalid-target"), false);
 		if (target.kind != WorkspaceTarget::Kind::Previous) {
@@ -594,30 +596,31 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 
 	if (index >= desktops->count()) {
 		if (!create) {
+			(void)window->beginMoveRequest();
 			desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-target"));
 			reportMoveRefusal(tracker, QStringLiteral("invalid-target"), false);
 			return;
 		}
 
+		const auto moveToken = window->beginMoveRequest();
 		const auto errorGeneration = tracker ? tracker->actionErrorGeneration() : 0;
-		desktops->ensureCount(
+		desktops->ensureCountWithReason(
 		    index + 1,
 		    [tracker = QPointer(tracker),
 		     desktops = QPointer(desktops),
 		     window = QPointer(window),
+		     moveToken,
 		     errorGeneration,
 		     index,
-		     follow](bool ok) {
-			    if (tracker && tracker->actionErrorGeneration() != errorGeneration) return;
+		     follow](bool ok, const QString& reason) {
 			    if (ok && window) {
+				    if (window->moveRequestToken() != moveToken) return;
 				    moveWindowTo(window, index, follow);
 				    return;
 			    }
+			    if (tracker && tracker->actionErrorGeneration() != errorGeneration) return;
 			    if (!ok) {
-				    const auto code = desktops
-				        ? desktops->lastCommand().value(QStringLiteral("reason")).toString()
-				        : QString();
-				    reportMoveRefusal(tracker.data(), code, false);
+				    reportMoveRefusal(tracker.data(), reason, false);
 				    return;
 			    }
 			    if (desktops) {

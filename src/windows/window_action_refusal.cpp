@@ -27,6 +27,41 @@ void TrackedWindow::clearActionError() {
 	this->tracker->clearWindowActionError(this);
 }
 
+bool TrackedWindow::finishMoveRequest(
+    bool accepted,
+    quint64 pendingSequence,
+    const QString& failureCode,
+    quint64 windowErrorGenerationBefore,
+    quint64 trackerErrorGenerationBefore,
+    const std::function<bool(HWND)>& checkElevated
+) {
+	if (!accepted) {
+		if (this->mActionErrorGeneration == windowErrorGenerationBefore
+		    && this->tracker->actionErrorGeneration() == trackerErrorGenerationBefore)
+		{
+			const auto elevated = checkElevated ? checkElevated(this->mHwnd) : false;
+			this->bElevated = elevated;
+			const auto reportElevated =
+			    elevated && qs::hyprland::ipc::isWindowRejectionMoveCode(failureCode);
+			this->reportActionRefused(
+			    QStringLiteral("move"),
+			    qs::hyprland::ipc::moveRefusalReason(failureCode, reportElevated),
+			    reportElevated
+			);
+		}
+		return false;
+	}
+
+	if (this->mActionErrorGeneration == windowErrorGenerationBefore) {
+		if (pendingSequence != 0) {
+			this->tracker->notePendingUserMove(pendingSequence, this);
+		} else {
+			this->clearActionError();
+		}
+	}
+	return true;
+}
+
 void WindowTracker::reportWindowActionRefused(
     const TrackedWindow* window,
     const QString& action,

@@ -747,32 +747,44 @@ bool VirtualDesktops::switchTo(qsizetype index) {
 }
 
 void VirtualDesktops::ensureCount(qsizetype count, std::function<void(bool)> done) {
+	this->ensureCountWithReason(count, [done = std::move(done)](bool ok, const QString&) {
+		if (done) done(ok);
+	});
+}
+
+void VirtualDesktops::ensureCountWithReason(
+    qsizetype count,
+    std::function<void(bool, const QString&)> done
+) {
 	this->retryAccessor();
 	if (this->nativeAccessor && nativeDesktopCommandPending()) {
-		this->refuseCommand(QStringLiteral("create"), QStringLiteral("provider-busy"));
-		done(false);
+		const auto reason = QStringLiteral("provider-busy");
+		this->refuseCommand(QStringLiteral("create"), reason);
+		done(false, reason);
 		return;
 	}
 	if (!this->supports(DesktopOperation::Create)) {
 		this->warnAccessorOnly("create desktops");
-		this->refuseCommand(QStringLiteral("create"),
-		    this->availability() == DesktopAvailability::Available
-		        ? QStringLiteral("operation-unsupported") : this->commandFailureReason());
-		done(false);
+		const auto reason = this->availability() == DesktopAvailability::Available
+		    ? QStringLiteral("operation-unsupported")
+		    : this->commandFailureReason();
+		this->refuseCommand(QStringLiteral("create"), reason);
+		done(false, reason);
 		return;
 	}
 
 	if (count > MAX_DESKTOPS || (!this->testMode && count > this->mWorkspaceLimit)) {
 		qCWarning(logDesktops) << "Refusing desktop creation above configured limit" << this->mWorkspaceLimit;
-		this->refuseCommand(QStringLiteral("create"), QStringLiteral("workspace-limit"));
-		done(false);
+		const auto reason = QStringLiteral("workspace-limit");
+		this->refuseCommand(QStringLiteral("create"), reason);
+		done(false, reason);
 		return;
 	}
 
 	if (this->count() >= count) {
 		this->publishCommand(DesktopRequestResult {++this->nextRequest, QStringLiteral("create"),
 		                                         DesktopCommandOutcome::Observed, {}});
-		done(true);
+		done(true, {});
 		return;
 	}
 
@@ -835,10 +847,11 @@ void VirtualDesktops::finishCreation(DesktopCommandOutcome failure, const QStrin
 	for (auto& [count, id, done]: waiters) {
 		const auto ok = this->accessorLoaded() && this->accessor.createDesktop != nullptr
 		             && this->count() >= count;
+		const auto waiterReason = ok ? QString() : reason;
 		this->publishCommand(DesktopRequestResult {id, QStringLiteral("create"),
 		                                         ok ? DesktopCommandOutcome::Observed : failure,
-		                                         ok ? QString() : reason});
-		done(ok);
+		                                         waiterReason});
+		done(ok, waiterReason);
 	}
 }
 
@@ -864,14 +877,22 @@ bool VirtualDesktops::removeDesktop(qsizetype index, qsizetype fallback) {
 	return true;
 }
 
-bool VirtualDesktops::moveWindow(HWND hwnd, qsizetype index, quint64* pendingSequence) {
+bool VirtualDesktops::moveWindow(
+    HWND hwnd,
+    qsizetype index,
+    quint64* pendingSequence,
+    QString* failureReason
+) {
 	if (pendingSequence != nullptr) *pendingSequence = 0;
+	if (failureReason != nullptr) failureReason->clear();
 	this->retryAccessor();
 	if (hwnd == nullptr || index < 0 || index >= this->count()) {
+		if (failureReason != nullptr) *failureReason = QStringLiteral("invalid-target");
 		this->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-target"));
 		return false;
 	}
-	auto result = [this](bool ok, const QString& reason) {
+	auto result = [this, failureReason](bool ok, const QString& reason) {
+		if (!ok && failureReason != nullptr) *failureReason = reason;
 		if (ok) this->publishCommand(DesktopUnobserved {QStringLiteral("move")});
 		else this->refuseCommand(QStringLiteral("move"), reason);
 		return ok;
