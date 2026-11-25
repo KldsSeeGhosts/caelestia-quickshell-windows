@@ -80,6 +80,7 @@ QMutex WindowsDesktopEntryBackend::sRegistryMutex;
 QHash<QString, QString> WindowsDesktopEntryBackend::sRegistry;    // NOLINT
 QHash<QString, QString> WindowsDesktopEntryBackend::sTargets;     // NOLINT
 QHash<QString, QString> WindowsDesktopEntryBackend::sLinkTargets; // NOLINT
+QHash<QString, QString> WindowsDesktopEntryBackend::sShortcutPaths; // NOLINT
 QHash<QString, QString> WindowsDesktopEntryBackend::sExeNames;    // NOLINT
 QMutex WindowsDesktopEntryBackend::sWindowExeMutex;
 QHash<QString, QString> WindowsDesktopEntryBackend::sWindowExes; // NOLINT
@@ -161,6 +162,11 @@ QString WindowsDesktopEntryBackend::idForParsingName(const QString& token) {
 QString WindowsDesktopEntryBackend::linkTargetForId(const QString& id) {
 	QMutexLocker locker(&WindowsDesktopEntryBackend::sRegistryMutex);
 	return WindowsDesktopEntryBackend::sLinkTargets.value(id);
+}
+
+QString WindowsDesktopEntryBackend::shortcutPathForId(const QString& id) {
+	QMutexLocker locker(&WindowsDesktopEntryBackend::sRegistryMutex);
+	return WindowsDesktopEntryBackend::sShortcutPaths.value(id);
 }
 
 namespace {
@@ -265,6 +271,7 @@ QList<ParsedDesktopEntryData> WindowsDesktopEntryBackend::scan() {
 
 	auto registry = QHash<QString, QString>();
 	auto linkTargets = QHash<QString, QString>();
+	auto shortcutPaths = QHash<QString, QString>();
 	QList<DesktopEntryAliasCandidate> aliasCandidates;
 
 	ComPtr<IShellItem> item;
@@ -324,6 +331,10 @@ QList<ParsedDesktopEntryData> WindowsDesktopEntryBackend::scan() {
 		registry.insert(id, token);
 		results.append(std::move(data));
 
+		if (!packaged && !fsPath.isEmpty()) {
+			shortcutPaths.insert(id, QDir::toNativeSeparators(fsPath));
+		}
+
 		auto target = linkTarget(current);
 		if (!target.isEmpty()) linkTargets.insert(id, target);
 		aliasCandidates.append({id, target, token});
@@ -336,6 +347,7 @@ QList<ParsedDesktopEntryData> WindowsDesktopEntryBackend::scan() {
 		WindowsDesktopEntryBackend::sRegistry = registry;
 		WindowsDesktopEntryBackend::sTargets = aliases.targets;
 		WindowsDesktopEntryBackend::sLinkTargets = linkTargets;
+		WindowsDesktopEntryBackend::sShortcutPaths = shortcutPaths;
 		WindowsDesktopEntryBackend::sExeNames = aliases.exeNames;
 	}
 

@@ -133,6 +133,12 @@ bool borderColoursSupported() {
 
 TilingManager* gManager = nullptr; // NOLINT
 
+void notifyTilingActiveChanged(bool wasActive) {
+	if ((TilingManager::active() != nullptr) != wasActive) {
+		if (auto* tracker = WindowTracker::instanceIfCreated()) emit tracker->tilingActiveChanged();
+	}
+}
+
 int rightOf(const QRect& rect) { return rect.left() + rect.width(); }
 int bottomOf(const QRect& rect) { return rect.top() + rect.height(); }
 
@@ -461,7 +467,9 @@ TilingManager* TilingManager::active() {
 }
 
 TilingManager::TilingManager(QString mutexName): mutexName(std::move(mutexName)) {
+	const auto wasActive = TilingManager::active() != nullptr;
 	gManager = this;
+	notifyTilingActiveChanged(wasActive);
 	this->mTelemetry = new tiling::TilingTelemetry(this);
 
 	this->syncTimer.setSingleShot(true);
@@ -508,11 +516,14 @@ TilingManager::TilingManager(QString mutexName): mutexName(std::move(mutexName))
 TilingManager::~TilingManager() {
 	if (this->mEnabled) this->stop();
 	this->restoreBorderColours();
+	const auto wasActive = TilingManager::active() != nullptr;
 	if (gManager == this) gManager = nullptr;
+	notifyTilingActiveChanged(wasActive);
 }
 
 void TilingManager::setEnabled(bool enabled) {
 	if (enabled == this->mEnabled) return;
+	const auto wasActive = TilingManager::active() != nullptr;
 	this->mEnabled = enabled;
 
 	if (enabled) {
@@ -521,6 +532,7 @@ void TilingManager::setEnabled(bool enabled) {
 			this->mEnabled = false;
 			qCWarning(logTiling) << "Enabling tiling was refused:" << error;
 			this->mTelemetry->refuseEnable(error);
+			notifyTilingActiveChanged(wasActive);
 			return;
 		}
 		this->mTelemetry->enableSucceeded();
@@ -528,6 +540,7 @@ void TilingManager::setEnabled(bool enabled) {
 		this->stop();
 	}
 
+	notifyTilingActiveChanged(wasActive);
 	emit this->enabledChanged();
 }
 
@@ -3713,8 +3726,15 @@ bool TilingManager::resizeTiled(TrackedWindow* window, qint32 dx, qint32 dy) {
 }
 
 bool TilingManager::setFloating(TrackedWindow* window, bool floating, bool toggle) {
+	const auto result = this->setFloatingDetailed(window, floating, toggle);
+	return result == FloatingChangeResult::Changed || result == FloatingChangeResult::Noop
+	    || result == FloatingChangeResult::Deferred;
+}
+
+FloatingChangeResult
+TilingManager::setFloatingDetailed(TrackedWindow* window, bool floating, bool toggle) {
 	auto iter = this->managed.find(window);
-	if (iter == this->managed.end()) return false;
+	if (iter == this->managed.end()) return FloatingChangeResult::Failed;
 
 	auto& m = iter->second;
 	if (toggle) floating = m.layout != nullptr;
@@ -3722,9 +3742,31 @@ bool TilingManager::setFloating(TrackedWindow* window, bool floating, bool toggl
 	if (!floating && m.elevated) {
 		qCInfo(logTiling) << "Window" << window->addressHex()
 		                  << "belongs to a more privileged process and can't be tiled.";
-		return false;
+		return FloatingChangeResult::Elevated;
 	}
 
+	if (!floating && this->outsideScope(m)) {
+		qCInfo(logTiling) << "Window" << window->addressHex()
+		                  << "is outside the configured tiling scope and can't be tiled.";
+		return FloatingChangeResult::ScopeExcluded;
+	}
+
+	if (!floating && m.layout == nullptr
+	    && (window->desktop() < 0 || this->desktops == nullptr
+	        || window->desktop() >= this->desktops->count() || window->screen() == nullptr
+	        || !QGuiApplication::screens().contains(window->screen())))
+	{
+		return FloatingChangeResult::Failed;
+	}
+
+	if (!toggle) {
+		const auto overrideMatches = floating ? m.override == Override::Float
+		                                      : m.override == Override::Tile;
+		const auto stateMatches = floating ? m.layout == nullptr : m.layout != nullptr;
+		if (overrideMatches && stateMatches) return FloatingChangeResult::Noop;
+	}
+
+	const auto wasTiled = m.layout != nullptr;
 	m.override = floating ? Override::Float : Override::Tile;
 	if (!floating) m.autoFloat = false;
 	// A manual float or tile ends any automatic admission wait.
@@ -3732,7 +3774,14 @@ bool TilingManager::setFloating(TrackedWindow* window, bool floating, bool toggl
 	m.terminalAdmissionAt = 0;
 
 	this->markWindow(window);
-	return true;
+	if (!floating && !wasTiled) {
+		const auto state = this->stateOf(m);
+		if (state == State::Out) return FloatingChangeResult::Failed;
+		if (state == State::Hidden || state == State::Suspended) {
+			return FloatingChangeResult::Deferred;
+		}
+	}
+	return FloatingChangeResult::Changed;
 }
 
 bool TilingManager::beginEdgeDrag(TrackedWindow* window, bool left, bool top) {

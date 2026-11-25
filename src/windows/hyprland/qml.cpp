@@ -6,6 +6,7 @@
 
 #include "../../core/model.hpp"
 #include "../../core/qmlscreen.hpp"
+#include "../tiling.hpp"
 #include "../virtual_desktops.hpp"
 #include "../window_stack.hpp"
 #include "../window_tracker.hpp"
@@ -50,8 +51,13 @@ HyprlandIpcQml::HyprlandIpcQml(): pinSupport(HyprlandIpc::instance()->desktops()
 	    this,
 	    &HyprlandIpcQml::desktopControlSupportedChanged
 	);
-
 	auto* tracker = qs::windows::WindowTracker::instance();
+	QObject::connect(
+	    tracker,
+	    &qs::windows::WindowTracker::tilingActiveChanged,
+	    this,
+	    &HyprlandIpcQml::tilingActiveChanged
+	);
 	QObject::connect(
 	    tracker,
 	    &qs::windows::WindowTracker::lastActionErrorChanged,
@@ -122,6 +128,10 @@ ObjectModel<HyprlandWorkspace>* HyprlandIpcQml::workspaces() {
 
 ObjectModel<HyprlandToplevel>* HyprlandIpcQml::toplevels() {
 	return HyprlandIpc::instance()->toplevels();
+}
+
+bool HyprlandIpcQml::tilingActive() const {
+	return qs::windows::TilingManager::active() != nullptr;
 }
 
 QString HyprlandIpcQml::lastActionError() const {

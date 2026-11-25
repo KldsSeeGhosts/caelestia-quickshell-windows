@@ -521,6 +521,7 @@ public:
 		static WindowTracker tracker;
 		return &tracker;
 	}
+	static WindowTracker* instanceIfCreated() { return instance(); }
 	QList<TrackedWindow*> fixtures;
 	QList<TrackedWindow*> pendingDiscovery;
 	void rescan() {
@@ -560,6 +561,7 @@ signals:
 	void moveSizeStarted(TrackedWindow*, bool super);
 	void moveSizeEnded(TrackedWindow*);
 	void movingLocationChanged(TrackedWindow*);
+	void tilingActiveChanged();
 };
 
 } // namespace qs::windows

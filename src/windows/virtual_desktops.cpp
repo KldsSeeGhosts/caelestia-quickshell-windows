@@ -866,10 +866,12 @@ bool VirtualDesktops::pinWindow(HWND hwnd, bool pinned) {
 	return this->call(-1, pinned ? a.pinWindow : a.unPinWindow, hwnd) != -1;
 }
 
-bool VirtualDesktops::isWindowPinned(HWND hwnd) const {
+std::optional<bool> VirtualDesktops::isWindowPinned(HWND hwnd) const {
 	const auto& a = this->accessor;
-	if (!this->pinSupported()) return false;
-	return this->call(-1, a.isPinnedWindow, hwnd) == 1;
+	if (!this->pinSupported()) return std::nullopt;
+	const auto pinned = this->call(-1, a.isPinnedWindow, hwnd);
+	if (pinned == -1) return std::nullopt;
+	return pinned == 1;
 }
 
 QString VirtualDesktops::guidToString(const GUID& guid) {

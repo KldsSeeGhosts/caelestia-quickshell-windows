@@ -1146,7 +1146,8 @@ void WinPanelWindow::stickToAllDesktops() {
 		auto* desktops = VirtualDesktops::instance();
 		if (!desktops->accessorLoaded() || this->pinFailedHwnd == hwnd) return;
 
-		this->pinnedToAllDesktops = desktops->isWindowPinned(hwnd) || desktops->pinWindow(hwnd, true);
+		this->pinnedToAllDesktops = desktops->isWindowPinned(hwnd).value_or(false)
+		    || desktops->pinWindow(hwnd, true);
 
 		if (!this->pinnedToAllDesktops) {
 			this->pinFailedHwnd = hwnd;

@@ -672,27 +672,6 @@ namespace {
 WindowTracker* trackerInstance = nullptr;
 } // namespace
 
-void WindowTracker::reportWindowActionRefused(
-    const TrackedWindow* window,
-    const QString& action,
-    const QString& reason,
-    bool elevated
-) {
-	auto text = window_action_detail::errorText(action, reason);
-	this->mLastActionErrorWindow = window;
-	if (this->mLastActionError != text) {
-		this->mLastActionError = text;
-		emit this->lastActionErrorChanged();
-	}
-	emit this->windowActionRefused(action, reason, elevated);
-}
-
-void WindowTracker::clearWindowActionError(const TrackedWindow* window) {
-	if (this->mLastActionError.isEmpty() || this->mLastActionErrorWindow != window) return;
-	this->mLastActionError.clear();
-	this->mLastActionErrorWindow = nullptr;
-	emit this->lastActionErrorChanged();
-}
 
 WindowTracker* WindowTracker::instance() {
 	static auto* instance = new WindowTracker(); // NOLINT

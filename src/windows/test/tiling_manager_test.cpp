@@ -1527,6 +1527,19 @@ private slots:
 		WindowTracker::instance()->fixtures.clear();
 	}
 
+	void tilingActiveNotifierFollowsManager() {
+		QSignalSpy activeChanges(WindowTracker::instance(), &WindowTracker::tilingActiveChanged);
+		QCOMPARE(TilingManager::active(), nullptr);
+
+		manager->setEnabled(true);
+		QCOMPARE(TilingManager::active(), manager);
+		QCOMPARE(activeChanges.size(), 1);
+
+		manager->setEnabled(false);
+		QCOMPARE(TilingManager::active(), nullptr);
+		QCOMPARE(activeChanges.size(), 2);
+	}
+
 	void enableAppliesInitialLayout() {
 		auto* a = add(1);
 		auto* b = add(2);
@@ -1973,6 +1986,158 @@ private slots:
 			QCOMPARE(fakeWindow(window->hwnd()).moves, 0);
 		}
 		QVERIFY(manager->isTiled(editor));
+	}
+
+	void floatingDetailedDistinguishesScopeExclusionFromNoop() {
+		auto* outside = add(1, QStringLiteral("other"));
+		auto* inside = add(2);
+		manager->setIncluded({QStringLiteral("editor")});
+		enable();
+
+		QVERIFY(manager->isTiled(inside));
+		QVERIFY(!manager->isTiled(outside));
+		QCOMPARE(
+		    manager->setFloatingDetailed(outside, false, false), FloatingChangeResult::ScopeExcluded
+		);
+		QCOMPARE(
+		    manager->setFloatingDetailed(outside, false, true), FloatingChangeResult::ScopeExcluded
+		);
+		QVERIFY(!manager->isTiled(outside));
+
+		QCOMPARE(manager->setFloatingDetailed(inside, true, false), FloatingChangeResult::Changed);
+		manager->sync();
+		QVERIFY(!manager->isTiled(inside));
+		QCOMPARE(manager->setFloatingDetailed(inside, true, false), FloatingChangeResult::Noop);
+		QVERIFY(!manager->isTiled(inside));
+	}
+
+	void satisfiedTileWhilePlacementIsSuspendedIsNoop_data() {
+		QTest::addColumn<QString>("state");
+		QTest::newRow("maximized") << QStringLiteral("maximized");
+		QTest::newRow("minimized") << QStringLiteral("minimized");
+	}
+
+	void satisfiedTileWhilePlacementIsSuspendedIsNoop() {
+		QFETCH(QString, state);
+		auto* window = add(1);
+		enable();
+		QCOMPARE(manager->setFloatingDetailed(window, true, false), FloatingChangeResult::Changed);
+		manager->sync();
+		QCOMPARE(manager->setFloatingDetailed(window, false, false), FloatingChangeResult::Changed);
+		manager->sync();
+		QVERIFY(manager->isTiled(window));
+
+		auto& native = fakeWindow(window->hwnd());
+		if (state == "maximized") {
+			native.maximized = true;
+			emit window->maximizedChanged();
+		} else {
+			native.minimized = true;
+			emit window->minimizedChanged();
+		}
+		manager->sync();
+		QVERIFY(manager->isTiled(window));
+
+		QCOMPARE(manager->setFloatingDetailed(window, false, false), FloatingChangeResult::Noop);
+	}
+
+	void autoTiledWindowSettiledWhileSuspendedIsNotDeferred_data() {
+		QTest::addColumn<QString>("state");
+		QTest::newRow("maximized") << QStringLiteral("maximized");
+		QTest::newRow("minimized") << QStringLiteral("minimized");
+	}
+
+	void autoTiledWindowSettiledWhileSuspendedIsNotDeferred() {
+		QFETCH(QString, state);
+		auto* window = add(1);
+		enable();
+		QVERIFY(manager->isTiled(window));
+
+		auto& native = fakeWindow(window->hwnd());
+		if (state == "maximized") {
+			native.maximized = true;
+			emit window->maximizedChanged();
+		} else {
+			native.minimized = true;
+			emit window->minimizedChanged();
+		}
+		manager->sync();
+		QVERIFY(manager->isTiled(window));
+
+		QCOMPARE(manager->setFloatingDetailed(window, false, false), FloatingChangeResult::Changed);
+		QCOMPARE(manager->setFloatingDetailed(window, false, false), FloatingChangeResult::Noop);
+	}
+
+	void tileRequestWithoutDesktopOrMonitorFails_data() {
+		QTest::addColumn<QString>("missing");
+		QTest::newRow("no desktop") << QStringLiteral("desktop");
+		QTest::newRow("out of range desktop") << QStringLiteral("out-of-range-desktop");
+		QTest::newRow("no monitor") << QStringLiteral("monitor");
+	}
+
+	void tileRequestWithoutDesktopOrMonitorFails() {
+		QFETCH(QString, missing);
+		auto* window = add(1);
+		if (missing == "desktop") {
+			fakeWindow(window->hwnd()).desktop = -1;
+			enable();
+		} else if (missing == "out-of-range-desktop") {
+			enable();
+			QVERIFY(manager->setFloating(window, true, false));
+			manager->sync();
+			fakeWindow(window->hwnd()).desktop = manager->desktops->count();
+		} else {
+			fakeDesktop.screens = {QGuiApplication::primaryScreen(), nullptr};
+			fakeWindow(window->hwnd()).monitor = 1;
+			enable();
+		}
+		QVERIFY(!manager->isTiled(window));
+
+		QCOMPARE(manager->setFloatingDetailed(window, false, false), FloatingChangeResult::Failed);
+		QCOMPARE(manager->setFloatingDetailed(window, false, true), FloatingChangeResult::Failed);
+		QVERIFY(!manager->isTiled(window));
+	}
+
+	void deferredTileWhilePlacementIsSuspended_data() {
+		QTest::addColumn<QString>("state");
+		QTest::newRow("maximized") << QStringLiteral("maximized");
+		QTest::newRow("minimized") << QStringLiteral("minimized");
+	}
+
+	void deferredTileWhilePlacementIsSuspended() {
+		QFETCH(QString, state);
+		auto* window = add(1);
+		enable();
+		QVERIFY(manager->setFloating(window, true, false));
+		manager->sync();
+		QVERIFY(!manager->isTiled(window));
+
+		auto& native = fakeWindow(window->hwnd());
+		if (state == "maximized") {
+			native.maximized = true;
+			emit window->maximizedChanged();
+		} else {
+			native.minimized = true;
+			emit window->minimizedChanged();
+		}
+		manager->sync();
+
+		QCOMPARE(
+		    manager->setFloatingDetailed(window, false, false), FloatingChangeResult::Deferred
+		);
+		manager->sync();
+		QVERIFY(!manager->isTiled(window));
+
+		if (state == "maximized") {
+			native.maximized = false;
+			emit window->maximizedChanged();
+		} else {
+			native.minimized = false;
+			emit window->minimizedChanged();
+		}
+		manager->sync();
+		QVERIFY(manager->isTiled(window));
+		QCOMPARE(manager->setFloatingDetailed(window, false, false), FloatingChangeResult::Noop);
 	}
 
 	void narrowedIncludedRemovesForcedTile() {

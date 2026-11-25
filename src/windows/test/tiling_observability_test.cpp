@@ -1,3 +1,5 @@
+#include <optional>
+
 #include <qhash.h>
 #include <qlist.h>
 #include <qlogging.h>
@@ -58,7 +60,7 @@ public:
 	int reads = 0;
 	int writes = 0;
 	bool writeSucceeds = true;
-	bool isWindowPinned(quintptr) {
+	std::optional<bool> isWindowPinned(quintptr) {
 		this->reads++;
 		return true; // Deliberately stale when exports or the accessor are missing.
 	}

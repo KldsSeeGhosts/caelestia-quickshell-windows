@@ -141,6 +141,12 @@ class TrackedWindow: public QObject {
 
 public:
 	~TrackedWindow() override;
+#ifdef QS_TEST
+	static TrackedWindow* createForTest(WindowTracker* tracker, HWND hwnd) {
+		return new TrackedWindow(tracker, hwnd);
+	}
+	void setElevatedForTest(bool elevated) { this->bElevated = elevated; }
+#endif
 	[[nodiscard]] HWND hwnd() const { return this->mHwnd; }
 	[[nodiscard]] quint64 address() const;
 	[[nodiscard]] QString addressHex() const;
@@ -298,6 +304,10 @@ class WindowTracker: public QObject {
 
 public:
 	static WindowTracker* instance();
+#ifdef QS_TEST
+	static WindowTracker* createForTest();
+	static void destroyForTest(WindowTracker* tracker);
+#endif
 	// Null until the first instance() call. A configuration setter uses this to
 	// re-evaluate live windows without starting the tracker just to store a
 	// list that no consumer needs yet.
@@ -321,6 +331,7 @@ public:
 
 	void rescan();
 	void refreshForeground();
+	void reportActionRefusal(const QString& action, const QString& reason, bool elevated);
 	// The start or end of a Super drag, which moves the window without a
 	// native move-size loop.
 	void noteMoveSize(HWND hwnd, bool started);
@@ -349,6 +360,7 @@ signals:
 	void lastActionErrorChanged();
 	// Broadcast form of TrackedWindow::actionRefused for shell-level toast UI.
 	void windowActionRefused(const QString& action, const QString& reason, bool elevated);
+	void tilingActiveChanged();
 
 private:
 	friend class TrackedWindow;

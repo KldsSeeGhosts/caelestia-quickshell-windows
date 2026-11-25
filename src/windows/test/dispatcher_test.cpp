@@ -1,3 +1,5 @@
+#include <optional>
+
 #include <qtest.h>
 
 #include "../hyprland/dispatcher_args.hpp"
@@ -19,7 +21,11 @@ struct PinFakeDesktops {
 	int calls = 0;
 
 	[[nodiscard]] bool pinSupported() const { return this->support; }
-	[[nodiscard]] bool isWindowPinned(int) const { return this->pinned; }
+	bool querySucceeds = true;
+	[[nodiscard]] std::optional<bool> isWindowPinned(int) const {
+		if (!this->querySucceeds) return std::nullopt;
+		return this->pinned;
+	}
 	bool pinWindow(int, bool value) {
 		this->calls++;
 		if (!this->result) return false;
@@ -680,6 +686,16 @@ void DispatcherTest::reportsPinSupportAndFailures() {
 	QCOMPARE(static_cast<int>(dispatchPin(desktops, 1)), static_cast<int>(PinDispatchResult::Failed));
 	QCOMPARE(desktops.calls, 1);
 	QVERIFY(!desktops.pinned);
+
+	for (const auto request: {PinRequest::Pin, PinRequest::Unpin, PinRequest::Toggle}) {
+		desktops = PinFakeDesktops();
+		desktops.querySucceeds = false;
+		QCOMPARE(
+		    static_cast<int>(dispatchPin(desktops, 1, request)),
+		    static_cast<int>(PinDispatchResult::QueryFailed)
+		);
+		QCOMPARE(desktops.calls, 0);
+	}
 }
 
 QTEST_GUILESS_MAIN(DispatcherTest)

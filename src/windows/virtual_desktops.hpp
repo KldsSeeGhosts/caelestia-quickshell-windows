@@ -93,7 +93,7 @@ public:
 	bool removeDesktop(qsizetype index, qsizetype fallback);
 	bool moveWindow(HWND hwnd, qsizetype index);
 	bool pinWindow(HWND hwnd, bool pinned);
-	[[nodiscard]] bool isWindowPinned(HWND hwnd) const;
+	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;
 	[[nodiscard]] DesktopAvailability availability() const;
 	[[nodiscard]] bool supports(DesktopOperation operation) const;
 	[[nodiscard]] QVariantMap capability() const;

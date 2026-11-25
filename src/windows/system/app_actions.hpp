@@ -13,6 +13,8 @@ struct AppActionInfo {
 	QString token;
 	QString name;
 	QString target;
+	QString linkTarget;
+	QString shortcutPath;
 	QString packageFamilyName;
 	QString executionAlias;
 	QString elevationTarget;
@@ -51,6 +53,7 @@ public:
 	Q_INVOKABLE QVariantMap launchShellAction(const QVariantMap& spec, QObject* parentWindow = nullptr);
 	Q_INVOKABLE bool isInlineSudoEnabled() const;
 	Q_INVOKABLE bool openFileLocation(const QString& entryId);
+	Q_INVOKABLE bool openProperties(const QString& entryId, QObject* parentWindow = nullptr);
 	Q_INVOKABLE bool openAppSettings(const QString& entryId);
 	Q_INVOKABLE bool uninstall(const QString& entryId);
 

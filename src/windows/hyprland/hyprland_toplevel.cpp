@@ -271,7 +271,8 @@ void HyprlandToplevel::refreshIpcObject() {
 	// VirtualDesktopAccessor reports the real pinned state; without the
 	// complete pin API pin is unsupported and the value must stay false.
 	auto* desktops = this->ipc->desktops();
-	auto pinnedState = desktops != nullptr && desktops->isWindowPinned(window->hwnd());
+	auto pinnedState = desktops != nullptr
+	    && desktops->isWindowPinned(window->hwnd()).value_or(false);
 	// Read support after the accessor call, which can discover accessor loss.
 	auto pinned = pinCapability(desktops != nullptr && desktops->pinSupported(), pinnedState);
 
