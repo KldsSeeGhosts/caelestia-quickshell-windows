@@ -57,6 +57,8 @@ struct LaunchCommand {
 [[nodiscard]] LaunchCommand parseElevatedLaunchCommand(const QString& command);
 // True when a parsed raw command has an unambiguous executable boundary for elevation.
 [[nodiscard]] bool canElevateParsedCommand(const LaunchCommand& command);
+// True when normal, non-elevated shell open cannot cross a UAC boundary.
+[[nodiscard]] bool canUseNormalShellOpen(const LaunchCommand& command);
 [[nodiscard]] bool canUseAutomaticElevation(const LaunchCommand& command, DWORD processError);
 // Validation for structured elevation targets whose executable/argument boundary is explicit.
 [[nodiscard]] DWORD validateElevatedTarget(const QString& target);
@@ -133,7 +135,7 @@ template <typename ExplorerOpen, typename ProcessLaunch, typename ShellFallback>
     ProcessLaunch&& processLaunch,
     ShellFallback&& shellFallback
 ) {
-	if (!canElevateParsedCommand(command)) {
+	if (!canUseNormalShellOpen(command)) {
 		if (!command.useProcess()) return launchResultForError(ERROR_INVALID_PARAMETER);
 		auto environment = cleanEnvironmentBlock();
 		return processLaunch(false, environment).result;

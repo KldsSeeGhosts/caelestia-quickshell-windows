@@ -499,6 +499,59 @@ private slots:
 		QCOMPARE(parsed.argumentTail, QStringLiteral("src\\file.cpp"));
 	}
 
+	void bareBatchScriptUsesNonElevatingNormalShellRoute() {
+		using namespace qs::windows::process;
+		QTemporaryDir root;
+		QVERIFY(root.isValid());
+		const auto tool = QDir::toNativeSeparators(QDir(root.path()).filePath(QStringLiteral("tool.cmd")));
+		QFile file(tool);
+		QVERIFY(file.open(QIODevice::WriteOnly));
+		QVERIFY(file.write("@echo off\r\n") != -1);
+		file.close();
+
+		const auto command = QStringLiteral("tool src\\file.cpp");
+		const auto oldPath = qgetenv("PATH");
+		qputenv("PATH", QDir::toNativeSeparators(root.path()).toUtf8() + ';' + oldPath);
+		const auto parsed = parseLaunchCommand(command);
+		const auto elevated = parseElevatedLaunchCommand(command);
+		if (oldPath.isNull()) qunsetenv("PATH");
+		else qputenv("PATH", oldPath);
+
+		QCOMPARE(parsed.error, DWORD(ERROR_SUCCESS));
+		QCOMPARE(parsed.program, QStringLiteral("tool"));
+		QCOMPARE(parsed.executable, tool);
+		QCOMPARE(parsed.kind, ProgramKind::Shell);
+		QVERIFY(!parsed.useProcess());
+		QVERIFY(!canElevateParsedCommand(parsed));
+		QVERIFY(canUseNormalShellOpen(parsed));
+		QCOMPARE(elevated.error, DWORD(ERROR_INVALID_PARAMETER));
+
+		auto explorerCalls = 0;
+		auto processCalls = 0;
+		auto shellCalls = 0;
+		const auto result = detail::routeLaunchCommand(
+		    parsed,
+		    [&] {
+			    ++explorerCalls;
+			    return LaunchResult {.status = LaunchStatus::Started};
+		    },
+		    [&](bool, std::wstring&) {
+			    ++processCalls;
+			    return detail::ProcessRouteResult {
+			        .result = detail::launchResultForError(ERROR_INVALID_PARAMETER),
+			    };
+		    },
+		    [&](std::wstring&) {
+			    ++shellCalls;
+			    return LaunchResult {.status = LaunchStatus::Started};
+		    }
+		);
+		QCOMPARE(result.status, LaunchStatus::Started);
+		QCOMPARE(explorerCalls, 1);
+		QCOMPARE(processCalls, 0);
+		QCOMPARE(shellCalls, 0);
+	}
+
 	void existingDirectoryTargetsUseShellOpenButNeverElevation() {
 		using namespace qs::windows::process;
 		QTemporaryDir root;
@@ -510,6 +563,20 @@ private slots:
 		QCOMPARE(quoted.kind, ProgramKind::Shell);
 		QCOMPARE(parseElevatedLaunchCommand(u'"' + directory + u'"').error, DWORD(ERROR_INVALID_PARAMETER));
 		QCOMPARE(validateElevatedTarget(directory), DWORD(ERROR_INVALID_PARAMETER));
+	}
+
+	void extendedPathPrefixesAreStrippedBeforeShellExecution() {
+		using namespace qs::windows::sys;
+		QCOMPARE(
+		    stripExtendedPathPrefix(QStringLiteral("\\\\?\\C:\\Temp\\app.exe")),
+		    QStringLiteral("C:\\Temp\\app.exe")
+		);
+		QCOMPARE(
+		    stripExtendedPathPrefix(QStringLiteral("\\\\?\\UNC\\server\\share\\file.exe")),
+		    QStringLiteral("\\\\server\\share\\file.exe")
+		);
+		QVERIFY(!stripExtendedPathPrefix(QStringLiteral("\\\\?\\C:\\Temp\\app.exe"))
+		            .startsWith(QStringLiteral("\\\\?\\"), Qt::CaseInsensitive));
 	}
 
 	void packageTargetsAreCanonicalAndConfinedToInstallRoot() {
@@ -533,6 +600,10 @@ private slots:
 		const auto canonicalInside = canonicalPackageTargetInsideRoot(inside, packageRoot);
 		QVERIFY(canonicalInside.has_value());
 		QCOMPARE(*canonicalInside, canonicalFilesystemPath(inside));
+		QVERIFY(!canonicalInside->startsWith(
+		    QStringLiteral("\\\\?\\"), Qt::CaseInsensitive
+		));
+		QCOMPARE(canonicalInside->at(1), u':');
 		QVERIFY(!canonicalPackageTargetInsideRoot(outside, packageRoot).has_value());
 
 		// Create a real NTFS junction inside the package root. Junction creation

@@ -814,6 +814,22 @@ bool canElevateParsedCommand(const LaunchCommand& command) {
 	return !hasUnquotedPathSeparator(command.argumentTail);
 }
 
+bool canUseNormalShellOpen(const LaunchCommand& command) {
+	if (canElevateParsedCommand(command)) return true;
+	if (command.error != ERROR_SUCCESS || command.quotedProgram || command.kind != ProgramKind::Shell
+	    || command.executable.isEmpty() || looksLikePath(command.program) || isShellName(command.program))
+	{
+		return false;
+	}
+
+	// A PATH/PATHEXT-resolved batch script has no PE manifest and therefore no
+	// ShellExecute open route that can produce a UAC prompt. This relaxation is
+	// deliberately unavailable to parseElevatedLaunchCommand and runas.
+	const auto extension = QFileInfo(command.executable).suffix();
+	return extension.compare(QStringLiteral("cmd"), Qt::CaseInsensitive) == 0
+	    || extension.compare(QStringLiteral("bat"), Qt::CaseInsensitive) == 0;
+}
+
 LaunchCommand parseElevatedLaunchCommand(const QString& command) {
 	auto parsed = parseLaunchCommand(command);
 	if (parsed.error != ERROR_SUCCESS) return parsed;

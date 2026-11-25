@@ -134,6 +134,18 @@ struct FinalPathInfo {
 	DWORD attributes = 0;
 };
 
+inline QString stripExtendedPathPrefix(QString path) {
+	const auto uncPrefix = QStringLiteral("\\\\?\\UNC\\");
+	const auto extendedPrefix = QStringLiteral("\\\\?\\");
+	if (path.startsWith(uncPrefix, Qt::CaseInsensitive)) {
+		return QStringLiteral("\\\\") + path.mid(uncPrefix.size());
+	}
+	if (path.startsWith(extendedPrefix, Qt::CaseInsensitive)) {
+		return path.mid(extendedPrefix.size());
+	}
+	return path;
+}
+
 // Resolves junctions, symlinks and volume mount points through the object
 // manager. FILE_FLAG_OPEN_REPARSE_POINT is deliberately absent.
 inline std::optional<FinalPathInfo> finalPathByHandle(const QString& path) {
@@ -167,14 +179,7 @@ inline std::optional<FinalPathInfo> finalPathByHandle(const QString& path) {
 	if (length == 0 || !hasInformation) return std::nullopt;
 
 	auto finalPath = QString::fromWCharArray(buffer.data(), static_cast<qsizetype>(length));
-	const auto uncPrefix = QString::fromWCharArray(LR"(\?\UNC\)");
-	const auto extendedPrefix = QString::fromWCharArray(LR"(\?\)");
-	if (finalPath.startsWith(uncPrefix, Qt::CaseInsensitive)) {
-		finalPath = QString::fromWCharArray(LR"(\)") + finalPath.mid(uncPrefix.size());
-	} else if (finalPath.startsWith(extendedPrefix, Qt::CaseInsensitive)) {
-		finalPath = finalPath.mid(extendedPrefix.size());
-	}
-	finalPath = QDir::toNativeSeparators(finalPath);
+	finalPath = QDir::toNativeSeparators(stripExtendedPathPrefix(finalPath));
 	return FinalPathInfo {.path = finalPath, .attributes = fileInformation.dwFileAttributes};
 }
 
