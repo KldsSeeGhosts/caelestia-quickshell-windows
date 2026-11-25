@@ -1000,8 +1000,7 @@ int workerIndex(GUID id) {
 	return -1;
 }
 int boundedSwitch(int index) {
-	const auto id = cachedId(index);
-	return channel().execute([id] { return switchDesktop(workerIndex(id)); });
+	return switchNativeDesktopById(cachedId(index));
 }
 int boundedCreate() {
 	return channel().execute([] { return createDesktop(); });
@@ -1117,6 +1116,10 @@ bool nativeDesktopRequestPending() {
 quint64 nativeDesktopWindowSnapshotRevision() { return channel().windowRevision; }
 GUID nativeWindowDesktopId(HWND hwnd) { return channel().window(hwnd).id; }
 int nativeWindowOnCurrentDesktop(HWND hwnd) { return channel().window(hwnd).onCurrent; }
+int switchNativeDesktopById(GUID desktop) {
+	return channel().execute([desktop] { return switchDesktop(workerIndex(desktop)); });
+}
+
 std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop) {
 	if (!channel().worker) return std::nullopt;
 	const auto result = channel().execute(

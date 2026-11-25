@@ -1013,6 +1013,46 @@ private slots:
 		QVERIFY(this->desktops->moveWindow(window, 1, nullptr, nullptr, {}, {}, &targetGuid));
 		QVERIFY(IsEqualGUID(targetGuid, expectedGuid) != FALSE);
 	}
+
+	void switchToTargetGuidIgnoresOutOfSyncNativeDesktopOrder() {
+		this->old.manager.array.desktops = {&this->old.one, &this->old.two, &this->old.three};
+		this->old.manager.current = &this->old.one;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		this->desktops->refresh();
+		QCoreApplication::processEvents();
+		QCOMPARE(this->desktops->count(), qsizetype(3));
+		QVERIFY(IsEqualGUID(this->desktops->desktops().at(1).id, this->old.two.id) != FALSE);
+
+		// Reorder the provider and refresh the native cache without letting the
+		// facade process the snapshot yet: facade has [A, B, C], native cache has [A, C, B].
+		this->old.manager.array.desktops = {&this->old.one, &this->old.three, &this->old.two};
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		QVERIFY(IsEqualGUID(this->desktops->desktops().at(1).id, this->old.two.id) != FALSE);
+		QVERIFY(IsEqualGUID(this->accessor.getDesktopIdByNumber(1), this->old.three.id) != FALSE);
+
+		this->old.manager.publishSwitch = true;
+		int observedCalls = 0;
+		qsizetype observedIndex = -1;
+		QVERIFY(this->desktops->switchTo(
+		    1,
+		    {},
+		    [&observedCalls, &observedIndex](qsizetype idx) {
+			    ++observedCalls;
+			    observedIndex = idx;
+		    },
+		    std::nullopt,
+		    this->old.two.id
+		));
+		// Must switch to B (this->old.two), never C (this->old.three).
+		QCOMPARE(this->old.manager.current, &this->old.two);
+		QVERIFY(waitUntil([&observedCalls] { return observedCalls == 1; }, 1000));
+		QCOMPARE(observedCalls, 1);
+		QCOMPARE(observedIndex, qsizetype(2));
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(2));
+		QVERIFY(
+		    IsEqualGUID(this->desktops->desktops().at(observedIndex).id, this->old.two.id) != FALSE
+		);
+	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)
 #include "erm625_native_desktop_facade_test.moc"

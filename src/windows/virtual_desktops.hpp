@@ -95,7 +95,8 @@ public:
 	    qsizetype index,
 	    const std::function<bool()>& shouldProceed = {},
 	    std::function<void(qsizetype)> onObserved = {},
-	    std::optional<quint64> expectedIntent = std::nullopt
+	    std::optional<quint64> expectedIntent = std::nullopt,
+	    std::optional<GUID> targetDesktopId = std::nullopt
 	);
 	void ensureCount(qsizetype count, std::function<void(bool)> done);
 	void ensureCountWithReason(qsizetype count, std::function<void(bool, const QString&)> done);

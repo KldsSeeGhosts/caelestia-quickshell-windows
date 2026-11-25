@@ -29,6 +29,7 @@ void requestNativeDesktopRefresh();
 [[nodiscard]] quint64 nativeDesktopWindowSnapshotRevision();
 [[nodiscard]] GUID nativeWindowDesktopId(HWND hwnd);
 [[nodiscard]] int nativeWindowOnCurrentDesktop(HWND hwnd);
+int switchNativeDesktopById(GUID desktop);
 std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop);
 void shutdownNativeDesktopAccessor();
 

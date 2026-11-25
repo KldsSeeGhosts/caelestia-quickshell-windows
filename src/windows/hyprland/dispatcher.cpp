@@ -174,7 +174,8 @@ void followMovedWindow(
 		    WorkspaceBehavior::instance()->expectFocus(observedIndex, activationSource);
 		    guardedWindow->activateOnCurrentDesktop(activationSource);
 	    },
-	    workspaceIntent
+	    workspaceIntent,
+	    !isNullDesktopGuid(targetDesktopId) ? std::optional<GUID>(targetDesktopId) : std::nullopt
 	);
 }
 
