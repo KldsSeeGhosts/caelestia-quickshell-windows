@@ -262,6 +262,12 @@ QString normalizeReparseTarget(const QString& parentDir, const ReparsePointInfo&
 	return QDir::toNativeSeparators(target);
 }
 
+bool isAmbiguousPathSegment(const QString& segment) {
+	if (segment.isEmpty() || malformedFilesystemPath(segment)) return true;
+	return segment == QStringLiteral("..") || segment.endsWith(u' ') || segment.endsWith(u'.')
+	    || segment.contains(u':') || segment.contains(u'\\') || segment.contains(u'/');
+}
+
 std::optional<QString> resolveLocalFilesystemPath(const QString& path, int depth) {
 	constexpr int MAX_REPARSE_DEPTH = 8;
 	if (depth > MAX_REPARSE_DEPTH) return std::nullopt;
@@ -287,11 +293,7 @@ std::optional<QString> resolveLocalFilesystemPath(const QString& path, int depth
 
 	for (const auto& segment: segments) {
 		if (segment == QStringLiteral(".")) continue;
-		if (segment == QStringLiteral("..") || segment.endsWith(u' ') || segment.endsWith(u'.')
-		    || segment.contains(u':'))
-		{
-			return std::nullopt;
-		}
+		if (isAmbiguousPathSegment(segment)) return std::nullopt;
 	}
 
 	for (const auto& segment: segments) {
@@ -621,6 +623,7 @@ QString findShortcut(const AppActionInfo& app, ShortcutLookupMode mode) {
 				do {
 					const auto name = QString::fromWCharArray(entry.cFileName);
 					if (name == QStringLiteral(".") || name == QStringLiteral("..")) continue;
+					if (isAmbiguousPathSegment(name)) continue;
 					const auto entryPath = prefix + name;
 					const auto attrs = entry.dwFileAttributes;
 					if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {

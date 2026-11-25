@@ -590,6 +590,56 @@ private slots:
 		QCOMPARE(filesystemProbes, 0);
 	}
 
+	void ambiguousEnumeratedDirectoriesAreSkippedDuringLocalShortcutScan_data() {
+		QTest::addColumn<QString>("subdirName");
+		QTest::newRow("trailing dot directory") << QStringLiteral("Ambiguous.");
+		QTest::newRow("trailing space directory") << QStringLiteral("Ambiguous ");
+	}
+
+	void ambiguousEnumeratedDirectoriesAreSkippedDuringLocalShortcutScan() {
+		QFETCH(QString, subdirName);
+		QTemporaryDir directory;
+		QVERIFY(directory.isValid());
+		const auto target = writeFile(directory, QStringLiteral("fixture.exe"));
+		QVERIFY(!target.isEmpty());
+
+		const auto tempShortcut = QDir::toNativeSeparators(directory.filePath(QStringLiteral("Fixture.lnk")));
+		QVERIFY(createShortcut(tempShortcut, target));
+
+		const auto nativeRoot = QDir::toNativeSeparators(directory.path());
+		const auto extendedDir = (QStringLiteral("\\\\?\\") + nativeRoot + QStringLiteral("\\") + subdirName)
+		                             .toStdWString();
+		const auto extendedShortcut =
+		    (QStringLiteral("\\\\?\\") + nativeRoot + QStringLiteral("\\") + subdirName
+		     + QStringLiteral("\\Fixture.lnk"))
+		        .toStdWString();
+
+		struct ExtendedDirCleanup {
+			std::wstring shortcutPath;
+			std::wstring dirPath;
+			~ExtendedDirCleanup() {
+				if (!shortcutPath.empty()) DeleteFileW(shortcutPath.c_str());
+				if (!dirPath.empty()) RemoveDirectoryW(dirPath.c_str());
+			}
+		} cleanup;
+
+		QVERIFY(CreateDirectoryW(extendedDir.c_str(), nullptr) != FALSE);
+		cleanup.dirPath = extendedDir;
+		const auto tempShortcutWide = tempShortcut.toStdWString();
+		QVERIFY(MoveFileW(tempShortcutWide.c_str(), extendedShortcut.c_str()) != FALSE);
+		cleanup.shortcutPath = extendedShortcut;
+		QVERIFY(QFile::remove(target));
+
+		qs::windows::sys::test::setShortcutRootsForTest({nativeRoot});
+		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-ambiguous-subdir"), target);
+		qs::windows::sys::test::setLinkTargetForId(QStringLiteral("fixture-ambiguous-subdir"), target);
+
+		AppActions actions;
+		const auto id = QStringLiteral("fixture-ambiguous-subdir");
+		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), false);
+		QVERIFY(!actions.openProperties(id));
+	}
+
 	void remoteStartMenuShortcutIsRejectedForPropertiesButUsedForElevation() {
 		QTemporaryDir directory;
 		QVERIFY(directory.isValid());
