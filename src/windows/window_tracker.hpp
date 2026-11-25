@@ -446,7 +446,8 @@ public:
 	    quint64 sequence,
 	    const QString& action,
 	    const QString& reason,
-	    bool elevated
+	    bool elevated,
+	    const std::shared_ptr<WindowActionOrderState>& actionOrder = {}
 	);
 	// The start or end of a Super drag, which moves the window without a
 	// native move-size loop.
@@ -548,7 +549,8 @@ private:
 	    const TrackedWindow* window,
 	    const QString& action,
 	    const QString& reason,
-	    bool elevated
+	    bool elevated,
+	    const std::shared_ptr<WindowActionOrderState>& actionOrder = {}
 	);
 
 	QList<TrackedWindow*> mWindows;

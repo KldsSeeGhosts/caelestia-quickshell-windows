@@ -1330,10 +1330,10 @@ private slots:
 		// Must not take the alreadyCurrent shortcut while the first switch's read is pending.
 		QCOMPARE(observedBack, 0);
 
-		this->old.manager.beforeEnumeration = {};
 		blockedRead->release();
 		QVERIFY(waitUntil([&observedBack] { return observedBack == 1; }, 1000));
 		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		this->old.manager.beforeEnumeration = {};
 		QCOMPARE(this->old.manager.switches, 2);
 		QCOMPARE(this->old.manager.current, &this->old.one);
 		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));

@@ -50,16 +50,6 @@ void TrackedWindow::reportActionRefusedWithSequence(
 	QPointer<TrackedWindow> self(this);
 	QPointer<WindowTracker> guardedTracker(tracker);
 	const auto actionOrder = this->mActionOrder;
-	if (tracker != nullptr) {
-		tracker->mLastActionErrorSequence = sequence;
-		tracker->mLastActionErrorWindow = this;
-		tracker->mLastActionError = text;
-	}
-
-	const auto stillCurrent = [&] {
-		return guardedTracker && tracker->mLastActionErrorSequence == sequence
-		    && tracker->mLastActionError == text && actionOrder->latestMoveSequence <= sequence;
-	};
 
 	this->notifyActionErrorChanged();
 	if (self && actionOrder->lastActionErrorSequence == sequence
@@ -67,11 +57,13 @@ void TrackedWindow::reportActionRefusedWithSequence(
 	{
 		emit this->actionRefused(action, reason, elevated);
 	}
-	if (stillCurrent()) {
-		tracker->notifyActionErrorChanged();
-	}
-	if (stillCurrent()) {
-		emit tracker->windowActionRefused(action, reason, elevated);
+	if (guardedTracker && guardedTracker->mLastActionErrorSequence < sequence
+	    && actionOrder->lastActionErrorSequence == sequence
+	    && actionOrder->latestMoveSequence <= sequence)
+	{
+		guardedTracker->reportWindowActionRefusedWithSequence(
+		    sequence, self.data(), action, reason, elevated, actionOrder
+		);
 	}
 }
 
@@ -167,9 +159,16 @@ void WindowTracker::reportWindowActionRefusedWithSequence(
     const TrackedWindow* window,
     const QString& action,
     const QString& reason,
-    bool elevated
+    bool elevated,
+    const std::shared_ptr<WindowActionOrderState>& actionOrder
 ) {
 	if (sequence == 0 || this->mLastActionErrorSequence >= sequence) return;
+	if (actionOrder != nullptr
+	    && (actionOrder->latestMoveSequence > sequence
+	        || actionOrder->lastActionErrorSequence > sequence))
+	{
+		return;
+	}
 	const auto text = window_action_detail::errorText(action, reason);
 	this->mLastActionErrorSequence = sequence;
 	this->mLastActionErrorWindow = window;
@@ -177,7 +176,11 @@ void WindowTracker::reportWindowActionRefusedWithSequence(
 
 	QPointer<WindowTracker> self(this);
 	this->notifyActionErrorChanged();
-	if (self && this->mLastActionErrorSequence == sequence && this->mLastActionError == text) {
+	if (self && this->mLastActionErrorSequence == sequence && this->mLastActionError == text
+	    && (actionOrder == nullptr
+	        || (actionOrder->latestMoveSequence <= sequence
+	            && actionOrder->lastActionErrorSequence <= sequence)))
+	{
 		emit this->windowActionRefused(action, reason, elevated);
 	}
 }
@@ -190,9 +193,12 @@ void WindowTracker::reportActionRefusalWithSequence(
     quint64 sequence,
     const QString& action,
     const QString& reason,
-    bool elevated
+    bool elevated,
+    const std::shared_ptr<WindowActionOrderState>& actionOrder
 ) {
-	this->reportWindowActionRefusedWithSequence(sequence, nullptr, action, reason, elevated);
+	this->reportWindowActionRefusedWithSequence(
+	    sequence, nullptr, action, reason, elevated, actionOrder
+	);
 }
 
 void WindowTracker::notePendingUserMove(
@@ -262,7 +268,8 @@ void WindowTracker::publishMoveFailure(
 		    moveSequence,
 		    QStringLiteral("move"),
 		    qs::hyprland::ipc::moveRefusalReason(code, false),
-		    false
+		    false,
+		    actionOrder
 		);
 		return;
 	}
@@ -271,7 +278,8 @@ void WindowTracker::publishMoveFailure(
 	    moveSequence,
 	    QStringLiteral("move"),
 	    qs::hyprland::ipc::moveRefusalReason(code, false),
-	    false
+	    false,
+	    actionOrder
 	);
 }
 

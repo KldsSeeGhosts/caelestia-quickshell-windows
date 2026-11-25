@@ -150,7 +150,7 @@ void Dispatcher::refuseImmediateMove(
 	if (orderSuperseded()) return;
 	if (!guardedTracker || guardedTracker->lastActionErrorSequence() >= moveSequence) return;
 	guardedTracker->reportActionRefusalWithSequence(
-	    moveSequence, QStringLiteral("move"), moveRefusalReason(code, false), false
+	    moveSequence, QStringLiteral("move"), moveRefusalReason(code, false), false, actionOrder
 	);
 }
 

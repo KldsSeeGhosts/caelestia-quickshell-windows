@@ -1144,6 +1144,11 @@ private slots:
 	void lastActionErrorChangedSupersedingMoveSuppressesRefusalSignals() {
 		DispatcherFixture fixture;
 		fixture.tracker->registerWindowForTest(fixture.window);
+		fixture.tracker->reportActionRefusal(
+		    QStringLiteral("close"), QStringLiteral("prior-error"), false
+		);
+		const auto priorTrackerError = fixture.tracker->lastActionError();
+		QCOMPARE(priorTrackerError, QStringLiteral("close:prior-error"));
 
 		const auto moveSeq = fixture.window->beginMoveRequest();
 		QSignalSpy windowRefused(fixture.window, &TrackedWindow::actionRefused);
@@ -1175,6 +1180,32 @@ private slots:
 		QVERIFY(startedNewerMove);
 		QCOMPARE(windowRefused.size(), 0);
 		QCOMPARE(trackerErrorChanged.size(), 0);
+		QCOMPARE(trackerRefused.size(), 0);
+		QCOMPARE(fixture.tracker->lastActionError(), priorTrackerError);
+	}
+
+	void trackerLastActionErrorChangedSupersedingMoveSuppressesImmediateRefusalSignal() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+		bool startedNewerMove = false;
+		QObject::connect(
+		    fixture.tracker,
+		    &WindowTracker::lastActionErrorChanged,
+		    fixture.tracker,
+		    [&fixture, &startedNewerMove] {
+			    if (startedNewerMove) return;
+			    startedNewerMove = true;
+			    (void)fixture.window->beginMoveRequest();
+		    }
+		);
+
+		fixture.dispatcher->refuseImmediateMoveForTest(
+		    fixture.window, QStringLiteral("invalid-target"), {}
+		);
+
+		QVERIFY(startedNewerMove);
 		QCOMPARE(trackerRefused.size(), 0);
 	}
 };
