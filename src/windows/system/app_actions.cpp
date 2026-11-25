@@ -138,11 +138,13 @@ using DriveTypeInvoker = std::function<UINT(const QString&)>;
 using FileAttributesInvoker = std::function<DWORD(const QString&)>;
 using KnownFolderPathInvoker = std::function<HRESULT(const GUID&, DWORD, QString*)>;
 using ReparsePointInvoker = std::function<bool(const QString&, DWORD*, QString*, bool*)>;
+using DirectoryScanObserver = std::function<void(const QString&)>;
 PropertiesInvoker propertiesInvokerForTest;
 DriveTypeInvoker driveTypeInvokerForTest;
 FileAttributesInvoker fileAttributesInvokerForTest;
 KnownFolderPathInvoker knownFolderPathInvokerForTest;
 ReparsePointInvoker reparsePointInvokerForTest;
+DirectoryScanObserver directoryScanObserverForTest;
 std::optional<QStringList> shortcutRootsForTest;
 #endif
 
@@ -608,7 +610,11 @@ QString findShortcut(const AppActionInfo& app, ShortcutLookupMode mode) {
 			while (!pending.isEmpty()) {
 				const auto dir = pending.takeLast();
 				const auto prefix = dir.endsWith(u'\\') ? dir : (dir + QStringLiteral("\\"));
-				const auto pattern = (prefix + QStringLiteral("*")).toStdWString();
+				const auto patternString = prefix + QStringLiteral("*");
+#ifdef QS_TEST
+				if (directoryScanObserverForTest) directoryScanObserverForTest(patternString);
+#endif
+				const auto pattern = patternString.toStdWString();
 				WIN32_FIND_DATAW entry {};
 				auto* handle = FindFirstFileExW(
 				    pattern.c_str(),
@@ -946,12 +952,17 @@ void setReparsePointInvokerForTest(const ReparsePointInvoker& invoker) {
 	reparsePointInvokerForTest = invoker;
 }
 
+void setDirectoryScanObserverForTest(const DirectoryScanObserver& observer) {
+	directoryScanObserverForTest = observer;
+}
+
 void resetPropertiesTestHooks() {
 	propertiesInvokerForTest = {};
 	driveTypeInvokerForTest = {};
 	fileAttributesInvokerForTest = {};
 	knownFolderPathInvokerForTest = {};
 	reparsePointInvokerForTest = {};
+	directoryScanObserverForTest = {};
 	shortcutRootsForTest.reset();
 	clearShortcutCache();
 }

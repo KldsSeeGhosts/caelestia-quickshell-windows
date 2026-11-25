@@ -45,6 +45,7 @@ void setDriveTypeInvokerForTest(const std::function<UINT(const QString&)>& invok
 void setFileAttributesInvokerForTest(const std::function<DWORD(const QString&)>& invoker);
 void setKnownFolderPathInvokerForTest(const KnownFolderPathInvoker& invoker);
 void setReparsePointInvokerForTest(const ReparsePointInvoker& invoker);
+void setDirectoryScanObserverForTest(const std::function<void(const QString&)>& observer);
 void setShellExecuteTargetInvokerForTest(const ShellExecuteInvoker& invoker);
 void resetPropertiesTestHooks();
 } // namespace qs::windows::sys::test
@@ -630,6 +631,10 @@ private slots:
 		cleanup.shortcutPath = extendedShortcut;
 		QVERIFY(QFile::remove(target));
 
+		QStringList scannedPatterns;
+		qs::windows::sys::test::setDirectoryScanObserverForTest([&](const QString& pattern) {
+			scannedPatterns.append(pattern);
+		});
 		qs::windows::sys::test::setShortcutRootsForTest({nativeRoot});
 		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-ambiguous-subdir"), target);
 		qs::windows::sys::test::setLinkTargetForId(QStringLiteral("fixture-ambiguous-subdir"), target);
@@ -638,6 +643,11 @@ private slots:
 		const auto id = QStringLiteral("fixture-ambiguous-subdir");
 		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), false);
 		QVERIFY(!actions.openProperties(id));
+		QVERIFY(!scannedPatterns.isEmpty());
+		const auto expectedRootPattern = nativeRoot + QStringLiteral("\\*");
+		for (const auto& pattern: scannedPatterns) {
+			QCOMPARE(pattern, expectedRootPattern);
+		}
 	}
 
 	void remoteStartMenuShortcutIsRejectedForPropertiesButUsedForElevation() {
