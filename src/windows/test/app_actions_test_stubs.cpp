@@ -13,6 +13,7 @@ namespace {
 
 QHash<QString, QString> gParsingNames;
 QHash<QString, QString> gLinkTargets;
+QHash<QString, QString> gShortcutPaths;
 
 } // namespace
 
@@ -26,9 +27,14 @@ void setLinkTargetForId(const QString& id, const QString& target) {
 	gLinkTargets.insert(id, target);
 }
 
+void setShortcutPathForId(const QString& id, const QString& path) {
+	gShortcutPaths.insert(id, path);
+}
+
 void clearParsingNames() {
 	gParsingNames.clear();
 	gLinkTargets.clear();
+	gShortcutPaths.clear();
 }
 
 } // namespace qs::windows::sys::test
@@ -66,6 +72,10 @@ QString WindowsDesktopEntryBackend::parsingNameForId(const QString& id) {
 }
 
 QString WindowsDesktopEntryBackend::linkTargetForId(const QString& id) { return gLinkTargets.value(id); }
+
+QString WindowsDesktopEntryBackend::shortcutPathForId(const QString& id) {
+	return gShortcutPaths.value(id);
+}
 
 unsigned long WindowsDesktopEntryBackend::launchSync(
     const QString&,

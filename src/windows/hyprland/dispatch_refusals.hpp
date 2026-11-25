@@ -39,6 +39,9 @@ toggleFloatingRefusalReason(qs::windows::FloatingChangeResult result, bool eleva
 	if (result == qs::windows::FloatingChangeResult::ScopeExcluded) {
 		return QStringLiteral("Window is excluded from tiling");
 	}
+	if (result == qs::windows::FloatingChangeResult::Deferred) {
+		return QStringLiteral("Tiling is deferred until the window can be placed");
+	}
 	return elevated ? QStringLiteral("Windows prevents tiling an elevated window")
 	                : QStringLiteral("Window cannot change floating state");
 }
@@ -50,8 +53,7 @@ void reportToggleFloatingResult(
     bool elevated
 ) {
 	if (result == qs::windows::FloatingChangeResult::Changed
-	    || result == qs::windows::FloatingChangeResult::Noop
-	    || result == qs::windows::FloatingChangeResult::Deferred)
+	    || result == qs::windows::FloatingChangeResult::Noop)
 	{
 		return;
 	}

@@ -2011,6 +2011,48 @@ private slots:
 		QVERIFY(!manager->isTiled(inside));
 	}
 
+	void deferredTileWhilePlacementIsSuspended_data() {
+		QTest::addColumn<QString>("state");
+		QTest::newRow("maximized") << QStringLiteral("maximized");
+		QTest::newRow("minimized") << QStringLiteral("minimized");
+	}
+
+	void deferredTileWhilePlacementIsSuspended() {
+		QFETCH(QString, state);
+		auto* window = add(1);
+		enable();
+		QVERIFY(manager->setFloating(window, true, false));
+		manager->sync();
+		QVERIFY(!manager->isTiled(window));
+
+		auto& native = fakeWindow(window->hwnd());
+		if (state == "maximized") {
+			native.maximized = true;
+			emit window->maximizedChanged();
+		} else {
+			native.minimized = true;
+			emit window->minimizedChanged();
+		}
+		manager->sync();
+
+		QCOMPARE(
+		    manager->setFloatingDetailed(window, false, false), FloatingChangeResult::Deferred
+		);
+		manager->sync();
+		QVERIFY(!manager->isTiled(window));
+
+		if (state == "maximized") {
+			native.maximized = false;
+			emit window->maximizedChanged();
+		} else {
+			native.minimized = false;
+			emit window->minimizedChanged();
+		}
+		manager->sync();
+		QVERIFY(manager->isTiled(window));
+		QCOMPARE(manager->setFloatingDetailed(window, false, false), FloatingChangeResult::Noop);
+	}
+
 	void narrowedIncludedRemovesForcedTile() {
 		auto* a = add(1);
 		auto* b = add(2, QStringLiteral("terminal"));

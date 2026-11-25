@@ -14,6 +14,7 @@ struct AppActionInfo {
 	QString name;
 	QString target;
 	QString linkTarget;
+	QString shortcutPath;
 	QString packageFamilyName;
 	QString executionAlias;
 	QString elevationTarget;
@@ -21,7 +22,6 @@ struct AppActionInfo {
 	bool allowAppsFolderElevation = false;
 	bool canRunAsAdmin = false;
 	bool canOpenLocation = false;
-	bool canOpenProperties = false;
 	bool canUninstall = false;
 };
 

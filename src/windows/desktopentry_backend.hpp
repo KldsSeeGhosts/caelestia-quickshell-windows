@@ -37,6 +37,7 @@ public:
 	static QString parsingNameForId(const QString& id);
 	static QString idForParsingName(const QString& token);
 	static QString linkTargetForId(const QString& id);
+	static QString shortcutPathForId(const QString& id);
 	static QString aliasForAppId(const QString& name);
 	static void launch(const QString& token, const QString& workingDirectory = QString());
 	static unsigned long launchSync(
@@ -54,6 +55,7 @@ private:
 	static QHash<QString, QString> sRegistry;
 	static QHash<QString, QString> sTargets;
 	static QHash<QString, QString> sLinkTargets;
+	static QHash<QString, QString> sShortcutPaths;
 	static QHash<QString, QString> sExeNames;
 	static QMutex sWindowExeMutex;
 	static QHash<QString, QString> sWindowExes;

@@ -271,14 +271,13 @@ private slots:
 		QCOMPARE(fixture.floating.calls, 1);
 	}
 
-	void acceptedNoopAndDeferredFloatingReportNothing_data() {
+	void acceptedAndNoopFloatingReportNothing_data() {
 		QTest::addColumn<int>("result");
 		QTest::newRow("changed") << static_cast<int>(FloatingChangeResult::Changed);
 		QTest::newRow("noop") << static_cast<int>(FloatingChangeResult::Noop);
-		QTest::newRow("deferred") << static_cast<int>(FloatingChangeResult::Deferred);
 	}
 
-	void acceptedNoopAndDeferredFloatingReportNothing() {
+	void acceptedAndNoopFloatingReportNothing() {
 		QFETCH(int, result);
 		DispatcherFixture fixture;
 		fixture.floating.result = static_cast<FloatingChangeResult>(result);
@@ -288,6 +287,26 @@ private slots:
 
 		QCOMPARE(refused.size(), 0);
 		QCOMPARE(fixture.tracker->lastActionError(), QString());
+		QCOMPARE(fixture.floating.calls, 1);
+	}
+
+	void deferredFloatingReportsDeferredRefusal() {
+		DispatcherFixture fixture;
+		fixture.floating.result = FloatingChangeResult::Deferred;
+		QSignalSpy refused(fixture.tracker, &WindowTracker::windowActionRefused);
+
+		fixture.dispatcher->toggleFloatingForTest(fixture.window, QStringLiteral("tile"));
+
+		QCOMPARE(refused.size(), 1);
+		QCOMPARE(refused.first().at(0).toString(), QStringLiteral("togglefloating"));
+		QCOMPARE(
+		    refused.first().at(1).toString(),
+		    QStringLiteral("Tiling is deferred until the window can be placed")
+		);
+		QCOMPARE(
+		    fixture.tracker->lastActionError(),
+		    QStringLiteral("togglefloating:Tiling is deferred until the window can be placed")
+		);
 		QCOMPARE(fixture.floating.calls, 1);
 	}
 };

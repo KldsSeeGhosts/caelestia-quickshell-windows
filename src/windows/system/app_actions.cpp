@@ -78,10 +78,27 @@ bool isUnderWindows(const QString& path) {
 	return path.startsWith(dir, Qt::CaseInsensitive) && path[dir.size()] == u'\\';
 }
 
-bool isFilesystemPath(const QString& path) {
-	if (path.size() < 3) return false;
-	if (path[0].isLetter() && path[1] == u':' && path[2] == u'\\') return true;
-	return path.startsWith(QStringLiteral("\\\\")) && path[2] != u'?' && path[2] != u'.';
+bool isUncFilesystemPath(const QString& path) {
+	if (path.startsWith(QStringLiteral("\\\\?\\UNC\\"), Qt::CaseInsensitive)
+	    || path.startsWith(QStringLiteral("\\\\.\\UNC\\"), Qt::CaseInsensitive))
+	{
+		return true;
+	}
+	if (!path.startsWith(QStringLiteral("\\\\"))) return false;
+	return !path.startsWith(QStringLiteral("\\\\?\\"))
+	    && !path.startsWith(QStringLiteral("\\\\.\\"));
+}
+
+std::optional<QChar> driveLetterOfFilesystemPath(const QString& path) {
+	qsizetype offset = 0;
+	if (path.startsWith(QStringLiteral("\\\\?\\"))) offset = 4;
+	if (path.size() < offset + 3) return std::nullopt;
+
+	const auto letter = path[offset];
+	if (!letter.isLetter() || path[offset + 1] != u':' || path[offset + 2] != u'\\') {
+		return std::nullopt;
+	}
+	return letter;
 }
 
 bool malformedFilesystemPath(const QString& path) {
@@ -94,20 +111,63 @@ bool malformedFilesystemPath(const QString& path) {
 std::optional<QString> validFilesystemPath(const QString& path) {
 	if (malformedFilesystemPath(path)) return std::nullopt;
 	const auto native = QDir::toNativeSeparators(path);
-	if (!isFilesystemPath(native)) return std::nullopt;
+	if (!driveLetterOfFilesystemPath(native).has_value() && !isUncFilesystemPath(native)) {
+		return std::nullopt;
+	}
 	return native;
-}
-
-bool existingFilesystemPath(const QString& path) {
-	const auto wide = path.toStdWString();
-	return GetFileAttributesW(wide.c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
 #ifdef QS_TEST
 using PropertiesInvoker = std::function<DWORD(const QString&, HWND, DWORD)>;
+using DriveTypeInvoker = std::function<UINT(const QString&)>;
+using FileAttributesInvoker = std::function<DWORD(const QString&)>;
 PropertiesInvoker propertiesInvokerForTest;
+DriveTypeInvoker driveTypeInvokerForTest;
+FileAttributesInvoker fileAttributesInvokerForTest;
 std::optional<QStringList> shortcutRootsForTest;
 #endif
+
+UINT driveTypeForRoot(const QString& root) {
+#ifdef QS_TEST
+	if (driveTypeInvokerForTest) return driveTypeInvokerForTest(root);
+#endif
+	const auto wide = root.toStdWString();
+	return GetDriveTypeW(wide.c_str());
+}
+
+DWORD fileAttributes(const QString& path) {
+#ifdef QS_TEST
+	if (fileAttributesInvokerForTest) return fileAttributesInvokerForTest(path);
+#endif
+	const auto wide = path.toStdWString();
+	return GetFileAttributesW(wide.c_str());
+}
+
+std::optional<QString> validLocalFilesystemPath(const QString& path) {
+	const auto valid = validFilesystemPath(path);
+	if (!valid.has_value()) return std::nullopt;
+	if (isUncFilesystemPath(*valid)) return std::nullopt;
+
+	const auto letter = driveLetterOfFilesystemPath(*valid);
+	if (!letter.has_value()) return std::nullopt;
+	const auto root = QString(*letter) + QStringLiteral(":\\");
+	switch (driveTypeForRoot(root)) {
+	case DRIVE_FIXED:
+	case DRIVE_REMOVABLE:
+	case DRIVE_CDROM:
+	case DRIVE_RAMDISK: return valid;
+	default: return std::nullopt;
+	}
+}
+
+bool existingFilesystemPath(const QString& path) {
+	return fileAttributes(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+QString existingLocalFilesystemPath(const QString& path) {
+	const auto valid = validLocalFilesystemPath(path);
+	return valid.has_value() && existingFilesystemPath(*valid) ? *valid : QString();
+}
 
 bool canElevate(const QString& path) {
 	static const auto suffixes = QStringList {"exe", "bat", "cmd", "com", "msc"};
@@ -309,19 +369,26 @@ LinkIdentity readLink(const QString& path) {
 }
 
 QStringList startMenuRoots() {
+	auto candidates = QStringList();
+	auto useTestRoots = false;
 #ifdef QS_TEST
-	if (shortcutRootsForTest.has_value()) return *shortcutRootsForTest;
+	useTestRoots = shortcutRootsForTest.has_value();
+	if (useTestRoots) candidates = *shortcutRootsForTest;
 #endif
 
-	auto roots = QStringList();
-
-	for (const auto& folderId: {FOLDERID_StartMenu, FOLDERID_CommonStartMenu}) {
-		PWSTR raw = nullptr;
-		auto hr = SHGetKnownFolderPath(folderId, KF_FLAG_DEFAULT, nullptr, &raw);
-		auto root = takeComString(raw);
-		if (SUCCEEDED(hr) && !root.isEmpty()) roots.append(root);
+	if (!useTestRoots) {
+		for (const auto& folderId: {FOLDERID_StartMenu, FOLDERID_CommonStartMenu}) {
+			PWSTR raw = nullptr;
+			auto hr = SHGetKnownFolderPath(folderId, KF_FLAG_DEFAULT, nullptr, &raw);
+			auto root = takeComString(raw);
+			if (SUCCEEDED(hr) && !root.isEmpty()) candidates.append(root);
+		}
 	}
 
+	auto roots = QStringList();
+	for (const auto& root: candidates) {
+		if (const auto local = validLocalFilesystemPath(root)) roots.append(*local);
+	}
 	return roots;
 }
 
@@ -386,30 +453,36 @@ void clearShortcutCache() {
 }
 
 QString startMenuShortcut(const AppActionInfo& app) {
+	const auto registered = existingLocalFilesystemPath(app.shortcutPath);
+	if (!registered.isEmpty()) return registered;
+
 	auto& cache = shortcutCache();
 	auto cached = QString();
-	auto known = false;
 
 	{
 		QMutexLocker locker(&cache.mutex);
-		auto it = cache.paths.constFind(app.token);
-		known = it != cache.paths.constEnd();
-		if (known) cached = *it;
+		cached = cache.paths.value(app.token);
 	}
 
-	if (known && (cached.isEmpty() || existingFilesystemPath(cached))) return cached;
+	if (!cached.isEmpty()) {
+		const auto existing = existingLocalFilesystemPath(cached);
+		if (!existing.isEmpty()) return existing;
+	}
 
 	auto path = findShortcut(app);
 
 	QMutexLocker locker(&cache.mutex);
-	cache.paths.insert(app.token, path);
+	if (path.isEmpty()) cache.paths.remove(app.token);
+	else cache.paths.insert(app.token, path);
 	return path;
 }
 
 QString resolvePropertiesTarget(const AppActionInfo& app) {
+	if (app.token.isEmpty() || app.packaged) return {};
+
 	for (const auto& candidate: {startMenuShortcut(app), app.target}) {
-		const auto valid = validFilesystemPath(candidate);
-		if (valid.has_value() && existingFilesystemPath(*valid)) return *valid;
+		const auto existing = existingLocalFilesystemPath(candidate);
+		if (!existing.isEmpty()) return existing;
 	}
 	return {};
 }
@@ -603,8 +676,18 @@ void setShortcutRootsForTest(const QStringList& roots) {
 	clearShortcutCache();
 }
 
+void setDriveTypeInvokerForTest(const DriveTypeInvoker& invoker) {
+	driveTypeInvokerForTest = invoker;
+}
+
+void setFileAttributesInvokerForTest(const FileAttributesInvoker& invoker) {
+	fileAttributesInvokerForTest = invoker;
+}
+
 void resetPropertiesTestHooks() {
 	propertiesInvokerForTest = {};
+	driveTypeInvokerForTest = {};
+	fileAttributesInvokerForTest = {};
 	shortcutRootsForTest.reset();
 	clearShortcutCache();
 }
@@ -654,13 +737,13 @@ AppActionInfo AppActions::details(const QString& entryId) {
 		}
 	} else {
 		app.target = win32Target(id, token, &app.linkTarget);
+		app.shortcutPath = QDir::toNativeSeparators(WindowsDesktopEntryBackend::shortcutPathForId(id));
 
 		auto* entry = DesktopEntryManager::instance()->byId(id);
 		if (entry != nullptr) app.name = entry->bindableName().value();
 
 		app.canRunAsAdmin = canElevate(app.target);
 		app.canOpenLocation = !app.target.isEmpty();
-		app.canOpenProperties = !resolvePropertiesTarget(app).isEmpty();
 		app.canUninstall = !app.target.isEmpty() && !isUnderWindows(app.target);
 	}
 
@@ -670,12 +753,13 @@ AppActionInfo AppActions::details(const QString& entryId) {
 
 QVariantMap AppActions::info(const QString& entryId) {
 	auto app = this->details(entryId);
+	const auto canOpenProperties = !app.packaged && !resolvePropertiesTarget(app).isEmpty();
 
 	return {
 	    {QStringLiteral("packaged"), app.packaged},
 	    {QStringLiteral("canRunAsAdmin"), app.canRunAsAdmin},
 	    {QStringLiteral("canOpenLocation"), app.canOpenLocation},
-	    {QStringLiteral("canOpenProperties"), app.canOpenProperties},
+	    {QStringLiteral("canOpenProperties"), canOpenProperties},
 	    {QStringLiteral("canUninstall"), app.canUninstall},
 	    {QStringLiteral("packageFamilyName"), app.packageFamilyName},
 	};
@@ -816,17 +900,18 @@ bool AppActions::openFileLocation(const QString& entryId) {
 
 bool AppActions::openProperties(const QString& entryId, QObject* parentWindow) {
 	auto app = this->details(entryId);
-	if (!app.canOpenProperties) {
-		const auto message = app.token.isEmpty()
-		    ? QStringLiteral("The application entry is not available")
-		    : QStringLiteral("Properties is not supported for this application");
-		this->setLastError(message);
+	if (app.token.isEmpty()) {
+		this->setLastError(QStringLiteral("The application entry is not available"));
+		return false;
+	}
+	if (app.packaged) {
+		this->setLastError(QStringLiteral("Properties is not supported for this application"));
 		return false;
 	}
 
 	const auto target = resolvePropertiesTarget(app);
 	if (target.isEmpty()) {
-		this->setLastError(QStringLiteral("The application entry is not available"));
+		this->setLastError(QStringLiteral("Properties is not supported for this application"));
 		return false;
 	}
 

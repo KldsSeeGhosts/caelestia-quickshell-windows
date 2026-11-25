@@ -22,9 +22,12 @@ using Microsoft::WRL::ComPtr;
 namespace qs::windows::sys::test {
 void setParsingNameForId(const QString& id, const QString& token);
 void setLinkTargetForId(const QString& id, const QString& target);
+void setShortcutPathForId(const QString& id, const QString& path);
 void clearParsingNames();
 void setPropertiesInvokerForTest(const std::function<DWORD(const QString&, HWND, DWORD)>& invoker);
 void setShortcutRootsForTest(const QStringList& roots);
+void setDriveTypeInvokerForTest(const std::function<UINT(const QString&)>& invoker);
+void setFileAttributesInvokerForTest(const std::function<DWORD(const QString&)>& invoker);
 void resetPropertiesTestHooks();
 } // namespace qs::windows::sys::test
 
@@ -148,27 +151,30 @@ private slots:
 		QCOMPARE(actions.lastError(), QString());
 	}
 
-	void deletionAfterInfoPreventsShellInvocation() {
+	void deletionAndRecreationAreResolvedLiveOnTheSameInstance() {
 		QTemporaryDir directory;
 		QVERIFY(directory.isValid());
 		const auto target = writeFile(directory, QStringLiteral("fixture.exe"));
 		QVERIFY(!target.isEmpty());
-		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-deleted"), target);
+		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-live"), target);
 
 		InvokeLog invoke;
 		installInvoker(invoke);
 		AppActions actions;
-		QCOMPARE(
-		    actions.info(QStringLiteral("fixture-deleted"))
-		        .value(QStringLiteral("canOpenProperties"))
-		        .toBool(),
-		    true
-		);
+		const auto id = QStringLiteral("fixture-live");
+		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), true);
 
 		QVERIFY(QFile::remove(target));
-		QVERIFY(!actions.openProperties(QStringLiteral("fixture-deleted")));
+		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), false);
+		QVERIFY(!actions.openProperties(id));
 		QCOMPARE(invoke.calls, 0);
-		QCOMPARE(actions.lastError(), QStringLiteral("The application entry is not available"));
+
+		QCOMPARE(writeFile(directory, QStringLiteral("fixture.exe")), target);
+		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), true);
+		QVERIFY(actions.openProperties(id));
+		QCOMPARE(invoke.calls, 1);
+		QCOMPARE(invoke.path, target);
+		verifySynchronousFlags(invoke.flags);
 	}
 
 	void registeredShortcutIsPreferredOverItsDestination() {
@@ -195,6 +201,63 @@ private slots:
 		QCOMPARE(invoke.calls, 1);
 		QCOMPARE(invoke.path, shortcut);
 		verifySynchronousFlags(invoke.flags);
+	}
+
+	void registeredShortcutOutsideStartMenuRootsIsUsedExactly() {
+		QTemporaryDir directory;
+		QVERIFY(directory.isValid());
+		QVERIFY(QDir(directory.path()).mkpath(QStringLiteral("outside")));
+		const auto target = writeFile(directory, QStringLiteral("fixture.exe"));
+		const auto shortcut = QDir::toNativeSeparators(
+		    directory.filePath(QStringLiteral("outside/Fixture Registered.lnk"))
+		);
+		QVERIFY(!target.isEmpty());
+		QVERIFY(createShortcut(shortcut, target));
+		qs::windows::sys::test::setShortcutRootsForTest({});
+		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-registered"), target);
+		qs::windows::sys::test::setLinkTargetForId(QStringLiteral("fixture-registered"), target);
+		qs::windows::sys::test::setShortcutPathForId(QStringLiteral("fixture-registered"), shortcut);
+
+		InvokeLog invoke;
+		installInvoker(invoke);
+		AppActions actions;
+		const auto id = QStringLiteral("fixture-registered");
+		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), true);
+		QVERIFY(actions.openProperties(id));
+		QCOMPARE(invoke.calls, 1);
+		QCOMPARE(invoke.path, shortcut);
+	}
+
+	void registeredShortcutWinsOverAnotherShortcutToTheSameDestination() {
+		QTemporaryDir directory;
+		QVERIFY(directory.isValid());
+		QVERIFY(QDir(directory.path()).mkpath(QStringLiteral("scan")));
+		QVERIFY(QDir(directory.path()).mkpath(QStringLiteral("registered")));
+		const auto target = writeFile(directory, QStringLiteral("fixture.exe"));
+		const auto decoy = QDir::toNativeSeparators(
+		    directory.filePath(QStringLiteral("scan/Fixture Decoy.lnk"))
+		);
+		const auto registered = QDir::toNativeSeparators(
+		    directory.filePath(QStringLiteral("registered/Fixture Registered.lnk"))
+		);
+		QVERIFY(!target.isEmpty());
+		QVERIFY(createShortcut(decoy, target));
+		QVERIFY(createShortcut(registered, target));
+		qs::windows::sys::test::setShortcutRootsForTest(
+		    {QDir::toNativeSeparators(directory.filePath(QStringLiteral("scan")))}
+		);
+		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-duplicate"), target);
+		qs::windows::sys::test::setLinkTargetForId(QStringLiteral("fixture-duplicate"), target);
+		qs::windows::sys::test::setShortcutPathForId(QStringLiteral("fixture-duplicate"), registered);
+
+		InvokeLog invoke;
+		installInvoker(invoke);
+		AppActions actions;
+		const auto id = QStringLiteral("fixture-duplicate");
+		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), true);
+		QVERIFY(actions.openProperties(id));
+		QCOMPARE(invoke.calls, 1);
+		QCOMPARE(invoke.path, registered);
 	}
 
 	void shortcutToShellNamespaceTargetKeepsShortcutProperties() {
@@ -256,6 +319,112 @@ private slots:
 		        .toBool(),
 		    false
 		);
+	}
+
+	void uncTargetsAreRejectedBeforeAnyFilesystemProbe_data() {
+		QTest::addColumn<QString>("target");
+		QTest::newRow("unc") << QStringLiteral("\\\\nonexistent-network-host.invalid\\share\\app.exe");
+		QTest::newRow("extended unc")
+		    << QStringLiteral("\\\\?\\UNC\\nonexistent-network-host.invalid\\share\\app.exe");
+		QTest::newRow("device unc")
+		    << QStringLiteral("\\\\.\\UNC\\nonexistent-network-host.invalid\\share\\app.exe");
+		QTest::newRow("slash unc") << QStringLiteral("//nonexistent-network-host.invalid/share/app.exe");
+	}
+
+	void uncTargetsAreRejectedBeforeAnyFilesystemProbe() {
+		QFETCH(QString, target);
+		auto driveCalls = 0;
+		auto filesystemProbes = 0;
+		qs::windows::sys::test::setDriveTypeInvokerForTest([&](const QString&) {
+			driveCalls++;
+			return DRIVE_FIXED;
+		});
+		qs::windows::sys::test::setFileAttributesInvokerForTest([&](const QString&) {
+			filesystemProbes++;
+			return DWORD(FILE_ATTRIBUTE_NORMAL);
+		});
+		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-unc"), target);
+
+		AppActions actions;
+		const auto id = QStringLiteral("fixture-unc");
+		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), false);
+		QVERIFY(!actions.openProperties(id));
+		QCOMPARE(driveCalls, 0);
+		QCOMPARE(filesystemProbes, 0);
+	}
+
+	void mappedNetworkDrivesAreRejectedBeforeTheTargetIsProbed_data() {
+		QTest::addColumn<QString>("target");
+		QTest::newRow("drive") << QStringLiteral("Z:\\fixture\\app.exe");
+		QTest::newRow("extended drive") << QStringLiteral("\\\\?\\Z:\\fixture\\app.exe");
+	}
+
+	void mappedNetworkDrivesAreRejectedBeforeTheTargetIsProbed() {
+		QFETCH(QString, target);
+		auto driveCalls = 0;
+		auto filesystemProbes = 0;
+		qs::windows::sys::test::setDriveTypeInvokerForTest([&](const QString& root) {
+			driveCalls++;
+			if (root.compare(QStringLiteral("Z:\\"), Qt::CaseInsensitive) == 0) return UINT(DRIVE_REMOTE);
+			const auto wide = root.toStdWString();
+			return GetDriveTypeW(wide.c_str());
+		});
+		qs::windows::sys::test::setFileAttributesInvokerForTest([&](const QString&) {
+			filesystemProbes++;
+			return DWORD(FILE_ATTRIBUTE_NORMAL);
+		});
+		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-mapped-network"), target);
+
+		AppActions actions;
+		const auto id = QStringLiteral("fixture-mapped-network");
+		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), false);
+		QVERIFY(!actions.openProperties(id));
+		QCOMPARE(filesystemProbes, 0);
+		QVERIFY(driveCalls > 0);
+	}
+
+	void redirectedShortcutRootsAreSkippedBeforeEnumeration() {
+		QTemporaryDir directory;
+		QVERIFY(directory.isValid());
+		const auto target = writeFile(directory, QStringLiteral("fixture.exe"));
+		QVERIFY(!target.isEmpty());
+		qs::windows::sys::test::setShortcutRootsForTest(
+		    {QStringLiteral("\\\\nonexistent-network-host.invalid\\startmenu")}
+		);
+		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-redirected-root"), target);
+
+		AppActions actions;
+		const auto id = QStringLiteral("fixture-redirected-root");
+		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), true);
+	}
+
+	void networkShortcutRootIsRejectedBeforeEnumeration() {
+		QTemporaryDir directory;
+		QVERIFY(directory.isValid());
+		const auto target = writeFile(directory, QStringLiteral("fixture.exe"));
+		const auto shortcut = QDir::toNativeSeparators(directory.filePath(QStringLiteral("Fixture.lnk")));
+		QVERIFY(!target.isEmpty());
+		QVERIFY(createShortcut(shortcut, target));
+		QVERIFY(QFile::remove(target));
+
+		const auto nativeRoot = QDir::toNativeSeparators(directory.path());
+		const auto driveRoot = nativeRoot.left(2) + QStringLiteral("\\");
+		auto rootValidationCalls = 0;
+		qs::windows::sys::test::setDriveTypeInvokerForTest([&](const QString& root) {
+			if (root.compare(driveRoot, Qt::CaseInsensitive) == 0 && rootValidationCalls++ == 0) {
+				return UINT(DRIVE_REMOTE);
+			}
+			const auto wide = root.toStdWString();
+			return GetDriveTypeW(wide.c_str());
+		});
+		qs::windows::sys::test::setShortcutRootsForTest({nativeRoot});
+		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-network-root"), target);
+		qs::windows::sys::test::setLinkTargetForId(QStringLiteral("fixture-network-root"), target);
+
+		AppActions actions;
+		const auto id = QStringLiteral("fixture-network-root");
+		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), false);
+		QVERIFY(rootValidationCalls > 0);
 	}
 
 	void synchronousInvocationFailureIsReported() {
