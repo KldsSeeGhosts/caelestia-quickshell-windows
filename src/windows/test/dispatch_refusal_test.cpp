@@ -1140,6 +1140,43 @@ private slots:
 		QCOMPARE(trackerRefused.size(), 0);
 		QCOMPARE(fixture.tracker->lastActionError(), QString());
 	}
+
+	void lastActionErrorChangedSupersedingMoveSuppressesRefusalSignals() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		const auto moveSeq = fixture.window->beginMoveRequest();
+		QSignalSpy windowRefused(fixture.window, &TrackedWindow::actionRefused);
+		QSignalSpy trackerErrorChanged(fixture.tracker, &WindowTracker::lastActionErrorChanged);
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+		bool startedNewerMove = false;
+		QObject::connect(
+		    fixture.window,
+		    &TrackedWindow::lastActionErrorChanged,
+		    fixture.tracker,
+		    [&fixture, &startedNewerMove] {
+			    if (startedNewerMove) return;
+			    startedNewerMove = true;
+			    (void)fixture.window->beginMoveRequest();
+		    }
+		);
+
+		QVERIFY(!fixture.window->finishMoveRequestForTest(
+		    false,
+		    0,
+		    false,
+		    std::nullopt,
+		    QStringLiteral("permission-denied"),
+		    moveSeq,
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; }
+		));
+
+		QVERIFY(startedNewerMove);
+		QCOMPARE(windowRefused.size(), 0);
+		QCOMPARE(trackerErrorChanged.size(), 0);
+		QCOMPARE(trackerRefused.size(), 0);
+	}
 };
 
 } // namespace

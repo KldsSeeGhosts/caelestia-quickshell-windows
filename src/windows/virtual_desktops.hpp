@@ -242,6 +242,7 @@ private:
 	quint64 mSwitchOrder = 0;
 	quint64 mWorkspaceIntentOrder = 0;
 	quint64 mLastNativeSwitchSequence = 0;
+	bool mHasUnobservedNativeSwitch = false;
 };
 
 } // namespace qs::windows

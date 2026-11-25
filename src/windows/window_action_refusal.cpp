@@ -6,7 +6,8 @@ namespace qs::windows {
 quint64 TrackedWindow::beginMoveRequest() {
 	this->mActionOrder->latestMoveSequence = this->tracker != nullptr
 	    ? this->tracker->nextActionSequence()
-	    : this->mActionOrder->latestMoveSequence + 1;
+	    : std::max(this->mActionOrder->latestMoveSequence, this->mActionOrder->lastActionErrorSequence)
+	          + 1;
 	return this->mActionOrder->latestMoveSequence;
 }
 
@@ -21,8 +22,10 @@ void TrackedWindow::reportActionRefused(
     const QString& reason,
     bool elevated
 ) {
-	const auto sequence = this->tracker != nullptr ? this->tracker->nextActionSequence()
-	                                               : this->mActionOrder->lastActionErrorSequence + 1;
+	const auto sequence = this->tracker != nullptr
+	    ? this->tracker->nextActionSequence()
+	    : std::max(this->mActionOrder->latestMoveSequence, this->mActionOrder->lastActionErrorSequence)
+	          + 1;
 	this->reportActionRefusedWithSequence(sequence, action, reason, elevated);
 }
 
@@ -32,7 +35,11 @@ void TrackedWindow::reportActionRefusedWithSequence(
     const QString& reason,
     bool elevated
 ) {
-	if (sequence == 0 || this->mActionOrder->lastActionErrorSequence >= sequence) return;
+	if (sequence == 0 || this->mActionOrder->lastActionErrorSequence >= sequence
+	    || this->mActionOrder->latestMoveSequence > sequence)
+	{
+		return;
+	}
 	auto* tracker = this->tracker;
 	if (tracker != nullptr && tracker->mLastActionErrorSequence >= sequence) return;
 
@@ -51,11 +58,13 @@ void TrackedWindow::reportActionRefusedWithSequence(
 
 	const auto stillCurrent = [&] {
 		return guardedTracker && tracker->mLastActionErrorSequence == sequence
-		    && tracker->mLastActionError == text;
+		    && tracker->mLastActionError == text && actionOrder->latestMoveSequence <= sequence;
 	};
 
 	this->notifyActionErrorChanged();
-	if (self && actionOrder->lastActionErrorSequence == sequence && this->mLastActionError == text) {
+	if (self && actionOrder->lastActionErrorSequence == sequence
+	    && actionOrder->latestMoveSequence <= sequence && this->mLastActionError == text)
+	{
 		emit this->actionRefused(action, reason, elevated);
 	}
 	if (stillCurrent()) {
@@ -67,8 +76,10 @@ void TrackedWindow::reportActionRefusedWithSequence(
 }
 
 void TrackedWindow::clearActionError() {
-	const auto sequence = this->tracker != nullptr ? this->tracker->nextActionSequence()
-	                                               : this->mActionOrder->lastActionErrorSequence + 1;
+	const auto sequence = this->tracker != nullptr
+	    ? this->tracker->nextActionSequence()
+	    : std::max(this->mActionOrder->latestMoveSequence, this->mActionOrder->lastActionErrorSequence)
+	          + 1;
 	this->clearActionErrorWithSequence(sequence);
 }
 

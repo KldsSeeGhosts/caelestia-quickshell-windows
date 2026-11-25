@@ -313,7 +313,9 @@ private slots:
 	void slowCommandRemainsAccepted() {
 		QFETCH(QString, operation);
 		QFETCH(bool, succeed);
-		const auto delay = [] { std::this_thread::sleep_for(std::chrono::milliseconds(150)); };
+		auto blocked = std::make_shared<BlockingCall>();
+		Unblock unblock {blocked};
+		const auto hold = [blocked] { (*blocked)(); };
 		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb2));
 		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
 		QVERIFY(waitUntil(
@@ -326,16 +328,16 @@ private slots:
 		QSignalSpy moveCompleted(this->desktops, &VirtualDesktops::moveWindowCompleted);
 		this->old.manager.publishSwitch = this->old.manager.publishCreation = true;
 		if (operation == "switch") {
-			this->old.manager.beforeSwitch = delay;
+			this->old.manager.beforeSwitch = hold;
 			this->old.manager.switchResult = succeed ? S_OK : E_ACCESSDENIED;
 		}
 		if (operation == "create") {
-			this->old.manager.beforeCreate = delay;
+			this->old.manager.beforeCreate = hold;
 			if (!succeed) this->old.manager.created = nullptr;
 		}
 		if (operation == "move") {
-			this->old.manager.beforeMove = [this, delay, succeed] {
-				delay();
+			this->old.manager.beforeMove = [this, hold, succeed] {
+				hold();
 				if (succeed) this->old.publicApi.desktopId = this->old.two.id;
 			};
 			this->old.manager.moveResult = succeed ? S_OK : E_ACCESSDENIED;
@@ -367,6 +369,7 @@ private slots:
 		QCOMPARE(completion->calls, 0);
 		QCOMPARE(moveCompleted.size(), 0);
 		if (operation == "move") QVERIFY(nativeDesktopPendingMoveSequence() != 0);
+		blocked->release();
 		QVERIFY(waitUntil([] { return !nativeDesktopCommandPending(); }, 1000));
 		QVERIFY(!nativeDesktopCommandPending());
 		QCOMPARE(this->acquisitions, 1);
@@ -1300,43 +1303,102 @@ private slots:
 		QCOMPARE(this->old.manager.moves, 1);
 	}
 
-	void reentrantSwitchBackToOriginDuringAcceptedStillIssuesNativeSwitch() {
+	void switchBackBeforePostSwitchReadStillIssuesNativeSwitch() {
 		this->old.manager.publishSwitch = true;
 		this->old.manager.beforeSwitch = {};
 		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));
 
-		bool switchedBack = false;
-		int observedBack = 0;
-		auto conn = QObject::connect(
-		    this->desktops,
-		    &VirtualDesktops::commandResult,
-		    this->desktops,
-		    [this, &switchedBack, &observedBack](const QVariantMap& result) {
-			    if (!switchedBack && result.value("operation").toString() == QStringLiteral("switch")
-			        && result.value("outcome").toString() == QStringLiteral("accepted"))
-			    {
-				    switchedBack = true;
-				    QVERIFY(this->desktops->switchTo(
-				        0,
-				        {},
-				        [&observedBack](qsizetype) { ++observedBack; },
-				        std::nullopt,
-				        this->old.one.id
-				    ));
-				    // Must not take the alreadyCurrent shortcut while the first switch's read is pending.
-				    QCOMPARE(observedBack, 0);
-			    }
-		    }
-		);
+		auto blockedRead = std::make_shared<BlockingCall>();
+		Unblock unblockRead {blockedRead};
+		this->old.manager.beforeEnumeration = [blockedRead] { (*blockedRead)(); };
 
 		QVERIFY(this->desktops->switchTo(1));
-		QObject::disconnect(conn);
-		QVERIFY(switchedBack);
+		// Deterministically wait for the first switch command to finish while its
+		// post-switch desktop read is held so both caches still report desktop 0.
+		QVERIFY(waitUntil([] { return !nativeDesktopCommandPending(); }, 1000));
+		QCOMPARE(this->old.manager.current, &this->old.two);
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));
+
+		int observedBack = 0;
+		QVERIFY(this->desktops->switchTo(
+		    0,
+		    {},
+		    [&observedBack](qsizetype) { ++observedBack; },
+		    std::nullopt,
+		    this->old.one.id
+		));
+		// Must not take the alreadyCurrent shortcut while the first switch's read is pending.
+		QCOMPARE(observedBack, 0);
+
+		this->old.manager.beforeEnumeration = {};
+		blockedRead->release();
 		QVERIFY(waitUntil([&observedBack] { return observedBack == 1; }, 1000));
 		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
 		QCOMPARE(this->old.manager.switches, 2);
 		QCOMPARE(this->old.manager.current, &this->old.one);
 		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));
+	}
+
+	void switchBackAfterStalePostSwitchReadStillIssuesNativeSwitch() {
+		// Windows accepts A -> B, but the first post-command desktop read still reports A.
+		this->old.manager.publishSwitch = false;
+		this->old.manager.beforeSwitch = {};
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));
+
+		QVERIFY(this->desktops->switchTo(1));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));
+
+		// Simulate the earlier switch landing on B right before a request to return to A.
+		this->old.manager.current = &this->old.two;
+		this->old.manager.publishSwitch = true;
+
+		int observedBack = 0;
+		QVERIFY(this->desktops->switchTo(
+		    0,
+		    {},
+		    [&observedBack](qsizetype) { ++observedBack; },
+		    std::nullopt,
+		    this->old.one.id
+		));
+		QVERIFY(waitUntil([&observedBack] { return observedBack == 1; }, 1000));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->old.manager.switches, 2);
+		QCOMPARE(this->old.manager.current, &this->old.one);
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));
+	}
+
+	void providerDisconnectDuringObservedSkipsFollowCallback() {
+		this->old.manager.publishSwitch = true;
+		this->old.manager.beforeSwitch = {};
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));
+
+		bool invalidated = false;
+		int observedCalls = 0;
+		auto conn = QObject::connect(
+		    this->desktops,
+		    &VirtualDesktops::commandResult,
+		    this->desktops,
+		    [&invalidated](const QVariantMap& result) {
+			    if (!invalidated && result.value("operation").toString() == QStringLiteral("switch")
+			        && result.value("outcome").toString() == QStringLiteral("observed"))
+			    {
+				    invalidated = true;
+				    invalidateNativeDesktopAccessor();
+			    }
+		    }
+		);
+
+		QVERIFY(this->desktops->switchTo(
+		    1,
+		    {},
+		    [&observedCalls](qsizetype) { ++observedCalls; },
+		    std::nullopt,
+		    this->old.two.id
+		));
+		QVERIFY(waitUntil([&invalidated] { return invalidated; }, 1000));
+		QObject::disconnect(conn);
+		QCOMPARE(observedCalls, 0);
 	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)

@@ -659,6 +659,7 @@ void VirtualDesktops::initCommandObservation() {
 	QObject::connect(this, &AccessorState::accessorStateChanged, this, [this] {
 		this->notifyCapability();
 		if (!this->accessorLoaded()) {
+			this->mHasUnobservedNativeSwitch = false;
 			this->finishSwitch(DesktopCommandOutcome::Denied, this->commandFailureReason());
 			this->creationTimer.stop();
 			this->finishCreation(DesktopCommandOutcome::Denied, this->commandFailureReason());
@@ -711,7 +712,13 @@ bool VirtualDesktops::isDesktopCurrentlyActive(qsizetype index, const GUID& targ
 	       && IsEqualGUID(this->mDesktops[this->mCurrent].id, targetGuid) != FALSE)
 	    : (index == this->mCurrent && index >= 0 && index < this->count());
 	if (!facadeMatches) return false;
-	if (!this->nativeAccessor || !this->accessorLoaded()) return true;
+	if (!this->nativeAccessor) return true;
+	if (!this->accessorLoaded() || this->availability() != DesktopAvailability::Available
+	    || nativeDesktopAvailability() != DesktopAvailability::Available)
+	{
+		return false;
+	}
+	if (this->mHasUnobservedNativeSwitch) return false;
 	if (this->mLastNativeSwitchSequence != 0
 	    && (nativeDesktopCommandPending()
 	        || nativeDesktopReadSequence() <= this->mLastNativeSwitchSequence))
@@ -736,6 +743,9 @@ void VirtualDesktops::finishSwitch(DesktopCommandOutcome outcome, const QString&
 	auto pending = std::move(*this->pendingSwitch);
 	this->pendingSwitch.reset();
 	this->switchDeadline.stop();
+	if (outcome == DesktopCommandOutcome::Observed) {
+		this->mHasUnobservedNativeSwitch = false;
+	}
 	this->publishCommand(DesktopRequestResult {pending.id, QStringLiteral("switch"), outcome, reason});
 	if (self && outcome == DesktopCommandOutcome::Observed
 	    && self->mWorkspaceIntentOrder == pending.intentOrder && pending.onObserved
@@ -854,8 +864,11 @@ bool VirtualDesktops::switchTo(
 	const auto id = ++this->nextRequest;
 	const auto minObservationSequence =
 	    this->nativeAccessor ? nativeDesktopSubmittedSequence() : quint64(0);
-	if (this->nativeAccessor && minObservationSequence > this->mLastNativeSwitchSequence) {
-		this->mLastNativeSwitchSequence = minObservationSequence;
+	if (this->nativeAccessor) {
+		this->mHasUnobservedNativeSwitch = true;
+		if (minObservationSequence > this->mLastNativeSwitchSequence) {
+			this->mLastNativeSwitchSequence = minObservationSequence;
+		}
 	}
 	this->pendingSwitch = PendingSwitch {
 	    id,
