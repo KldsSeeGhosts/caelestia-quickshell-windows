@@ -688,11 +688,6 @@ struct Channel {
 		if (result.desktopRead && result.sequence > this->desktopReadApplied) {
 			this->desktopReadApplied = result.sequence;
 		}
-		if (result.result == -2 && result.operationError == HRESULT_FROM_WIN32(ERROR_CANCELLED)
-		    && result.sequence > this->cancelledCommandSequence)
-		{
-			this->cancelledCommandSequence = result.sequence;
-		}
 		this->snapshot = std::move(result);
 		return true;
 	}
@@ -919,6 +914,12 @@ struct Channel {
 			const auto success = outcome != -1;
 			const auto operationError = value.operationError;
 			const auto publicReady = value.publicReady;
+			if (finished.switchCommand && outcome == -2
+			    && operationError == HRESULT_FROM_WIN32(ERROR_CANCELLED)
+			    && seq > this->cancelledCommandSequence)
+			{
+				this->cancelledCommandSequence = seq;
+			}
 			if (finished.switchCommand && outcome == -1 && seq > this->failedSwitchSequence) {
 				this->failedSwitchSequence = seq;
 				this->failedSwitchError = operationError;

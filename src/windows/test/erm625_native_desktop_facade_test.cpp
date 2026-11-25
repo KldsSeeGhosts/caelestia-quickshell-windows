@@ -1586,7 +1586,7 @@ private slots:
 	}
 
 	void moveAndFollowSucceedsAfterObservationTimeout() {
-		NativeDesktopFacadeTestHook::setObservationBudget(*this->desktops, 150);
+		NativeDesktopFacadeTestHook::setObservationBudget(*this->desktops, 300);
 		this->old.manager.array.desktops = {&this->old.one, &this->old.two};
 		this->old.manager.current = &this->old.one;
 		this->old.manager.publishSwitch = false;
@@ -1599,6 +1599,8 @@ private slots:
 		QVERIFY(this->desktops->switchTo(1));
 		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("accepted"));
 		QVERIFY(!this->desktops->isDesktopCurrentlyActive(0, this->old.one.id));
+		// Drain any initial observation refresh before hooking the post-timeout refresh.
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
 
 		// Block the post-timeout refresh to verify the stale-cache guard holds until it lands.
 		auto refreshBlocked = std::make_shared<BlockingCall>();
@@ -1609,7 +1611,7 @@ private slots:
 			    return this->desktops->lastCommand().value("outcome").toString()
 			        == QStringLiteral("timed-out");
 		    },
-		    1000
+		    1500
 		));
 		QCOMPARE(
 		    this->desktops->lastCommand().value("reason").toString(),
@@ -1687,6 +1689,99 @@ private slots:
 		    QStringLiteral("permission-denied")
 		);
 		QCOMPARE(this->old.manager.switches, 1);
+		QCOMPARE(observedCalls, 0);
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(1));
+		QVERIFY(this->desktops->isDesktopCurrentlyActive(1, this->old.two.id));
+	}
+
+	void lateCancelledSwitchHiddenByNewerRefreshStillSkipsFollow() {
+		this->old.manager.array.desktops = {&this->old.one, &this->old.two, &this->old.three};
+		this->old.manager.current = &this->old.one;
+		this->old.manager.publishSwitch = true;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		this->desktops->refresh();
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));
+
+		// Create a message-only window so the worker can synchronously trigger
+		// requestNativeDesktopRefresh() via QS_SENDMESSAGE during execute()'s 100 ms wait.
+		static const wchar_t* className = L"QsErm625SentRefreshProbe";
+		WNDCLASSW wc {};
+		wc.lpfnWndProc = [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+			if (msg == WM_APP) {
+				requestNativeDesktopRefresh();
+				return 1;
+			}
+			return DefWindowProcW(hwnd, msg, wp, lp);
+		};
+		wc.hInstance = GetModuleHandleW(nullptr);
+		wc.lpszClassName = className;
+		RegisterClassW(&wc);
+		HWND msgHwnd =
+		    CreateWindowExW(0, className, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+		QVERIFY(msgHwnd != nullptr);
+		struct WindowGuard {
+			HWND hwnd;
+			~WindowGuard() {
+				if (this->hwnd) DestroyWindow(this->hwnd);
+			}
+		} windowGuard {msgHwnd};
+
+		auto blocked = std::make_shared<BlockingCall>();
+		Unblock unblock {blocked};
+		HANDLE refreshStarted = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		struct EventGuard {
+			HANDLE handle;
+			~EventGuard() {
+				if (this->handle) CloseHandle(this->handle);
+			}
+		} eventGuard {refreshStarted};
+		std::atomic<int> enumCalls {0};
+		this->old.manager.beforeEnumeration = [blocked, msgHwnd, refreshStarted, &enumCalls] {
+			const auto call = ++enumCalls;
+			if (call == 1) {
+				SendMessageW(msgHwnd, WM_APP, 0, 0);
+				(*blocked)();
+			} else if (call == 2) {
+				SetEvent(refreshStarted);
+			}
+		};
+
+		const auto followIntent = this->desktops->beginWorkspaceIntent();
+		int observedCalls = 0;
+		QVERIFY(this->desktops->switchTo(
+		    1,
+		    {},
+		    [&observedCalls](qsizetype) { ++observedCalls; },
+		    followIntent,
+		    this->old.two.id,
+		    this->old.one.id
+		));
+		QVERIFY(nativeDesktopCommandPending());
+		QCOMPARE(WaitForSingleObject(blocked->entered, 1000), WAIT_OBJECT_0);
+
+		// Task View switched to destination B while the switch's origin check was blocked.
+		this->old.manager.current = &this->old.two;
+		blocked->release();
+		// Let both the cancelled switch (N) and the queued refresh (N+1) complete on the worker
+		// before pumping GUI events so Channel::collect() sees refresh N+1 ready alongside switch N.
+		QCOMPARE(WaitForSingleObject(refreshStarted, 1000), WAIT_OBJECT_0);
+		QThread::msleep(20);
+
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("superseded");
+		    },
+		    1000
+		));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		this->old.manager.beforeEnumeration = {};
+		QCOMPARE(
+		    this->desktops->lastCommand().value("reason").toString(),
+		    QStringLiteral("origin-changed")
+		);
+		QCOMPARE(this->old.manager.switches, 0);
 		QCOMPARE(observedCalls, 0);
 		QCOMPARE(this->desktops->currentIndex(), qsizetype(1));
 		QVERIFY(this->desktops->isDesktopCurrentlyActive(1, this->old.two.id));
