@@ -130,13 +130,18 @@ void Dispatcher::refuseImmediateMove(
     const std::function<void()>& publishCommandResult
 ) {
 	auto* tracker = this->actionTracker();
-	QPointer<TrackedWindow> guardedTarget(target);
 	QPointer<WindowTracker> guardedTracker(tracker);
+	const auto actionOrder = target != nullptr ? target->actionOrderState() : nullptr;
 	const auto moveSequence = target != nullptr
 	    ? target->beginMoveRequest()
 	    : (tracker != nullptr ? tracker->nextActionSequence() : 0);
 	if (publishCommandResult) publishCommandResult();
-	if (guardedTarget && guardedTarget->latestMoveSequence() != moveSequence) return;
+	if (actionOrder != nullptr
+	    && (actionOrder->latestMoveSequence != moveSequence
+	        || actionOrder->lastActionErrorSequence >= moveSequence))
+	{
+		return;
+	}
 	if (!guardedTracker || guardedTracker->lastActionErrorSequence() >= moveSequence) return;
 	guardedTracker->reportActionRefusalWithSequence(
 	    moveSequence, QStringLiteral("move"), moveRefusalReason(code, false), false

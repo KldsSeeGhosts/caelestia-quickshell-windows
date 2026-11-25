@@ -904,6 +904,114 @@ private slots:
 		QCOMPARE(trackerRefused.first().at(2).toBool(), false);
 	}
 
+	void deletingWindowAfterNewerMoveDoesNotReviveOlderRefusal() {
+		DispatcherFixture fixture;
+		auto* ephemeral = TrackedWindow::createForTest(
+		    fixture.tracker, reinterpret_cast<HWND>(static_cast<quintptr>(0x334))
+		);
+		fixture.tracker->registerWindowForTest(ephemeral);
+
+		const auto olderSeq = ephemeral->beginMoveRequest();
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+		bool replacedAndDeleted = false;
+		QObject::connect(
+		    ephemeral,
+		    &TrackedWindow::elevatedChanged,
+		    fixture.tracker,
+		    [&fixture, &ephemeral, &replacedAndDeleted] {
+			    if (replacedAndDeleted) return;
+			    replacedAndDeleted = true;
+			    // A newer move succeeds on the same window, then the wrapper is deleted.
+			    const auto newerSeq = ephemeral->beginMoveRequest();
+			    QVERIFY(ephemeral->finishMoveRequestForTest(
+			        true,
+			        0,
+			        false,
+			        std::nullopt,
+			        QString(),
+			        newerSeq,
+			        [](const TrackedWindow*) { return true; },
+			        [](HWND) { return false; }
+			    ));
+			    fixture.tracker->unregisterWindowForTest(ephemeral);
+			    delete ephemeral;
+			    ephemeral = nullptr;
+		    }
+		);
+
+		QVERIFY(!ephemeral->finishMoveRequestForTest(
+		    false,
+		    0,
+		    false,
+		    std::nullopt,
+		    QStringLiteral("permission-denied"),
+		    olderSeq,
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return true; }
+		));
+
+		QVERIFY(replacedAndDeleted);
+		QCOMPARE(trackerRefused.size(), 0);
+		QCOMPARE(fixture.tracker->lastActionError(), QString());
+	}
+
+	void pendingMoveOnlyInvokesFollowCallbackOnConfirmedSuccess() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		int followCalls = 0;
+		const auto moveSeq = fixture.window->beginMoveRequest();
+		QVERIFY(fixture.window->finishMoveRequestForTest(
+		    true,
+		    92,
+		    false,
+		    std::nullopt,
+		    QString(),
+		    moveSeq,
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; },
+		    [&followCalls](quint64) { ++followCalls; }
+		));
+		// Still pending: must NOT invoke follow yet.
+		QCOMPARE(followCalls, 0);
+
+		// Failure must NOT invoke follow.
+		fixture.tracker->completePendingUserMoveForTest(
+		    92,
+		    reinterpret_cast<quintptr>(fixture.window->hwnd()),
+		    false,
+		    QStringLiteral("permission-denied"),
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; }
+		);
+		QCOMPARE(followCalls, 0);
+
+		// A new pending move that succeeds DOES invoke follow once.
+		const auto moveSeq2 = fixture.window->beginMoveRequest();
+		QVERIFY(fixture.window->finishMoveRequestForTest(
+		    true,
+		    93,
+		    false,
+		    std::nullopt,
+		    QString(),
+		    moveSeq2,
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; },
+		    [&followCalls](quint64) { ++followCalls; }
+		));
+		QCOMPARE(followCalls, 0);
+
+		fixture.tracker->completePendingUserMoveForTest(
+		    93,
+		    reinterpret_cast<quintptr>(fixture.window->hwnd()),
+		    true,
+		    QString(),
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; }
+		);
+		QCOMPARE(followCalls, 1);
+	}
+
 	void nestedPendingFailurePreventsFollowEvenAfterNewerRefusal() {
 		DispatcherFixture fixture;
 		fixture.tracker->registerWindowForTest(fixture.window);

@@ -707,7 +707,7 @@ void VirtualDesktops::observeSwitch() {
 		this->finishSwitch(DesktopCommandOutcome::Observed);
 }
 
-bool VirtualDesktops::switchTo(qsizetype index) {
+bool VirtualDesktops::switchTo(qsizetype index, const std::function<bool()>& shouldProceed) {
 	this->retryAccessor();
 	if (this->nativeAccessor && nativeDesktopCommandPending()) {
 		this->refuseCommand(QStringLiteral("switch"), QStringLiteral("provider-busy"));
@@ -726,6 +726,22 @@ bool VirtualDesktops::switchTo(qsizetype index) {
 	}
 
 	this->finishSwitch(DesktopCommandOutcome::Superseded, QStringLiteral("newer-request"));
+	if (shouldProceed && !shouldProceed()) return false;
+	if (this->nativeAccessor && nativeDesktopCommandPending()) {
+		this->refuseCommand(QStringLiteral("switch"), QStringLiteral("provider-busy"));
+		return false;
+	}
+	if (!this->supports(DesktopOperation::Switch)) {
+		this->warnAccessorOnly("switch desktops");
+		this->refuseCommand(QStringLiteral("switch"),
+		    this->availability() == DesktopAvailability::Available
+		        ? QStringLiteral("operation-unsupported") : this->commandFailureReason());
+		return false;
+	}
+	if (index < 0 || index >= this->count()) {
+		this->refuseCommand(QStringLiteral("switch"), QStringLiteral("invalid-target"));
+		return false;
+	}
 	if (index == this->mCurrent) {
 		this->publishCommand(DesktopRequestResult {++this->nextRequest, QStringLiteral("switch"),
 		                                         DesktopCommandOutcome::Observed, {}});

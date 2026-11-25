@@ -4,9 +4,10 @@
 namespace qs::windows {
 
 quint64 TrackedWindow::beginMoveRequest() {
-	this->mLatestMoveSequence = this->tracker != nullptr ? this->tracker->nextActionSequence()
-	                                                     : this->mLatestMoveSequence + 1;
-	return this->mLatestMoveSequence;
+	this->mActionOrder->latestMoveSequence = this->tracker != nullptr
+	    ? this->tracker->nextActionSequence()
+	    : this->mActionOrder->latestMoveSequence + 1;
+	return this->mActionOrder->latestMoveSequence;
 }
 
 void TrackedWindow::notifyActionErrorChanged() {
@@ -21,7 +22,7 @@ void TrackedWindow::reportActionRefused(
     bool elevated
 ) {
 	const auto sequence = this->tracker != nullptr ? this->tracker->nextActionSequence()
-	                                               : this->mLastActionErrorSequence + 1;
+	                                               : this->mActionOrder->lastActionErrorSequence + 1;
 	this->reportActionRefusedWithSequence(sequence, action, reason, elevated);
 }
 
@@ -31,16 +32,17 @@ void TrackedWindow::reportActionRefusedWithSequence(
     const QString& reason,
     bool elevated
 ) {
-	if (sequence == 0 || this->mLastActionErrorSequence >= sequence) return;
+	if (sequence == 0 || this->mActionOrder->lastActionErrorSequence >= sequence) return;
 	auto* tracker = this->tracker;
 	if (tracker != nullptr && tracker->mLastActionErrorSequence >= sequence) return;
 
 	const auto text = window_action_detail::errorText(action, reason);
-	this->mLastActionErrorSequence = sequence;
+	this->mActionOrder->lastActionErrorSequence = sequence;
 	this->mLastActionError = text;
 
 	QPointer<TrackedWindow> self(this);
 	QPointer<WindowTracker> guardedTracker(tracker);
+	const auto actionOrder = this->mActionOrder;
 	if (tracker != nullptr) {
 		tracker->mLastActionErrorSequence = sequence;
 		tracker->mLastActionErrorWindow = this;
@@ -53,7 +55,7 @@ void TrackedWindow::reportActionRefusedWithSequence(
 	};
 
 	this->notifyActionErrorChanged();
-	if (self && this->mLastActionErrorSequence == sequence && this->mLastActionError == text) {
+	if (self && actionOrder->lastActionErrorSequence == sequence && this->mLastActionError == text) {
 		emit this->actionRefused(action, reason, elevated);
 	}
 	if (stillCurrent()) {
@@ -66,13 +68,13 @@ void TrackedWindow::reportActionRefusedWithSequence(
 
 void TrackedWindow::clearActionError() {
 	const auto sequence = this->tracker != nullptr ? this->tracker->nextActionSequence()
-	                                               : this->mLastActionErrorSequence + 1;
+	                                               : this->mActionOrder->lastActionErrorSequence + 1;
 	this->clearActionErrorWithSequence(sequence);
 }
 
 void TrackedWindow::clearActionErrorWithSequence(quint64 sequence) {
-	if (sequence == 0 || this->mLastActionErrorSequence >= sequence) return;
-	this->mLastActionErrorSequence = sequence;
+	if (sequence == 0 || this->mActionOrder->lastActionErrorSequence >= sequence) return;
+	this->mActionOrder->lastActionErrorSequence = sequence;
 	this->mLastActionError.clear();
 
 	auto* tracker = this->tracker;
@@ -98,11 +100,13 @@ bool TrackedWindow::finishMoveRequest(
     const QString& failureCode,
     quint64 moveSequence,
     const std::function<bool(const TrackedWindow*)>& ownerMatches,
-    const std::function<bool(HWND)>& checkElevated
+    const std::function<bool(HWND)>& checkElevated,
+    std::function<void(quint64)> onConfirmedSuccess
 ) {
+	const auto actionOrder = this->mActionOrder;
 	if (!accepted) {
 		this->tracker->publishMoveFailure(
-		    moveSequence, this, this->mHwnd, failureCode, ownerMatches, checkElevated
+		    moveSequence, this, actionOrder, this->mHwnd, failureCode, ownerMatches, checkElevated
 		);
 		return false;
 	}
@@ -111,27 +115,32 @@ bool TrackedWindow::finishMoveRequest(
 		return false;
 	}
 
-	if (this->mLatestMoveSequence != moveSequence) {
+	if (actionOrder->latestMoveSequence != moveSequence) {
 		return false;
 	}
 
 	const auto hwnd = this->mHwnd;
 	if (pendingSequence != 0) {
-		if (!pendingRegistered && this->mLastActionErrorSequence < moveSequence) {
-			this->tracker->notePendingUserMove(pendingSequence, this, moveSequence);
+		if (!pendingRegistered && actionOrder->lastActionErrorSequence < moveSequence) {
+			this->tracker->notePendingUserMove(
+			    pendingSequence, this, moveSequence, nullptr, std::move(onConfirmedSuccess)
+			);
 		}
-		return this->mLatestMoveSequence == moveSequence
+		return actionOrder->latestMoveSequence == moveSequence
 		    && this->tracker->windowFor(hwnd) == this && ownerMatches && ownerMatches(this);
 	}
 
 	QPointer<TrackedWindow> self(this);
 	QPointer<WindowTracker> guardedTracker(this->tracker);
 	if (this->tracker->windowFor(hwnd) == this && ownerMatches && ownerMatches(this)) {
-		if (this->mLastActionErrorSequence < moveSequence) {
+		if (actionOrder->lastActionErrorSequence < moveSequence) {
 			this->clearActionErrorWithSequence(moveSequence);
 		}
-		return self && guardedTracker && self->mLatestMoveSequence == moveSequence
+		const auto confirmed = self && guardedTracker
+		    && actionOrder->latestMoveSequence == moveSequence
 		    && guardedTracker->windowFor(hwnd) == self && ownerMatches(self);
+		if (confirmed && onConfirmedSuccess) onConfirmedSuccess(moveSequence);
+		return confirmed;
 	}
 	return false;
 }
@@ -179,16 +188,19 @@ void WindowTracker::notePendingUserMove(
     quint64 sequence,
     TrackedWindow* window,
     quint64 moveSequence,
-    std::shared_ptr<std::optional<bool>> completedOutcome
+    std::shared_ptr<std::optional<bool>> completedOutcome,
+    std::function<void(quint64)> onSucceeded
 ) {
 	if (sequence == 0 || window == nullptr || window->hwnd() == nullptr || moveSequence == 0) return;
 	this->mPendingUserMoves.insert(
 	    sequence,
 	    PendingUserMove {
 	        .window = window,
+	        .actionOrder = window->actionOrderState(),
 	        .hwnd = window->hwnd(),
 	        .moveSequence = moveSequence,
 	        .completedOutcome = std::move(completedOutcome),
+	        .onSucceeded = std::move(onSucceeded),
 	    }
 	);
 }
@@ -196,16 +208,18 @@ void WindowTracker::notePendingUserMove(
 void WindowTracker::publishMoveFailure(
     quint64 moveSequence,
     TrackedWindow* window,
+    const std::shared_ptr<WindowActionOrderState>& actionOrder,
     HWND hwnd,
     const QString& code,
     const std::function<bool(const TrackedWindow*)>& ownerMatches,
     const std::function<bool(HWND)>& checkElevated
 ) {
-	if (moveSequence == 0 || this->mLastActionErrorSequence >= moveSequence) return;
-	if (window != nullptr
-	    && (window->mLatestMoveSequence != moveSequence
-	        || window->mLastActionErrorSequence >= moveSequence))
-	{
+	auto orderSuperseded = [&] {
+		return actionOrder != nullptr
+		    && (actionOrder->latestMoveSequence != moveSequence
+		        || actionOrder->lastActionErrorSequence >= moveSequence);
+	};
+	if (moveSequence == 0 || this->mLastActionErrorSequence >= moveSequence || orderSuperseded()) {
 		return;
 	}
 
@@ -215,10 +229,8 @@ void WindowTracker::publishMoveFailure(
 		QPointer<TrackedWindow> guardedWindow(window);
 		QPointer<WindowTracker> guardedTracker(this);
 		window->bElevated = elevated;
-		if (!guardedTracker || guardedTracker->mLastActionErrorSequence >= moveSequence) return;
-		if (guardedWindow
-		    && (guardedWindow->mLatestMoveSequence != moveSequence
-		        || guardedWindow->mLastActionErrorSequence >= moveSequence))
+		if (!guardedTracker || guardedTracker->mLastActionErrorSequence >= moveSequence
+		    || orderSuperseded())
 		{
 			return;
 		}
@@ -270,19 +282,31 @@ void WindowTracker::completePendingUserMove(
 	if (entry.completedOutcome) *entry.completedOutcome = succeeded;
 
 	auto* window = entry.window.data();
+	const auto actionOrder = entry.actionOrder;
 	const auto sameTracked = window != nullptr && this->byHwnd.value(hwnd) == window;
 	if (succeeded) {
-		if (sameTracked && window->mLatestMoveSequence == entry.moveSequence
-		    && window->mLastActionErrorSequence < entry.moveSequence && ownerMatches
+		if (sameTracked && actionOrder != nullptr
+		    && actionOrder->latestMoveSequence == entry.moveSequence && ownerMatches
 		    && ownerMatches(window))
 		{
-			window->clearActionErrorWithSequence(entry.moveSequence);
+			QPointer<TrackedWindow> guardedWindow(window);
+			QPointer<WindowTracker> guardedTracker(this);
+			if (actionOrder->lastActionErrorSequence < entry.moveSequence) {
+				window->clearActionErrorWithSequence(entry.moveSequence);
+			}
+			if (entry.onSucceeded && guardedWindow && guardedTracker
+			    && guardedTracker->byHwnd.value(hwnd) == guardedWindow
+			    && actionOrder->latestMoveSequence == entry.moveSequence
+			    && ownerMatches(guardedWindow))
+			{
+				entry.onSucceeded(entry.moveSequence);
+			}
 		}
 		return;
 	}
 
 	this->publishMoveFailure(
-	    entry.moveSequence, window, hwnd, code, ownerMatches, checkElevated
+	    entry.moveSequence, window, actionOrder, hwnd, code, ownerMatches, checkElevated
 	);
 }
 

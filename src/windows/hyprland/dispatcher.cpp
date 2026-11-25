@@ -106,20 +106,17 @@ void launchCommandLine(const QString& line) {
 	}
 }
 
-void moveWindowTo(
-    TrackedWindow* window,
+void followMovedWindow(
+    const QPointer<TrackedWindow>& guardedWindow,
     qsizetype index,
     bool follow,
-    quint64 existingMoveSequence = 0
+    quint64 moveSequence
 ) {
-	QPointer<TrackedWindow> guardedWindow(window);
-	quint64 moveSequence = 0;
-	if (!window->moveToDesktop(index, &moveSequence, existingMoveSequence)) return;
-	if (!guardedWindow || !guardedWindow->isTrackedAndOwned()
-	    || guardedWindow->latestMoveSequence() != moveSequence)
-	{
-		return;
-	}
+	auto stillValid = [guardedWindow, moveSequence] {
+		return guardedWindow && guardedWindow->isTrackedAndOwned()
+		    && guardedWindow->latestMoveSequence() == moveSequence;
+	};
+	if (!stillValid()) return;
 
 	auto* behavior = WorkspaceBehavior::instance();
 	if (!follow) {
@@ -128,14 +125,26 @@ void moveWindowTo(
 	}
 
 	behavior->prepareWarp(index, true);
-	if (!VirtualDesktops::instance()->switchTo(index)) return;
-	if (!guardedWindow || !guardedWindow->isTrackedAndOwned()
-	    || guardedWindow->latestMoveSequence() != moveSequence)
-	{
-		return;
-	}
+	if (!VirtualDesktops::instance()->switchTo(index, stillValid)) return;
+	if (!stillValid()) return;
 	behavior->expectFocus(index);
 	guardedWindow->activate();
+}
+
+void moveWindowTo(
+    TrackedWindow* window,
+    qsizetype index,
+    bool follow,
+    quint64 existingMoveSequence = 0
+) {
+	QPointer<TrackedWindow> guardedWindow(window);
+	(void)window->moveToDesktop(
+	    index,
+	    existingMoveSequence,
+	    [guardedWindow, index, follow](quint64 moveSequence) {
+		    followMovedWindow(guardedWindow, index, follow, moveSequence);
+	    }
+	);
 }
 
 } // namespace
@@ -616,17 +625,24 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 			return;
 		}
 
+		const auto actionOrder = window->actionOrderState();
 		const auto moveSequence = window->beginMoveRequest();
 		desktops->ensureCountWithReason(
 		    index + 1,
 		    [tracker = QPointer(tracker),
 		     desktops = QPointer(desktops),
 		     window = QPointer(window),
+		     actionOrder,
 		     moveSequence,
 		     index,
 		     follow](bool ok, const QString& reason) {
-			    if (window && window->latestMoveSequence() != moveSequence) return;
-			    if (ok && window) {
+			    if (actionOrder
+			        && (actionOrder->latestMoveSequence != moveSequence
+			            || actionOrder->lastActionErrorSequence >= moveSequence))
+			    {
+				    return;
+			    }
+			    if (ok && window && window->isTrackedAndOwned()) {
 				    moveWindowTo(window, index, follow, moveSequence);
 				    return;
 			    }
@@ -644,6 +660,12 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 			    }
 			    if (desktops) {
 				    desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-window"));
+			    }
+			    if (actionOrder
+			        && (actionOrder->latestMoveSequence != moveSequence
+			            || actionOrder->lastActionErrorSequence >= moveSequence))
+			    {
+				    return;
 			    }
 			    if (tracker && tracker->lastActionErrorSequence() >= moveSequence) return;
 			    if (tracker) {

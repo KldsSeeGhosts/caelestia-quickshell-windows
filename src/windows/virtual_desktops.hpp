@@ -88,7 +88,7 @@ public:
 	[[nodiscard]] int workspaceLimit() const { return this->mWorkspaceLimit; }
 	void setWorkspaceLimit(int count) { this->mWorkspaceLimit = qBound(1, count, 20); }
 	void retryAccessor();
-	bool switchTo(qsizetype index);
+	bool switchTo(qsizetype index, const std::function<bool()>& shouldProceed = {});
 	void ensureCount(qsizetype count, std::function<void(bool)> done);
 	void ensureCountWithReason(qsizetype count, std::function<void(bool, const QString&)> done);
 	bool removeDesktop(qsizetype index, qsizetype fallback);

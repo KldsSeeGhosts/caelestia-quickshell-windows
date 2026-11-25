@@ -827,6 +827,32 @@ private slots:
 		QVERIFY(sawCompletionInsideCommandResult);
 		QVERIFY(sawRegisteredAtCompletion);
 	}
+
+	void switchToRevalidatesAfterSupersededPublicationBeforeNativeSwitch() {
+		this->old.manager.beforeSwitch = [] { QThread::msleep(150); };
+		QVERIFY(this->desktops->switchTo(1));
+		QVERIFY(waitUntil([] { return !nativeDesktopCommandPending(); }, 1000));
+
+		int nativeSwitches = 0;
+		this->old.manager.beforeSwitch = [&nativeSwitches] { ++nativeSwitches; };
+		bool stillValid = true;
+		auto conn = QObject::connect(
+		    this->desktops,
+		    &VirtualDesktops::commandResult,
+		    this->desktops,
+		    [&stillValid](const QVariantMap& result) {
+			    if (result.value("outcome").toString() == QStringLiteral("superseded")) {
+				    stillValid = false;
+			    }
+		    }
+		);
+
+		QVERIFY(!this->desktops->switchTo(1, [&stillValid] { return stillValid; }));
+		QObject::disconnect(conn);
+		this->old.manager.beforeSwitch = {};
+		QVERIFY(!stillValid);
+		QCOMPARE(nativeSwitches, 0);
+	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)
 #include "erm625_native_desktop_facade_test.moc"
