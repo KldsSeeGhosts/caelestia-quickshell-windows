@@ -610,8 +610,22 @@ void TrackedWindow::fullscreenOn(QScreen* screen) {
 	}
 }
 
-bool TrackedWindow::moveToDesktop(qsizetype index, quint64* requestSequence) {
-	const auto moveSequence = this->beginMoveRequest();
+bool TrackedWindow::isTrackedAndOwned() const {
+	return this->tracker != nullptr && this->tracker->windowFor(this->mHwnd) == this
+	    && this->hasCurrentOwner();
+}
+
+bool TrackedWindow::moveToDesktop(
+    qsizetype index,
+    quint64* requestSequence,
+    quint64 existingMoveSequence
+) {
+	quint64 moveSequence = existingMoveSequence;
+	if (moveSequence != 0) {
+		if (this->mLatestMoveSequence != moveSequence) return false;
+	} else {
+		moveSequence = this->beginMoveRequest();
+	}
 	if (requestSequence != nullptr) *requestSequence = moveSequence;
 	if (!this->hasCurrentOwner()) {
 		this->reportActionRefusedWithSequence(
@@ -624,42 +638,52 @@ bool TrackedWindow::moveToDesktop(qsizetype index, quint64* requestSequence) {
 	}
 	quint64 pendingSequence = 0;
 	bool pendingRegistered = false;
+	auto pendingOutcome = std::make_shared<std::optional<bool>>();
 	QString failureCode;
 	QPointer<TrackedWindow> self(this);
-	auto* tracker = this->tracker;
-	const auto accepted = tracker->desktops()->moveWindow(
+	QPointer<WindowTracker> guardedTracker(this->tracker);
+	const auto accepted = this->tracker->desktops()->moveWindow(
 	    this->mHwnd,
 	    index,
 	    &pendingSequence,
 	    &failureCode,
-	    [self, tracker, moveSequence, &pendingRegistered](quint64 sequence) {
-		    if (!self || sequence == 0) return;
+	    [self, guardedTracker, moveSequence, pendingOutcome, &pendingRegistered](quint64 sequence) {
+		    if (!self || !guardedTracker || sequence == 0) return;
 		    if (self->latestMoveSequence() != moveSequence
 		        || self->lastActionErrorSequence() >= moveSequence)
 		    {
 			    return;
 		    }
-		    tracker->notePendingUserMove(sequence, self.data(), moveSequence);
+		    guardedTracker->notePendingUserMove(sequence, self.data(), moveSequence, pendingOutcome);
 		    pendingRegistered = true;
 	    }
 	);
-	if (!self) return false;
+	if (!self) {
+		if (!accepted && guardedTracker) {
+			guardedTracker->reportActionRefusalWithSequence(
+			    moveSequence,
+			    QStringLiteral("move"),
+			    qs::hyprland::ipc::moveRefusalReason(failureCode, false),
+			    false
+			);
+		}
+		return false;
+	}
 	const auto ok = this->finishMoveRequest(
 	    accepted,
 	    pendingSequence,
 	    pendingRegistered,
+	    *pendingOutcome,
 	    failureCode,
 	    moveSequence,
 	    [](const TrackedWindow* window) { return window->hasCurrentOwner(); },
 	    [](HWND hwnd) { return isMoreElevated(hwnd); }
 	);
-	if (!ok || !self || self->latestMoveSequence() != moveSequence
-	    || tracker->lastActionErrorSequence() == moveSequence)
-	{
+	if (!ok || !self || !self->isTrackedAndOwned() || self->latestMoveSequence() != moveSequence) {
 		return false;
 	}
-	if (self->hasCurrentOwner()) this->refreshDesktop(true);
-	return self && self->latestMoveSequence() == moveSequence;
+	this->refreshDesktop(true);
+	return self && self->isTrackedAndOwned() && self->latestMoveSequence() == moveSequence;
 }
 
 void TrackedWindow::moveTo(const QPoint& logical) {

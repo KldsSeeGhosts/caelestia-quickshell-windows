@@ -94,6 +94,7 @@ bool TrackedWindow::finishMoveRequest(
     bool accepted,
     quint64 pendingSequence,
     bool pendingRegistered,
+    std::optional<bool> pendingOutcome,
     const QString& failureCode,
     quint64 moveSequence,
     const std::function<bool(const TrackedWindow*)>& ownerMatches,
@@ -106,22 +107,33 @@ bool TrackedWindow::finishMoveRequest(
 		return false;
 	}
 
-	if (this->mLatestMoveSequence != moveSequence || this->mLastActionErrorSequence >= moveSequence) {
-		return this->tracker->lastActionErrorSequence() != moveSequence
-		    && this->mLatestMoveSequence == moveSequence;
+	if (pendingOutcome.has_value() && !*pendingOutcome) {
+		return false;
 	}
 
+	if (this->mLatestMoveSequence != moveSequence) {
+		return false;
+	}
+
+	const auto hwnd = this->mHwnd;
 	if (pendingSequence != 0) {
-		if (!pendingRegistered) {
+		if (!pendingRegistered && this->mLastActionErrorSequence < moveSequence) {
 			this->tracker->notePendingUserMove(pendingSequence, this, moveSequence);
 		}
-		return this->tracker->lastActionErrorSequence() != moveSequence;
+		return this->mLatestMoveSequence == moveSequence
+		    && this->tracker->windowFor(hwnd) == this && ownerMatches && ownerMatches(this);
 	}
 
-	if (this->tracker->windowFor(this->mHwnd) == this && ownerMatches && ownerMatches(this)) {
-		this->clearActionErrorWithSequence(moveSequence);
+	QPointer<TrackedWindow> self(this);
+	QPointer<WindowTracker> guardedTracker(this->tracker);
+	if (this->tracker->windowFor(hwnd) == this && ownerMatches && ownerMatches(this)) {
+		if (this->mLastActionErrorSequence < moveSequence) {
+			this->clearActionErrorWithSequence(moveSequence);
+		}
+		return self && guardedTracker && self->mLatestMoveSequence == moveSequence
+		    && guardedTracker->windowFor(hwnd) == self && ownerMatches(self);
 	}
-	return true;
+	return false;
 }
 
 void WindowTracker::notifyActionErrorChanged() {
@@ -166,7 +178,8 @@ void WindowTracker::reportActionRefusalWithSequence(
 void WindowTracker::notePendingUserMove(
     quint64 sequence,
     TrackedWindow* window,
-    quint64 moveSequence
+    quint64 moveSequence,
+    std::shared_ptr<std::optional<bool>> completedOutcome
 ) {
 	if (sequence == 0 || window == nullptr || window->hwnd() == nullptr || moveSequence == 0) return;
 	this->mPendingUserMoves.insert(
@@ -175,6 +188,7 @@ void WindowTracker::notePendingUserMove(
 	        .window = window,
 	        .hwnd = window->hwnd(),
 	        .moveSequence = moveSequence,
+	        .completedOutcome = std::move(completedOutcome),
 	    }
 	);
 }
@@ -202,12 +216,15 @@ void WindowTracker::publishMoveFailure(
 		QPointer<WindowTracker> guardedTracker(this);
 		window->bElevated = elevated;
 		if (!guardedTracker || guardedTracker->mLastActionErrorSequence >= moveSequence) return;
-		if (!guardedWindow || guardedWindow->mLatestMoveSequence != moveSequence
-		    || guardedWindow->mLastActionErrorSequence >= moveSequence)
+		if (guardedWindow
+		    && (guardedWindow->mLatestMoveSequence != moveSequence
+		        || guardedWindow->mLastActionErrorSequence >= moveSequence))
 		{
 			return;
 		}
-		if (guardedTracker->byHwnd.value(hwnd) == guardedWindow && ownerMatches(guardedWindow)) {
+		if (guardedWindow && guardedTracker->byHwnd.value(hwnd) == guardedWindow
+		    && ownerMatches(guardedWindow))
+		{
 			const auto reportElevated =
 			    elevated && qs::hyprland::ipc::isWindowRejectionMoveCode(code);
 			guardedWindow->reportActionRefusedWithSequence(
@@ -250,6 +267,7 @@ void WindowTracker::completePendingUserMove(
 	}
 	const auto entry = pending.value();
 	this->mPendingUserMoves.erase(pending);
+	if (entry.completedOutcome) *entry.completedOutcome = succeeded;
 
 	auto* window = entry.window.data();
 	const auto sameTracked = window != nullptr && this->byHwnd.value(hwnd) == window;

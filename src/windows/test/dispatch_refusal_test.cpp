@@ -547,6 +547,7 @@ private slots:
 		    true,
 		    61,
 		    false,
+		    std::nullopt,
 		    QString(),
 		    innerMoveSeq,
 		    [](const TrackedWindow*) { return true; },
@@ -559,6 +560,7 @@ private slots:
 		    true,
 		    0,
 		    false,
+		    std::nullopt,
 		    QString(),
 		    outerMoveSeq,
 		    [](const TrackedWindow*) { return true; },
@@ -600,6 +602,7 @@ private slots:
 		    true,
 		    71,
 		    false,
+		    std::nullopt,
 		    QString(),
 		    moveSeq,
 		    [](const TrackedWindow*) { return true; },
@@ -675,6 +678,7 @@ private slots:
 		    false,
 		    0,
 		    false,
+		    std::nullopt,
 		    QStringLiteral("permission-denied"),
 		    olderImmediateSeq,
 		    [](const TrackedWindow*) { return true; },
@@ -843,6 +847,7 @@ private slots:
 		    false,
 		    0,
 		    false,
+		    std::nullopt,
 		    QStringLiteral("permission-denied"),
 		    moveSeq,
 		    [](const TrackedWindow*) { return true; },
@@ -853,6 +858,101 @@ private slots:
 		QCOMPARE(windowRefused.size(), 0);
 		QCOMPARE(trackerRefused.size(), 0);
 		QCOMPARE(fixture.tracker->lastActionError(), QString());
+	}
+
+	void deletingWindowDuringElevationChangeFallsBackToTrackerRefusal() {
+		DispatcherFixture fixture;
+		auto* ephemeral = TrackedWindow::createForTest(
+		    fixture.tracker, reinterpret_cast<HWND>(static_cast<quintptr>(0x333))
+		);
+		fixture.tracker->registerWindowForTest(ephemeral);
+
+		const auto moveSeq = ephemeral->beginMoveRequest();
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+		bool deletedWrapper = false;
+		QObject::connect(
+		    ephemeral,
+		    &TrackedWindow::elevatedChanged,
+		    fixture.tracker,
+		    [&fixture, &ephemeral, &deletedWrapper] {
+			    if (deletedWrapper) return;
+			    deletedWrapper = true;
+			    fixture.tracker->unregisterWindowForTest(ephemeral);
+			    delete ephemeral;
+			    ephemeral = nullptr;
+		    }
+		);
+
+		QVERIFY(!ephemeral->finishMoveRequestForTest(
+		    false,
+		    0,
+		    false,
+		    std::nullopt,
+		    QStringLiteral("permission-denied"),
+		    moveSeq,
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return true; }
+		));
+
+		QVERIFY(deletedWrapper);
+		QCOMPARE(trackerRefused.size(), 1);
+		QCOMPARE(trackerRefused.first().at(0).toString(), QStringLiteral("move"));
+		QCOMPARE(
+		    trackerRefused.first().at(1).toString(),
+		    QStringLiteral("Windows denied permission to move this window")
+		);
+		QCOMPARE(trackerRefused.first().at(2).toBool(), false);
+	}
+
+	void nestedPendingFailurePreventsFollowEvenAfterNewerRefusal() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		auto outcome = std::make_shared<std::optional<bool>>();
+		fixture.tracker->notePendingUserMoveForTest(91, fixture.window, outcome);
+		const auto moveSeq = fixture.window->latestMoveSequence();
+
+		// Newer refusal replaces tracker error before the pending move fails
+		// inside a nested event loop.
+		qs::hyprland::ipc::reportMoveRefusal(fixture.tracker, QStringLiteral("invalid-target"), false);
+		fixture.tracker->completePendingUserMoveForTest(
+		    91,
+		    reinterpret_cast<quintptr>(fixture.window->hwnd()),
+		    false,
+		    QStringLiteral("permission-denied"),
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; }
+		);
+
+		QVERIFY(outcome->has_value());
+		QVERIFY(!outcome->value());
+		QVERIFY(!fixture.window->finishMoveRequestForTest(
+		    true,
+		    91,
+		    true,
+		    *outcome,
+		    QString(),
+		    moveSeq,
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; }
+		));
+	}
+
+	void lostOwnerPreventsFollowOnSuccessfulMove() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		const auto moveSeq = fixture.window->beginMoveRequest();
+		QVERIFY(!fixture.window->finishMoveRequestForTest(
+		    true,
+		    0,
+		    false,
+		    std::nullopt,
+		    QString(),
+		    moveSeq,
+		    [](const TrackedWindow*) { return false; },
+		    [](HWND) { return false; }
+		));
 	}
 
 	void immediateMoveFailureSkipsElevationProbeWhenOwnerChanged() {
@@ -868,6 +968,7 @@ private slots:
 		    false,
 		    0,
 		    false,
+		    std::nullopt,
 		    QStringLiteral("permission-denied"),
 		    moveSeq,
 		    [](const TrackedWindow*) { return false; },

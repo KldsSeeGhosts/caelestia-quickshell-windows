@@ -1,5 +1,7 @@
 #pragma once
 #include <functional>
+#include <memory>
+#include <optional>
 #include <thread>
 
 #include <vector>
@@ -156,6 +158,7 @@ public:
 	    bool accepted,
 	    quint64 pendingSequence,
 	    bool pendingRegistered,
+	    std::optional<bool> pendingOutcome,
 	    const QString& failureCode,
 	    quint64 moveSequence,
 	    const std::function<bool(const TrackedWindow*)>& ownerMatches,
@@ -165,6 +168,7 @@ public:
 		    accepted,
 		    pendingSequence,
 		    pendingRegistered,
+		    pendingOutcome,
 		    failureCode,
 		    moveSequence,
 		    ownerMatches,
@@ -241,7 +245,12 @@ public:
 	void setMaximized(bool maximized);
 	void setFullscreen(bool fullscreen);
 	void fullscreenOn(QScreen* screen);
-	bool moveToDesktop(qsizetype index, quint64* requestSequence = nullptr);
+	[[nodiscard]] bool isTrackedAndOwned() const;
+	bool moveToDesktop(
+	    qsizetype index,
+	    quint64* requestSequence = nullptr,
+	    quint64 existingMoveSequence = 0
+	);
 	void moveTo(const QPoint& logical);
 
 signals:
@@ -298,6 +307,7 @@ private:
 	    bool accepted,
 	    quint64 pendingSequence,
 	    bool pendingRegistered,
+	    std::optional<bool> pendingOutcome,
 	    const QString& failureCode,
 	    quint64 moveSequence,
 	    const std::function<bool(const TrackedWindow*)>& ownerMatches,
@@ -364,9 +374,13 @@ public:
 			this->byHwnd.remove(window->hwnd());
 		}
 	}
-	void notePendingUserMoveForTest(quint64 sequence, TrackedWindow* window) {
+	void notePendingUserMoveForTest(
+	    quint64 sequence,
+	    TrackedWindow* window,
+	    std::shared_ptr<std::optional<bool>> completedOutcome = {}
+	) {
 		const auto moveSequence = window != nullptr ? window->beginMoveRequest() : 0;
-		this->notePendingUserMove(sequence, window, moveSequence);
+		this->notePendingUserMove(sequence, window, moveSequence, std::move(completedOutcome));
 	}
 	void completePendingUserMoveForTest(
 	    quint64 sequence,
@@ -475,10 +489,16 @@ private:
 		QPointer<TrackedWindow> window;
 		HWND hwnd = nullptr;
 		quint64 moveSequence = 0;
+		std::shared_ptr<std::optional<bool>> completedOutcome;
 	};
 
 	void notifyActionErrorChanged();
-	void notePendingUserMove(quint64 sequence, TrackedWindow* window, quint64 moveSequence);
+	void notePendingUserMove(
+	    quint64 sequence,
+	    TrackedWindow* window,
+	    quint64 moveSequence,
+	    std::shared_ptr<std::optional<bool>> completedOutcome = {}
+	);
 	void publishMoveFailure(
 	    quint64 moveSequence,
 	    TrackedWindow* window,

@@ -106,11 +106,20 @@ void launchCommandLine(const QString& line) {
 	}
 }
 
-void moveWindowTo(TrackedWindow* window, qsizetype index, bool follow) {
+void moveWindowTo(
+    TrackedWindow* window,
+    qsizetype index,
+    bool follow,
+    quint64 existingMoveSequence = 0
+) {
 	QPointer<TrackedWindow> guardedWindow(window);
 	quint64 moveSequence = 0;
-	if (!window->moveToDesktop(index, &moveSequence)) return;
-	if (!guardedWindow || guardedWindow->latestMoveSequence() != moveSequence) return;
+	if (!window->moveToDesktop(index, &moveSequence, existingMoveSequence)) return;
+	if (!guardedWindow || !guardedWindow->isTrackedAndOwned()
+	    || guardedWindow->latestMoveSequence() != moveSequence)
+	{
+		return;
+	}
 
 	auto* behavior = WorkspaceBehavior::instance();
 	if (!follow) {
@@ -120,7 +129,11 @@ void moveWindowTo(TrackedWindow* window, qsizetype index, bool follow) {
 
 	behavior->prepareWarp(index, true);
 	if (!VirtualDesktops::instance()->switchTo(index)) return;
-	if (!guardedWindow || guardedWindow->latestMoveSequence() != moveSequence) return;
+	if (!guardedWindow || !guardedWindow->isTrackedAndOwned()
+	    || guardedWindow->latestMoveSequence() != moveSequence)
+	{
+		return;
+	}
 	behavior->expectFocus(index);
 	guardedWindow->activate();
 }
@@ -614,7 +627,7 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 		     follow](bool ok, const QString& reason) {
 			    if (window && window->latestMoveSequence() != moveSequence) return;
 			    if (ok && window) {
-				    moveWindowTo(window, index, follow);
+				    moveWindowTo(window, index, follow, moveSequence);
 				    return;
 			    }
 			    if (tracker && tracker->lastActionErrorSequence() >= moveSequence) return;
