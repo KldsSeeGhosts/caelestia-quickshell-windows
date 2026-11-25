@@ -611,7 +611,7 @@ void TrackedWindow::fullscreenOn(QScreen* screen) {
 }
 
 bool TrackedWindow::moveToDesktop(qsizetype index) {
-	(void)this->beginMoveRequest();
+	const auto moveToken = this->beginMoveRequest();
 	if (!this->hasCurrentOwner()) {
 		this->reportActionRefused(
 		    QStringLiteral("move"),
@@ -624,17 +624,21 @@ bool TrackedWindow::moveToDesktop(qsizetype index) {
 	const auto trackerGeneration = this->tracker->actionErrorGeneration();
 	quint64 pendingSequence = 0;
 	QString failureCode;
+	QPointer<TrackedWindow> self(this);
 	const auto accepted =
 	    this->tracker->desktops()->moveWindow(this->mHwnd, index, &pendingSequence, &failureCode);
+	if (!self) return false;
 	const auto ok = this->finishMoveRequest(
 	    accepted,
 	    pendingSequence,
 	    failureCode,
+	    moveToken,
 	    windowGeneration,
 	    trackerGeneration,
+	    [](const TrackedWindow* window) { return window->hasCurrentOwner(); },
 	    [](HWND hwnd) { return isMoreElevated(hwnd); }
 	);
-	if (ok) this->refreshDesktop(true);
+	if (ok && self && self->hasCurrentOwner()) this->refreshDesktop(true);
 	return ok;
 }
 

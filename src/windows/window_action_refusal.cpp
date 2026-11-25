@@ -3,59 +3,110 @@
 
 namespace qs::windows {
 
+quint64 TrackedWindow::beginMoveRequest() {
+	if (this->tracker != nullptr) ++this->tracker->mMoveRequestGeneration;
+	return ++this->mMoveRequestToken;
+}
+
 void TrackedWindow::reportActionRefused(
     const QString& action,
     const QString& reason,
     bool elevated
 ) {
-	++this->mActionErrorGeneration;
-	auto text = window_action_detail::errorText(action, reason);
-	if (this->mLastActionError != text) {
-		this->mLastActionError = text;
-		emit this->lastActionErrorChanged();
+	const auto windowGeneration = ++this->mActionErrorGeneration;
+	const auto text = window_action_detail::errorText(action, reason);
+	const auto windowChanged = this->mLastActionError != text;
+	if (windowChanged) this->mLastActionError = text;
+
+	auto* tracker = this->tracker;
+	QPointer<TrackedWindow> self(this);
+	QPointer<WindowTracker> guardedTracker(tracker);
+	const auto trackerGeneration = ++tracker->mActionErrorGeneration;
+	const auto trackerChanged = tracker->mLastActionError != text;
+	tracker->mLastActionErrorWindow = this;
+	if (trackerChanged) tracker->mLastActionError = text;
+
+	const auto stillCurrent = [&] {
+		return guardedTracker && tracker->mActionErrorGeneration == trackerGeneration
+		    && tracker->mLastActionError == text;
+	};
+
+	if (windowChanged) emit this->lastActionErrorChanged();
+	if (self && this->mActionErrorGeneration == windowGeneration) {
+		emit this->actionRefused(action, reason, elevated);
 	}
-	emit this->actionRefused(action, reason, elevated);
-	this->tracker->reportWindowActionRefused(this, action, reason, elevated);
+	if (trackerChanged && stillCurrent()) {
+		emit tracker->lastActionErrorChanged();
+	}
+	if (stillCurrent()) {
+		emit tracker->windowActionRefused(action, reason, elevated);
+	}
 }
 
 void TrackedWindow::clearActionError() {
+	const auto windowChanged = !this->mLastActionError.isEmpty();
 	++this->mActionErrorGeneration;
-	if (!this->mLastActionError.isEmpty()) {
-		this->mLastActionError.clear();
-		emit this->lastActionErrorChanged();
+	if (windowChanged) this->mLastActionError.clear();
+
+	auto* tracker = this->tracker;
+	QPointer<WindowTracker> guardedTracker(tracker);
+	const auto trackerGeneration = tracker->mActionErrorGeneration;
+	const auto trackerChanged =
+	    !tracker->mLastActionError.isEmpty() && tracker->mLastActionErrorWindow == this;
+	if (trackerChanged) {
+		tracker->mLastActionError.clear();
+		tracker->mLastActionErrorWindow = nullptr;
 	}
-	this->tracker->clearWindowActionError(this);
+
+	if (windowChanged) emit this->lastActionErrorChanged();
+	if (guardedTracker && trackerChanged && tracker->mActionErrorGeneration == trackerGeneration
+	    && tracker->mLastActionError.isEmpty())
+	{
+		emit tracker->lastActionErrorChanged();
+	}
 }
 
 bool TrackedWindow::finishMoveRequest(
     bool accepted,
     quint64 pendingSequence,
     const QString& failureCode,
+    quint64 moveToken,
     quint64 windowErrorGenerationBefore,
     quint64 trackerErrorGenerationBefore,
+    const std::function<bool(const TrackedWindow*)>& ownerMatches,
     const std::function<bool(HWND)>& checkElevated
 ) {
 	if (!accepted) {
-		if (this->mActionErrorGeneration == windowErrorGenerationBefore
+		if (this->mMoveRequestToken == moveToken
+		    && this->mActionErrorGeneration == windowErrorGenerationBefore
 		    && this->tracker->actionErrorGeneration() == trackerErrorGenerationBefore)
 		{
-			const auto elevated = checkElevated ? checkElevated(this->mHwnd) : false;
-			this->bElevated = elevated;
-			const auto reportElevated =
-			    elevated && qs::hyprland::ipc::isWindowRejectionMoveCode(failureCode);
-			this->reportActionRefused(
-			    QStringLiteral("move"),
-			    qs::hyprland::ipc::moveRefusalReason(failureCode, reportElevated),
-			    reportElevated
-			);
+			const auto sameTracked = this->tracker->windowFor(this->mHwnd) == this;
+			if (sameTracked && ownerMatches && ownerMatches(this)) {
+				const auto elevated = checkElevated ? checkElevated(this->mHwnd) : false;
+				this->bElevated = elevated;
+				const auto reportElevated =
+				    elevated && qs::hyprland::ipc::isWindowRejectionMoveCode(failureCode);
+				this->reportActionRefused(
+				    QStringLiteral("move"),
+				    qs::hyprland::ipc::moveRefusalReason(failureCode, reportElevated),
+				    reportElevated
+				);
+			} else {
+				qs::hyprland::ipc::reportMoveRefusal(this->tracker, failureCode, false);
+			}
 		}
 		return false;
 	}
 
-	if (this->mActionErrorGeneration == windowErrorGenerationBefore) {
+	if (this->mMoveRequestToken == moveToken
+	    && this->mActionErrorGeneration == windowErrorGenerationBefore)
+	{
 		if (pendingSequence != 0) {
-			this->tracker->notePendingUserMove(pendingSequence, this, trackerErrorGenerationBefore);
-		} else {
+			this->tracker->notePendingUserMove(
+			    pendingSequence, this, moveToken, trackerErrorGenerationBefore
+			);
+		} else if (this->tracker->windowFor(this->mHwnd) == this && ownerMatches && ownerMatches(this)) {
 			this->clearActionError();
 		}
 	}
@@ -68,30 +119,29 @@ void WindowTracker::reportWindowActionRefused(
     const QString& reason,
     bool elevated
 ) {
-	++this->mActionErrorGeneration;
-	auto text = window_action_detail::errorText(action, reason);
+	const auto trackerGeneration = ++this->mActionErrorGeneration;
+	const auto text = window_action_detail::errorText(action, reason);
+	const auto changed = this->mLastActionError != text;
 	this->mLastActionErrorWindow = window;
-	if (this->mLastActionError != text) {
-		this->mLastActionError = text;
-		emit this->lastActionErrorChanged();
+	if (changed) this->mLastActionError = text;
+
+	QPointer<WindowTracker> self(this);
+	if (changed) emit this->lastActionErrorChanged();
+	if (self && this->mActionErrorGeneration == trackerGeneration
+	    && this->mLastActionError == text)
+	{
+		emit this->windowActionRefused(action, reason, elevated);
 	}
-	emit this->windowActionRefused(action, reason, elevated);
 }
 
 void WindowTracker::reportActionRefusal(const QString& action, const QString& reason, bool elevated) {
 	this->reportWindowActionRefused(nullptr, action, reason, elevated);
 }
 
-void WindowTracker::clearWindowActionError(const TrackedWindow* window) {
-	if (this->mLastActionError.isEmpty() || this->mLastActionErrorWindow != window) return;
-	this->mLastActionError.clear();
-	this->mLastActionErrorWindow = nullptr;
-	emit this->lastActionErrorChanged();
-}
-
 void WindowTracker::notePendingUserMove(
     quint64 sequence,
     TrackedWindow* window,
+    quint64 moveToken,
     quint64 trackerErrorGeneration
 ) {
 	if (sequence == 0 || window == nullptr || window->hwnd() == nullptr) return;
@@ -101,6 +151,7 @@ void WindowTracker::notePendingUserMove(
 	    PendingUserMove {
 	        .window = window,
 	        .hwnd = window->hwnd(),
+	        .moveToken = moveToken,
 	        .windowErrorGeneration = window->mActionErrorGeneration,
 	        .trackerErrorGeneration = trackerErrorGeneration,
 	    }
@@ -126,7 +177,8 @@ void WindowTracker::completePendingUserMove(
 	auto* window = entry.window.data();
 	const auto sameTracked = window != nullptr && this->byHwnd.value(hwnd) == window;
 	if (succeeded) {
-		if (sameTracked && window->mActionErrorGeneration == entry.windowErrorGeneration
+		if (sameTracked && window->mMoveRequestToken == entry.moveToken
+		    && window->mActionErrorGeneration == entry.windowErrorGeneration
 		    && ownerMatches && ownerMatches(window))
 		{
 			window->clearActionError();
@@ -135,7 +187,9 @@ void WindowTracker::completePendingUserMove(
 	}
 
 	if (this->mActionErrorGeneration != entry.trackerErrorGeneration
-	    || (sameTracked && window->mActionErrorGeneration != entry.windowErrorGeneration))
+	    || (window != nullptr
+	        && (window->mMoveRequestToken != entry.moveToken
+	            || window->mActionErrorGeneration != entry.windowErrorGeneration)))
 	{
 		return;
 	}

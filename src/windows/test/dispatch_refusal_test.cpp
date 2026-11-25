@@ -538,22 +538,38 @@ private slots:
 		DispatcherFixture fixture;
 		fixture.tracker->registerWindowForTest(fixture.window);
 
-		// Outer move A captures generations before moveWindow(), then during A's
-		// synchronous commandResult publication, inner move B starts pending on
-		// the SAME window.
+		// Outer move A captures tokens and generations before moveWindow(), then
+		// during A's synchronous commandResult publication, inner move B starts
+		// pending on the SAME window.
+		const auto outerMoveToken = fixture.window->beginMoveRequest();
 		const auto outerWindowGen = fixture.window->actionErrorGeneration();
 		const auto outerTrackerGen = fixture.tracker->actionErrorGeneration();
 
+		const auto innerMoveToken = fixture.window->beginMoveRequest();
 		const auto innerWindowGen = fixture.window->actionErrorGeneration();
 		const auto innerTrackerGen = fixture.tracker->actionErrorGeneration();
 		QVERIFY(fixture.window->finishMoveRequestForTest(
-		    true, 61, QString(), innerWindowGen, innerTrackerGen, [](HWND) { return false; }
+		    true,
+		    61,
+		    QString(),
+		    innerMoveToken,
+		    innerWindowGen,
+		    innerTrackerGen,
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; }
 		));
 
 		// Outer move A now finishes its synchronous success without bumping
 		// generation or dropping B's pending registration.
 		QVERIFY(fixture.window->finishMoveRequestForTest(
-		    true, 0, QString(), outerWindowGen, outerTrackerGen, [](HWND) { return false; }
+		    true,
+		    0,
+		    QString(),
+		    outerMoveToken,
+		    outerWindowGen,
+		    outerTrackerGen,
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; }
 		));
 
 		QSignalSpy windowRefused(fixture.window, &TrackedWindow::actionRefused);
@@ -579,6 +595,7 @@ private slots:
 		DispatcherFixture fixture;
 		fixture.tracker->registerWindowForTest(fixture.window);
 
+		const auto moveToken = fixture.window->beginMoveRequest();
 		const auto windowGenBefore = fixture.window->actionErrorGeneration();
 		const auto trackerGenBefore = fixture.tracker->actionErrorGeneration();
 
@@ -589,7 +606,14 @@ private slots:
 		QCOMPARE(newerError, QStringLiteral("move:The target workspace is not available"));
 
 		QVERIFY(fixture.window->finishMoveRequestForTest(
-		    true, 71, QString(), windowGenBefore, trackerGenBefore, [](HWND) { return false; }
+		    true,
+		    71,
+		    QString(),
+		    moveToken,
+		    windowGenBefore,
+		    trackerGenBefore,
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; }
 		));
 
 		QSignalSpy windowRefused(fixture.window, &TrackedWindow::actionRefused);
@@ -606,6 +630,174 @@ private slots:
 		QCOMPARE(windowRefused.size(), 0);
 		QCOMPARE(trackerRefused.size(), 0);
 		QCOMPARE(fixture.tracker->lastActionError(), newerError);
+	}
+
+	void reentrantMoveDuringImmediateRefusalSuppressesStaleRefusal() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		QSignalSpy windowRefused(fixture.window, &TrackedWindow::actionRefused);
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+
+		// Simulate a synchronous commandResult handler inside refuseCommand()
+		// starting a newer pending move on the same window without changing the
+		// tracker error generation.
+		fixture.dispatcher->refuseImmediateMoveForTest(
+		    fixture.window,
+		    QStringLiteral("invalid-target"),
+		    [&fixture] { fixture.tracker->notePendingUserMoveForTest(81, fixture.window); }
+		);
+
+		QCOMPARE(trackerRefused.size(), 0);
+		QCOMPARE(fixture.tracker->lastActionError(), QString());
+
+		fixture.tracker->completePendingUserMoveForTest(
+		    81,
+		    reinterpret_cast<quintptr>(fixture.window->hwnd()),
+		    false,
+		    QStringLiteral("permission-denied"),
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; }
+		);
+
+		QCOMPARE(windowRefused.size(), 1);
+		QCOMPARE(trackerRefused.size(), 1);
+		QCOMPARE(
+		    fixture.tracker->lastActionError(),
+		    QStringLiteral("move:Windows denied permission to move this window")
+		);
+	}
+
+	void newerMoveRequestTokenSuppressesOlderNativeMoveFailure() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		// Immediate failure after a newer workspace-creation move bumped only
+		// the window move request token.
+		const auto olderImmediateToken = fixture.window->beginMoveRequest();
+		const auto windowGenBefore = fixture.window->actionErrorGeneration();
+		const auto trackerGenBefore = fixture.tracker->actionErrorGeneration();
+		(void)fixture.window->beginMoveRequest();
+
+		QSignalSpy windowRefused(fixture.window, &TrackedWindow::actionRefused);
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+		int elevationChecks = 0;
+
+		QVERIFY(!fixture.window->finishMoveRequestForTest(
+		    false,
+		    0,
+		    QStringLiteral("permission-denied"),
+		    olderImmediateToken,
+		    windowGenBefore,
+		    trackerGenBefore,
+		    [](const TrackedWindow*) { return true; },
+		    [&elevationChecks](HWND) {
+			    ++elevationChecks;
+			    return true;
+		    }
+		));
+
+		QCOMPARE(elevationChecks, 0);
+		QCOMPARE(windowRefused.size(), 0);
+		QCOMPARE(trackerRefused.size(), 0);
+		QCOMPARE(fixture.tracker->actionErrorGeneration(), trackerGenBefore);
+
+		// Pending native move failure after a newer workspace-creation move
+		// bumped only the window move request token.
+		fixture.tracker->notePendingUserMoveForTest(82, fixture.window);
+		const auto trackerGenForCreation = fixture.tracker->actionErrorGeneration();
+		(void)fixture.window->beginMoveRequest();
+
+		fixture.tracker->completePendingUserMoveForTest(
+		    82,
+		    reinterpret_cast<quintptr>(fixture.window->hwnd()),
+		    false,
+		    QStringLiteral("permission-denied"),
+		    [](const TrackedWindow*) { return true; },
+		    [&elevationChecks](HWND) {
+			    ++elevationChecks;
+			    return true;
+		    }
+		);
+
+		QCOMPARE(elevationChecks, 0);
+		QCOMPARE(windowRefused.size(), 0);
+		QCOMPARE(trackerRefused.size(), 0);
+		QCOMPARE(fixture.tracker->actionErrorGeneration(), trackerGenForCreation);
+	}
+
+	void reentrantRefusalFromWindowSignalPreservesNewerTrackerError() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+		bool dispatchedInner = false;
+		QObject::connect(
+		    fixture.window,
+		    &TrackedWindow::actionRefused,
+		    fixture.tracker,
+		    [&fixture, &dispatchedInner](const QString&, const QString&, bool) {
+			    if (dispatchedInner) return;
+			    dispatchedInner = true;
+			    qs::hyprland::ipc::reportMoveRefusal(
+			        fixture.tracker, QStringLiteral("invalid-target"), false
+			    );
+		    }
+		);
+
+		fixture.window->reportActionRefusedForTest(
+		    QStringLiteral("move"),
+		    qs::hyprland::ipc::moveRefusalReason(QStringLiteral("permission-denied"), false),
+		    false
+		);
+
+		QVERIFY(dispatchedInner);
+		QCOMPARE(trackerRefused.size(), 1);
+		QCOMPARE(
+		    trackerRefused.first().at(1).toString(),
+		    QStringLiteral("The target workspace is not available")
+		);
+		QCOMPARE(
+		    fixture.tracker->lastActionError(),
+		    QStringLiteral("move:The target workspace is not available")
+		);
+	}
+
+	void immediateMoveFailureSkipsElevationProbeWhenOwnerChanged() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		const auto moveToken = fixture.window->beginMoveRequest();
+		const auto windowGenBefore = fixture.window->actionErrorGeneration();
+		const auto trackerGenBefore = fixture.tracker->actionErrorGeneration();
+		QSignalSpy windowRefused(fixture.window, &TrackedWindow::actionRefused);
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+		int elevationChecks = 0;
+
+		QVERIFY(!fixture.window->finishMoveRequestForTest(
+		    false,
+		    0,
+		    QStringLiteral("permission-denied"),
+		    moveToken,
+		    windowGenBefore,
+		    trackerGenBefore,
+		    [](const TrackedWindow*) { return false; },
+		    [&elevationChecks](HWND) {
+			    ++elevationChecks;
+			    return true;
+		    }
+		));
+
+		QCOMPARE(elevationChecks, 0);
+		QVERIFY(!fixture.window->elevated());
+		QCOMPARE(windowRefused.size(), 0);
+		QCOMPARE(trackerRefused.size(), 1);
+		QCOMPARE(trackerRefused.first().at(0).toString(), QStringLiteral("move"));
+		QCOMPARE(
+		    trackerRefused.first().at(1).toString(),
+		    QStringLiteral("Windows denied permission to move this window")
+		);
+		QCOMPARE(trackerRefused.first().at(2).toBool(), false);
 	}
 
 	void lateMoveCompletionIgnoresUntrackedMove() {

@@ -38,6 +38,13 @@ public:
 	void toggleFloatingForTest(qs::windows::TrackedWindow* window, const QString& action) {
 		this->toggleFloating(window, action);
 	}
+	void refuseImmediateMoveForTest(
+	    qs::windows::TrackedWindow* target,
+	    const QString& code,
+	    const std::function<void()>& publishCommandResult
+	) {
+		this->refuseImmediateMove(target, code, publishCommandResult);
+	}
 #endif
 
 	void dispatch(const QString& request);
@@ -63,6 +70,11 @@ private:
 	void focusWorkspace(const QString& arg);
 	void focusMonitor(const QString& arg);
 	void cycleWindow(std::optional<bool> backward);
+	void refuseImmediateMove(
+	    qs::windows::TrackedWindow* target,
+	    const QString& code,
+	    const std::function<void()>& publishCommandResult
+	);
 	void moveToWorkspace(qs::windows::TrackedWindow* window, const QString& arg, bool follow);
 	void fullscreen(qs::windows::TrackedWindow* window, int mode);
 	void pin(qs::windows::TrackedWindow* window, PinRequest request);

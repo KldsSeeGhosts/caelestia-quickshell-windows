@@ -156,16 +156,20 @@ public:
 	    bool accepted,
 	    quint64 pendingSequence,
 	    const QString& failureCode,
+	    quint64 moveToken,
 	    quint64 windowErrorGenerationBefore,
 	    quint64 trackerErrorGenerationBefore,
+	    const std::function<bool(const TrackedWindow*)>& ownerMatches,
 	    const std::function<bool(HWND)>& checkElevated
 	) {
 		return this->finishMoveRequest(
 		    accepted,
 		    pendingSequence,
 		    failureCode,
+		    moveToken,
 		    windowErrorGenerationBefore,
 		    trackerErrorGenerationBefore,
+		    ownerMatches,
 		    checkElevated
 		);
 	}
@@ -205,7 +209,7 @@ public:
 	[[nodiscard]] bool elevated() const { return this->bElevated.value(); }
 	[[nodiscard]] QString lastActionError() const { return this->mLastActionError; }
 	[[nodiscard]] quint64 actionErrorGeneration() const { return this->mActionErrorGeneration; }
-	[[nodiscard]] quint64 beginMoveRequest() { return ++this->mMoveRequestToken; }
+	[[nodiscard]] quint64 beginMoveRequest();
 	[[nodiscard]] quint64 moveRequestToken() const { return this->mMoveRequestToken; }
 	[[nodiscard]] quint32 pid() const { return this->bPid.value(); }
 	// Process and thread of the frame window itself, recorded when the tracker
@@ -288,8 +292,10 @@ private:
 	    bool accepted,
 	    quint64 pendingSequence,
 	    const QString& failureCode,
+	    quint64 moveToken,
 	    quint64 windowErrorGenerationBefore,
 	    quint64 trackerErrorGenerationBefore,
+	    const std::function<bool(const TrackedWindow*)>& ownerMatches,
 	    const std::function<bool(HWND)>& checkElevated
 	);
 
@@ -353,7 +359,8 @@ public:
 		}
 	}
 	void notePendingUserMoveForTest(quint64 sequence, TrackedWindow* window) {
-		this->notePendingUserMove(sequence, window, this->mActionErrorGeneration);
+		const auto moveToken = window != nullptr ? window->beginMoveRequest() : 0;
+		this->notePendingUserMove(sequence, window, moveToken, this->mActionErrorGeneration);
 	}
 	void completePendingUserMoveForTest(
 	    quint64 sequence,
@@ -384,6 +391,7 @@ public:
 	[[nodiscard]] VirtualDesktops* desktops() const { return this->mDesktops; }
 	[[nodiscard]] QString lastActionError() const { return this->mLastActionError; }
 	[[nodiscard]] quint64 actionErrorGeneration() const { return this->mActionErrorGeneration; }
+	[[nodiscard]] quint64 moveRequestGeneration() const { return this->mMoveRequestGeneration; }
 
 	[[nodiscard]] QScreen* screenFor(HMONITOR monitor) const;
 	[[nodiscard]] static qsizetype screenIndex(QScreen* screen);
@@ -454,6 +462,7 @@ private:
 	struct PendingUserMove {
 		QPointer<TrackedWindow> window;
 		HWND hwnd = nullptr;
+		quint64 moveToken = 0;
 		quint64 windowErrorGeneration = 0;
 		quint64 trackerErrorGeneration = 0;
 	};
@@ -461,6 +470,7 @@ private:
 	void notePendingUserMove(
 	    quint64 sequence,
 	    TrackedWindow* window,
+	    quint64 moveToken,
 	    quint64 trackerErrorGeneration
 	);
 	void completePendingUserMove(
@@ -478,12 +488,12 @@ private:
 	    const QString& reason,
 	    bool elevated
 	);
-	void clearWindowActionError(const TrackedWindow* window);
 
 	QList<TrackedWindow*> mWindows;
 	QString mLastActionError;
-	const TrackedWindow* mLastActionErrorWindow = nullptr;
+	QPointer<const TrackedWindow> mLastActionErrorWindow;
 	quint64 mActionErrorGeneration = 0;
+	quint64 mMoveRequestGeneration = 0;
 	QHash<quint64, PendingUserMove> mPendingUserMoves;
 	QHash<HWND, TrackedWindow*> byHwnd;
 	TrackedWindow* mActive = nullptr;

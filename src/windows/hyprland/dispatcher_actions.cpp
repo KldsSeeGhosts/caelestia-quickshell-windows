@@ -124,6 +124,28 @@ void Dispatcher::toggleFloating(TrackedWindow* window, const QString& action) {
 	reportToggleFloatingResult(this->actionTracker(), *result, window->elevated());
 }
 
+void Dispatcher::refuseImmediateMove(
+    TrackedWindow* target,
+    const QString& code,
+    const std::function<void()>& publishCommandResult
+) {
+	auto* tracker = this->actionTracker();
+	QPointer<TrackedWindow> guardedTarget(target);
+	QPointer<WindowTracker> guardedTracker(tracker);
+	const auto moveToken = target ? target->beginMoveRequest() : 0;
+	const auto moveGeneration = tracker ? tracker->moveRequestGeneration() : 0;
+	const auto errorGeneration = tracker ? tracker->actionErrorGeneration() : 0;
+	if (publishCommandResult) publishCommandResult();
+	if (guardedTarget && guardedTarget->moveRequestToken() != moveToken) return;
+	if (guardedTracker
+	    && (guardedTracker->actionErrorGeneration() != errorGeneration
+	        || guardedTracker->moveRequestGeneration() != moveGeneration))
+	{
+		return;
+	}
+	reportMoveRefusal(guardedTracker.data(), code, false);
+}
+
 void Dispatcher::unsupported(const QString& what) {
 	if (this->warned.contains(what)) return;
 	this->warned.insert(what);
