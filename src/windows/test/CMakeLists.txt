@@ -420,6 +420,7 @@ target_link_libraries(dispatcher_compile_check PRIVATE Qt6::Quick Qt6::Qml)
 add_library(toplevel_compile_check OBJECT
 	${QS_WINDOWS_SRC}/wayland/toplevel.cpp
 	${QS_WINDOWS_SRC}/hyprland/hyprland_toplevel.cpp
+	${QS_WINDOWS_SRC}/hyprland/qml.cpp
 )
 target_compile_definitions(toplevel_compile_check PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(toplevel_compile_check PRIVATE ${QS_WINDOWS_SRC})

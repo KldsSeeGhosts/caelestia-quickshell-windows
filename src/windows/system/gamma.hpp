@@ -16,6 +16,12 @@ class ScreenIdentityRegistry;
 
 namespace qs::windows::sys {
 
+namespace gamma_detail {
+
+[[nodiscard]] bool parseCrashTargetIdentity(const wchar_t* identity, LUID& adapter, UINT32& target);
+
+} // namespace gamma_detail
+
 class GammaController
     : public QObject
     , public QAbstractNativeEventFilter {
@@ -30,6 +36,10 @@ public:
 		decltype(&DeleteDC) deleteDc;
 		decltype(&GetDeviceGammaRamp) getRamp;
 		decltype(&SetDeviceGammaRamp) setRamp;
+		// Crash-time identity resolution. It maps a saved stable target identity
+		// to the current GDI device, or fails when the target cannot be verified.
+		using ResolveDevice = BOOL(WINAPI*)(const wchar_t*, wchar_t*, DWORD);
+		ResolveDevice resolveDevice = nullptr;
 	};
 	explicit GammaController(NativeApi api, QObject* parent = nullptr);
 	// Test-only injection of the same identity registry production uses.
@@ -100,6 +110,12 @@ private:
 	QHash<QString, Ramp> originals;
 	// A saved snapshot alone creates no restoration obligation.
 	QSet<QString> written;
+	// Keys with an outstanding user-requested dimming factor. Unlike `written`,
+	// this survives a transient write failure so the next display wake retries it.
+	QSet<QString> dimmingRequested;
+	// The requested backlight factor while `backlightFactor` is rolled back to
+	// the last owned state after a failed write.
+	QHash<QString, qreal> retryBacklightFactor;
 	// Bumped each time an id is retired; a native call that spans a bump aborts.
 	QHash<QString, quint64> lifetimes;
 	QTimer reapplyTimer;

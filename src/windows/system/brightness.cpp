@@ -502,7 +502,16 @@ HRESULT connectWmi(IWbemServices** out) {
 	if (!locator) return E_FAIL;
 
 	Bstr ns(L"ROOT\\WMI");
-	hr = locator->ConnectServer(ns.value, nullptr, nullptr, nullptr, 0, nullptr, nullptr, out);
+	hr = locator->ConnectServer(
+	    ns.value,
+	    nullptr,
+	    nullptr,
+	    nullptr,
+	    WBEM_FLAG_CONNECT_USE_MAX_WAIT,
+	    nullptr,
+	    nullptr,
+	    out
+	);
 	if (FAILED(hr)) return hr;
 	if (*out == nullptr) return E_FAIL;
 
@@ -1210,21 +1219,23 @@ namespace brightness_detail {
 
 EventWatchThread::~EventWatchThread() { this->stop(); }
 
-bool EventWatchThread::start(const std::function<void(HANDLE)>& worker) {
+bool EventWatchThread::start(const Worker& worker) {
 	auto lock = std::lock_guard(this->mutex);
-	if (this->thread.joinable() || this->stopEvent != nullptr) return false;
-	this->stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-	if (this->stopEvent == nullptr) return false;
+	if (this->thread.joinable() || this->stopState != nullptr) return false;
+	auto* event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if (event == nullptr) return false;
+
+	auto state = std::make_shared<StopState>(event);
 	this->finished = std::make_shared<std::atomic<bool>>(false);
 	auto finished = this->finished;
 	try {
-		this->thread = std::thread([worker, stop = this->stopEvent, finished] {
-			worker(stop);
+		this->thread = std::thread([worker, state, finished] {
+			Cancelled cancelled(state, &state->cancelled);
+			worker(state->event, cancelled);
 			finished->store(true, std::memory_order_release);
 		});
+		this->stopState = std::move(state);
 	} catch (...) {
-		CloseHandle(this->stopEvent);
-		this->stopEvent = nullptr;
 		finished->store(true, std::memory_order_release);
 		return false;
 	}
@@ -1233,14 +1244,17 @@ bool EventWatchThread::start(const std::function<void(HANDLE)>& worker) {
 
 void EventWatchThread::stop() {
 	std::thread worker;
-	HANDLE stopEvent = nullptr;
+	std::shared_ptr<StopState> state;
 	std::shared_ptr<std::atomic<bool>> finished;
 	{
 		auto lock = std::lock_guard(this->mutex);
-		if (this->stopEvent == nullptr && !this->thread.joinable()) return;
-		stopEvent = this->stopEvent;
+		if (this->stopState == nullptr && !this->thread.joinable()) return;
+		state = this->stopState;
 		finished = this->finished;
-		if (stopEvent != nullptr) SetEvent(stopEvent);
+		if (state != nullptr) {
+			state->cancelled.store(true, std::memory_order_release);
+			SetEvent(state->event);
+		}
 		if (this->thread.joinable()) worker = std::move(this->thread);
 	}
 
@@ -1252,16 +1266,16 @@ void EventWatchThread::stop() {
 		else worker.detach();
 	}
 
-	if (joined && stopEvent != nullptr) CloseHandle(stopEvent);
 	{
 		auto lock = std::lock_guard(this->mutex);
-		if (this->stopEvent == stopEvent) this->stopEvent = nullptr;
+		this->stopState.reset();
 	}
 }
 
 bool EventWatchThread::running() const {
 	auto lock = std::lock_guard(this->mutex);
-	return this->thread.joinable() && !this->finished->load(std::memory_order_acquire);
+	return this->thread.joinable() && this->finished != nullptr
+	    && !this->finished->load(std::memory_order_acquire);
 }
 
 } // namespace brightness_detail
@@ -1283,16 +1297,22 @@ QPointer<Brightness>& activeBrightness() {
 	return *instance;
 }
 
-void watchBrightnessEvents(const std::function<void(const QString&, int)>& deliver, HANDLE stop) {
+void watchBrightnessEvents(
+    const std::function<void(const QString&, int)>& deliver,
+    HANDLE stop,
+    const brightness_detail::EventWatchThread::Cancelled& cancelled
+) {
 	auto failures = 0;
 	auto comFailures = 0;
 	auto announced = false;
 
-	while (WaitForSingleObject(stop, 0) == WAIT_TIMEOUT) {
+	while (WaitForSingleObject(stop, 0) == WAIT_TIMEOUT && !cancelled->load(std::memory_order_acquire)) {
 		auto com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 		if (FAILED(com)) {
 			++comFailures;
-			if (comFailures == 1 || comFailures == brightness_detail::EVENT_BACKOFF_CAP) {
+			if (!cancelled->load(std::memory_order_acquire)
+			    && (comFailures == 1 || comFailures == brightness_detail::EVENT_BACKOFF_CAP))
+			{
 				qCWarning(logBrightness).noquote()
 				    << "Can't watch brightness changes yet: CoInitializeEx failed with" << hrText(com)
 				    << "; retrying in the background";
@@ -1302,7 +1322,7 @@ void watchBrightnessEvents(const std::function<void(const QString&, int)>& deliv
 		}
 		comFailures = 0;
 
-		while (WaitForSingleObject(stop, 0) == WAIT_TIMEOUT) {
+		while (WaitForSingleObject(stop, 0) == WAIT_TIMEOUT && !cancelled->load(std::memory_order_acquire)) {
 			ComPtr<IWbemServices> services;
 			auto hr = connectWmi(services.GetAddressOf());
 
@@ -1323,13 +1343,13 @@ void watchBrightnessEvents(const std::function<void(const QString&, int)>& deliv
 			auto healthySince = brightness_detail::EventClock::now();
 			if (SUCCEEDED(hr)) {
 				secure(events.Get());
-				if (!announced) {
+				if (!announced && !cancelled->load(std::memory_order_acquire)) {
 					announced = true;
 					qCInfo(logBrightness) << "Watching WmiMonitorBrightnessEvent for brightness changes made "
 					                         "outside ii (Fn keys, Settings, adaptive brightness)";
 				}
 
-				while (WaitForSingleObject(stop, 0) == WAIT_TIMEOUT) {
+				while (WaitForSingleObject(stop, 0) == WAIT_TIMEOUT && !cancelled->load(std::memory_order_acquire)) {
 					ComPtr<IWbemClassObject> event;
 					ULONG returned = 0;
 					hr = events->Next(
@@ -1347,7 +1367,8 @@ void watchBrightnessEvents(const std::function<void(const QString&, int)>& deliv
 					failures = 0;
 					auto instanceName = stringProperty(event.Get(), L"InstanceName");
 					auto level = intProperty(event.Get(), L"Brightness", -1);
-					if (!instanceName.isEmpty() && level >= 0) deliver(instanceName, level);
+					if (!cancelled->load(std::memory_order_acquire) && !instanceName.isEmpty() && level >= 0)
+						deliver(instanceName, level);
 				}
 			}
 
@@ -1365,7 +1386,9 @@ void watchBrightnessEvents(const std::function<void(const QString&, int)>& deliv
 			// lose WMI during power transitions and recover minutes later. Backoff is
 			// capped and the healthy-run reset above keeps intermittent failures from
 			// accumulating across days.
-			if (failures == 1 || failures == brightness_detail::EVENT_BACKOFF_CAP) {
+			if (!cancelled->load(std::memory_order_acquire)
+			    && (failures == 1 || failures == brightness_detail::EVENT_BACKOFF_CAP))
+			{
 				qCWarning(logBrightness).noquote()
 				    << "Brightness change events stopped or couldn't start:" << hrText(hr)
 				    << "; retrying in the background";
@@ -1494,7 +1517,9 @@ public:
 
 	void startEventWatch(const std::function<void(const QString&, int)>& deliver) override {
 		auto& watch = eventWatch();
-		if (!watch.thread.start([deliver](HANDLE stop) { watchBrightnessEvents(deliver, stop); })) {
+		if (!watch.thread.start([deliver](HANDLE stop, const brightness_detail::EventWatchThread::Cancelled& cancelled) {
+			    watchBrightnessEvents(deliver, stop, cancelled);
+		    })) {
 			watch.started.store(false, std::memory_order_release);
 		}
 	}

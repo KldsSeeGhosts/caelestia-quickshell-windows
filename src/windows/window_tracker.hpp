@@ -39,14 +39,14 @@ struct WindowEvent {
 
 namespace window_action_detail {
 
-[[nodiscard]] inline bool shouldReportFailure(DWORD error, bool elevated) {
-	return error == ERROR_ACCESS_DENIED || elevated;
+[[nodiscard]] inline bool shouldReportFailure(DWORD error, bool) {
+	return error == ERROR_ACCESS_DENIED || error == ERROR_INVALID_WINDOW_HANDLE;
 }
 
 [[nodiscard]] inline QString refusalReason(DWORD error, bool elevated) {
-	return elevated ? QStringLiteral("elevated-window")
-	     : error == ERROR_ACCESS_DENIED ? QStringLiteral("access-denied")
-	                                    : QString();
+	if (error == ERROR_INVALID_WINDOW_HANDLE) return QStringLiteral("stale-window");
+	if (error != ERROR_ACCESS_DENIED) return {};
+	return elevated ? QStringLiteral("elevated-window") : QStringLiteral("access-denied");
 }
 
 [[nodiscard]] inline QString errorText(const QString& action, const QString& reason) {

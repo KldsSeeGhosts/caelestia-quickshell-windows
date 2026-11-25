@@ -280,12 +280,18 @@ bool isMoreElevated(HWND hwnd) {
 	auto own = ownIntegrity();
 
 	auto* process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-	if (process == nullptr) return own < SECURITY_MANDATORY_HIGH_RID;
+	if (process == nullptr) {
+		// Only an access denial is evidence of a boundary. A closed process,
+		// recycled pid, or other OpenProcess failure must not invent elevation.
+		return GetLastError() == ERROR_ACCESS_DENIED && own < SECURITY_MANDATORY_HIGH_RID;
+	}
 
 	HANDLE token = nullptr;
 	auto opened = OpenProcessToken(process, TOKEN_QUERY, &token) != FALSE;
+	auto tokenError = GetLastError();
 	CloseHandle(process);
-	if (!opened) return own < SECURITY_MANDATORY_HIGH_RID;
+	if (!opened)
+		return tokenError == ERROR_ACCESS_DENIED && own < SECURITY_MANDATORY_HIGH_RID;
 
 	auto level = tokenIntegrity(token);
 	CloseHandle(token);

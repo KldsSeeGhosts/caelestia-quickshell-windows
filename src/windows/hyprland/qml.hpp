@@ -24,6 +24,7 @@ class HyprlandIpcQml: public QObject {
 	Q_PROPERTY(bool pinSupported READ pinSupported NOTIFY pinSupportedChanged);
 	Q_PROPERTY(bool desktopControlSupported READ desktopControlSupported NOTIFY desktopControlSupportedChanged);
 	Q_PROPERTY(QObject* desktopControl READ desktopControl CONSTANT);
+	Q_PROPERTY(QString lastActionError READ lastActionError NOTIFY lastActionErrorChanged);
 	Q_PROPERTY(qs::hyprland::ipc::HyprlandMonitor* focusedMonitor READ default NOTIFY focusedMonitorChanged BINDABLE bindableFocusedMonitor);
 	Q_PROPERTY(qs::hyprland::ipc::HyprlandWorkspace* focusedWorkspace READ default NOTIFY focusedWorkspaceChanged BINDABLE bindableFocusedWorkspace);
 	Q_PROPERTY(qs::hyprland::ipc::HyprlandToplevel* activeToplevel READ default NOTIFY activeToplevelChanged BINDABLE bindableActiveToplevel);
@@ -86,6 +87,7 @@ public:
 	[[nodiscard]] static ObjectModel<HyprlandMonitor>* monitors();
 	[[nodiscard]] static ObjectModel<HyprlandWorkspace>* workspaces();
 	[[nodiscard]] static ObjectModel<HyprlandToplevel>* toplevels();
+	[[nodiscard]] QString lastActionError() const;
 
 signals:
 	void rawEvent(qs::hyprland::ipc::HyprlandIpcEvent* event);
@@ -97,6 +99,8 @@ signals:
 	void focusedWorkspaceChanged();
 	void activeToplevelChanged();
 	void pinSupportedChanged();
+	void lastActionErrorChanged();
+	void actionRefused(const QString& action, const QString& reason, bool elevated);
 
 private:
 	PinSupport pinSupport;

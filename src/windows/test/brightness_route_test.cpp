@@ -1552,10 +1552,10 @@ private slots:
 		brightness_detail::EventWatchThread watch;
 		std::atomic<bool> entered = false;
 		std::atomic<bool> sawStop = false;
-		QVERIFY(watch.start([&](HANDLE stop) {
+		QVERIFY(watch.start([&](HANDLE stop, const brightness_detail::EventWatchThread::Cancelled& cancelled) {
 			entered = true;
 			while (WaitForSingleObject(stop, 5) == WAIT_TIMEOUT) {}
-			sawStop = true;
+			sawStop = cancelled->load(std::memory_order_acquire);
 		}));
 		QVERIFY(watch.running());
 
@@ -1568,9 +1568,35 @@ private slots:
 		QVERIFY(sawStop.load());
 
 		// A second lifecycle is independent and starts cleanly after the first join.
-		QVERIFY(watch.start([](HANDLE stop) { WaitForSingleObject(stop, 50); }));
+		QVERIFY(watch.start([](HANDLE stop, const brightness_detail::EventWatchThread::Cancelled&) {
+			WaitForSingleObject(stop, 50);
+		}));
 		watch.stop();
 	}
+
+	void eventWatchThreadDetachKeepsTheStopEventAlive() {
+		brightness_detail::EventWatchThread watch;
+		std::atomic<bool> release = false;
+		std::atomic<bool> completed = false;
+		std::atomic<bool> cancelledSeen = false;
+		std::atomic<bool> handleStillValid = false;
+		QVERIFY(watch.start([&](HANDLE stop, const brightness_detail::EventWatchThread::Cancelled& cancelled) {
+			while (!release.load(std::memory_order_acquire)) Sleep(5);
+			cancelledSeen = cancelled->load(std::memory_order_acquire);
+			// stop() times out and detaches while this worker is still inside the
+			// gate. Shared RAII ownership keeps the signaled event valid here.
+			handleStillValid = WaitForSingleObject(stop, 0) == WAIT_OBJECT_0;
+			completed = true;
+		}));
+
+		watch.stop();
+		QVERIFY(!watch.running());
+		release = true;
+		QTRY_VERIFY(completed.load(std::memory_order_acquire));
+		QVERIFY(cancelledSeen.load(std::memory_order_acquire));
+		QVERIFY(handleStillValid.load(std::memory_order_acquire));
+	}
+
 };
 
 QTEST_GUILESS_MAIN(BrightnessRouteTest)

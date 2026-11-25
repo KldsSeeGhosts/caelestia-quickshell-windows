@@ -91,6 +91,12 @@ private slots:
 			nameLen = static_cast<DWORD>(wideName.size());
 
 			auto bytes = wideBytes(entry.value, entry.terminate);
+			type = entry.type;
+			if (data == nullptr) {
+				// Stale small metadata models a value that grows before the data read.
+				dataLen = index == 0 ? DWORD(10) : static_cast<DWORD>(bytes.size());
+				return ERROR_SUCCESS;
+			}
 			if (static_cast<size_t>(dataLen) < static_cast<size_t>(bytes.size())) {
 				dataLen = static_cast<DWORD>(bytes.size());
 				++oversizedReads;
@@ -98,7 +104,6 @@ private slots:
 			}
 			std::memcpy(data, bytes.constData(), static_cast<size_t>(bytes.size()));
 			dataLen = static_cast<DWORD>(bytes.size());
-			type = entry.type;
 			if (index == 1) enumeratedAfterResize = true;
 			return ERROR_SUCCESS;
 		};
@@ -120,6 +125,84 @@ private slots:
 		QCOMPARE(oversizedReads, 1);
 		QVERIFY(enumeratedAfterResize);
 	}
+	void registryScanChecksNamesForEveryTypeAndSkipsOversizedData() {
+		const auto clsid = QStringLiteral("{EC1CC9CE-FAED-4822-828A-82A81A6F018F}");
+		const auto oversizedNoise = QString(600000, QLatin1Char('x'));
+		QList<Entry> entries {
+		    {QStringLiteral("oversized"), oversizedNoise, REG_SZ, false},
+		    {QStringLiteral("binary,%1").arg(clsid), QStringLiteral("noise"), REG_BINARY, false},
+		    {QStringLiteral("later"), QStringLiteral("noise"), REG_SZ, false},
+		};
+		QStringList scannedNames;
+		auto oversizedDataReads = 0;
+
+		equalizer_apo_detail::RegistryEnumValue enumerate =
+		    [&](DWORD index,
+		        wchar_t* name,
+		        DWORD& nameLen,
+		        DWORD& type,
+		        BYTE* data,
+		        DWORD& dataLen) -> LSTATUS {
+			if (index >= static_cast<DWORD>(entries.size())) return ERROR_NO_MORE_ITEMS;
+			const auto& entry = entries.at(static_cast<qsizetype>(index));
+			auto wideName = entry.name.toStdWString();
+			std::memcpy(name, wideName.data(), wideName.size() * sizeof(wchar_t));
+			name[wideName.size()] = L'\0';
+			nameLen = static_cast<DWORD>(wideName.size());
+			type = entry.type;
+			auto bytes = wideBytes(entry.value, entry.terminate);
+			if (data == nullptr) {
+				dataLen = static_cast<DWORD>(bytes.size());
+				return ERROR_SUCCESS;
+			}
+			++oversizedDataReads;
+			if (static_cast<size_t>(dataLen) < static_cast<size_t>(bytes.size()))
+				return ERROR_MORE_DATA;
+			std::memcpy(data, bytes.constData(), static_cast<size_t>(bytes.size()));
+			dataLen = static_cast<DWORD>(bytes.size());
+			return ERROR_SUCCESS;
+		};
+
+		auto found = equalizer_apo_detail::scanRegistryStringValues(
+		    enumerate,
+		    [&](const QString& name, const QString&) {
+			    scannedNames.append(name);
+			    return equalizer_apo_detail::registryTextContainsClsid(name, clsid);
+		    }
+		);
+
+		QVERIFY(found);
+		QCOMPARE(scannedNames, QStringList({entries[0].name, entries[1].name}));
+		// The oversized first value never caused a data read or ended the scan;
+		// the binary second value still had its name inspected.
+		QCOMPARE(oversizedDataReads, 0);
+	}
+
+	void elevatedHookScriptCreatesAndVerifiesTheIncludeFile() {
+		const auto script = equalizer_apo_detail::elevatedHookScript(
+		    QStringLiteral("C:\\EqualizerAPO\\config\\config.txt"),
+		    QStringLiteral("C:\\EqualizerAPO\\config\\ii-equalizer.txt")
+		);
+		QVERIFY(script.contains(QStringLiteral("[IO.File]::WriteAllText($includePath")));
+		QVERIFY(script.contains(QStringLiteral("Test-Path -LiteralPath $includePath -PathType Leaf")));
+		QVERIFY(script.contains(QStringLiteral("exit 3")));
+		QVERIFY(script.contains(QStringLiteral("[IO.File]::AppendAllText($configPath")));
+	}
+
+	void elevationCompletionNeverClaimsSuccessWithoutAProcessHandle() {
+		auto unverified = equalizer_apo_detail::elevationCompletion(false, 0, 0);
+		QVERIFY(!unverified.success);
+		QCOMPARE(unverified.reason, QStringLiteral("completion-unverified"));
+
+		auto success = equalizer_apo_detail::elevationCompletion(true, WAIT_OBJECT_0, 0);
+		QVERIFY(success.success);
+		QVERIFY(success.reason.isEmpty());
+
+		auto failed = equalizer_apo_detail::elevationCompletion(true, WAIT_OBJECT_0, 2);
+		QVERIFY(!failed.success);
+		QCOMPARE(failed.reason, QStringLiteral("exit-2"));
+	}
+
 };
 
 } // namespace

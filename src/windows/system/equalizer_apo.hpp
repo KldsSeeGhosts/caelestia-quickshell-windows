@@ -39,6 +39,13 @@ using RegistryEnumValue = std::function<LSTATUS(
     bool* scanComplete = nullptr
 );
 [[nodiscard]] bool registryTextContainsClsid(const QString& text, const QString& clsid);
+[[nodiscard]] QString elevatedHookScript(const QString& configPath, const QString& includePath);
+struct ElevationCompletion {
+	bool success = false;
+	QString reason;
+};
+[[nodiscard]] ElevationCompletion
+elevationCompletion(bool hasProcess, DWORD waitResult, DWORD exitCode);
 
 } // namespace equalizer_apo_detail
 

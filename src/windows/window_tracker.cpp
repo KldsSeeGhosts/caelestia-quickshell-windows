@@ -567,8 +567,8 @@ void TrackedWindow::fullscreenOn(QScreen* screen) {
 		auto release = this->fullscreenOwner.release();
 		if (release == fullscreen_ownership::Release::Failed) {
 			qCWarning(logTracker) << "Could not restore optional fullscreen for" << this->addressHex();
-			if (isMoreElevated(this->mHwnd))
-				this->reportActionRefused(QStringLiteral("fullscreen"), QStringLiteral("elevated-window"));
+			if (!IsWindow(this->mHwnd))
+				this->reportActionRefused(QStringLiteral("fullscreen"), QStringLiteral("stale-window"));
 			return;
 		}
 		if (release == fullscreen_ownership::Release::Restored
@@ -583,8 +583,8 @@ void TrackedWindow::fullscreenOn(QScreen* screen) {
 	auto rect = toRECT(rects.monitor);
 	if (this->fullscreenOwner.enter(rect, this->bFullscreen.value())) {
 		this->clearActionError();
-	} else if (isMoreElevated(this->mHwnd)) {
-		this->reportActionRefused(QStringLiteral("fullscreen"), QStringLiteral("elevated-window"));
+	} else if (!IsWindow(this->mHwnd)) {
+		this->reportActionRefused(QStringLiteral("fullscreen"), QStringLiteral("stale-window"));
 	}
 }
 

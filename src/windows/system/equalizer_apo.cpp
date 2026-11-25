@@ -110,36 +110,70 @@ bool scanRegistryStringValues(
 	std::vector<BYTE> valueData(initialDataBytes);
 	std::vector<wchar_t> valueName(512);
 	for (DWORD index = 0;;) {
-		DWORD nameLen = static_cast<DWORD>(valueName.size());
-		DWORD dataLen = static_cast<DWORD>(valueData.size());
+		// First read only the name and metadata. A huge or unreadable data item
+		// must not corrupt, truncate, or end enumeration of the value name.
+		DWORD nameLen = 0;
+		DWORD requiredDataLen = 0;
 		DWORD type = 0;
-		auto status = enumerate(index, valueName.data(), nameLen, type, valueData.data(), dataLen);
+		LSTATUS status = ERROR_SUCCESS;
+		for (;;) {
+			nameLen = static_cast<DWORD>(valueName.size());
+			requiredDataLen = 0;
+			type = 0;
+			status = enumerate(index, valueName.data(), nameLen, type, nullptr, requiredDataLen);
+			if (status == ERROR_MORE_DATA && nameLen >= valueName.size()
+			    && valueName.size() < maxNameChars)
+			{
+				valueName.resize(std::min(valueName.size() * 2, maxNameChars));
+				continue;
+			}
+			break;
+		}
 
 		if (status == ERROR_NO_MORE_ITEMS) {
 			if (scanComplete != nullptr) *scanComplete = true;
 			return false;
 		}
-		if (status == ERROR_MORE_DATA) {
-			auto resized = false;
-			if (dataLen > valueData.size() && dataLen <= maxDataBytes) {
-				valueData.resize(dataLen);
-				resized = true;
-			}
-			if (nameLen >= valueName.size() && valueName.size() < maxNameChars) {
-				valueName.resize(std::min(valueName.size() * 2, maxNameChars));
-				resized = true;
-			}
-			if (!resized) return false;
-			continue;
-		}
 		if (status != ERROR_SUCCESS) return false;
 
-		if ((type == REG_SZ || type == REG_EXPAND_SZ)
-		    && predicate(
-		        QString::fromWCharArray(valueName.data(), static_cast<qsizetype>(nameLen)),
-		        decodeRegistryString(valueData.data(), dataLen)
-		    ))
+		auto name = QString::fromWCharArray(valueName.data(), static_cast<qsizetype>(nameLen));
+		QString value;
+		if ((type == REG_SZ || type == REG_EXPAND_SZ) && requiredDataLen <= maxDataBytes
+		    && requiredDataLen > 0)
 		{
+			if (requiredDataLen > valueData.size()) valueData.resize(requiredDataLen);
+			for (;;) {
+				DWORD readNameLen = static_cast<DWORD>(valueName.size());
+				DWORD dataLen = static_cast<DWORD>(valueData.size());
+				DWORD readType = 0;
+				status = enumerate(
+				    index,
+				    valueName.data(),
+				    readNameLen,
+				    readType,
+				    valueData.data(),
+				    dataLen
+				);
+				if (status == ERROR_MORE_DATA) {
+					// A concurrent writer can grow the value between the metadata
+					// and data reads. Resize within the cap; above the cap skip only
+					// this value's data and keep scanning later names.
+					if (dataLen > valueData.size() && dataLen <= maxDataBytes) {
+						valueData.resize(dataLen);
+						continue;
+					}
+					break;
+				}
+				if (status != ERROR_SUCCESS) return false;
+				if (readType == REG_SZ || readType == REG_EXPAND_SZ)
+					value = decodeRegistryString(valueData.data(), dataLen);
+				break;
+			}
+		}
+
+		// The name is inspected for every registry type, including values whose
+		// data is oversized, binary, or absent.
+		if (predicate(name, value)) {
 			if (scanComplete != nullptr) *scanComplete = true;
 			return true;
 		}
@@ -163,6 +197,36 @@ bool registryStringValueMatches(
 
 bool registryTextContainsClsid(const QString& text, const QString& clsid) {
 	return !clsid.isEmpty() && text.contains(clsid, Qt::CaseInsensitive);
+}
+
+QString elevatedHookScript(const QString& configPath, const QString& includePath) {
+	return QStringLiteral(
+	           "$configPath = '%1'\n"
+	           "$includePath = '%2'\n"
+	           "$line = 'Include: %2'\n"
+	           "try {\n"
+	           "    $utf8 = New-Object Text.UTF8Encoding $false\n"
+	           "    if (!(Test-Path -LiteralPath $includePath -PathType Leaf)) {\n"
+	           "        [IO.File]::WriteAllText($includePath, \"Preamp: 0 dB`n\", $utf8)\n"
+	           "    }\n"
+	           "    if (!(Test-Path -LiteralPath $includePath -PathType Leaf)) { exit 3 }\n"
+	           "    $text = Get-Content -LiteralPath $configPath -Raw -ErrorAction Stop\n"
+	           "    if ($null -eq $text) { $text = '' }\n"
+	           "    if ($text -notmatch [regex]::Escape($line)) {\n"
+	           "        [IO.File]::AppendAllText($configPath, \"`n$line`n\", $utf8)\n"
+	           "    }\n"
+	           "    exit 0\n"
+	           "} catch {\n"
+	           "    exit 2\n"
+	           "}\n"
+	       )
+	    .arg(psSingleQuote(configPath), psSingleQuote(includePath));
+}
+
+ElevationCompletion elevationCompletion(bool hasProcess, DWORD waitResult, DWORD exitCode) {
+	if (!hasProcess) return {false, QStringLiteral("completion-unverified")};
+	auto success = waitResult == WAIT_OBJECT_0 && exitCode == 0;
+	return {success, success ? QString() : QStringLiteral("exit-%1").arg(exitCode)};
 }
 
 } // namespace equalizer_apo_detail
@@ -298,9 +362,10 @@ bool EqualizerApo::hookDirectly() {
 	if (!this->mConfigWritable) return false;
 	if (this->mHooked) return true;
 
-	if (!QFileInfo::exists(this->includeFilePath())) {
-		this->writeCurve(QStringLiteral("Preamp: 0 dB\n"));
-	}
+	if (!QFileInfo(this->includeFilePath()).isFile()
+	    && !this->writeCurve(QStringLiteral("Preamp: 0 dB\n")))
+		return false;
+	if (!QFileInfo(this->includeFilePath()).isFile()) return false;
 
 	QFile file(this->configFilePath());
 	if (!file.open(QIODevice::Append | QIODevice::Text)) return false;
@@ -317,25 +382,15 @@ bool EqualizerApo::hookDirectly() {
 void EqualizerApo::hookElevated(QObject* parentWindow) {
 	if (this->mConfigPath.isEmpty()) return;
 
-	if (!QFileInfo::exists(this->includeFilePath())) {
-		this->writeCurve(QStringLiteral("Preamp: 0 dB\n"));
-	}
+	// Try the unelevated write first, but do not treat its failure as fatal: the
+	// elevated script performs and verifies the same creation in the protected directory.
+	if (!QFileInfo(this->includeFilePath()).isFile())
+		(void) this->writeCurve(QStringLiteral("Preamp: 0 dB\n"));
 
-	auto script = QStringLiteral(
-	                   "$configPath = '%1'\n"
-	                   "$line = 'Include: %2'\n"
-	                   "try {\n"
-	                   "    $text = Get-Content -LiteralPath $configPath -Raw -ErrorAction Stop\n"
-	                   "    if ($null -eq $text) { $text = '' }\n"
-	                   "    if ($text -notmatch [regex]::Escape($line)) {\n"
-	                   "        [IO.File]::AppendAllText($configPath, \"`n$line`n\", (New-Object Text.UTF8Encoding $false))\n"
-	                   "    }\n"
-	                   "    exit 0\n"
-	                   "} catch {\n"
-	                   "    exit 2\n"
-	                   "}\n"
-	               )
-	                   .arg(psSingleQuote(this->configFilePath()), psSingleQuote(this->includeFilePath()));
+	auto script = equalizer_apo_detail::elevatedHookScript(
+	    this->configFilePath(),
+	    this->includeFilePath()
+	);
 
 	auto encoded = QByteArray(
 	                   reinterpret_cast<const char*>(script.utf16()),
@@ -372,7 +427,8 @@ void EqualizerApo::hookElevated(QObject* parentWindow) {
 	}
 	if (info.hProcess == nullptr) {
 		this->refresh();
-		emit this->elevationFinished(true, QString());
+		auto completion = equalizer_apo_detail::elevationCompletion(false, 0, 1);
+		emit this->elevationFinished(completion.success, completion.reason);
 		return;
 	}
 
@@ -388,11 +444,8 @@ void EqualizerApo::hookElevated(QObject* parentWindow) {
 		waitTimer->stop();
 		waitTimer->deleteLater();
 		this->refresh();
-		auto success = wait == WAIT_OBJECT_0 && exitCode == 0;
-		emit this->elevationFinished(
-		    success,
-		    success ? QString() : QStringLiteral("exit-%1").arg(exitCode)
-		);
+		auto completion = equalizer_apo_detail::elevationCompletion(true, wait, exitCode);
+		emit this->elevationFinished(completion.success, completion.reason);
 	});
 	waitTimer->start();
 }

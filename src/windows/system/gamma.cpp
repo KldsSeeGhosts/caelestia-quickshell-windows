@@ -1,9 +1,12 @@
 #include "gamma.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
+#include <cwctype>
 #include <utility>
 
 #include <qcoreapplication.h>
@@ -30,30 +33,175 @@ constexpr int REAPPLY_DEBOUNCE_MS = 400;
 constexpr size_t CRASH_SNAPSHOT_COUNT = 32;
 constexpr size_t CRASH_KEY_CHARS = 384;
 constexpr size_t CRASH_DEVICE_CHARS = 32;
+constexpr UINT32 CRASH_MAX_DISPLAY_PATHS = 64;
+constexpr UINT32 CRASH_MAX_DISPLAY_MODES = 128;
 
+static_assert(std::atomic<quint64>::is_always_lock_free);
+static_assert(std::atomic<wchar_t>::is_always_lock_free);
+static_assert(std::atomic<WORD>::is_always_lock_free);
+
+// Every element is atomic. The sequence protocol can reject a torn copy, but
+// it cannot make concurrent non-atomic element access well-defined; the crash
+// reader and the normal writer therefore use atomic loads and stores throughout.
 struct CrashSnapshot {
 	std::atomic<quint64> sequence {0};
-	wchar_t key[CRASH_KEY_CHARS] {};
-	wchar_t device[CRASH_DEVICE_CHARS] {};
-	WORD ramp[3][256] {}; // NOLINT
+	std::atomic<wchar_t> key[CRASH_KEY_CHARS];       // NOLINT
+	std::atomic<wchar_t> device[CRASH_DEVICE_CHARS]; // NOLINT
+	std::atomic<wchar_t> identity[CRASH_KEY_CHARS];  // NOLINT
+	std::atomic<WORD> ramp[3][256];                  // NOLINT
 };
 
 CrashSnapshot gCrashSnapshots[CRASH_SNAPSHOT_COUNT]; // NOLINT
 std::atomic<bool> gExitRestoreRegistered = false;     // NOLINT
 
-void copyWide(wchar_t* target, size_t capacity, const std::wstring& value) {
+bool copyWidePlainBounded(
+    wchar_t* target,
+    size_t targetCapacity,
+    const wchar_t* source,
+    size_t sourceCapacity
+) {
+	if (target == nullptr || targetCapacity == 0 || source == nullptr) return false;
+	size_t length = 0;
+	while (length < sourceCapacity && source[length] != L'\0') ++length;
+	if (length == sourceCapacity || length >= targetCapacity) {
+		target[0] = L'\0';
+		return false;
+	}
+	std::memcpy(target, source, length * sizeof(wchar_t));
+	target[length] = L'\0';
+	return true;
+}
+
+void storeWideAtomic(std::atomic<wchar_t>* target, size_t capacity, const std::wstring& value) {
 	if (capacity == 0) return;
 	auto length = std::min(value.size(), capacity - 1);
-	std::memcpy(target, value.data(), length * sizeof(wchar_t));
-	target[length] = L'\0';
+	for (size_t index = 0; index < capacity; ++index) {
+		target[index].store(index < length ? value[index] : L'\0', std::memory_order_relaxed);
+	}
+}
+
+void loadWideAtomic(const std::atomic<wchar_t>* source, wchar_t* target, size_t capacity) {
+	if (capacity == 0) return;
+	for (size_t index = 0; index < capacity; ++index) {
+		target[index] = source[index].load(std::memory_order_relaxed);
+	}
+}
+
+bool atomicWideEquals(
+    const std::atomic<wchar_t>* source,
+    size_t capacity,
+    const std::wstring& value
+) {
+	for (size_t index = 0; index < capacity; ++index) {
+		auto expected = index < value.size() ? value[index] : L'\0';
+		if (source[index].load(std::memory_order_relaxed) != expected) return false;
+		if (expected == L'\0') return true;
+	}
+	return value.size() == capacity - 1;
 }
 
 void writeSnapshotKey(CrashSnapshot& snapshot, const QString& key) {
-	copyWide(snapshot.key, CRASH_KEY_CHARS, key.toStdWString());
+	storeWideAtomic(snapshot.key, CRASH_KEY_CHARS, key.toStdWString());
+	storeWideAtomic(snapshot.identity, CRASH_KEY_CHARS, key.toStdWString());
 }
 
 bool snapshotKeyIs(const CrashSnapshot& snapshot, const QString& key) {
-	return key.compare(QString::fromWCharArray(snapshot.key), Qt::CaseInsensitive) == 0;
+	return atomicWideEquals(snapshot.key, CRASH_KEY_CHARS, key.toStdWString());
+}
+
+bool boundedWideEqualsIgnoreCase(const wchar_t* fixed, size_t capacity, const wchar_t* text) {
+	if (fixed == nullptr || text == nullptr) return false;
+	for (size_t index = 0; index < capacity; ++index) {
+		auto a = fixed[index];
+		auto b = *text;
+		if (a == L'\0' || b == L'\0') return a == b;
+		if (static_cast<wchar_t>(std::towlower(a)) != static_cast<wchar_t>(std::towlower(b))) return false;
+		++text;
+	}
+	return false;
+}
+
+bool wideStartsWith(const wchar_t* text, const wchar_t* prefix) {
+	while (*prefix != L'\0') {
+		if (*text++ != *prefix++) return false;
+	}
+	return true;
+}
+
+// Crash/atexit-safe display config resolution: fixed stack storage, native API
+// calls only, and no Qt, heap allocation, mutex, or shared mutable buffer. A
+// topology larger than the fixed buffers fails closed rather than risking a
+// restore on the wrong target.
+BOOL WINAPI resolveDisplayDeviceForIdentity(const wchar_t* identity, wchar_t* device, DWORD capacity) {
+	if (identity == nullptr || device == nullptr || capacity == 0) return FALSE;
+	device[0] = L'\0';
+	const auto pathIdentity = wideStartsWith(identity, L"path:");
+	LUID targetAdapter {};
+	UINT32 targetId = 0;
+	const auto targetIdentity = gamma_detail::parseCrashTargetIdentity(identity, targetAdapter, targetId);
+	if (!pathIdentity && !targetIdentity) return FALSE;
+
+	UINT32 pathCount = 0;
+	UINT32 modeCount = 0;
+	if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
+		return FALSE;
+	if (pathCount == 0 || pathCount > CRASH_MAX_DISPLAY_PATHS || modeCount > CRASH_MAX_DISPLAY_MODES)
+		return FALSE;
+
+	std::array<DISPLAYCONFIG_PATH_INFO, CRASH_MAX_DISPLAY_PATHS> paths {};
+	std::array<DISPLAYCONFIG_MODE_INFO, CRASH_MAX_DISPLAY_MODES> modes {};
+	auto status = QueryDisplayConfig(
+	    QDC_ONLY_ACTIVE_PATHS,
+	    &pathCount,
+	    paths.data(),
+	    &modeCount,
+	    modes.data(),
+	    nullptr
+	);
+	if (status != ERROR_SUCCESS) return FALSE;
+
+	for (UINT32 index = 0; index < pathCount; ++index) {
+		const auto& path = paths[index];
+		auto matches = false;
+		if (pathIdentity) {
+			DISPLAYCONFIG_TARGET_DEVICE_NAME target {};
+			target.header = {
+			    DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+			    sizeof(target),
+			    path.targetInfo.adapterId,
+			    path.targetInfo.id
+			};
+			if (DisplayConfigGetDeviceInfo(&target.header) != ERROR_SUCCESS) continue;
+			matches = boundedWideEqualsIgnoreCase(
+			    target.monitorDevicePath,
+			    std::size(target.monitorDevicePath),
+			    identity + 5
+			);
+		} else {
+			matches = path.targetInfo.adapterId.HighPart == targetAdapter.HighPart
+			    && path.targetInfo.adapterId.LowPart == targetAdapter.LowPart
+			    && path.targetInfo.id == targetId;
+		}
+		if (!matches) continue;
+
+		DISPLAYCONFIG_SOURCE_DEVICE_NAME source {};
+		source.header = {
+		    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+		    sizeof(source),
+		    path.sourceInfo.adapterId,
+		    path.sourceInfo.id
+		};
+		if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) return FALSE;
+		if (!copyWidePlainBounded(
+		        device,
+		        capacity,
+		        source.viewGdiDeviceName,
+		        std::size(source.viewGdiDeviceName)
+		    ))
+			return FALSE;
+		return TRUE;
+	}
+	return FALSE;
 }
 
 void factorsForTemperature(int kelvin, double factors[3]) { // NOLINT
@@ -78,6 +226,31 @@ void factorsForTemperature(int kelvin, double factors[3]) { // NOLINT
 }
 
 } // namespace
+
+bool qs::windows::sys::gamma_detail::parseCrashTargetIdentity(const wchar_t* identity, LUID& adapter, UINT32& target) {
+	if (wideStartsWith(identity, L"session:")) {
+		const wchar_t* sessionEnd = identity + 8;
+		if (*sessionEnd == L'\0') return false;
+		while (*sessionEnd >= L'0' && *sessionEnd <= L'9') ++sessionEnd;
+		if (sessionEnd == identity + 8 || *sessionEnd != L':') return false;
+		identity = sessionEnd + 1;
+	}
+	if (!wideStartsWith(identity, L"target:")) return false;
+	const wchar_t* cursor = identity + 7;
+	wchar_t* end = nullptr;
+	auto high = std::wcstol(cursor, &end, 10);
+	if (end == cursor || *end != L':') return false;
+	cursor = end + 1;
+	auto low = std::wcstoul(cursor, &end, 10);
+	if (end == cursor || *end != L':') return false;
+	cursor = end + 1;
+	auto id = std::wcstoul(cursor, &end, 10);
+	if (end == cursor || *end != L'\0') return false;
+	adapter.HighPart = static_cast<LONG>(high);
+	adapter.LowPart = static_cast<DWORD>(low);
+	target = static_cast<UINT32>(id);
+	return true;
+}
 
 struct GammaController::PowerNotifications {
 	explicit PowerNotifications(GammaController* controller) {
@@ -151,7 +324,14 @@ GammaController* GammaController::instance() {
 }
 
 GammaController::GammaController(QObject* parent)
-    : GammaController({&CreateDCW, &DeleteDC, &GetDeviceGammaRamp, &SetDeviceGammaRamp}, parent) {
+    : GammaController(
+          {&CreateDCW,
+           &DeleteDC,
+           &GetDeviceGammaRamp,
+           &SetDeviceGammaRamp,
+           &resolveDisplayDeviceForIdentity},
+          parent
+      ) {
 	this->powerNotifications = std::make_unique<PowerNotifications>(this);
 }
 
@@ -215,10 +395,18 @@ void GammaController::reapplyActive() {
 	// put this process's desired ramp back. Resolve every id again because GDI
 	// display numbers may have been reordered underneath the same stable ids.
 	auto keys = this->written;
+	keys.unite(this->dimmingRequested);
+	for (auto iter = this->backlightFactor.constBegin(); iter != this->backlightFactor.constEnd(); ++iter)
+		keys.insert(iter.key());
+	for (auto iter = this->retryBacklightFactor.constBegin(); iter != this->retryBacklightFactor.constEnd(); ++iter)
+		keys.insert(iter.key());
+	for (auto iter = this->dimFactor.constBegin(); iter != this->dimFactor.constEnd(); ++iter)
+		keys.insert(iter.key());
 	for (const auto& key: keys) this->reapply(key);
 }
 
 void GammaController::updateCrashSnapshot(const QString& key, const Ramp& ramp) {
+	if (key.size() >= static_cast<qsizetype>(CRASH_KEY_CHARS)) return;
 	auto device = this->deviceFor(key);
 	if (device.isEmpty()) return;
 
@@ -229,18 +417,24 @@ void GammaController::updateCrashSnapshot(const QString& key, const Ramp& ramp) 
 			target = &snapshot;
 			break;
 		}
-		if (empty == nullptr && snapshot.key[0] == L'\0') empty = &snapshot;
+		if (empty == nullptr && snapshot.key[0].load(std::memory_order_relaxed) == L'\0')
+			empty = &snapshot;
 	}
 	if (target == nullptr) target = empty;
 	if (target == nullptr) return;
 
 	// Odd means a partial update. A crash reader only accepts an unchanged even
 	// sequence, so a crash during this copy loses this entry but never applies a
-	// torn ramp to the wrong display.
+	// torn ramp to the wrong display. Every element access remains atomic, so a
+	// concurrent crash read is a failed validation rather than undefined behavior.
 	target->sequence.fetch_add(1, std::memory_order_acq_rel);
 	writeSnapshotKey(*target, key);
-	copyWide(target->device, CRASH_DEVICE_CHARS, device.toStdWString());
-	std::memcpy(target->ramp, ramp.values, sizeof(target->ramp));
+	storeWideAtomic(target->device, CRASH_DEVICE_CHARS, device.toStdWString());
+	for (auto channel = 0; channel < 3; ++channel) {
+		for (auto index = 0; index < 256; ++index) {
+			target->ramp[channel][index].store(ramp.values[channel][index], std::memory_order_relaxed);
+		}
+	}
 	target->sequence.fetch_add(1, std::memory_order_acq_rel);
 }
 
@@ -248,8 +442,9 @@ void GammaController::removeCrashSnapshot(const QString& key) {
 	for (auto& snapshot: gCrashSnapshots) {
 		if (!snapshotKeyIs(snapshot, key)) continue;
 		snapshot.sequence.fetch_add(1, std::memory_order_acq_rel);
-		snapshot.key[0] = L'\0';
-		snapshot.device[0] = L'\0';
+		storeWideAtomic(snapshot.key, CRASH_KEY_CHARS, {});
+		storeWideAtomic(snapshot.device, CRASH_DEVICE_CHARS, {});
+		storeWideAtomic(snapshot.identity, CRASH_KEY_CHARS, {});
 		snapshot.sequence.fetch_add(1, std::memory_order_acq_rel);
 	}
 }
@@ -258,7 +453,9 @@ quintptr GammaController::crashSnapshotCount() {
 	quintptr count = 0;
 	for (const auto& snapshot: gCrashSnapshots) {
 		auto sequence = snapshot.sequence.load(std::memory_order_acquire);
-		if (sequence != 0 && sequence % 2 == 0 && snapshot.key[0] != L'\0') ++count;
+		if (sequence != 0 && sequence % 2 == 0
+		    && snapshot.key[0].load(std::memory_order_relaxed) != L'\0')
+			++count;
 	}
 	return count;
 }
@@ -266,8 +463,9 @@ quintptr GammaController::crashSnapshotCount() {
 void GammaController::clearCrashSnapshots() {
 	for (auto& snapshot: gCrashSnapshots) {
 		snapshot.sequence.fetch_add(1, std::memory_order_acq_rel);
-		snapshot.key[0] = L'\0';
-		snapshot.device[0] = L'\0';
+		storeWideAtomic(snapshot.key, CRASH_KEY_CHARS, {});
+		storeWideAtomic(snapshot.device, CRASH_DEVICE_CHARS, {});
+		storeWideAtomic(snapshot.identity, CRASH_KEY_CHARS, {});
 		snapshot.sequence.fetch_add(1, std::memory_order_acq_rel);
 	}
 }
@@ -277,12 +475,26 @@ void GammaController::restoreSnapshots(const NativeApi& api) {
 		auto before = snapshot.sequence.load(std::memory_order_acquire);
 		if (before == 0 || before % 2 != 0) continue;
 
-		wchar_t device[CRASH_DEVICE_CHARS] {};
+		wchar_t identity[CRASH_KEY_CHARS] {};
+		wchar_t savedDevice[CRASH_DEVICE_CHARS] {};
 		WORD ramp[3][256] {}; // NOLINT
-		std::memcpy(device, snapshot.device, sizeof(device));
-		std::memcpy(ramp, snapshot.ramp, sizeof(ramp));
+		loadWideAtomic(snapshot.identity, identity, CRASH_KEY_CHARS);
+		loadWideAtomic(snapshot.device, savedDevice, CRASH_DEVICE_CHARS);
+		for (auto channel = 0; channel < 3; ++channel) {
+			for (auto index = 0; index < 256; ++index) {
+				ramp[channel][index] = snapshot.ramp[channel][index].load(std::memory_order_relaxed);
+			}
+		}
 		auto after = snapshot.sequence.load(std::memory_order_acquire);
-		if (before != after || device[0] == L'\0') continue;
+		if (before != after || identity[0] == L'\0' || savedDevice[0] == L'\0') continue;
+
+		// DISPLAYn is only a topology slot. Resolve the saved target identity
+		// against the active display configuration immediately before writing;
+		// if it cannot be verified, fail closed instead of restoring another monitor.
+		wchar_t device[CRASH_DEVICE_CHARS] {};
+		if (api.resolveDevice == nullptr
+		    || !api.resolveDevice(identity, device, CRASH_DEVICE_CHARS) || device[0] == L'\0')
+			continue;
 
 		auto* hdc = api.createDc(L"DISPLAY", device, nullptr, nullptr);
 		if (hdc == nullptr) continue;
@@ -292,7 +504,13 @@ void GammaController::restoreSnapshots(const NativeApi& api) {
 }
 
 void GammaController::restoreForCrash() {
-	restoreSnapshots({&CreateDCW, &DeleteDC, &GetDeviceGammaRamp, &SetDeviceGammaRamp});
+	restoreSnapshots(
+	    {&CreateDCW,
+	     &DeleteDC,
+	     &GetDeviceGammaRamp,
+	     &SetDeviceGammaRamp,
+	     &resolveDisplayDeviceForIdentity}
+	);
 }
 
 void GammaController::watchIdentities() {
@@ -338,12 +556,23 @@ bool GammaController::trySetBrightness(const QString& screenName, qreal brightne
 	const auto lifetime = this->lifetimeOf(key);
 	auto clamped = std::clamp(brightness, 0.0, 1.0);
 	auto previous = this->backlightFactor.value(key, 1.0);
-	if (clamped >= 1.0) this->backlightFactor.remove(key);
-	else this->backlightFactor.insert(key, clamped);
+	if (clamped >= 1.0) {
+		this->backlightFactor.remove(key);
+		if (!this->dimFactor.contains(key)) this->dimmingRequested.remove(key);
+		this->retryBacklightFactor.remove(key);
+	} else {
+		this->backlightFactor.insert(key, clamped);
+		this->dimmingRequested.insert(key);
+	}
 	if (this->reapply(key)) return true;
 	// The screen went away or changed identity during the writes. Its state was
 	// dropped with it and a stale call must not bring any of it back.
 	if (this->lifetimeOf(key) != lifetime) return false;
+
+	// A dimming request stays outstanding after a transient write failure even
+	// though the owned factor rolls back to the last restorable state. The next
+	// display wake or topology change retries the requested factor.
+	if (clamped < 1.0) this->retryBacklightFactor.insert(key, clamped);
 
 	// A failed dim can still leave a written ramp (e.g. a successful floor probe
 	// whose undo failed). Keep the requested factor so a clear stays eligible.
@@ -359,8 +588,14 @@ bool GammaController::trySetBrightness(const QString& screenName, qreal brightne
 void GammaController::setDim(const QString& screenName, qreal factor) {
 	auto key = this->keyFor(screenName);
 	auto clamped = std::clamp(factor, 0.0, 1.0);
-	if (clamped >= 1.0) this->dimFactor.remove(key);
-	else this->dimFactor.insert(key, clamped);
+	if (clamped >= 1.0) {
+		this->dimFactor.remove(key);
+		if (!this->backlightFactor.contains(key) && !this->retryBacklightFactor.contains(key))
+			this->dimmingRequested.remove(key);
+	} else {
+		this->dimFactor.insert(key, clamped);
+		this->dimmingRequested.insert(key);
+	}
 	this->reapply(key);
 }
 
@@ -401,6 +636,8 @@ qreal GammaController::floorFor(const QString& key) {
 
 bool GammaController::reapply(const QString& key) {
 	auto ok = this->reapplyFactors(key);
+	if (ok && this->retryBacklightFactor.contains(key))
+		this->backlightFactor.insert(key, this->retryBacklightFactor.take(key));
 	// A snapshot is only kept while restoration is owed. Otherwise another
 	// application may change the ramp before the next attempt, which must then
 	// save that ramp rather than restore a stale one over it.
@@ -410,7 +647,7 @@ bool GammaController::reapply(const QString& key) {
 
 bool GammaController::reapplyFactors(const QString& key) {
 	const auto lifetime = this->lifetimeOf(key);
-	auto backlight = this->backlightFactor.value(key, 1.0);
+	auto backlight = this->retryBacklightFactor.value(key, this->backlightFactor.value(key, 1.0));
 	auto dim = this->dimFactor.value(key, 1.0);
 	auto combined = std::clamp(backlight * dim, 0.0, 1.0);
 
@@ -467,8 +704,12 @@ bool GammaController::apply(const QString& key, qreal brightness) {
 			}
 		}
 
-		// A copy: a retire during the native call drops the stored snapshot.
+		// Publish the original before the first non-neutral write. If the process
+		// dies inside the driver call, crash recovery already has everything it
+		// needs; a failed initial write removes that obligation again.
 		auto saved = this->originals.value(key);
+		auto wasWritten = this->written.contains(key);
+		this->updateCrashSnapshot(key, saved);
 		ok = this->api.setRamp(hdc, ramp.values) != FALSE;
 		if (this->lifetimeOf(key) != lifetime) {
 			// The id was retired while the write ran, so nothing owns it any more.
@@ -478,11 +719,12 @@ bool GammaController::apply(const QString& key, qreal brightness) {
 			ok = false;
 		} else if (ok) {
 			this->written.insert(key);
-			this->updateCrashSnapshot(key, saved);
 		}
-		if (!ok)
+		if (!ok) {
+			if (!wasWritten) this->removeCrashSnapshot(key);
 			qCDebug(logGamma) << "SetDeviceGammaRamp refused for" << qs::windows::logId(key)
 			                  << brightness;
+		}
 	}
 
 	this->api.deleteDc(hdc);
@@ -560,6 +802,8 @@ void GammaController::retire(const QString& id) {
 	++this->lifetimes[id];
 	this->backlightFactor.remove(id);
 	this->dimFactor.remove(id);
+	this->dimmingRequested.remove(id);
+	this->retryBacklightFactor.remove(id);
 	this->floors.remove(id);
 	this->originals.remove(id);
 	this->written.remove(id);

@@ -70,21 +70,34 @@ constexpr DWORD EVENT_RETRY_BASE_MS = 5000;
 	return EVENT_RETRY_BASE_MS * static_cast<DWORD>(factor);
 }
 
-// Owns the stop event and watcher thread. stop() signals the event and joins a
-// finitely polling worker with a bounded wait, so application teardown cannot hang.
+// Owns the watcher thread and shares RAII ownership of its stop event with that
+// worker. stop() cancels and joins a finitely polling worker with a bounded wait;
+// if the wait times out, the detached worker still owns a valid event handle and
+// exits without touching owner storage.
 class EventWatchThread {
 public:
 	EventWatchThread() = default;
 	~EventWatchThread();
 	Q_DISABLE_COPY_MOVE(EventWatchThread);
 
-	bool start(const std::function<void(HANDLE)>& worker);
+	using Cancelled = std::shared_ptr<std::atomic<bool>>;
+	using Worker = std::function<void(HANDLE, const Cancelled&)>;
+	bool start(const Worker& worker);
 	void stop();
 	[[nodiscard]] bool running() const;
 
 private:
+	struct StopState {
+		explicit StopState(HANDLE event): event(event) {}
+		~StopState() {
+			if (this->event != nullptr) CloseHandle(this->event);
+		}
+		HANDLE event;
+		std::atomic<bool> cancelled {false};
+	};
+
 	mutable std::mutex mutex;
-	HANDLE stopEvent = nullptr;
+	std::shared_ptr<StopState> stopState;
 	std::thread thread;
 	// Shared with the worker so the bounded-stop fallback can never leave a
 	// detached thread writing into this object's storage.

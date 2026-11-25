@@ -19,18 +19,28 @@ private slots:
 		);
 	}
 
-	void unrelatedFailuresStaySilentWithoutElevationEvidence() {
-		QVERIFY(!window_action_detail::shouldReportFailure(ERROR_INVALID_WINDOW_HANDLE, false));
+	void staleWindowHandlesUseTheirOwnReason() {
+		QVERIFY(window_action_detail::shouldReportFailure(ERROR_INVALID_WINDOW_HANDLE, false));
+		QVERIFY(window_action_detail::shouldReportFailure(ERROR_INVALID_WINDOW_HANDLE, true));
 		QCOMPARE(
 		    window_action_detail::refusalReason(ERROR_INVALID_WINDOW_HANDLE, false),
-		    QString()
+		    QStringLiteral("stale-window")
+		);
+		QCOMPARE(
+		    window_action_detail::refusalReason(ERROR_INVALID_WINDOW_HANDLE, true),
+		    QStringLiteral("stale-window")
 		);
 	}
 
-	void elevatedWindowsUseTheStableElevatedReason() {
-		QVERIFY(window_action_detail::shouldReportFailure(ERROR_INVALID_WINDOW_HANDLE, true));
+	void unrelatedFailuresStaySilentEvenOnAnElevatedWindow() {
+		QVERIFY(!window_action_detail::shouldReportFailure(ERROR_INVALID_PARAMETER, true));
+		QCOMPARE(window_action_detail::refusalReason(ERROR_INVALID_PARAMETER, true), QString());
+	}
+
+	void elevatedWindowsUseTheStableElevatedReasonOnlyForAccessDenied() {
+		QVERIFY(window_action_detail::shouldReportFailure(ERROR_ACCESS_DENIED, true));
 		QCOMPARE(
-		    window_action_detail::refusalReason(ERROR_INVALID_WINDOW_HANDLE, true),
+		    window_action_detail::refusalReason(ERROR_ACCESS_DENIED, true),
 		    QStringLiteral("elevated-window")
 		);
 		QCOMPARE(
