@@ -1,5 +1,6 @@
 #include <atomic>
 #include <functional>
+#include <optional>
 
 #include <qelapsedtimer.h>
 #include <qqmlcomponent.h>
@@ -538,7 +539,10 @@ QtObject {
 		QCOMPARE(desktops->pinSupported(), pinSupported);
 		QCOMPARE(observer.pinSupported(), pinSupported);
 		auto window = reinterpret_cast<HWND>(quintptr(1));
-		QCOMPARE(desktops->isWindowPinned(window), pinSupported);
+		QCOMPARE(
+		    desktops->isWindowPinned(window),
+		    pinSupported ? std::optional<bool>(true) : std::nullopt
+		);
 		QCOMPARE(
 		    qs::hyprland::ipc::dispatchPin(*desktops, window),
 		    pinSupported ? qs::hyprland::ipc::PinDispatchResult::Succeeded

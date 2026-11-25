@@ -1988,6 +1988,29 @@ private slots:
 		QVERIFY(manager->isTiled(editor));
 	}
 
+	void floatingDetailedDistinguishesScopeExclusionFromNoop() {
+		auto* outside = add(1, QStringLiteral("other"));
+		auto* inside = add(2);
+		manager->setIncluded({QStringLiteral("editor")});
+		enable();
+
+		QVERIFY(manager->isTiled(inside));
+		QVERIFY(!manager->isTiled(outside));
+		QCOMPARE(
+		    manager->setFloatingDetailed(outside, false, false), FloatingChangeResult::ScopeExcluded
+		);
+		QCOMPARE(
+		    manager->setFloatingDetailed(outside, false, true), FloatingChangeResult::ScopeExcluded
+		);
+		QVERIFY(!manager->isTiled(outside));
+
+		QCOMPARE(manager->setFloatingDetailed(inside, true, false), FloatingChangeResult::Changed);
+		manager->sync();
+		QVERIFY(!manager->isTiled(inside));
+		QCOMPARE(manager->setFloatingDetailed(inside, true, false), FloatingChangeResult::Noop);
+		QVERIFY(!manager->isTiled(inside));
+	}
+
 	void narrowedIncludedRemovesForcedTile() {
 		auto* a = add(1);
 		auto* b = add(2, QStringLiteral("terminal"));

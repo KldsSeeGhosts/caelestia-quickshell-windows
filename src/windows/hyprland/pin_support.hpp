@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include <qpointer.h>
 #include <qtypes.h>
 
@@ -20,19 +22,37 @@ struct PinCapability {
 	return PinCapability {pinSupported, pinSupported && accessorPinned};
 }
 
-enum class PinDispatchResult { Unsupported, Failed, Succeeded };
+enum class PinDispatchResult { Unsupported, QueryFailed, Failed, Succeeded };
 
 // Shared with fake-accessor tests; no native tracker or desktop is constructed.
+template <typename Supported, typename Query, typename Mutate, typename Window>
+PinDispatchResult dispatchPinAccess(
+    Supported&& pinSupported,
+    Query&& isWindowPinned,
+    Mutate&& pinWindow,
+    Window window,
+    PinRequest request = PinRequest::Toggle
+) {
+	if (!pinSupported()) return PinDispatchResult::Unsupported;
+
+	auto pinned = isWindowPinned(window);
+	if (!pinned.has_value()) return PinDispatchResult::QueryFailed;
+	auto desired = request == PinRequest::Pin ? true : request == PinRequest::Unpin ? false : !*pinned;
+	if (desired == *pinned) return PinDispatchResult::Succeeded;
+	if (!pinWindow(window, desired)) return PinDispatchResult::Failed;
+	return PinDispatchResult::Succeeded;
+}
+
 template <typename Desktops, typename Window>
 PinDispatchResult
 dispatchPin(Desktops& desktops, Window window, PinRequest request = PinRequest::Toggle) {
-	if (!desktops.pinSupported()) return PinDispatchResult::Unsupported;
-
-	auto pinned = desktops.isWindowPinned(window);
-	auto desired = request == PinRequest::Pin ? true : request == PinRequest::Unpin ? false : !pinned;
-	if (desired == pinned) return PinDispatchResult::Succeeded;
-	if (!desktops.pinWindow(window, desired)) return PinDispatchResult::Failed;
-	return PinDispatchResult::Succeeded;
+	return dispatchPinAccess(
+	    [&desktops] { return desktops.pinSupported(); },
+	    [&desktops](Window value) { return desktops.isWindowPinned(value); },
+	    [&desktops](Window value, bool pinned) { return desktops.pinWindow(value, pinned); },
+	    window,
+	    request
+	);
 }
 
 // The QML facade uses this observation core directly. It can be exercised

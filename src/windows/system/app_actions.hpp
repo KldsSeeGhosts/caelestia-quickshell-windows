@@ -13,6 +13,7 @@ struct AppActionInfo {
 	QString token;
 	QString name;
 	QString target;
+	QString linkTarget;
 	QString packageFamilyName;
 	QString executionAlias;
 	QString elevationTarget;

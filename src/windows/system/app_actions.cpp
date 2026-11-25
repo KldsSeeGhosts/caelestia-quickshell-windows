@@ -1,5 +1,6 @@
 #include "app_actions.hpp"
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -82,6 +83,31 @@ bool isFilesystemPath(const QString& path) {
 	if (path[0].isLetter() && path[1] == u':' && path[2] == u'\\') return true;
 	return path.startsWith(QStringLiteral("\\\\")) && path[2] != u'?' && path[2] != u'.';
 }
+
+bool malformedFilesystemPath(const QString& path) {
+	for (const auto c: path) {
+		if (c.unicode() < 0x20 || c.unicode() == 0x7f) return true;
+	}
+	return false;
+}
+
+std::optional<QString> validFilesystemPath(const QString& path) {
+	if (malformedFilesystemPath(path)) return std::nullopt;
+	const auto native = QDir::toNativeSeparators(path);
+	if (!isFilesystemPath(native)) return std::nullopt;
+	return native;
+}
+
+bool existingFilesystemPath(const QString& path) {
+	const auto wide = path.toStdWString();
+	return GetFileAttributesW(wide.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+#ifdef QS_TEST
+using PropertiesInvoker = std::function<DWORD(const QString&, HWND, DWORD)>;
+PropertiesInvoker propertiesInvokerForTest;
+std::optional<QStringList> shortcutRootsForTest;
+#endif
 
 bool canElevate(const QString& path) {
 	static const auto suffixes = QStringList {"exe", "bat", "cmd", "com", "msc"};
@@ -203,13 +229,14 @@ QString knownFolderTarget(const QString& token) {
 	return folder + token.sliced(close + 1);
 }
 
-QString win32Target(const QString& id, const QString& token) {
+QString win32Target(const QString& id, const QString& token, QString* registeredTarget = nullptr) {
 	auto target = WindowsDesktopEntryBackend::linkTargetForId(id);
+	if (registeredTarget != nullptr) *registeredTarget = QDir::toNativeSeparators(target);
 	if (target.isEmpty()) target = knownFolderTarget(token);
 	if (target.isEmpty()) target = token;
 
 	target = QDir::toNativeSeparators(target);
-	return isFilesystemPath(target) ? target : QString();
+	return validFilesystemPath(target).value_or(QString());
 }
 
 struct LinkIdentity {
@@ -217,24 +244,75 @@ struct LinkIdentity {
 	QString target;
 };
 
+QString normalizedNamespaceTarget(const QString& target) {
+	auto normalized = target;
+	if (normalized.startsWith(QStringLiteral("shell:::"), Qt::CaseInsensitive)) {
+		normalized.remove(0, QStringLiteral("shell:").size());
+	}
+	return normalized.startsWith(QStringLiteral("::{")) ? normalized.toLower() : QString();
+}
+
+bool sameLinkTarget(const QString& left, const QString& right) {
+	if (left.compare(right, Qt::CaseInsensitive) == 0) return true;
+	const auto leftNamespace = normalizedNamespaceTarget(left);
+	return !leftNamespace.isEmpty() && leftNamespace == normalizedNamespaceTarget(right);
+}
+
 LinkIdentity readLink(const QString& path) {
+	const auto com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+	if (FAILED(com) && com != RPC_E_CHANGED_MODE) return {};
+
 	auto wpath = path.toStdWString();
-	ComPtr<IShellItem2> item;
-	if (FAILED(SHCreateItemFromParsingName(wpath.c_str(), nullptr, IID_PPV_ARGS(&item)))) return {};
-
 	auto link = LinkIdentity();
-	PWSTR raw = nullptr;
-	if (SUCCEEDED(item->GetString(PKEY_AppUserModel_ID, &raw))) link.aumid = takeComString(raw);
+	ComPtr<IShellItem2> item;
+	if (SUCCEEDED(SHCreateItemFromParsingName(wpath.c_str(), nullptr, IID_PPV_ARGS(&item)))) {
+		PWSTR raw = nullptr;
+		if (SUCCEEDED(item->GetString(PKEY_AppUserModel_ID, &raw))) link.aumid = takeComString(raw);
 
-	raw = nullptr;
-	if (SUCCEEDED(item->GetString(PKEY_Link_TargetParsingPath, &raw))) {
-		link.target = QDir::toNativeSeparators(takeComString(raw));
+		raw = nullptr;
+		if (SUCCEEDED(item->GetString(PKEY_Link_TargetParsingPath, &raw))) {
+			link.target = QDir::toNativeSeparators(takeComString(raw));
+		}
 	}
 
+	ComPtr<IShellLinkW> shellLink;
+	if (SUCCEEDED(CoCreateInstance(
+	        CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&shellLink)
+	    )))
+	{
+		ComPtr<IPersistFile> persist;
+		if (SUCCEEDED(shellLink->QueryInterface(IID_PPV_ARGS(&persist)))
+		    && SUCCEEDED(persist->Load(wpath.c_str(), STGM_READ)))
+		{
+			PIDLIST_ABSOLUTE pidl = nullptr;
+			if (SUCCEEDED(shellLink->GetIDList(&pidl)) && pidl != nullptr) {
+				PWSTR parsingName = nullptr;
+				if (SUCCEEDED(SHGetNameFromIDList(pidl, SIGDN_DESKTOPABSOLUTEPARSING, &parsingName))) {
+					link.target = takeComString(parsingName);
+				}
+				CoTaskMemFree(pidl);
+			}
+
+			wchar_t target[MAX_PATH] = {};
+			if (link.target.isEmpty()
+			    && SUCCEEDED(shellLink->GetPath(target, MAX_PATH, nullptr, SLGP_RAWPATH)))
+			{
+				link.target = QDir::toNativeSeparators(QString::fromWCharArray(target));
+			}
+		}
+	}
+
+	item.Reset();
+	shellLink.Reset();
+	if (SUCCEEDED(com)) CoUninitialize();
 	return link;
 }
 
 QStringList startMenuRoots() {
+#ifdef QS_TEST
+	if (shortcutRootsForTest.has_value()) return *shortcutRootsForTest;
+#endif
+
 	auto roots = QStringList();
 
 	for (const auto& folderId: {FOLDERID_StartMenu, FOLDERID_CommonStartMenu}) {
@@ -255,7 +333,7 @@ QString findShortcut(const AppActionInfo& app) {
 		auto iter = QDirIterator(
 		    root,
 		    {QStringLiteral("*.lnk")},
-		    QDir::Files | QDir::Hidden,
+		    QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoSymLinks,
 		    QDirIterator::Subdirectories
 		);
 
@@ -278,9 +356,10 @@ QString findShortcut(const AppActionInfo& app) {
 				continue;
 			}
 
-			if (link.target.isEmpty() || link.target.compare(app.target, Qt::CaseInsensitive) != 0) {
-				continue;
-			}
+			const auto matchesTarget = !link.target.isEmpty()
+			    && (sameLinkTarget(link.target, app.target)
+			        || (!app.linkTarget.isEmpty() && sameLinkTarget(link.target, app.linkTarget)));
+			if (!matchesTarget) continue;
 
 			if (list == &named) return path;
 			if (fallback.isEmpty()) fallback = path;
@@ -318,13 +397,21 @@ QString startMenuShortcut(const AppActionInfo& app) {
 		if (known) cached = *it;
 	}
 
-	if (known && (cached.isEmpty() || QFileInfo::exists(cached))) return cached;
+	if (known && (cached.isEmpty() || existingFilesystemPath(cached))) return cached;
 
 	auto path = findShortcut(app);
 
 	QMutexLocker locker(&cache.mutex);
 	cache.paths.insert(app.token, path);
 	return path;
+}
+
+QString resolvePropertiesTarget(const AppActionInfo& app) {
+	for (const auto& candidate: {startMenuShortcut(app), app.target}) {
+		const auto valid = validFilesystemPath(candidate);
+		if (valid.has_value() && existingFilesystemPath(*valid)) return *valid;
+	}
+	return {};
 }
 
 DWORD runElevated(const QString& id, const AppActionInfo& app, HWND owner) {
@@ -433,18 +520,30 @@ HWND hwndForObject(QObject* object) {
 }
 
 DWORD showProperties(const QString& path, HWND owner) {
+	constexpr DWORD flags = SEE_MASK_INVOKEIDLIST | SEE_MASK_FLAG_NO_UI;
+#ifdef QS_TEST
+	if (propertiesInvokerForTest) return propertiesInvokerForTest(path, owner, flags);
+#endif
+
+	const auto com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+	if (FAILED(com)) return ERROR_INVALID_PARAMETER;
+
 	auto wpath = path.toStdWString();
 	auto info = SHELLEXECUTEINFOW {};
 	info.cbSize = sizeof(info);
-	info.fMask = SEE_MASK_INVOKEIDLIST | SEE_MASK_ASYNCOK | SEE_MASK_FLAG_NO_UI;
+	info.fMask = flags;
 	info.hwnd = owner;
 	info.lpVerb = L"properties";
 	info.lpFile = wpath.c_str();
 	info.nShow = SW_SHOWNORMAL;
 
-	if (ShellExecuteExW(&info)) return ERROR_SUCCESS;
-	const auto error = GetLastError();
-	return error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error;
+	auto error = DWORD(ERROR_SUCCESS);
+	if (!ShellExecuteExW(&info)) {
+		error = GetLastError();
+		if (error == ERROR_SUCCESS) error = ERROR_GEN_FAILURE;
+	}
+	CoUninitialize();
+	return error;
 }
 
 bool selectInExplorer(const QString& id, const QString& path) {
@@ -492,6 +591,27 @@ void openSettings(const QString& id, const QString& uri) {
 
 } // namespace
 
+#ifdef QS_TEST
+namespace test {
+
+void setPropertiesInvokerForTest(const std::function<DWORD(const QString&, HWND, DWORD)>& invoker) {
+	propertiesInvokerForTest = invoker;
+}
+
+void setShortcutRootsForTest(const QStringList& roots) {
+	shortcutRootsForTest = roots;
+	clearShortcutCache();
+}
+
+void resetPropertiesTestHooks() {
+	propertiesInvokerForTest = {};
+	shortcutRootsForTest.reset();
+	clearShortcutCache();
+}
+
+} // namespace test
+#endif
+
 AppActions::AppActions(QObject* parent): QObject(parent) {
 	QObject::connect(
 	    DesktopEntryManager::instance(),
@@ -533,14 +653,14 @@ AppActionInfo AppActions::details(const QString& entryId) {
 			app.canUninstall = true;
 		}
 	} else {
-		app.target = win32Target(id, token);
+		app.target = win32Target(id, token, &app.linkTarget);
 
 		auto* entry = DesktopEntryManager::instance()->byId(id);
 		if (entry != nullptr) app.name = entry->bindableName().value();
 
 		app.canRunAsAdmin = canElevate(app.target);
 		app.canOpenLocation = !app.target.isEmpty();
-		app.canOpenProperties = !app.target.isEmpty();
+		app.canOpenProperties = !resolvePropertiesTarget(app).isEmpty();
 		app.canUninstall = !app.target.isEmpty() && !isUnderWindows(app.target);
 	}
 
@@ -704,9 +824,8 @@ bool AppActions::openProperties(const QString& entryId, QObject* parentWindow) {
 		return false;
 	}
 
-	auto target = startMenuShortcut(app);
-	if (target.isEmpty() || !QFileInfo::exists(target)) target = app.target;
-	if (target.isEmpty() || target.contains(QChar::Null)) {
+	const auto target = resolvePropertiesTarget(app);
+	if (target.isEmpty()) {
 		this->setLastError(QStringLiteral("The application entry is not available"));
 		return false;
 	}

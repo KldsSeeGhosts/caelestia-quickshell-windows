@@ -2,6 +2,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include <qhash.h>
 #include <qlist.h>
@@ -619,27 +620,6 @@ void Dispatcher::fullscreen(TrackedWindow* window, int mode) {
 	window->setMaximized(!window->maximized());
 }
 
-void Dispatcher::pin(TrackedWindow* window, PinRequest request) {
-	if (window == nullptr) return;
-
-	auto* desktops = this->ipc->desktops();
-	auto result = dispatchPin(*desktops, window->hwnd(), request);
-	if (result == PinDispatchResult::Unsupported) {
-		this->unsupported("pin (needs VirtualDesktopAccessor.dll with pin exports)");
-		reportPinRefusal(this->ipc->tracker(), result, window->elevated());
-		return;
-	}
-
-	if (result == PinDispatchResult::Failed) {
-		this->unsupported("pin (VirtualDesktopAccessor call failed)");
-		reportPinRefusal(this->ipc->tracker(), result, window->elevated());
-		return;
-	}
-
-	// Pinned is now read from the accessor, so refresh the window's ipc object.
-	if (auto* toplevel = this->ipc->toplevelForWindow(window)) toplevel->markIpcObjectDirty();
-}
-
 void Dispatcher::focusMonitor(const QString& arg) {
 	auto* desktops = this->ipc->desktops();
 	const auto operation = QStringLiteral("focusmonitor");
@@ -835,22 +815,6 @@ void Dispatcher::swapWindow(const QString& direction) {
 	tiling->swapDirection(*edge);
 }
 
-void Dispatcher::toggleFloating(TrackedWindow* window, const QString& action) {
-	auto* tiling = TilingManager::active();
-	if (tiling == nullptr) {
-		this->unsupported("togglefloating (without tiling)");
-		reportToggleFloatingDisabled(
-		    this->ipc->tracker(), window != nullptr && window->elevated()
-		);
-		return;
-	}
-
-	if (window == nullptr) return;
-	if (!tiling->setFloating(window, action == "float", action == "toggle")) {
-		reportToggleFloatingFailure(this->ipc->tracker(), window->elevated());
-	}
-}
-
 void Dispatcher::toggleSplit() {
 	auto* tiling = TilingManager::active();
 	if (tiling == nullptr) {
@@ -1004,13 +968,6 @@ void Dispatcher::unknown(const QString& what) {
 	if (this->warned.contains(what)) return;
 	this->warned.insert(what);
 	qCWarning(logDispatch) << "Unknown dispatcher" << what << "(further uses are not logged)";
-}
-
-void Dispatcher::unsupported(const QString& what) {
-	if (this->warned.contains(what)) return;
-	this->warned.insert(what);
-	qCInfo(logDispatch) << "Dispatcher" << what
-	                    << "has no Windows equivalent; ignored (further uses are not logged)";
 }
 
 } // namespace qs::hyprland::ipc

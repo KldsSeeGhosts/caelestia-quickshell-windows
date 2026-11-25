@@ -1,11 +1,15 @@
 #pragma once
 
+#include <functional>
+#include <optional>
+
 #include <qhash.h>
 #include <qset.h>
 #include <qstring.h>
 #include <qstringlist.h>
 #include <qtypes.h>
 
+#include "../tiling_result.hpp"
 #include "../window_tracker.hpp"
 #include "dispatcher_args.hpp"
 #include "window_cycle.hpp"
@@ -16,7 +20,25 @@ class HyprlandIpc;
 
 class Dispatcher {
 public:
-	explicit Dispatcher(HyprlandIpc* ipc): ipc(ipc) {}
+	explicit Dispatcher(HyprlandIpc* ipc);
+
+#ifdef QS_TEST
+	struct TestHooks {
+		qs::windows::WindowTracker* tracker = nullptr;
+		std::function<bool()> pinSupported;
+		std::function<std::optional<bool>(HWND)> queryPin;
+		std::function<bool(HWND, bool)> setPin;
+		std::function<std::optional<qs::windows::FloatingChangeResult>(
+		    qs::windows::TrackedWindow*, bool, bool)>
+		    setFloating;
+	};
+
+	explicit Dispatcher(TestHooks hooks);
+	void pinForTest(qs::windows::TrackedWindow* window, PinRequest request) { this->pin(window, request); }
+	void toggleFloatingForTest(qs::windows::TrackedWindow* window, const QString& action) {
+		this->toggleFloating(window, action);
+	}
+#endif
 
 	void dispatch(const QString& request);
 
@@ -55,10 +77,20 @@ private:
 	void moveWindowPixel(qs::windows::TrackedWindow* window, const QString& x, const QString& y);
 	void exec(const QString& command);
 
+	[[nodiscard]] qs::windows::WindowTracker* actionTracker() const;
+	[[nodiscard]] bool pinActionSupported() const;
+	[[nodiscard]] std::optional<bool> pinState(HWND hwnd) const;
+	bool setPinState(HWND hwnd, bool pinned);
+	[[nodiscard]] std::optional<qs::windows::FloatingChangeResult>
+	changeFloating(qs::windows::TrackedWindow* window, bool floating, bool toggle) const;
+
 	void unknown(const QString& what);
 	void unsupported(const QString& what);
 
 	HyprlandIpc* ipc;
+#ifdef QS_TEST
+	TestHooks testHooks;
+#endif
 	QSet<QString> warned;
 	WindowCycle<qs::windows::TrackedWindow> windowCycle;
 };

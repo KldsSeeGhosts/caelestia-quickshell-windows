@@ -25,6 +25,7 @@
 
 #include "tiling_layout.hpp"
 #include "tiling_persistence.hpp"
+#include "tiling_result.hpp"
 #include "tiling_scope.hpp"
 
 namespace qs::windows {
@@ -143,6 +144,7 @@ public:
 	bool focusMaster(TrackedWindow* window);
 	bool resizeTiled(TrackedWindow* window, qint32 dx, qint32 dy);
 	bool setFloating(TrackedWindow* window, bool floating, bool toggle);
+	FloatingChangeResult setFloatingDetailed(TrackedWindow* window, bool floating, bool toggle);
 
 	bool scrollColumns(TrackedWindow* window, qint32 delta);
 	bool scrollView(TrackedWindow* window, qint32 pixels);

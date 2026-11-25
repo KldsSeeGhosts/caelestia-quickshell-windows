@@ -430,7 +430,7 @@ qs_add_portable_suite(app_actions
 	${QS_WINDOWS_SRC}/../core/model.cpp
 	${QS_WINDOWS_SRC}/../core/redact.cpp
 )
-target_compile_definitions(qs_suite_app_actions PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_definitions(qs_suite_app_actions PRIVATE QS_TEST NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(qs_suite_app_actions PRIVATE ${QS_WINDOWS_SRC})
 target_link_libraries(qs_suite_app_actions PRIVATE
 	Qt6::Core Qt6::Gui Qt6::Quick Qt6::Qml Qt6::Test shell32 ole32 user32 advapi32
@@ -438,12 +438,13 @@ target_link_libraries(qs_suite_app_actions PRIVATE
 
 qs_add_portable_suite(dispatch_refusal
 	dispatch_refusal_test.cpp
+	${QS_WINDOWS_SRC}/hyprland/dispatcher_actions.cpp
 	${QS_WINDOWS_SRC}/window_action_refusal.cpp
 	${QS_WINDOWS_SRC}/window_tracker.hpp
 )
 target_compile_definitions(qs_suite_dispatch_refusal PRIVATE QS_TEST NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(qs_suite_dispatch_refusal PRIVATE ${QS_WINDOWS_SRC})
-target_link_libraries(qs_suite_dispatch_refusal PRIVATE Qt6::Core Qt6::Gui Qt6::Test)
+target_link_libraries(qs_suite_dispatch_refusal PRIVATE Qt6::Core Qt6::Gui Qt6::Test user32)
 
 qs_add_portable_suite(hyprland_qml
 	hyprland_qml_test.cpp
@@ -468,7 +469,10 @@ target_link_libraries(qs_suite_hyprland_qml PRIVATE Qt6::Core Qt6::Gui Qt6::Qml 
 
 # Compile the native dispatcher and toplevel adaptors too: the pure fixture
 # above deliberately does not link their platform singletons or execute activation.
-add_library(dispatcher_compile_check OBJECT ${QS_WINDOWS_SRC}/hyprland/dispatcher.cpp)
+add_library(dispatcher_compile_check OBJECT
+	${QS_WINDOWS_SRC}/hyprland/dispatcher.cpp
+	${QS_WINDOWS_SRC}/hyprland/dispatcher_actions.cpp
+)
 target_compile_definitions(dispatcher_compile_check PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(dispatcher_compile_check PRIVATE Qt6::Quick Qt6::Qml)
 

@@ -2,6 +2,7 @@
 
 #include <qstring.h>
 
+#include "../tiling_result.hpp"
 #include "pin_support.hpp"
 
 namespace qs::hyprland::ipc {
@@ -9,6 +10,9 @@ namespace qs::hyprland::ipc {
 [[nodiscard]] inline QString pinRefusalReason(PinDispatchResult result, bool elevated) {
 	if (result == PinDispatchResult::Unsupported) {
 		return QStringLiteral("Window pinning is not available on this system");
+	}
+	if (result == PinDispatchResult::QueryFailed) {
+		return QStringLiteral("Could not read the window pin state");
 	}
 	if (result == PinDispatchResult::Failed) {
 		return elevated ? QStringLiteral("Windows refused to pin an elevated window")
@@ -30,15 +34,29 @@ void reportToggleFloatingDisabled(Tracker* tracker, bool elevated) {
 	);
 }
 
-[[nodiscard]] inline QString toggleFloatingRefusalReason(bool elevated) {
+[[nodiscard]] inline QString
+toggleFloatingRefusalReason(qs::windows::FloatingChangeResult result, bool elevated) {
+	if (result == qs::windows::FloatingChangeResult::ScopeExcluded) {
+		return QStringLiteral("Window is excluded from tiling");
+	}
 	return elevated ? QStringLiteral("Windows prevents tiling an elevated window")
 	                : QStringLiteral("Window cannot change floating state");
 }
 
 template <typename Tracker>
-void reportToggleFloatingFailure(Tracker* tracker, bool elevated) {
+void reportToggleFloatingResult(
+    Tracker* tracker,
+    qs::windows::FloatingChangeResult result,
+    bool elevated
+) {
+	if (result == qs::windows::FloatingChangeResult::Changed
+	    || result == qs::windows::FloatingChangeResult::Noop
+	    || result == qs::windows::FloatingChangeResult::Deferred)
+	{
+		return;
+	}
 	tracker->reportActionRefusal(
-	    QStringLiteral("togglefloating"), toggleFloatingRefusalReason(elevated), elevated
+	    QStringLiteral("togglefloating"), toggleFloatingRefusalReason(result, elevated), elevated
 	);
 }
 

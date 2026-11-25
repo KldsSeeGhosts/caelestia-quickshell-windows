@@ -1,6 +1,7 @@
 qt_add_library(quickshell-windows-hyprland STATIC
 	connection.cpp
 	dispatcher.cpp
+	dispatcher_actions.cpp
 	monitor.cpp
 	workspace.cpp
 	hyprland_toplevel.cpp

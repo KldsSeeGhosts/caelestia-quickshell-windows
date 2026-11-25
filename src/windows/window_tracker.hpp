@@ -141,6 +141,12 @@ class TrackedWindow: public QObject {
 
 public:
 	~TrackedWindow() override;
+#ifdef QS_TEST
+	static TrackedWindow* createForTest(WindowTracker* tracker, HWND hwnd) {
+		return new TrackedWindow(tracker, hwnd);
+	}
+	void setElevatedForTest(bool elevated) { this->bElevated = elevated; }
+#endif
 	[[nodiscard]] HWND hwnd() const { return this->mHwnd; }
 	[[nodiscard]] quint64 address() const;
 	[[nodiscard]] QString addressHex() const;

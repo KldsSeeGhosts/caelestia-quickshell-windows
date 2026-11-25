@@ -3726,8 +3726,15 @@ bool TilingManager::resizeTiled(TrackedWindow* window, qint32 dx, qint32 dy) {
 }
 
 bool TilingManager::setFloating(TrackedWindow* window, bool floating, bool toggle) {
+	const auto result = this->setFloatingDetailed(window, floating, toggle);
+	return result == FloatingChangeResult::Changed || result == FloatingChangeResult::Noop
+	    || result == FloatingChangeResult::Deferred;
+}
+
+FloatingChangeResult
+TilingManager::setFloatingDetailed(TrackedWindow* window, bool floating, bool toggle) {
 	auto iter = this->managed.find(window);
-	if (iter == this->managed.end()) return false;
+	if (iter == this->managed.end()) return FloatingChangeResult::Failed;
 
 	auto& m = iter->second;
 	if (toggle) floating = m.layout != nullptr;
@@ -3735,7 +3742,20 @@ bool TilingManager::setFloating(TrackedWindow* window, bool floating, bool toggl
 	if (!floating && m.elevated) {
 		qCInfo(logTiling) << "Window" << window->addressHex()
 		                  << "belongs to a more privileged process and can't be tiled.";
-		return false;
+		return FloatingChangeResult::Elevated;
+	}
+
+	if (!floating && this->outsideScope(m)) {
+		qCInfo(logTiling) << "Window" << window->addressHex()
+		                  << "is outside the configured tiling scope and can't be tiled.";
+		return FloatingChangeResult::ScopeExcluded;
+	}
+
+	if (!toggle) {
+		const auto overrideMatches = floating ? m.override == Override::Float
+		                                      : m.override == Override::Tile;
+		const auto stateMatches = floating ? m.layout == nullptr : m.layout != nullptr;
+		if (overrideMatches && stateMatches) return FloatingChangeResult::Noop;
 	}
 
 	m.override = floating ? Override::Float : Override::Tile;
@@ -3745,7 +3765,7 @@ bool TilingManager::setFloating(TrackedWindow* window, bool floating, bool toggl
 	m.terminalAdmissionAt = 0;
 
 	this->markWindow(window);
-	return true;
+	return FloatingChangeResult::Changed;
 }
 
 bool TilingManager::beginEdgeDrag(TrackedWindow* window, bool left, bool top) {
