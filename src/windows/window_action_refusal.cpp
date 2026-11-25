@@ -33,6 +33,7 @@ void WindowTracker::reportWindowActionRefused(
     const QString& reason,
     bool elevated
 ) {
+	++this->mActionErrorGeneration;
 	auto text = window_action_detail::errorText(action, reason);
 	this->mLastActionErrorWindow = window;
 	if (this->mLastActionError != text) {
@@ -62,6 +63,7 @@ void WindowTracker::notePendingUserMove(quint64 sequence, TrackedWindow* window)
 	        .window = window,
 	        .hwnd = window->hwnd(),
 	        .windowErrorGeneration = window->mActionErrorGeneration,
+	        .trackerErrorGeneration = this->mActionErrorGeneration,
 	    }
 	);
 }
@@ -84,7 +86,9 @@ void WindowTracker::completePendingUserMove(
 
 	auto* window = entry.window.data();
 	const auto sameTracked = window != nullptr && this->byHwnd.value(hwnd) == window;
-	if (sameTracked && window->mActionErrorGeneration != entry.windowErrorGeneration) {
+	if (this->mActionErrorGeneration != entry.trackerErrorGeneration
+	    || (sameTracked && window->mActionErrorGeneration != entry.windowErrorGeneration))
+	{
 		return;
 	}
 	if (succeeded) {

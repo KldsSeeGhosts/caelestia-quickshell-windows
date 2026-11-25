@@ -1165,6 +1165,10 @@ int refreshNativeDesktopForTest() {
 	return channel().execute([] { return desktopCount(); }, true, false, Channel::Kind::Probe);
 }
 int nativeDesktopWorkerCountForTest() { return liveWorkers().load(); }
+bool nativeDesktopPendingReadyForTest() {
+	const auto& c = channel();
+	return c.pending && c.pending->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+}
 void setNativeDesktopStuckBoundForTest(int milliseconds) {
 	channel().stallLimit = std::chrono::milliseconds(milliseconds);
 }

@@ -425,6 +425,7 @@ private:
 		QPointer<TrackedWindow> window;
 		HWND hwnd = nullptr;
 		quint64 windowErrorGeneration = 0;
+		quint64 trackerErrorGeneration = 0;
 	};
 
 	void notePendingUserMove(quint64 sequence, TrackedWindow* window);
@@ -448,6 +449,7 @@ private:
 	QList<TrackedWindow*> mWindows;
 	QString mLastActionError;
 	const TrackedWindow* mLastActionErrorWindow = nullptr;
+	quint64 mActionErrorGeneration = 0;
 	QHash<quint64, PendingUserMove> mPendingUserMoves;
 	QHash<HWND, TrackedWindow*> byHwnd;
 	TrackedWindow* mActive = nullptr;

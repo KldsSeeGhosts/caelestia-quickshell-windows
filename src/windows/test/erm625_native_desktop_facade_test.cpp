@@ -644,25 +644,25 @@ private slots:
 		// A later provider disconnect before deferred delivery must not reclassify
 		// an already-completed unmovable rejection as provider-disconnected.
 		moveCompleted.clear();
-		std::atomic<bool> firstFinished = false;
 		this->old.manager.canMove = false;
-		this->old.manager.beforeCanMove = [&firstFinished] {
-			QThread::msleep(150);
-			firstFinished.store(true);
-		};
+		this->old.manager.beforeCanMove = [] { QThread::msleep(150); };
 		QVERIFY(this->desktops->moveWindow(window, 1));
 		const auto seqA = nativeDesktopPendingMoveSequence();
 		QVERIFY(seqA != 0);
 		QElapsedTimer waitWorker;
 		waitWorker.start();
-		while (!firstFinished.load() && waitWorker.elapsed() < 1000) QThread::msleep(5);
-		QThread::msleep(20);
+		while (!nativeDesktopPendingReadyForTest() && waitWorker.elapsed() < 1000) QThread::msleep(5);
+		QVERIFY(nativeDesktopPendingReadyForTest());
 		// Second move collects A synchronously (queuing A's notification) and then
 		// disconnects the provider before Qt delivers A's queued callback.
 		this->old.manager.canMove = true;
 		this->old.manager.beforeCanMove = {};
 		this->old.manager.moveResult = RPC_E_DISCONNECTED;
 		QVERIFY(!this->desktops->moveWindow(window, 1));
+		QCOMPARE(
+		    this->desktops->lastCommand().value("reason").toString(),
+		    QStringLiteral("provider-disconnected")
+		);
 		QVERIFY(waitUntil([&moveCompleted] { return moveCompleted.size() == 1; }, 1000));
 		QCOMPARE(moveCompleted.size(), 1);
 		QCOMPARE(moveCompleted.first().at(0).toULongLong(), seqA);
