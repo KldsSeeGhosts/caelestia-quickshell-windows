@@ -346,6 +346,106 @@ private slots:
 		    QStringLiteral("move:") + expectedReason
 		);
 	}
+
+	void lateMoveRefusalIgnoresReplacementWindowAndDoesNotProbeElevation() {
+		DispatcherFixture fixture;
+		const auto hwnd = reinterpret_cast<HWND>(static_cast<quintptr>(0x42));
+		auto* original = TrackedWindow::createForTest(fixture.tracker, hwnd);
+		fixture.tracker->registerWindowForTest(original);
+		fixture.tracker->notePendingUserMoveForTest(11, original);
+
+		// Close the original window and recycle the HWND for a replacement.
+		fixture.tracker->unregisterWindowForTest(original);
+		delete original;
+		auto* replacement = TrackedWindow::createForTest(fixture.tracker, hwnd);
+		fixture.tracker->registerWindowForTest(replacement);
+
+		QSignalSpy replacementRefused(replacement, &TrackedWindow::actionRefused);
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+		int elevationChecks = 0;
+
+		fixture.tracker->completePendingUserMoveForTest(
+		    11,
+		    reinterpret_cast<quintptr>(hwnd),
+		    false,
+		    QStringLiteral("permission-denied"),
+		    [](const TrackedWindow*) { return true; },
+		    [&elevationChecks](HWND) {
+			    ++elevationChecks;
+			    return true;
+		    }
+		);
+
+		QCOMPARE(elevationChecks, 0);
+		QCOMPARE(replacementRefused.size(), 0);
+		QCOMPARE(replacement->lastActionError(), QString());
+		QCOMPARE(trackerRefused.size(), 1);
+		QCOMPARE(trackerRefused.first().at(0).toString(), QStringLiteral("move"));
+		QCOMPARE(
+		    trackerRefused.first().at(1).toString(),
+		    QStringLiteral("Windows denied permission to move this window")
+		);
+		QCOMPARE(trackerRefused.first().at(2).toBool(), false);
+	}
+
+	void lateMoveSuccessPreservesNewerRefusalAndClearsOlderError() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		// Start pending move A, then record a newer refusal B before A finishes.
+		fixture.tracker->notePendingUserMoveForTest(21, fixture.window);
+		fixture.window->reportActionRefusedForTest(
+		    QStringLiteral("move"),
+		    qs::hyprland::ipc::moveRefusalReason(QStringLiteral("provider-busy"), false),
+		    false
+		);
+		const auto busyError = fixture.window->lastActionError();
+		QVERIFY(!busyError.isEmpty());
+
+		fixture.tracker->completePendingUserMoveForTest(
+		    21,
+		    reinterpret_cast<quintptr>(fixture.window->hwnd()),
+		    true,
+		    QString(),
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; }
+		);
+
+		QCOMPARE(fixture.window->lastActionError(), busyError);
+		QCOMPARE(fixture.tracker->lastActionError(), busyError);
+
+		// A later move C started after refusal B clears it on late success.
+		fixture.tracker->notePendingUserMoveForTest(22, fixture.window);
+		fixture.tracker->completePendingUserMoveForTest(
+		    22,
+		    reinterpret_cast<quintptr>(fixture.window->hwnd()),
+		    true,
+		    QString(),
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; }
+		);
+
+		QCOMPARE(fixture.window->lastActionError(), QString());
+		QCOMPARE(fixture.tracker->lastActionError(), QString());
+	}
+
+	void lateMoveCompletionIgnoresUntrackedMove() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+
+		fixture.tracker->completePendingUserMoveForTest(
+		    99,
+		    reinterpret_cast<quintptr>(fixture.window->hwnd()),
+		    false,
+		    QStringLiteral("permission-denied"),
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return true; }
+		);
+
+		QCOMPARE(trackerRefused.size(), 0);
+		QCOMPARE(fixture.tracker->lastActionError(), QString());
+	}
 };
 
 } // namespace

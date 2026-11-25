@@ -90,6 +90,7 @@ struct Provider {
 	bool privateEnabled = true;
 	DesktopAvailability availability = DesktopAvailability::MissingProvider;
 	HRESULT lastError = S_OK;
+	HRESULT operationError = S_OK;
 
 	void dropPrivate() {
 		release(this->snapshot);
@@ -108,6 +109,7 @@ struct Provider {
 		qCWarning(logNativeDesktops) << operation << "raised a structured exception";
 		this->structuredException = true;
 		this->lastError = E_UNEXPECTED;
+		this->operationError = E_UNEXPECTED;
 		this->availability = DesktopAvailability::Disconnected;
 		this->drop();
 	}
@@ -130,6 +132,7 @@ struct Provider {
 	bool check(HRESULT hr, const char* operation) {
 		if (SUCCEEDED(hr)) return true;
 		this->lastError = hr;
+		this->operationError = hr;
 		qCWarning(logNativeDesktops) << operation << "refused, HRESULT" << Qt::hex << hr;
 		if (hr == RPC_E_DISCONNECTED || hr == CO_E_OBJNOTCONNECTED
 		    || hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE))
@@ -331,6 +334,7 @@ int createDesktop() {
 
 int moveWindow(HWND window, int index) {
 	auto& p = provider();
+	p.lastError = S_OK;
 	auto desktop = p.desktop(index);
 	if (!desktop || !p.validWindow(window)) return -1;
 	ApplicationView* view = nullptr;
@@ -377,6 +381,7 @@ struct Snapshot {
 	QHash<quintptr, WindowSnapshot> windows;
 	DesktopAvailability availability = DesktopAvailability::MissingProvider;
 	HRESULT error = S_OK;
+	HRESULT operationError = S_OK;
 	int result = -1;
 	quint64 sequence = 0;
 	bool publicReady = false;
@@ -468,7 +473,9 @@ struct Worker {
 			Snapshot snapshot;
 			snapshot.sequence = request->sequence;
 			try {
+				p.operationError = S_OK;
 				snapshot.result = FAILED(apartment) ? -1 : request->operation();
+				snapshot.operationError = FAILED(apartment) ? apartment : p.operationError;
 				for (const auto value: request->windows) {
 					auto hwnd = reinterpret_cast<HWND>(value);
 					WindowSnapshot window;
@@ -501,6 +508,7 @@ struct Worker {
 			} catch (...) {
 				snapshot.availability = DesktopAvailability::Disconnected;
 				snapshot.error = E_UNEXPECTED;
+				snapshot.operationError = E_UNEXPECTED;
 			}
 			request->completion.set_value(std::move(snapshot));
 			SetEvent(request->finished);
@@ -843,7 +851,7 @@ struct Channel {
 			auto value = finished.result.get();
 			const auto outcome = value.result;
 			const auto success = outcome != -1;
-			const auto error = value.error;
+			const auto operationError = value.operationError;
 			const auto publicReady = value.publicReady;
 			if (!finished.queryWindows) value.windows = this->snapshot.windows;
 			if (value.sequence < this->applied) this->refreshAgain = true;
@@ -851,7 +859,12 @@ struct Channel {
 			if (finished.moveTarget != nullptr) {
 				const auto moveOk = outcome == 0 && (available || (finished.publicOperation && publicReady));
 				const auto moveSequence = finished.request ? finished.request->sequence : 0;
-				this->notifyMoveCompleted(moveSequence, finished.moveTarget, moveOk, moveOk ? S_OK : error);
+				this->notifyMoveCompleted(
+				    moveSequence,
+				    finished.moveTarget,
+				    moveOk,
+				    moveOk ? S_OK : operationError
+				);
 			}
 			if (finished.kind == Kind::Acquisition && success && available) {
 				++this->windowRevision;
@@ -1063,6 +1076,7 @@ std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop) {
 	const auto result = channel().execute(
 	    [hwnd, desktop] {
 		    auto& p = provider();
+		    p.lastError = S_OK;
 		    if (!p.publicApi) return -2;
 		    return p.invoke(
 		               [&] { return p.publicApi->MoveWindowToDesktop(hwnd, desktop); },

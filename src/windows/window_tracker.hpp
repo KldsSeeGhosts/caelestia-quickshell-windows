@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <thread>
 
 #include <vector>
@@ -9,6 +10,7 @@
 #include <qlist.h>
 #include <qobject.h>
 #include <qpoint.h>
+#include <qpointer.h>
 #include <qproperty.h>
 #include <qrect.h>
 #include <qscreen.h>
@@ -146,6 +148,9 @@ public:
 		return new TrackedWindow(tracker, hwnd);
 	}
 	void setElevatedForTest(bool elevated) { this->bElevated = elevated; }
+	void reportActionRefusedForTest(const QString& action, const QString& reason, bool elevated) {
+		this->reportActionRefused(action, reason, elevated);
+	}
 #endif
 	[[nodiscard]] HWND hwnd() const { return this->mHwnd; }
 	[[nodiscard]] quint64 address() const;
@@ -261,6 +266,7 @@ private:
 
 	WindowTracker* tracker;
 	QString mLastActionError;
+	quint64 mActionErrorGeneration = 0;
 	HWND mHwnd;
 	bool uwpFrame = false;
 	quint32 mFrameProcessId = 0;
@@ -308,6 +314,27 @@ public:
 #ifdef QS_TEST
 	static WindowTracker* createForTest();
 	static void destroyForTest(WindowTracker* tracker);
+	void registerWindowForTest(TrackedWindow* window) {
+		if (window != nullptr) this->byHwnd.insert(window->hwnd(), window);
+	}
+	void unregisterWindowForTest(TrackedWindow* window) {
+		if (window != nullptr && this->byHwnd.value(window->hwnd()) == window) {
+			this->byHwnd.remove(window->hwnd());
+		}
+	}
+	void notePendingUserMoveForTest(quint64 sequence, TrackedWindow* window) {
+		this->notePendingUserMove(sequence, window);
+	}
+	void completePendingUserMoveForTest(
+	    quint64 sequence,
+	    quintptr rawHwnd,
+	    bool succeeded,
+	    const QString& code,
+	    const std::function<bool(const TrackedWindow*)>& ownerMatches,
+	    const std::function<bool(HWND)>& checkElevated
+	) {
+		this->completePendingUserMove(sequence, rawHwnd, succeeded, code, ownerMatches, checkElevated);
+	}
 #endif
 	// Null until the first instance() call. A configuration setter uses this to
 	// re-evaluate live windows without starting the tracker just to store a
@@ -393,7 +420,21 @@ private:
 	void updateScreens();
 	void onScreensChanged();
 	void onDesktopsChanged();
-	void notePendingUserMove(quint64 sequence, HWND hwnd);
+	struct PendingUserMove {
+		QPointer<TrackedWindow> window;
+		HWND hwnd = nullptr;
+		quint64 windowErrorGeneration = 0;
+	};
+
+	void notePendingUserMove(quint64 sequence, TrackedWindow* window);
+	void completePendingUserMove(
+	    quint64 sequence,
+	    quintptr rawHwnd,
+	    bool succeeded,
+	    const QString& code,
+	    const std::function<bool(const TrackedWindow*)>& ownerMatches,
+	    const std::function<bool(HWND)>& checkElevated
+	);
 	void onMoveWindowCompleted(quint64 sequence, quintptr hwnd, bool succeeded, const QString& code);
 	void reportWindowActionRefused(
 	    const TrackedWindow* window,
@@ -406,7 +447,7 @@ private:
 	QList<TrackedWindow*> mWindows;
 	QString mLastActionError;
 	const TrackedWindow* mLastActionErrorWindow = nullptr;
-	QHash<quint64, HWND> mPendingUserMoves;
+	QHash<quint64, PendingUserMove> mPendingUserMoves;
 	QHash<HWND, TrackedWindow*> byHwnd;
 	TrackedWindow* mActive = nullptr;
 	VirtualDesktops* mDesktops = nullptr;

@@ -612,6 +612,38 @@ private slots:
 		QCOMPARE(nativeDesktopWorkerCountForTest(), 1);
 		QCOMPARE(results.count(), 1);
 	}
+
+	void lateUnmovableMoveDoesNotReusePriorPermissionError() {
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb3));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		this->old.manager.moveResult = E_ACCESSDENIED;
+		QVERIFY(!this->desktops->moveWindow(window, 1));
+		QCOMPARE(
+		    this->desktops->lastCommand().value("reason").toString(),
+		    QStringLiteral("permission-denied")
+		);
+
+		QSignalSpy moveCompleted(this->desktops, &VirtualDesktops::moveWindowCompleted);
+		this->old.manager.moveResult = S_OK;
+		this->old.manager.canMove = false;
+		this->old.manager.beforeCanMove = [] { QThread::msleep(150); };
+		QVERIFY(this->desktops->moveWindow(window, 1));
+		QVERIFY(nativeDesktopCommandPending());
+		const auto sequence = nativeDesktopPendingMoveSequence();
+		QVERIFY(sequence != 0);
+		QVERIFY(waitUntil([&moveCompleted] { return moveCompleted.size() == 1; }, 1000));
+		QCOMPARE(moveCompleted.size(), 1);
+		QCOMPARE(moveCompleted.first().at(0).toULongLong(), sequence);
+		QCOMPARE(
+		    moveCompleted.first().at(1).value<quintptr>(),
+		    reinterpret_cast<quintptr>(window)
+		);
+		QCOMPARE(moveCompleted.first().at(2).toBool(), false);
+		QCOMPARE(moveCompleted.first().at(3).toString(), QStringLiteral("command-rejected"));
+
+		this->old.manager.canMove = true;
+		this->old.manager.beforeCanMove = {};
+	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)
 #include "erm625_native_desktop_facade_test.moc"

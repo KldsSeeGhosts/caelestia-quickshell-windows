@@ -91,6 +91,7 @@ struct FakeManager: FakeCom<DesktopManager> {
 	bool faultOnCurrent = false;
 	bool faultOnCanMove = false;
 	bool faultOnMove = false;
+	bool canMove = true;
 	int canMoves = 0;
 	int moves = 0;
 	HRESULT moveResult = S_OK;
@@ -100,7 +101,7 @@ struct FakeManager: FakeCom<DesktopManager> {
 	ApplicationView* expectedView = nullptr;
 	FakeDesktop* current = nullptr;
 	FakeDesktop* created = nullptr;
-	std::function<void()> beforeEnumeration, beforeSwitch, beforeCreate, beforeMove;
+	std::function<void()> beforeEnumeration, beforeSwitch, beforeCreate, beforeCanMove, beforeMove;
 	HRESULT STDMETHODCALLTYPE GetCount(UINT* out) override { return this->array.GetCount(out); }
 	HRESULT STDMETHODCALLTYPE MoveViewToDesktop(ApplicationView* view, Desktop*) override {
 		if (this->beforeMove) this->beforeMove();
@@ -109,10 +110,11 @@ struct FakeManager: FakeCom<DesktopManager> {
 		return view == this->expectedView ? this->moveResult : E_INVALIDARG;
 	}
 	HRESULT STDMETHODCALLTYPE CanViewMoveDesktops(ApplicationView* view, BOOL* out) override {
+		if (this->beforeCanMove) this->beforeCanMove();
 		++this->canMoves;
 		if (this->faultOnCanMove) fault();
 		if (view != this->expectedView) return E_INVALIDARG;
-		*out = TRUE;
+		*out = this->canMove ? TRUE : FALSE;
 		return S_OK;
 	}
 	HRESULT STDMETHODCALLTYPE GetCurrentDesktop(Desktop** out) override {

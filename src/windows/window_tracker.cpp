@@ -517,32 +517,10 @@ void TrackedWindow::reportActionRefused(const QString& action, const QString& re
 	this->reportActionRefused(action, reason, elevated);
 }
 
-void TrackedWindow::reportActionRefused(
-    const QString& action,
-    const QString& reason,
-    bool elevated
-) {
-	auto text = window_action_detail::errorText(action, reason);
-	if (this->mLastActionError != text) {
-		this->mLastActionError = text;
-		emit this->lastActionErrorChanged();
-	}
-	emit this->actionRefused(action, reason, elevated);
-	this->tracker->reportWindowActionRefused(this, action, reason, elevated);
-}
-
 void TrackedWindow::reportActionFailure(const QString& action, DWORD error) {
 	auto elevated = isMoreElevated(this->mHwnd);
 	if (!window_action_detail::shouldReportFailure(error, elevated)) return;
 	this->reportActionRefused(action, window_action_detail::refusalReason(error, elevated));
-}
-
-void TrackedWindow::clearActionError() {
-	if (!this->mLastActionError.isEmpty()) {
-		this->mLastActionError.clear();
-		emit this->lastActionErrorChanged();
-	}
-	this->tracker->clearWindowActionError(this);
 }
 
 void TrackedWindow::close() {
@@ -655,7 +633,7 @@ bool TrackedWindow::moveToDesktop(qsizetype index) {
 		return false;
 	}
 	if (const auto sequence = nativeDesktopPendingMoveSequence(); sequence != 0) {
-		this->tracker->notePendingUserMove(sequence, this->mHwnd);
+		this->tracker->notePendingUserMove(sequence, this);
 	} else {
 		this->clearActionError();
 	}
@@ -1269,43 +1247,20 @@ void WindowTracker::onScreensChanged() {
 	this->schedule();
 }
 
-void WindowTracker::notePendingUserMove(quint64 sequence, HWND hwnd) {
-	if (sequence == 0 || hwnd == nullptr) return;
-	this->mPendingUserMoves.insert(sequence, hwnd);
-}
-
 void WindowTracker::onMoveWindowCompleted(
     quint64 sequence,
     quintptr rawHwnd,
     bool succeeded,
     const QString& code
 ) {
-	const auto hwnd = reinterpret_cast<HWND>(rawHwnd);
-	const auto pending = this->mPendingUserMoves.constFind(sequence);
-	if (sequence == 0 || pending == this->mPendingUserMoves.cend() || pending.value() != hwnd) {
-		return;
-	}
-	this->mPendingUserMoves.erase(pending);
-
-	auto* window = this->windowFor(hwnd);
-	if (succeeded) {
-		if (window != nullptr) window->clearActionError();
-		return;
-	}
-
-	if (window != nullptr && window->hasCurrentOwner()) {
-		const auto elevated = isMoreElevated(hwnd);
-		window->bElevated = elevated;
-		const auto reportElevated = elevated && qs::hyprland::ipc::isWindowRejectionMoveCode(code);
-		window->reportActionRefused(
-		    QStringLiteral("move"),
-		    qs::hyprland::ipc::moveRefusalReason(code, reportElevated),
-		    reportElevated
-		);
-		return;
-	}
-
-	qs::hyprland::ipc::reportMoveRefusal(this, code, false);
+	this->completePendingUserMove(
+	    sequence,
+	    rawHwnd,
+	    succeeded,
+	    code,
+	    [](const TrackedWindow* window) { return window->hasCurrentOwner(); },
+	    [](HWND hwnd) { return isMoreElevated(hwnd); }
+	);
 }
 
 void WindowTracker::onDesktopsChanged() {
