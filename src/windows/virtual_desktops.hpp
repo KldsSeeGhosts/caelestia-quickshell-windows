@@ -147,7 +147,13 @@ private:
 
 	void loadAccessor();
 	void bindNativeDesktopQueries();
-	void onNativeMoveCompleted(quint64 sequence, HWND hwnd, bool succeeded, HRESULT error);
+	void onNativeMoveCompleted(
+	    quint64 sequence,
+	    HWND hwnd,
+	    bool succeeded,
+	    DesktopAvailability availability,
+	    HRESULT error
+	);
 	void applyNativeSnapshot();
 	void notifyCapability();
 	bool readRegistry(QList<GUID>& ids, GUID& current) const;
@@ -167,7 +173,7 @@ private:
 	void initCommandObservation();
 	void observeSwitch();
 	void finishSwitch(DesktopCommandOutcome outcome, const QString& reason = {});
-	[[nodiscard]] QString failureReasonForError(HRESULT error) const;
+	[[nodiscard]] static QString failureReasonForError(DesktopAvailability availability, HRESULT error);
 	[[nodiscard]] QString commandFailureReason() const;
 
 	template <typename R, typename... P, typename... A>

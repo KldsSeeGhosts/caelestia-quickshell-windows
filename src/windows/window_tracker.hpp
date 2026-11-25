@@ -151,6 +151,7 @@ public:
 	void reportActionRefusedForTest(const QString& action, const QString& reason, bool elevated) {
 		this->reportActionRefused(action, reason, elevated);
 	}
+	void clearActionErrorForTest() { this->clearActionError(); }
 #endif
 	[[nodiscard]] HWND hwnd() const { return this->mHwnd; }
 	[[nodiscard]] quint64 address() const;

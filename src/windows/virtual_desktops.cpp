@@ -291,9 +291,13 @@ void VirtualDesktops::applyNativeSnapshot() {
 void VirtualDesktops::bindNativeDesktopQueries() {
 	setNativeDesktopMoveObserver(
 	    this,
-	    [this](quint64 sequence, HWND hwnd, bool succeeded, HRESULT error) {
-		    this->onNativeMoveCompleted(sequence, hwnd, succeeded, error);
-	    }
+	    [this](
+	        quint64 sequence,
+	        HWND hwnd,
+	        bool succeeded,
+	        DesktopAvailability availability,
+	        HRESULT error
+	    ) { this->onNativeMoveCompleted(sequence, hwnd, succeeded, availability, error); }
 	);
 	initializeNativeDesktopQueries(this, [this] { this->applyNativeSnapshot(); });
 }
@@ -302,13 +306,14 @@ void VirtualDesktops::onNativeMoveCompleted(
     quint64 sequence,
     HWND hwnd,
     bool succeeded,
+    DesktopAvailability availability,
     HRESULT error
 ) {
 	emit this->moveWindowCompleted(
 	    sequence,
 	    reinterpret_cast<quintptr>(hwnd),
 	    succeeded,
-	    succeeded ? QString() : this->failureReasonForError(error)
+	    succeeded ? QString() : failureReasonForError(availability, error)
 	);
 }
 
@@ -654,11 +659,11 @@ void VirtualDesktops::notifyCapability() {
 	emit this->capabilityChanged();
 }
 
-QString VirtualDesktops::failureReasonForError(HRESULT error) const {
+QString VirtualDesktops::failureReasonForError(DesktopAvailability availability, HRESULT error) {
 	if (error == HRESULT_FROM_WIN32(ERROR_TIMEOUT)) return QStringLiteral("provider-timeout");
 	if (error == HRESULT_FROM_WIN32(ERROR_BUSY)) return QStringLiteral("provider-busy");
 	if (error == E_ACCESSDENIED) return QStringLiteral("permission-denied");
-	const auto reason = desktopAvailabilityReason(this->availability());
+	const auto reason = desktopAvailabilityReason(availability);
 	if (!reason.isEmpty()) return reason;
 	return QStringLiteral("command-rejected");
 }

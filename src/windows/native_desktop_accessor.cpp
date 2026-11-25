@@ -540,7 +540,7 @@ struct Channel {
 	QPointer<QObject> context;
 	std::function<void()> recovered;
 	std::function<void()> updated;
-	std::function<void(quint64, HWND, bool, HRESULT)> moveCompleted;
+	std::function<void(quint64, HWND, bool, DesktopAvailability, HRESULT)> moveCompleted;
 	QTimer deadline;
 	std::atomic<bool> completionWake = false;
 	std::optional<Pending> refresh;
@@ -594,10 +594,18 @@ struct Channel {
 		if (this->context && this->updated) QTimer::singleShot(0, this->context, this->updated);
 	}
 
-	void notifyMoveCompleted(quint64 seq, HWND hwnd, bool succeeded, HRESULT error) {
+	void notifyMoveCompleted(
+	    quint64 seq,
+	    HWND hwnd,
+	    bool succeeded,
+	    DesktopAvailability availability,
+	    HRESULT error
+	) {
 		if (hwnd == nullptr || !this->context || !this->moveCompleted) return;
-		QTimer::singleShot(0, this->context, [this, seq, hwnd, succeeded, error] {
-			if (this->context && this->moveCompleted) this->moveCompleted(seq, hwnd, succeeded, error);
+		QTimer::singleShot(0, this->context, [this, seq, hwnd, succeeded, availability, error] {
+			if (this->context && this->moveCompleted) {
+				this->moveCompleted(seq, hwnd, succeeded, availability, error);
+			}
 		});
 	}
 
@@ -615,7 +623,15 @@ struct Channel {
 		// Keep the last desktop/window values as explicitly stale state.
 		this->recovery.disconnected();
 		this->notify();
-		if (pendingMove != nullptr) this->notifyMoveCompleted(pendingSequence, pendingMove, false, error);
+		if (pendingMove != nullptr) {
+			this->notifyMoveCompleted(
+			    pendingSequence,
+			    pendingMove,
+			    false,
+			    DesktopAvailability::Disconnected,
+			    error
+			);
+		}
 	}
 
 	bool apply(Snapshot result) {
@@ -856,6 +872,7 @@ struct Channel {
 			if (!finished.queryWindows) value.windows = this->snapshot.windows;
 			if (value.sequence < this->applied) this->refreshAgain = true;
 			const auto available = this->apply(std::move(value));
+			const auto availability = this->snapshot.availability;
 			if (finished.moveTarget != nullptr) {
 				const auto moveOk = outcome == 0 && (available || (finished.publicOperation && publicReady));
 				const auto moveSequence = finished.request ? finished.request->sequence : 0;
@@ -863,6 +880,7 @@ struct Channel {
 				    moveSequence,
 				    finished.moveTarget,
 				    moveOk,
+				    availability,
 				    moveOk ? S_OK : operationError
 				);
 			}
@@ -885,7 +903,13 @@ struct Channel {
 			this->retire(E_UNEXPECTED);
 			if (finished.moveTarget != nullptr) {
 				const auto moveSequence = finished.request ? finished.request->sequence : 0;
-				this->notifyMoveCompleted(moveSequence, finished.moveTarget, false, E_UNEXPECTED);
+				this->notifyMoveCompleted(
+				    moveSequence,
+				    finished.moveTarget,
+				    false,
+				    DesktopAvailability::Disconnected,
+				    E_UNEXPECTED
+				);
 			}
 		}
 	}
@@ -1047,7 +1071,7 @@ void initializeNativeDesktopQueries(QObject* context, std::function<void()> upda
 
 void setNativeDesktopMoveObserver(
     QObject* context,
-    std::function<void(quint64, HWND, bool, HRESULT)> onMoveCompleted
+    std::function<void(quint64, HWND, bool, DesktopAvailability, HRESULT)> onMoveCompleted
 ) {
 	auto& c = channel();
 	c.context = context;

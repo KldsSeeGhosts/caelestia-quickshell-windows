@@ -19,7 +19,7 @@ void invalidateNativeDesktopAccessor(HRESULT error = S_OK);
 void initializeNativeDesktopQueries(QObject* context, std::function<void()> updated);
 void setNativeDesktopMoveObserver(
     QObject* context,
-    std::function<void(quint64, HWND, bool, HRESULT)> onMoveCompleted
+    std::function<void(quint64, HWND, bool, DesktopAvailability, HRESULT)> onMoveCompleted
 );
 void requestNativeDesktopRefresh();
 [[nodiscard]] bool nativeDesktopCommandPending();

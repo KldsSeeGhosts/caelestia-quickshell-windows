@@ -429,6 +429,38 @@ private slots:
 		QCOMPARE(fixture.tracker->lastActionError(), QString());
 	}
 
+	void lateMoveFailureDoesNotOverwriteNewerSuccess() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		// Move A is pending, then move B succeeds synchronously and clears errors
+		// before move A's queued failure callback runs.
+		fixture.tracker->notePendingUserMoveForTest(31, fixture.window);
+		fixture.window->clearActionErrorForTest();
+
+		QSignalSpy windowRefused(fixture.window, &TrackedWindow::actionRefused);
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+		int elevationChecks = 0;
+
+		fixture.tracker->completePendingUserMoveForTest(
+		    31,
+		    reinterpret_cast<quintptr>(fixture.window->hwnd()),
+		    false,
+		    QStringLiteral("permission-denied"),
+		    [](const TrackedWindow*) { return true; },
+		    [&elevationChecks](HWND) {
+			    ++elevationChecks;
+			    return true;
+		    }
+		);
+
+		QCOMPARE(elevationChecks, 0);
+		QCOMPARE(windowRefused.size(), 0);
+		QCOMPARE(trackerRefused.size(), 0);
+		QCOMPARE(fixture.window->lastActionError(), QString());
+		QCOMPARE(fixture.tracker->lastActionError(), QString());
+	}
+
 	void lateMoveCompletionIgnoresUntrackedMove() {
 		DispatcherFixture fixture;
 		fixture.tracker->registerWindowForTest(fixture.window);

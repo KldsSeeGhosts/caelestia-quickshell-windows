@@ -19,6 +19,7 @@ void TrackedWindow::reportActionRefused(
 }
 
 void TrackedWindow::clearActionError() {
+	++this->mActionErrorGeneration;
 	if (!this->mLastActionError.isEmpty()) {
 		this->mLastActionError.clear();
 		emit this->lastActionErrorChanged();
@@ -54,6 +55,7 @@ void WindowTracker::clearWindowActionError(const TrackedWindow* window) {
 
 void WindowTracker::notePendingUserMove(quint64 sequence, TrackedWindow* window) {
 	if (sequence == 0 || window == nullptr || window->hwnd() == nullptr) return;
+	++window->mActionErrorGeneration;
 	this->mPendingUserMoves.insert(
 	    sequence,
 	    PendingUserMove {
@@ -82,10 +84,11 @@ void WindowTracker::completePendingUserMove(
 
 	auto* window = entry.window.data();
 	const auto sameTracked = window != nullptr && this->byHwnd.value(hwnd) == window;
+	if (sameTracked && window->mActionErrorGeneration != entry.windowErrorGeneration) {
+		return;
+	}
 	if (succeeded) {
-		if (sameTracked && window->mActionErrorGeneration == entry.windowErrorGeneration
-		    && ownerMatches && ownerMatches(window))
-		{
+		if (sameTracked && ownerMatches && ownerMatches(window)) {
 			window->clearActionError();
 		}
 		return;
