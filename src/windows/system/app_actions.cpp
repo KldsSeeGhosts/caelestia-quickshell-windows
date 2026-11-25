@@ -1,5 +1,6 @@
 #include "app_actions.hpp"
 
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -7,19 +8,19 @@
 #include <qdiriterator.h>
 #include <qfile.h>
 #include <qfileinfo.h>
+#include <qfuturewatcher.h>
 #include <qhash.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
 #include <qmutex.h>
 #include <qobject.h>
+#include <qpromise.h>
 #include <qquickitem.h>
 #include <qquickwindow.h>
 #include <qstring.h>
 #include <qstringlist.h>
-#include <qtenvironmentvariables.h>
 #include <quuid.h>
 #include <qvariant.h>
-#include <qxmlstream.h>
 
 #include <qt_windows.h>
 
@@ -37,6 +38,7 @@
 #include "../process_launch.hpp"
 #include "../redact.hpp"
 #include "../util.hpp"
+#include "appx_manifest.hpp"
 
 using Microsoft::WRL::ComPtr;
 
@@ -102,45 +104,31 @@ QString packageFamilyOf(const QString& token) {
 	return family;
 }
 
-struct AppxManifestInfo {
-	bool allowElevation = false;
-	QString executionAlias;
-};
-
-AppxManifestInfo readAppxManifest(const QString& packagePath) {
-	auto info = AppxManifestInfo();
-	QFile file(QDir(packagePath).filePath(QStringLiteral("AppxManifest.xml")));
-	if (!file.open(QFile::ReadOnly | QFile::Text)) return info;
-
-	auto xml = QXmlStreamReader(&file);
-	while (!xml.atEnd()) {
-		xml.readNext();
-		if (!xml.isStartElement()) continue;
-		const auto name = xml.name();
-		if (name == u"Capability") {
-			const auto capability = xml.attributes().value(QStringLiteral("Name"));
-			if (capability.compare(QStringLiteral("allowElevation"), Qt::CaseInsensitive) == 0) {
-				info.allowElevation = true;
-			}
-		} else if (name == u"ExecutionAlias" && info.executionAlias.isEmpty()) {
-			const auto alias = xml.attributes().value(QStringLiteral("Alias")).toString();
-			if (!alias.isEmpty() && !alias.contains(u'/') && !alias.contains(u'\\')) {
-				info.executionAlias = alias;
-			}
-		}
-	}
-
-	return info;
-}
-
 struct PackageInstallInfo {
-	QString fullName;
 	QString path;
 	bool allowElevation = false;
 	QString executionAlias;
 };
 
-std::optional<PackageInstallInfo> packageInstall(const QString& family) {
+QString verifiedPackageAlias(const QString& family, const QStringList& aliases) {
+	if (aliases.isEmpty()) return {};
+
+	PWSTR raw = nullptr;
+	const auto hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &raw);
+	const auto localAppData = takeComString(raw);
+	if (FAILED(hr) || localAppData.isEmpty()) return {};
+
+	// The unscoped alias can belong to a different package. Only consider a
+	// registered AppExecLink inside the requested package family's directory.
+	const auto directory = QDir(localAppData + QStringLiteral("/Microsoft/WindowsApps/") + family);
+	for (const auto& alias: aliases) {
+		const auto path = QDir::toNativeSeparators(directory.filePath(alias));
+		if (process::isAppExecutionAlias(path)) return path;
+	}
+	return {};
+}
+
+std::optional<PackageInstallInfo> packageInstall(const QString& family, QStringView applicationId) {
 	auto wfamily = family.toStdWString();
 	UINT32 count = 0;
 	UINT32 length = 0;
@@ -153,33 +141,29 @@ std::optional<PackageInstallInfo> packageInstall(const QString& family) {
 	rc = GetPackagesByPackageFamily(wfamily.c_str(), &count, names.data(), &length, buffer.data());
 	if (rc != ERROR_SUCCESS || count == 0) return std::nullopt;
 
-	UINT32 pathLength = 0;
-	if (GetPackagePathByFullName(names.front(), &pathLength, nullptr) != ERROR_INSUFFICIENT_BUFFER) {
-		return std::nullopt;
-	}
-
-	auto path = std::vector<wchar_t>(pathLength);
-	if (GetPackagePathByFullName(names.front(), &pathLength, path.data()) != ERROR_SUCCESS) {
-		return std::nullopt;
-	}
-
-	auto install = PackageInstallInfo {
-	    .fullName = QString::fromWCharArray(names.front()),
-	    .path = QDir::toNativeSeparators(QString::fromWCharArray(path.data())),
-	};
-
-	const auto manifest = readAppxManifest(install.path);
-	install.allowElevation = manifest.allowElevation;
-	if (!manifest.executionAlias.isEmpty()) {
-		const auto localAppData = qEnvironmentVariable("LOCALAPPDATA");
-		if (!localAppData.isEmpty()) {
-			install.executionAlias = QDir::toNativeSeparators(
-			    localAppData + QStringLiteral("/Microsoft/WindowsApps/") + manifest.executionAlias
-			);
+	auto firstInstall = std::optional<PackageInstallInfo>();
+	for (UINT32 i = 0; i < count; ++i) {
+		UINT32 pathLength = 0;
+		if (GetPackagePathByFullName(names[i], &pathLength, nullptr) != ERROR_INSUFFICIENT_BUFFER) {
+			continue;
 		}
-	}
 
-	return install;
+		auto path = std::vector<wchar_t>(pathLength);
+		if (GetPackagePathByFullName(names[i], &pathLength, path.data()) != ERROR_SUCCESS) continue;
+
+		auto install = PackageInstallInfo();
+		install.path = QDir::toNativeSeparators(QString::fromWCharArray(path.data()));
+		if (!firstInstall) firstInstall = install;
+		QFile file(QDir(install.path).filePath(QStringLiteral("AppxManifest.xml")));
+		if (!file.open(QFile::ReadOnly)) continue;
+
+		const auto manifest = readAppxManifest(&file, applicationId);
+		if (!manifest.applicationFound) continue;
+		install.allowElevation = manifest.allowElevation;
+		install.executionAlias = verifiedPackageAlias(family, manifest.desktopExecutionAliases);
+		return install;
+	}
+	return firstInstall;
 }
 
 QString knownFolderTarget(const QString& token) {
@@ -324,71 +308,30 @@ QString startMenuShortcut(const AppActionInfo& app) {
 }
 
 DWORD runElevated(const QString& id, const AppActionInfo& app, HWND owner) {
-	auto error = static_cast<DWORD>(ERROR_FILE_NOT_FOUND);
+	const auto launch = [&](const QString& target, bool invokeIdList, const QString& directory = {}) {
+		return process::shellExecuteTarget(
+		    target, {}, directory, QStringLiteral("runas"), owner, invokeIdList
+		);
+	};
+	auto result = process::detail::launchResultForError(ERROR_FILE_NOT_FOUND);
 
 	if (app.packaged) {
-		const auto shellTarget = QStringLiteral("shell:AppsFolder\\") + app.token;
-		auto result = process::shellExecuteTarget(
-		    shellTarget,
-		    QString(),
-		    QString(),
-		    QStringLiteral("runas"),
-		    owner,
-		    true,
-		    false
-		);
-		error = result.error;
-
-		if (error != ERROR_SUCCESS && error != ERROR_CANCELLED && !app.executionAlias.isEmpty()) {
-			qCDebug(logAppActions) << "Elevating the packaged app"
-			                       << qs::windows::logId(id)
-			                       << "through AppsFolder failed:" << error;
-			result = process::shellExecuteTarget(
-			    app.executionAlias,
-			    QString(),
-			    QString(),
-			    QStringLiteral("runas"),
-			    owner,
-			    false,
-			    false
-			);
-			error = result.error;
+		if (app.allowAppsFolderElevation) {
+			result = launch(QStringLiteral("shell:AppsFolder\\") + app.token, true);
 		}
+		result = process::detail::fallbackOnFailure(result, [&] {
+			return app.executionAlias.isEmpty() ? result : launch(app.executionAlias, false);
+		});
 	} else {
-		auto shortcut = startMenuShortcut(app);
-
-		if (!shortcut.isEmpty()) {
-			error = process::shellExecuteTarget(
-			            shortcut,
-			            QString(),
-			            QString(),
-			            QStringLiteral("runas"),
-			            owner,
-			            true,
-			            false
-			        )
-			        .error;
-			if (error != ERROR_SUCCESS && error != ERROR_CANCELLED) {
-				qCDebug(logAppActions) << "Elevating the shortcut of"
-				                       << qs::windows::logId(id) << "failed:" << error;
-			}
-		}
-
-		if (error != ERROR_SUCCESS && error != ERROR_CANCELLED) {
-			auto directory = QDir::toNativeSeparators(QFileInfo(app.target).absolutePath());
-			error = process::shellExecuteTarget(
-			            app.target,
-			            QString(),
-			            directory,
-			            QStringLiteral("runas"),
-			            owner,
-			            true,
-			            false
-			        )
-			        .error;
-		}
+		const auto shortcut = startMenuShortcut(app);
+		if (!shortcut.isEmpty()) result = launch(shortcut, true);
+		result = process::detail::fallbackOnFailure(result, [&] {
+			const auto directory = QDir::toNativeSeparators(QFileInfo(app.target).absolutePath());
+			return launch(app.target, true, directory);
+		});
 	}
 
+	const auto error = result.error;
 	if (error == ERROR_CANCELLED) {
 		qCDebug(logAppActions) << "Elevation of" << qs::windows::logId(id) << "was cancelled";
 	} else if (error != ERROR_SUCCESS) {
@@ -427,8 +370,10 @@ QString actionStatus(AppActions::ActionResult result) {
 	case AppActions::ActionResult::Started: return QStringLiteral("started");
 	case AppActions::ActionResult::Cancelled: return QStringLiteral("cancelled");
 	case AppActions::ActionResult::Refused: return QStringLiteral("refused");
-	default: return QStringLiteral("notSupported");
+	case AppActions::ActionResult::NotSupported: return QStringLiteral("notSupported");
+	case AppActions::ActionResult::Queued: return QStringLiteral("queued");
 	}
+	Q_UNREACHABLE_RETURN(QString());
 }
 
 QVariantMap actionResultMap(AppActions::ActionResult result, DWORD error, const QString& message) {
@@ -521,11 +466,14 @@ AppActionInfo AppActions::details(const QString& entryId) {
 	app.packaged = !app.packageFamilyName.isEmpty();
 
 	if (app.packaged) {
-		const auto install = packageInstall(app.packageFamilyName);
+		const auto install = packageInstall(
+		    app.packageFamilyName, QStringView(token).sliced(app.packageFamilyName.size() + 1)
+		);
 		if (install.has_value()) {
 			app.canUninstall = !isUnderWindows(install->path);
-			app.canRunAsAdmin = install->allowElevation;
+			app.allowAppsFolderElevation = install->allowElevation;
 			app.executionAlias = install->executionAlias;
+			app.canRunAsAdmin = app.allowAppsFolderElevation || !app.executionAlias.isEmpty();
 		} else {
 			// Preserve the old failure behavior: metadata lookup failure did not
 			// prove that the package is a system package.
@@ -623,22 +571,38 @@ QVariantMap AppActions::launchShellAction(const QVariantMap& spec, QObject* pare
 		arguments = process::joinCommandArguments(argsValue.toStringList());
 	}
 
+	const auto directory = spec.value(QStringLiteral("workingDir")).toString();
+	if (verb == QStringLiteral("open")) {
+		// Explorer COM and the fallback helper can both block. The watcher is
+		// owned by AppActions, but the launcher task never captures AppActions.
+		auto promise = std::make_shared<QPromise<DWORD>>();
+		promise->start();
+		auto* watcher = new QFutureWatcher<DWORD>(this);
+		connect(watcher, &QFutureWatcher<DWORD>::finished, this, [this, watcher] {
+			const auto error = watcher->result();
+			watcher->deleteLater();
+			const auto message = windowsErrorString(error);
+			this->setLastError(message);
+			emit this->shellActionFinished(actionResultMap(actionResultForError(error), error, message));
+		});
+		watcher->setFuture(promise->future());
+		runLauncher([target, arguments, directory, invokeIdList, promise] {
+			const auto result = process::shellExecuteTarget(
+			    target, arguments, directory, QStringLiteral("open"), nullptr, invokeIdList
+			);
+			promise->addResult(result.error);
+			promise->finish();
+		});
+		this->setLastError({});
+		return actionResultMap(ActionResult::Queued, ERROR_SUCCESS, {});
+	}
+
 	const auto result = process::shellExecuteTarget(
-	    target,
-	    arguments,
-	    spec.value(QStringLiteral("workingDir")).toString(),
-	    verb,
-	    hwndForObject(parentWindow),
-	    invokeIdList,
-	    verb == QStringLiteral("open")
+	    target, arguments, directory, verb, hwndForObject(parentWindow), invokeIdList
 	);
-
-	auto actionResult = ActionResult::Refused;
-	if (result.status == process::LaunchStatus::Started) actionResult = ActionResult::Started;
-	else if (result.status == process::LaunchStatus::Cancelled) actionResult = ActionResult::Cancelled;
-
-	this->setLastError(windowsErrorString(result.error));
-	return actionResultMap(actionResult, result.error, QString());
+	const auto message = windowsErrorString(result.error);
+	this->setLastError(message);
+	return actionResultMap(actionResultForError(result.error), result.error, message);
 }
 
 bool AppActions::isInlineSudoEnabled() const {

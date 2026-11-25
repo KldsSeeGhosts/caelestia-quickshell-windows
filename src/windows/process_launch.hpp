@@ -2,6 +2,7 @@
 
 #include <qt_windows.h>
 
+#include <optional>
 #include <string>
 
 #include <qstring.h>
@@ -14,11 +15,12 @@ enum class LaunchStatus : quint8 {
 	Started,
 	Cancelled,
 	Failed,
+	Indeterminate, // Explorer disconnected after receiving the request; do not retry.
 };
 
 struct LaunchResult {
 	LaunchStatus status = LaunchStatus::Failed;
-	DWORD error = ERROR_SUCCESS;
+	DWORD error = ERROR_GEN_FAILURE;
 	bool usedExplorer = false;
 	bool usedProcess = false;
 	bool usedShell = false;
@@ -34,11 +36,11 @@ enum class ProgramKind : quint8 {
 };
 
 struct LaunchCommand {
-	QString input;
 	QString program;
-	QStringList arguments;
+	QString argumentTail;
 	QString executable;
 	ProgramKind kind = ProgramKind::Unresolved;
+	DWORD error = ERROR_FILE_NOT_FOUND;
 
 	[[nodiscard]] bool useProcess() const
 	{
@@ -61,8 +63,8 @@ struct LaunchCommand {
 [[nodiscard]] std::wstring cleanEnvironmentBlock();
 
 // Shell target launch. Open verbs try Explorer's IShellDispatch2 first so the
-// child receives Explorer's environment and parentage; every path falls back to
-// ShellExecuteExW without requiring Explorer or an interactive shell desktop.
+// child receives Explorer's environment and parentage. The local fallback
+// runs ShellExecuteExW in a helper with the original environment.
 [[nodiscard]] LaunchResult shellExecuteTarget(
     const QString& target,
     const QString& arguments = QString(),
@@ -72,6 +74,10 @@ struct LaunchCommand {
     bool invokeIdList = false,
     bool useExplorer = true
 );
+
+// Internal early-entry mode for that helper. An ordinary invocation returns
+// nullopt so it can continue through the normal CLI.
+[[nodiscard]] std::optional<DWORD> runShellOpenHelper(int argc, char** argv);
 
 // Unified command launch shared by keybinds and dispatch exec.
 [[nodiscard]] LaunchResult launchCommand(
@@ -84,5 +90,28 @@ struct LaunchCommand {
     const QString& workingDirectory = QString(),
     HWND owner = nullptr
 );
+
+namespace detail {
+
+[[nodiscard]] inline LaunchResult launchResultForError(DWORD error) {
+	return {
+	    .status = error == ERROR_SUCCESS ? LaunchStatus::Started
+	                                      : error == ERROR_CANCELLED ? LaunchStatus::Cancelled
+	                                                                 : LaunchStatus::Failed,
+	    .error = error,
+	};
+}
+
+template <typename Fallback>
+[[nodiscard]] LaunchResult fallbackOnFailure(LaunchResult result, Fallback&& fallback) {
+	return result.status == LaunchStatus::Failed ? fallback() : result;
+}
+
+template <typename ExplorerLaunch, typename CleanLaunch>
+[[nodiscard]] LaunchResult openWithFallback(ExplorerLaunch&& explorer, CleanLaunch&& clean) {
+	return fallbackOnFailure(explorer(), [&] { return clean(cleanEnvironmentBlock()); });
+}
+
+} // namespace detail
 
 } // namespace qs::windows::process

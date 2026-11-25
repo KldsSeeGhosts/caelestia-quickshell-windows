@@ -20,6 +20,9 @@ qt_add_library(quickshell-launch STATIC
 
 if (WIN32)
 	target_sources(quickshell-launch PRIVATE daemon_win.cpp)
+	if (WINDOWS_BACKEND)
+		target_compile_definitions(quickshell-launch PRIVATE QS_WINDOWS_BACKEND)
+	endif()
 endif()
 
 target_link_libraries(quickshell-launch PRIVATE

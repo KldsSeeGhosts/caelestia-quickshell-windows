@@ -411,7 +411,7 @@ target_compile_definitions(qs_suite_dispatcher PRIVATE NOMINMAX WIN32_LEAN_AND_M
 target_include_directories(qs_suite_dispatcher PRIVATE ${QS_WINDOWS_SRC})
 target_link_libraries(qs_suite_dispatcher PRIVATE Qt6::Core Qt6::Test)
 
-# Command parsing, executable classification and the clean environment block.
+# Command parsing, clean launch fallback, elevation and packaged app metadata.
 # These slots never create or shell-execute a child process.
 qs_add_portable_suite(process_launch
 	process_launch_test.cpp

@@ -13,14 +13,13 @@
 #include "process_launch.hpp"
 
 #include <algorithm>
-#include <vector>
+#include <cwchar>
 
 #include <qcoreapplication.h>
 #include <qdir.h>
 #include <qendian.h>
 #include <qfile.h>
 #include <qfileinfo.h>
-#include <qprocess.h>
 #include <qstandardpaths.h>
 #include <qtenvironmentvariables.h>
 
@@ -36,15 +35,107 @@ namespace {
 constexpr DWORD IO_REPARSE_TAG_APPEXECLINK = 0x8000001BL;
 #endif
 
-bool looksLikePath(const QString& program) {
+constexpr auto SHELL_OPEN_HELPER_ARG = "--internal-windows-shell-open";
+
+bool looksLikePath(QStringView program) {
 	return program.contains(u'/') || program.contains(u'\\')
-	    || (program.size() > 2 && program.at(0).isLetter() && program.at(1) == u':');
+	    || (program.size() >= 2 && program.at(0).isLetter() && program.at(1) == u':');
+}
+
+bool isShellName(QStringView program) {
+	const auto colon = program.indexOf(u':');
+	if (colon < 2 || !program.front().isLetter()) return false;
+	return std::ranges::all_of(program.first(colon), [](QChar c) {
+		return c.isLetterOrNumber() || c == u'+' || c == u'-' || c == u'.';
+	});
+}
+
+bool isCommandSpace(QChar c) {
+	return c == u' ' || c == u'\t';
+}
+
+qsizetype skipCommandSpace(QStringView line, qsizetype position) {
+	while (position < line.size() && isCommandSpace(line[position])) ++position;
+	return position;
+}
+
+qsizetype endOfWord(QStringView line, qsizetype position) {
+	while (position < line.size() && !isCommandSpace(line[position])) ++position;
+	return position;
+}
+
+bool hasFileExtension(QStringView path) {
+	const auto separator = std::max(path.lastIndexOf(u'\\'), path.lastIndexOf(u'/'));
+	const auto dot = path.lastIndexOf(u'.');
+	return dot > separator && dot + 1 < path.size();
+}
+
+bool isSeparateArgument(QStringView word) {
+	if (word.startsWith(u'-') || word.startsWith(u'/')) {
+		const auto option = word.sliced(1);
+		return option.contains(u'=') || (!looksLikePath(option) && !hasFileExtension(option));
+	}
+	return word.startsWith(u'"') || word.startsWith(QStringLiteral("\\\\"))
+	    || (word.size() >= 2 && word[0].isLetter() && word[1] == u':') || isShellName(word);
+}
+
+bool hasAmbiguousRelativePath(QStringView line, qsizetype firstEnd) {
+	for (auto start = skipCommandSpace(line, firstEnd); start < line.size();) {
+		const auto end = endOfWord(line, start);
+		const auto word = line.sliced(start, end - start);
+		if (isSeparateArgument(word)) break;
+		if (looksLikePath(word)) {
+			if (word.startsWith(QStringLiteral(".\\")) || word.startsWith(QStringLiteral("..\\"))
+			    || word.startsWith(QStringLiteral("./")) || word.startsWith(QStringLiteral("../")))
+			{
+				break;
+			}
+			// "Program Files\tool.exe" could be a relative target or a
+			// bare executable followed by a relative path. Require quotes.
+			return true;
+		}
+		start = skipCommandSpace(line, end);
+	}
+	return false;
+}
+
+// An unquoted path with spaces needs an identifiable end. Once a file
+// extension supplies that boundary, a further filename-like token could
+// still be part of the path (e.g. C:\bin.exe files\tool.exe). Require quotes
+// in that case. Never use file existence to shorten an explicit path.
+qsizetype explicitPathEnd(QStringView line, qsizetype firstEnd) {
+	auto boundary = hasFileExtension(line.first(firstEnd)) ? firstEnd : -1;
+	auto lastEnd = firstEnd;
+	for (auto start = skipCommandSpace(line, firstEnd); start < line.size();
+	     start = skipCommandSpace(line, lastEnd)) {
+		const auto end = endOfWord(line, start);
+		const auto word = line.sliced(start, end - start);
+		if (isSeparateArgument(word)) {
+			// Without an extension, this might be the middle of a filename.
+			// Do not try the shorter extensionless prefix with PATHEXT.
+			return boundary;
+		}
+		if (boundary >= 0) {
+			if (word.contains(u'\\') || word.contains(u'/') || hasFileExtension(word)) return -1;
+		} else {
+			if (word.contains(u'"')) return -1;
+			if (hasFileExtension(word)) boundary = end;
+		}
+		lastEnd = end;
+	}
+	return boundary >= 0 ? boundary : lastEnd;
 }
 
 QString normalizedExistingFile(const QString& path) {
-	auto info = QFileInfo(path);
-	if (!info.isFile()) return QString();
-	return QDir::toNativeSeparators(info.absoluteFilePath());
+	const auto absolute = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
+	// Check the .lnk itself, even if its target is a folder or namespace item.
+	const auto attributes = GetFileAttributesW(absolute.toStdWString().c_str());
+	if ((attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+	    || isAppExecutionAlias(absolute))
+	{
+		return absolute;
+	}
+	return {};
 }
 
 QStringList executableExtensions() {
@@ -62,42 +153,12 @@ QStringList executableExtensions() {
 
 QString resolvePathCandidate(const QString& candidate) {
 	if (auto existing = normalizedExistingFile(candidate); !existing.isEmpty()) return existing;
+	if (hasFileExtension(candidate)) return QString();
 
-	// Windows does not require typing PATHEXT. Mirror that lookup for explicit
-	// paths as well so lpApplicationName receives the real file instead of a
-	// best-effort prefix.
+	// Allow omitted PATHEXT only on a target without a named extension.
 	for (const auto& extension: executableExtensions()) {
-		if (candidate.endsWith(extension, Qt::CaseInsensitive)) continue;
 		if (auto existing = normalizedExistingFile(candidate + extension); !existing.isEmpty()) {
 			return existing;
-		}
-	}
-
-	return QString();
-}
-
-QString resolvePathProgram(const QString& program) {
-	return resolvePathCandidate(program);
-}
-
-QString resolvePathProgram(const QStringList& tokens, bool firstWasQuoted, qsizetype& consumed) {
-	consumed = 1;
-	if (tokens.isEmpty()) return QString();
-
-	const auto& first = tokens.first();
-	if (!looksLikePath(first) || firstWasQuoted) {
-		return resolvePathCandidate(first);
-	}
-
-	// QProcess::splitCommand correctly removes quotes, but legacy exec lines
-	// also carry unquoted paths such as C:\Program Files\app.exe. Choose the
-	// longest existing prefix so a space in the path is not mistaken for the
-	// first argument boundary.
-	for (qsizetype count = tokens.size(); count >= 1; --count) {
-		const auto candidate = tokens.first(count).join(u' ');
-		if (auto resolved = resolvePathCandidate(candidate); !resolved.isEmpty()) {
-			consumed = count;
-			return resolved;
 		}
 	}
 
@@ -166,7 +227,7 @@ HRESULT explorerShellExecute(
     const QString& target,
     const QString& arguments,
     const QString& workingDirectory,
-    const QString& verb
+    bool& mayHaveStarted
 ) {
 	auto com = ComApartment(COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 	if (FAILED(com.hr)) return com.hr;
@@ -235,11 +296,16 @@ HRESULT explorerShellExecute(
 	Variant directory;
 	if (!workingDirectory.isEmpty()) directory.setString(workingDirectory);
 	Variant operation;
-	if (!verb.isEmpty()) operation.setString(verb);
+	operation.setString(QStringLiteral("open"));
 	Variant show;
 	show.setInt(SW_SHOWNORMAL);
 
-	return shell->ShellExecute(file.get(), args.value, directory.value, operation.value, show.value);
+	hr = shell->ShellExecute(file.get(), args.value, directory.value, operation.value, show.value);
+	// A disconnect during the call is not proof that Explorer did not launch
+	// the target. Failures during discovery, before ShellExecute, are retryable.
+	mayHaveStarted = hr == RPC_E_SERVER_DIED || hr == RPC_E_DISCONNECTED
+	              || hr == RPC_E_CALL_CANCELED || hr == HRESULT_FROM_WIN32(RPC_S_CALL_FAILED);
+	return hr;
 }
 
 LaunchResult shellExecuteExTarget(
@@ -250,9 +316,6 @@ LaunchResult shellExecuteExTarget(
     HWND owner,
     bool invokeIdList
 ) {
-	auto result = LaunchResult();
-	result.usedShell = true;
-
 	auto wtarget = target.toStdWString();
 	auto warguments = arguments.toStdWString();
 	auto wdirectory = workingDirectory.toStdWString();
@@ -269,18 +332,76 @@ LaunchResult shellExecuteExTarget(
 	info.lpDirectory = wdirectory.empty() ? nullptr : wdirectory.c_str();
 	info.nShow = SW_SHOWNORMAL;
 
-	if (ShellExecuteExW(&info)) {
-		result.status = LaunchStatus::Started;
-		result.error = ERROR_SUCCESS;
-		return result;
+	auto error = DWORD(ERROR_SUCCESS);
+	if (!ShellExecuteExW(&info)) {
+		error = GetLastError();
+		if (error == ERROR_SUCCESS) error = ERROR_GEN_FAILURE;
 	}
-
-	result.error = GetLastError();
-	result.status = result.error == ERROR_CANCELLED ? LaunchStatus::Cancelled : LaunchStatus::Failed;
+	auto result = detail::launchResultForError(error);
+	result.usedShell = true;
 	return result;
 }
 
-LaunchResult createProcess(const LaunchCommand& command, const QString& workingDirectory) {
+LaunchResult cleanShellExecute(
+    const QString& target,
+    const QString& arguments,
+    const QString& workingDirectory,
+    bool invokeIdList,
+    std::wstring& environment
+) {
+	// ShellExecuteExW cannot take an environment block. Re-enter the same
+	// executable before CLI/GUI initialization, with no inherited handles.
+	const auto executable = QDir::toNativeSeparators(QCoreApplication::applicationFilePath());
+	if (executable.isEmpty()) return detail::launchResultForError(ERROR_FILE_NOT_FOUND);
+	const auto application = executable.toStdWString();
+	const auto helperDirectory = QDir::toNativeSeparators(QFileInfo(executable).absolutePath())
+	                                 .toStdWString();
+	auto commandLine = joinCommandLine(
+	    executable,
+	    {QString::fromLatin1(SHELL_OPEN_HELPER_ARG),
+	     invokeIdList ? QStringLiteral("1") : QStringLiteral("0"),
+	     target,
+	     arguments,
+	     workingDirectory}
+	).toStdWString();
+
+	STARTUPINFOW startup {};
+	startup.cb = sizeof(startup);
+	PROCESS_INFORMATION process {};
+	if (!CreateProcessW(
+	        application.c_str(),
+	        commandLine.data(),
+	        nullptr,
+	        nullptr,
+	        FALSE,
+	        CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+	        environment.data(),
+	        helperDirectory.c_str(),
+	        &startup,
+	        &process
+	    ))
+	{
+		return detail::launchResultForError(GetLastError());
+	}
+
+	CloseHandle(process.hThread);
+	DWORD error = ERROR_GEN_FAILURE;
+	if (WaitForSingleObject(process.hProcess, INFINITE) == WAIT_OBJECT_0) {
+		if (!GetExitCodeProcess(process.hProcess, &error)) error = GetLastError();
+	} else {
+		error = GetLastError();
+	}
+	CloseHandle(process.hProcess);
+	auto result = detail::launchResultForError(error);
+	result.usedShell = true;
+	return result;
+}
+
+LaunchResult createProcess(
+    const LaunchCommand& command,
+    const QString& workingDirectory,
+    std::wstring& environment
+) {
 	auto result = LaunchResult();
 	result.usedProcess = true;
 
@@ -290,10 +411,10 @@ LaunchResult createProcess(const LaunchCommand& command, const QString& workingD
 	}
 
 	auto application = command.executable.toStdWString();
-	auto commandLineText = joinCommandLine(command.executable, command.arguments);
+	auto commandLineText = quoteCommandArgument(command.executable);
+	if (!command.argumentTail.isEmpty()) commandLineText += u' ' + command.argumentTail;
 	auto commandLine = commandLineText.toStdWString();
 	auto directory = workingDirectory.toStdWString();
-	auto environment = cleanEnvironmentBlock();
 
 	STARTUPINFOW startup {};
 	startup.cb = sizeof(startup);
@@ -340,7 +461,47 @@ QString defaultWorkingDirectory(const QString& workingDirectory) {
 	return workingDirectory.isEmpty() ? QDir::toNativeSeparators(QDir::homePath()) : workingDirectory;
 }
 
+LaunchResult explorerOpen(const QString& target, const QString& args, const QString& directory) {
+	auto mayHaveStarted = false;
+	const auto hr = explorerShellExecute(target, args, directory, mayHaveStarted);
+	if (mayHaveStarted) {
+		return {.status = LaunchStatus::Indeterminate, .error = ERROR_GEN_FAILURE};
+	}
+	if (FAILED(hr)) {
+		return detail::launchResultForError(
+		    hr == HRESULT_FROM_WIN32(ERROR_CANCELLED) ? ERROR_CANCELLED : ERROR_GEN_FAILURE
+		);
+	}
+	return {.status = LaunchStatus::Started, .error = ERROR_SUCCESS, .usedExplorer = true};
+}
+
 } // namespace
+
+std::optional<DWORD> runShellOpenHelper(int argc, char** argv) {
+	if (argc < 2 || qstrcmp(argv[1], SHELL_OPEN_HELPER_ARG) != 0) return std::nullopt;
+
+	int count = 0;
+	auto* args = CommandLineToArgvW(GetCommandLineW(), &count);
+	if (args == nullptr) return ERROR_INVALID_PARAMETER;
+	if (count != 6 || (std::wcscmp(args[2], L"0") != 0 && std::wcscmp(args[2], L"1") != 0)
+	    || args[3][0] == L'\0')
+	{
+		LocalFree(args);
+		return ERROR_INVALID_PARAMETER;
+	}
+
+	const auto invokeIdList = args[2][0] == L'1';
+	const auto target = QString::fromWCharArray(args[3]);
+	const auto parameters = QString::fromWCharArray(args[4]);
+	const auto directory = QString::fromWCharArray(args[5]);
+	LocalFree(args);
+
+	auto com = ComApartment(COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+	if (FAILED(com.hr)) return ERROR_GEN_FAILURE;
+	return shellExecuteExTarget(
+	           target, parameters, directory, QStringLiteral("open"), nullptr, invokeIdList
+	).error;
+}
 
 QString quoteCommandArgument(const QString& argument) {
 	if (!argument.isEmpty()
@@ -392,18 +553,13 @@ QString joinCommandLine(const QString& program, const QStringList& arguments) {
 QString resolveExecutable(const QString& program) {
 	if (program.isEmpty()) return QString();
 
-	if (looksLikePath(program)) return resolvePathProgram(program);
+	if (looksLikePath(program)) return resolvePathCandidate(program);
 
 	// A file beside the shell wins over PATH, matching the keybind behavior that
 	// shipped before the unified launcher.
 	if (!QCoreApplication::applicationDirPath().isEmpty()) {
-		for (const auto& candidate: {
-		         QDir(QCoreApplication::applicationDirPath()).filePath(program),
-		         QDir(QCoreApplication::applicationDirPath()).filePath(program + QStringLiteral(".exe")),
-		     })
-		{
-			if (auto existing = normalizedExistingFile(candidate); !existing.isEmpty()) return existing;
-		}
+		const auto candidate = QDir(QCoreApplication::applicationDirPath()).filePath(program);
+		if (auto existing = resolvePathCandidate(candidate); !existing.isEmpty()) return existing;
 	}
 
 	auto found = QStandardPaths::findExecutable(program);
@@ -418,6 +574,8 @@ QString resolveExecutable(const QString& program) {
 }
 
 bool isAppExecutionAlias(const QString& path) {
+	const auto name = QFileInfo(path).fileName();
+	if (name.contains(u'*') || name.contains(u'?')) return false;
 	const auto wide = QDir::toNativeSeparators(path).toStdWString();
 	WIN32_FIND_DATAW data {};
 	auto* find = FindFirstFileW(wide.c_str(), &data);
@@ -457,34 +615,53 @@ ProgramKind classifyProgram(const QString& path) {
 }
 
 LaunchCommand parseLaunchCommand(const QString& command) {
-	auto parsed = LaunchCommand {.input = command};
-	const auto tokens = QProcess::splitCommand(command);
-	if (tokens.isEmpty()) return parsed;
+	auto parsed = LaunchCommand();
+	const auto line = QStringView(command).sliced(skipCommandSpace(command, 0));
+	if (line.isEmpty()) return parsed;
 
-	const auto trimmed = command.trimmed();
-	const auto firstWasQuoted = trimmed.startsWith(u'"') || trimmed.startsWith(u'\'');
-	qsizetype consumed = 1;
-	parsed.executable = resolvePathProgram(tokens, firstWasQuoted, consumed);
-
-	if (parsed.executable.isEmpty() && !looksLikePath(tokens.first())) {
-		parsed.executable = resolveExecutable(tokens.first());
-	}
-
-	if (consumed == 1 || parsed.executable.isEmpty()) {
-		parsed.program = tokens.first();
-		parsed.arguments = tokens.mid(1);
+	parsed.error = ERROR_INVALID_PARAMETER;
+	if (line.contains(QChar::Null)) return parsed;
+	auto end = qsizetype(0);
+	if (line.startsWith(u'"')) {
+		const auto close = line.indexOf(u'"', 1);
+		if (close < 0 || (close + 1 < line.size() && !isCommandSpace(line[close + 1]))) {
+			return parsed;
+		}
+		parsed.program = line.sliced(1, close - 1).toString();
+		end = close + 1;
 	} else {
-		parsed.program = tokens.first(consumed).join(u' ');
-		parsed.arguments = tokens.mid(consumed);
+		end = endOfWord(line, 0);
+		const auto first = line.first(end);
+		if (first.contains(u'"')) return parsed;
+		if (!isShellName(first)) {
+			if (looksLikePath(first)) {
+				end = explicitPathEnd(line, end);
+				if (end < 0) return parsed;
+			} else if (hasAmbiguousRelativePath(line, end)) {
+				return parsed;
+			}
+		}
+		parsed.program = line.first(end).toString();
 	}
+	if (parsed.program.isEmpty()) return parsed;
 
+	// Do not parse or rebuild the argument tail. Windows applications may use
+	// their own parser; even empty arguments and escaped quotes must survive.
+	parsed.argumentTail = line.sliced(skipCommandSpace(line, end)).toString();
+	parsed.error = ERROR_SUCCESS;
+	if (isShellName(parsed.program)) return parsed;
+
+	parsed.executable = resolveExecutable(parsed.program);
+	if (parsed.executable.isEmpty() && looksLikePath(parsed.program)) {
+		parsed.error = ERROR_FILE_NOT_FOUND;
+		return parsed;
+	}
 	parsed.kind = classifyProgram(parsed.executable);
 	return parsed;
 }
 
 std::wstring cleanEnvironmentBlock() {
 	auto environment = Common::INITIAL_ENVIRONMENT;
-	if (environment.isEmpty()) environment = QProcessEnvironment::systemEnvironment();
 
 	// Defense in depth: the launch path also removes these before capturing the
 	// snapshot, but no process created through this helper may receive them.
@@ -502,6 +679,7 @@ std::wstring cleanEnvironmentBlock() {
 		block.append(wide);
 		block.push_back(L'\0');
 	}
+	if (block.empty()) block.push_back(L'\0');
 	block.push_back(L'\0');
 	return block;
 }
@@ -516,58 +694,49 @@ LaunchResult shellExecuteTarget(
     bool useExplorer
 ) {
 	if (target.isEmpty()) {
-		return {.status = LaunchStatus::Failed, .error = ERROR_FILE_NOT_FOUND};
+		return detail::launchResultForError(ERROR_FILE_NOT_FOUND);
+	}
+	if (target.contains(QChar::Null) || arguments.contains(QChar::Null)
+	    || workingDirectory.contains(QChar::Null))
+	{
+		return detail::launchResultForError(ERROR_INVALID_PARAMETER);
 	}
 
 	const auto directory = defaultWorkingDirectory(workingDirectory);
-	if (useExplorer && verb.compare(QStringLiteral("open"), Qt::CaseInsensitive) == 0) {
-		const auto hr = explorerShellExecute(target, arguments, directory, verb);
-		if (SUCCEEDED(hr)) {
-			return {
-			    .status = LaunchStatus::Started,
-			    .error = ERROR_SUCCESS,
-			    .usedExplorer = true,
-			};
-		}
+	if (verb == QStringLiteral("open")) {
+		return detail::openWithFallback(
+		    [&] { return useExplorer ? explorerOpen(target, arguments, directory) : LaunchResult(); },
+		    [&](std::wstring environment) {
+			    return cleanShellExecute(target, arguments, directory, invokeIdList, environment);
+		    }
+		);
 	}
-
-	return shellExecuteExTarget(target, arguments, directory, verb, owner, invokeIdList);
+	if (verb == QStringLiteral("runas")) {
+		return shellExecuteExTarget(target, arguments, directory, verb, owner, invokeIdList);
+	}
+	return detail::launchResultForError(ERROR_NOT_SUPPORTED);
 }
 
 LaunchResult launchCommand(const QString& command, const QString& workingDirectory, HWND owner) {
 	const auto parsed = parseLaunchCommand(command);
-	if (parsed.program.isEmpty()) {
-		return {.status = LaunchStatus::Failed, .error = ERROR_FILE_NOT_FOUND};
-	}
+	if (parsed.error != ERROR_SUCCESS) return detail::launchResultForError(parsed.error);
 
 	const auto directory = defaultWorkingDirectory(workingDirectory);
-	const auto arguments = joinCommandArguments(parsed.arguments);
 	const auto target = targetFor(parsed);
-
-	// Explorer owns normal application launches when it is available. This keeps
-	// shell-specific Qt/pragma state out of the child even when the shell itself
-	// had to mutate its own process environment.
-	const auto explorer = explorerShellExecute(target, arguments, directory, QStringLiteral("open"));
-	if (SUCCEEDED(explorer)) {
-		return {
-		    .status = LaunchStatus::Started,
-		    .error = ERROR_SUCCESS,
-		    .usedExplorer = true,
-		};
-	}
-
-	if (parsed.useProcess()) {
-		auto process = createProcess(parsed, directory);
-		if (process.started() || process.status == LaunchStatus::Cancelled) return process;
-	}
-
-	return shellExecuteExTarget(
-	    target,
-	    arguments,
-	    directory,
-	    QStringLiteral("open"),
-	    owner,
-	    false
+	return detail::openWithFallback(
+	    [&] { return explorerOpen(target, parsed.argumentTail, directory); },
+	    [&](std::wstring environment) {
+		    if (parsed.useProcess()) {
+			    const auto result = createProcess(parsed, directory, environment);
+			    if (result.error == ERROR_ELEVATION_REQUIRED) {
+				    return shellExecuteTarget(
+				        target, parsed.argumentTail, directory, QStringLiteral("runas"), owner
+				    );
+			    }
+			    if (result.status != LaunchStatus::Failed) return result;
+		    }
+		    return cleanShellExecute(target, parsed.argumentTail, directory, false, environment);
+	    }
 	);
 }
 
@@ -577,17 +746,14 @@ LaunchResult launchElevatedCommand(
     HWND owner
 ) {
 	const auto parsed = parseLaunchCommand(command);
-	if (parsed.program.isEmpty()) {
-		return {.status = LaunchStatus::Failed, .error = ERROR_FILE_NOT_FOUND};
-	}
+	if (parsed.error != ERROR_SUCCESS) return detail::launchResultForError(parsed.error);
 
-	return shellExecuteExTarget(
+	return shellExecuteTarget(
 	    targetFor(parsed),
-	    joinCommandArguments(parsed.arguments),
+	    parsed.argumentTail,
 	    defaultWorkingDirectory(workingDirectory),
 	    QStringLiteral("runas"),
-	    owner,
-	    false
+	    owner
 	);
 }
 

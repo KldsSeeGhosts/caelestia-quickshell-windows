@@ -28,6 +28,10 @@
 #include "build.hpp"
 #include "launch_p.hpp"
 
+#ifdef QS_WINDOWS_BACKEND
+#include "../windows/process_launch.hpp"
+#endif
+
 #if CRASH_HANDLER && !defined(_WIN32)
 #include "../crash/main.hpp"
 #endif
@@ -36,10 +40,8 @@ namespace qs::launch {
 
 namespace {
 
-void checkCrashRelaunch(char** argv) {
+void checkCrashRelaunch([[maybe_unused]] char** argv) {
 #if CRASH_HANDLER && defined(_WIN32)
-	Q_UNUSED(argv);
-
 	if (qEnvironmentVariableIsSet("__QUICKSHELL_CRASH_RELAUNCH")) {
 		auto launchTimeMs = qEnvironmentVariable("__QUICKSHELL_CRASH_LAUNCH_TIME").toLongLong();
 		auto nowMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
@@ -160,6 +162,12 @@ void exitDaemon(int code) {
 #endif
 
 int main(int argc, char** argv) {
+#ifdef QS_WINDOWS_BACKEND
+	if (const auto result = windows::process::runShellOpenHelper(argc, argv)) {
+		return static_cast<int>(*result);
+	}
+#endif
+
 #ifdef QS_WINDOWS_GUI_EXE
 	if (AttachConsole(ATTACH_PARENT_PROCESS)) {
 		FILE* stream = nullptr;

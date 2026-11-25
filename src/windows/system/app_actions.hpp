@@ -16,6 +16,7 @@ struct AppActionInfo {
 	QString packageFamilyName;
 	QString executionAlias;
 	bool packaged = false;
+	bool allowAppsFolderElevation = false;
 	bool canRunAsAdmin = false;
 	bool canOpenLocation = false;
 	bool canUninstall = false;
@@ -33,6 +34,7 @@ public:
 		Cancelled,
 		Refused,
 		NotSupported,
+		Queued,
 	};
 	Q_ENUM(ActionResult)
 
@@ -43,6 +45,8 @@ public:
 	Q_INVOKABLE QVariantMap info(const QString& entryId);
 	Q_INVOKABLE bool runAsAdmin(const QString& entryId, QObject* parentWindow = nullptr);
 	Q_INVOKABLE QVariantMap runAsAdminDetailed(const QString& entryId, QObject* parentWindow = nullptr);
+	// Open returns Queued and reports completion via shellActionFinished.
+	// Runas returns its result synchronously so parentWindow still owns consent.
 	Q_INVOKABLE QVariantMap launchShellAction(const QVariantMap& spec, QObject* parentWindow = nullptr);
 	Q_INVOKABLE bool isInlineSudoEnabled() const;
 	Q_INVOKABLE bool openFileLocation(const QString& entryId);
@@ -51,6 +55,7 @@ public:
 
 signals:
 	void lastErrorChanged();
+	void shellActionFinished(const QVariantMap& result);
 
 private:
 	AppActionInfo details(const QString& entryId);

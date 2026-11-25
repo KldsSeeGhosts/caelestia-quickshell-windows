@@ -360,7 +360,7 @@ void launchToken(const QString& token, const QString& workingDirectory) {
 	    false,
 	    true
 	);
-	if (shell.started()) return;
+	if (shell.status != process::LaunchStatus::Failed) return;
 
 	ComPtr<IApplicationActivationManager> activationManager;
 	auto hr = CoCreateInstance(
