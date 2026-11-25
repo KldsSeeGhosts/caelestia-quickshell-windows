@@ -136,14 +136,19 @@ void followMovedWindow(
 	}
 
 	auto* behavior = WorkspaceBehavior::instance();
-	if (!follow) {
+	const auto originStillActive = [&] {
 		const auto currentIndex = guardedDesktops->currentIndex();
-		if (currentIndex < 0 || currentIndex >= guardedDesktops->count()) return;
+		if (currentIndex < 0 || currentIndex >= guardedDesktops->count()) return false;
 		const auto checkIndex = isNullDesktopGuid(originDesktopId) ? originIndex : currentIndex;
-		if (!guardedDesktops->isDesktopCurrentlyActive(checkIndex, originDesktopId)) return;
-		behavior->expectFocus(currentIndex, activationSource);
+		return guardedDesktops->isDesktopCurrentlyActive(checkIndex, originDesktopId);
+	};
+	if (!follow) {
+		if (!originStillActive()) return;
+		behavior->expectFocus(guardedDesktops->currentIndex(), activationSource);
 		return;
 	}
+
+	if (!originStillActive()) return;
 
 	qsizetype targetIndex = fallbackIndex;
 	if (!isNullDesktopGuid(targetDesktopId)) {
@@ -168,7 +173,8 @@ void followMovedWindow(
 		    guardedWindow->activateOnCurrentDesktop(activationSource);
 	    },
 	    workspaceIntent,
-	    !isNullDesktopGuid(targetDesktopId) ? std::optional<GUID>(targetDesktopId) : std::nullopt
+	    !isNullDesktopGuid(targetDesktopId) ? std::optional<GUID>(targetDesktopId) : std::nullopt,
+	    !isNullDesktopGuid(originDesktopId) ? std::optional<GUID>(originDesktopId) : std::nullopt
 	);
 }
 

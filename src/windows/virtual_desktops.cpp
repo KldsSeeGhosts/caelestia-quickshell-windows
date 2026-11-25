@@ -440,8 +440,13 @@ void VirtualDesktops::refresh(bool rereadNames) {
 			if (current >= 0 && current < count) {
 				const auto currentId = this->mDesktops[current].id;
 				if (current != this->mCurrent || !IsEqualGUID(currentId, this->mCurrentId)) {
+					const auto externalChange = !this->pendingSwitch && this->mCurrent >= 0
+					    && (current != this->mCurrent
+					        || (!guidIsNull(this->mCurrentId)
+					            && !IsEqualGUID(currentId, this->mCurrentId)));
 					this->mCurrent = current;
 					this->mCurrentId = currentId;
+					if (externalChange) ++this->mWorkspaceIntentOrder;
 					emit this->currentChanged();
 				}
 			}
@@ -525,10 +530,16 @@ void VirtualDesktops::refresh(bool rereadNames) {
 	}
 
 	auto currentChanged = currentIndex != this->mCurrent || !IsEqualGUID(current, this->mCurrentId);
+	const auto externalChange = !this->pendingSwitch && this->mCurrent >= 0
+	    && (currentIndex != this->mCurrent
+	        || (!guidIsNull(this->mCurrentId) && !IsEqualGUID(current, this->mCurrentId)));
 
 	this->mDesktops = desktops;
 	this->mCurrent = currentIndex;
 	this->mCurrentId = current;
+	if (currentChanged && externalChange) {
+		++this->mWorkspaceIntentOrder;
+	}
 
 	if (listChanged) {
 		qCDebug(logDesktops) << "Desktop list changed:" << desktops.length() << "desktops";
@@ -765,6 +776,14 @@ void VirtualDesktops::observeSwitch() {
 			return;
 		}
 	}
+	if (pending.expectedOrigin && !guidIsNull(*pending.expectedOrigin)
+	    && this->mCurrent >= 0 && this->mCurrent < this->count()
+	    && !IsEqualGUID(this->mDesktops[this->mCurrent].id, *pending.expectedOrigin)
+	    && !IsEqualGUID(this->mDesktops[this->mCurrent].id, pending.desktop))
+	{
+		this->finishSwitch(DesktopCommandOutcome::Superseded, QStringLiteral("origin-changed"));
+		return;
+	}
 	if (!guidIsNull(pending.desktop)) {
 		if (this->mCurrent >= 0 && this->mCurrent < this->count()
 		    && IsEqualGUID(pending.desktop, this->mDesktops[this->mCurrent].id))
@@ -784,7 +803,8 @@ bool VirtualDesktops::switchTo(
     const std::function<bool()>& shouldProceed,
     std::function<void(qsizetype)> onObserved,
     std::optional<quint64> expectedIntent,
-    std::optional<GUID> targetDesktopId
+    std::optional<GUID> targetDesktopId,
+    std::optional<GUID> expectedOriginDesktopId
 ) {
 	QPointer<VirtualDesktops> self(this);
 	const auto entrySwitchOrder = this->mSwitchOrder;
@@ -810,6 +830,14 @@ bool VirtualDesktops::switchTo(
 	if (index < 0 || index >= this->count()) {
 		this->refuseCommand(QStringLiteral("switch"), QStringLiteral("invalid-target"));
 		return false;
+	}
+	const auto hasExpectedOrigin =
+	    expectedOriginDesktopId && !guidIsNull(*expectedOriginDesktopId);
+	if (hasExpectedOrigin) {
+		const auto originIdx = this->indexOf(*expectedOriginDesktopId);
+		if (originIdx < 0 || !this->isDesktopCurrentlyActive(originIdx, *expectedOriginDesktopId)) {
+			return false;
+		}
 	}
 
 	const auto switchOrder = ++this->mSwitchOrder;
@@ -838,9 +866,16 @@ bool VirtualDesktops::switchTo(
 		this->refuseCommand(QStringLiteral("switch"), QStringLiteral("invalid-target"));
 		return false;
 	}
+	if (hasExpectedOrigin) {
+		const auto originIdx = this->indexOf(*expectedOriginDesktopId);
+		if (originIdx < 0 || !this->isDesktopCurrentlyActive(originIdx, *expectedOriginDesktopId)) {
+			return false;
+		}
+	}
 	const auto targetGuid =
 	    (targetDesktopId && !guidIsNull(*targetDesktopId)) ? *targetDesktopId : this->mDesktops[index].id;
-	const auto alreadyCurrent = this->isDesktopCurrentlyActive(index, targetGuid);
+	const auto alreadyCurrent = !(hasExpectedOrigin && this->nativeAccessor)
+	                         && this->isDesktopCurrentlyActive(index, targetGuid);
 	if (alreadyCurrent) {
 		this->publishCommand(DesktopRequestResult {++this->nextRequest, QStringLiteral("switch"),
 		                                         DesktopCommandOutcome::Observed, {}});
@@ -853,8 +888,16 @@ bool VirtualDesktops::switchTo(
 	}
 
 	const auto switchResult = (this->nativeAccessor && !guidIsNull(targetGuid))
-	    ? this->call(-1, &switchNativeDesktopById, targetGuid)
+	    ? (hasExpectedOrigin
+	           ? this->call(
+	                 -1, &switchNativeDesktopByIdIfCurrent, targetGuid, *expectedOriginDesktopId
+	             )
+	           : this->call(-1, &switchNativeDesktopById, targetGuid))
 	    : this->call(-1, this->accessor.goToDesktopNumber, static_cast<int>(index));
+	if (switchResult == -2) {
+		this->refresh();
+		return false;
+	}
 	if (switchResult == -1) {
 		qCWarning(logDesktops) << "GoToDesktopNumber" << index << "failed";
 		this->refuseCommand(QStringLiteral("switch"), this->commandFailureReason());
@@ -877,6 +920,7 @@ bool VirtualDesktops::switchTo(
 	    switchIntent,
 	    std::move(onObserved),
 	    minObservationSequence,
+	    expectedOriginDesktopId,
 	};
 	if (!this->nativeAccessor || !nativeDesktopRequestPending()) this->switchDeadline.start();
 	this->publishCommand(DesktopRequestResult {id, QStringLiteral("switch"), DesktopCommandOutcome::Accepted, {}});

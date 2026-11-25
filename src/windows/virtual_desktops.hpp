@@ -97,7 +97,8 @@ public:
 	    const std::function<bool()>& shouldProceed = {},
 	    std::function<void(qsizetype)> onObserved = {},
 	    std::optional<quint64> expectedIntent = std::nullopt,
-	    std::optional<GUID> targetDesktopId = std::nullopt
+	    std::optional<GUID> targetDesktopId = std::nullopt,
+	    std::optional<GUID> expectedOriginDesktopId = std::nullopt
 	);
 	void ensureCount(qsizetype count, std::function<void(bool)> done);
 	void ensureCountWithReason(qsizetype count, std::function<void(bool, const QString&)> done);
@@ -235,6 +236,7 @@ private:
 		quint64 intentOrder = 0;
 		std::function<void(qsizetype)> onObserved;
 		quint64 minObservationSequence = 0;
+		std::optional<GUID> expectedOrigin;
 	};
 	std::optional<PendingSwitch> pendingSwitch;
 	QTimer switchDeadline;

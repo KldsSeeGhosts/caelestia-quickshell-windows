@@ -1121,6 +1121,22 @@ int nativeWindowOnCurrentDesktop(HWND hwnd) { return channel().window(hwnd).onCu
 int switchNativeDesktopById(GUID desktop) {
 	return channel().execute([desktop] { return switchDesktop(workerIndex(desktop)); });
 }
+int switchNativeDesktopByIdIfCurrent(GUID desktop, GUID expectedCurrent) {
+	return channel().execute([desktop, expectedCurrent] {
+		auto& p = provider();
+		p.lastError = S_OK;
+		if (!p.refresh()) return -1;
+		if (p.current < 0 || p.current >= p.ids.size()
+		    || !IsEqualGUID(p.ids[p.current], expectedCurrent))
+		{
+			p.operationError = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+			return -2;
+		}
+		if (IsEqualGUID(desktop, expectedCurrent)) return 0;
+		p.desktopRefreshed = false;
+		return switchDesktop(workerIndex(desktop));
+	});
+}
 int moveNativeDesktopWindowById(HWND hwnd, GUID desktop) {
 	const auto result = channel().execute(
 	    [hwnd, desktop] { return moveWindow(hwnd, workerIndex(desktop)); },

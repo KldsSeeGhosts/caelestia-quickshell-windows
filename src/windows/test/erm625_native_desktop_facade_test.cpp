@@ -1400,6 +1400,65 @@ private slots:
 		QObject::disconnect(conn);
 		QCOMPARE(observedCalls, 0);
 	}
+
+	void externalDesktopChangeAdvancesWorkspaceIntentAndBlocksStaleFollow() {
+		this->old.manager.array.desktops = {&this->old.one, &this->old.two, &this->old.three};
+		this->old.manager.current = &this->old.one;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		this->desktops->refresh();
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));
+
+		const auto moveIntent = this->desktops->beginWorkspaceIntent();
+		// Simulate an external Windows Task View switch from A to C.
+		this->old.manager.current = &this->old.three;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		this->desktops->refresh();
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(2));
+		QVERIFY(this->desktops->workspaceIntentOrder() != moveIntent);
+
+		int observedCalls = 0;
+		QVERIFY(!this->desktops->switchTo(
+		    1,
+		    {},
+		    [&observedCalls](qsizetype) { ++observedCalls; },
+		    moveIntent,
+		    this->old.two.id,
+		    this->old.one.id
+		));
+		QCOMPARE(this->old.manager.switches, 0);
+		QCOMPARE(observedCalls, 0);
+	}
+
+	void conditionalFollowSwitchAbortsWhenTaskViewChangedDesktopBeforeCacheRefresh() {
+		this->old.manager.array.desktops = {&this->old.one, &this->old.two, &this->old.three};
+		this->old.manager.current = &this->old.one;
+		this->old.manager.publishSwitch = true;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		this->desktops->refresh();
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));
+
+		const auto moveIntent = this->desktops->beginWorkspaceIntent();
+		// User switches to C in Task View before any native cache refresh runs.
+		this->old.manager.current = &this->old.three;
+
+		int observedCalls = 0;
+		QVERIFY(!this->desktops->switchTo(
+		    1,
+		    {},
+		    [&observedCalls](qsizetype) { ++observedCalls; },
+		    moveIntent,
+		    this->old.two.id,
+		    this->old.one.id
+		));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->old.manager.switches, 0);
+		QCOMPARE(this->old.manager.current, &this->old.three);
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(2));
+		QCOMPARE(observedCalls, 0);
+	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)
 #include "erm625_native_desktop_facade_test.moc"
