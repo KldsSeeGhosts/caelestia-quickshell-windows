@@ -613,11 +613,12 @@ void Dispatcher::focusWorkspace(const QString& arg) {
 		if (!behavior->backAndForth() || target.kind == WorkspaceTarget::Kind::Relative || previous < 0
 		    || previous == index)
 		{
+			const auto focusIntent = desktops->beginWorkspaceIntent();
 			desktops->switchTo(
 			    index,
 			    {},
 			    {},
-			    std::nullopt,
+			    focusIntent,
 			    !isNullDesktopGuid(initialTargetId) ? std::optional<GUID>(initialTargetId) : std::nullopt
 			);
 			behavior->warpToActive();
@@ -645,13 +646,14 @@ void Dispatcher::focusWorkspace(const QString& arg) {
 	}
 
 	const auto targetId = desktopIdAt(desktops, index);
+	const auto focusIntent = desktops->beginWorkspaceIntent();
 	behavior->prepareWarp(index);
 	behavior->expectFocus(index);
 	desktops->switchTo(
 	    index,
 	    {},
 	    {},
-	    std::nullopt,
+	    focusIntent,
 	    !isNullDesktopGuid(targetId) ? std::optional<GUID>(targetId) : std::nullopt
 	);
 }

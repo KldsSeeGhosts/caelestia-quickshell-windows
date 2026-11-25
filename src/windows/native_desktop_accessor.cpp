@@ -88,6 +88,7 @@ struct Provider {
 	int current = -1;
 	bool structuredException = false;
 	bool privateEnabled = true;
+	bool desktopRefreshed = false;
 	DesktopAvailability availability = DesktopAvailability::MissingProvider;
 	HRESULT lastError = S_OK;
 	HRESULT operationError = S_OK;
@@ -281,6 +282,7 @@ struct Provider {
 		ok = this->releaseLocal(desktop) && ok;
 		ok = this->releaseLocal(desktops) && ok;
 		ok = this->releaseLocal(array) && ok;
+		if (ok) this->desktopRefreshed = true;
 		return ok;
 	}
 
@@ -385,6 +387,7 @@ struct Snapshot {
 	int result = -1;
 	quint64 sequence = 0;
 	bool publicReady = false;
+	bool desktopRead = false;
 };
 
 struct Request {
@@ -474,6 +477,7 @@ struct Worker {
 			snapshot.sequence = request->sequence;
 			try {
 				p.operationError = S_OK;
+				p.desktopRefreshed = false;
 				snapshot.result = FAILED(apartment) ? -1 : request->operation();
 				snapshot.operationError = FAILED(apartment) ? apartment : p.operationError;
 				for (const auto value: request->windows) {
@@ -505,6 +509,7 @@ struct Worker {
 				snapshot.availability = p.availability;
 				snapshot.error = p.lastError;
 				snapshot.publicReady = p.publicApi != nullptr;
+				snapshot.desktopRead = p.desktopRefreshed;
 			} catch (...) {
 				snapshot.availability = DesktopAvailability::Disconnected;
 				snapshot.error = E_UNEXPECTED;
@@ -553,6 +558,7 @@ struct Channel {
 	bool waiting = false;
 	quint64 sequence = 0;
 	quint64 applied = 0;
+	quint64 desktopReadApplied = 0;
 	quint64 windowRevision = 0;
 #ifdef QS_TEST
 	NativeDesktopFactory factory;
@@ -674,6 +680,9 @@ struct Channel {
 			this->retire(error);
 			this->snapshot.availability = state;
 			return false;
+		}
+		if (result.desktopRead && result.sequence > this->desktopReadApplied) {
+			this->desktopReadApplied = result.sequence;
 		}
 		this->snapshot = std::move(result);
 		return true;
@@ -1105,7 +1114,7 @@ bool nativeDesktopRequestPending() {
 	return c.waiting || c.pending.has_value() || c.refresh.has_value();
 }
 quint64 nativeDesktopSubmittedSequence() { return channel().sequence; }
-quint64 nativeDesktopAppliedSequence() { return channel().applied; }
+quint64 nativeDesktopReadSequence() { return channel().desktopReadApplied; }
 quint64 nativeDesktopWindowSnapshotRevision() { return channel().windowRevision; }
 GUID nativeWindowDesktopId(HWND hwnd) { return channel().window(hwnd).id; }
 int nativeWindowOnCurrentDesktop(HWND hwnd) { return channel().window(hwnd).onCurrent; }
@@ -1167,6 +1176,7 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.privateEnabled = false;
 	p.refusedBuild = false;
 	p.applied = 0;
+	p.desktopReadApplied = 0;
 	p.windowRevision = 0;
 	p.snapshot = {};
 	p.watchedWindows.clear();

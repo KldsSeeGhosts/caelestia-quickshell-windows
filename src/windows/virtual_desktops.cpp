@@ -744,7 +744,7 @@ void VirtualDesktops::observeSwitch() {
 	auto& pending = *this->pendingSwitch;
 	if (this->nativeAccessor && pending.minObservationSequence != 0) {
 		if (nativeDesktopCommandPending()
-		    || nativeDesktopAppliedSequence() <= pending.minObservationSequence)
+		    || nativeDesktopReadSequence() <= pending.minObservationSequence)
 		{
 			return;
 		}
@@ -777,6 +777,7 @@ bool VirtualDesktops::switchTo(
 	if (expectedIntent && this->mWorkspaceIntentOrder != *expectedIntent) return false;
 	if (shouldProceed && !shouldProceed()) return false;
 	if (this->nativeAccessor && nativeDesktopCommandPending()) {
+		if (!expectedIntent) ++this->mWorkspaceIntentOrder;
 		this->refuseCommand(QStringLiteral("switch"), QStringLiteral("provider-busy"));
 		return false;
 	}
@@ -803,6 +804,7 @@ bool VirtualDesktops::switchTo(
 	}
 	if (shouldProceed && !shouldProceed()) return false;
 	if (this->nativeAccessor && nativeDesktopCommandPending()) {
+		if (!expectedIntent) ++this->mWorkspaceIntentOrder;
 		this->refuseCommand(QStringLiteral("switch"), QStringLiteral("provider-busy"));
 		return false;
 	}

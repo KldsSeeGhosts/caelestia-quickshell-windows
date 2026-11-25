@@ -881,9 +881,7 @@ private slots:
 
 		QVERIFY(!this->desktops->switchTo(1));
 		QObject::disconnect(conn);
-		this->old.manager.beforeSwitch = {};
 		QVERIFY(innerRan);
-		QCOMPARE(nativeSwitches, 1);
 		QCOMPARE(innerAccepted.value("outcome").toString(), QStringLiteral("accepted"));
 		QCOMPARE(this->desktops->lastCommand(), innerAccepted);
 
@@ -894,6 +892,9 @@ private slots:
 		    },
 		    1000
 		));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		this->old.manager.beforeSwitch = {};
+		QCOMPARE(nativeSwitches, 1);
 		QCOMPARE(this->desktops->lastCommand().value("requestId"), innerAccepted.value("requestId"));
 	}
 
@@ -1164,6 +1165,93 @@ private slots:
 		this->old.manager.beforeSwitch = {};
 		this->old.manager.switchResult = S_OK;
 		QCOMPARE(observedCalls, 0);
+	}
+
+	void reentrantMoveDuringAcceptedDoesNotObservePreCommandSwitchSnapshot() {
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xbc));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		this->old.manager.array.desktops = {&this->old.one, &this->old.two, &this->old.three};
+		this->old.manager.current = &this->old.three;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		this->desktops->refresh();
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+
+		// Populate native cache with B without refreshing facade (facade says C, native cache says B),
+		// then move provider to C with a failing synchronous switch so Accepted runs a reentrant move.
+		this->old.manager.current = &this->old.two;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		this->old.manager.current = &this->old.three;
+		this->old.manager.publishSwitch = false;
+		this->old.manager.switchResult = S_OK;
+		this->old.manager.beforeSwitch = {};
+		this->old.manager.moveResult = S_OK;
+		this->old.manager.beforeMove = {};
+
+		bool movedInsideAccepted = false;
+		int observedCalls = 0;
+		auto conn = QObject::connect(
+		    this->desktops,
+		    &VirtualDesktops::commandResult,
+		    this->desktops,
+		    [this, window, &movedInsideAccepted](const QVariantMap& result) {
+			    if (!movedInsideAccepted && result.value("operation").toString() == QStringLiteral("switch")
+			        && result.value("outcome").toString() == QStringLiteral("accepted"))
+			    {
+				    movedInsideAccepted = true;
+				    QVERIFY(this->desktops->moveWindow(window, 1));
+			    }
+		    }
+		);
+
+		QVERIFY(this->desktops->switchTo(
+		    1,
+		    {},
+		    [&observedCalls](qsizetype) { ++observedCalls; },
+		    std::nullopt,
+		    this->old.two.id
+		));
+		QObject::disconnect(conn);
+		QVERIFY(movedInsideAccepted);
+		// Reentrant move advanced the native command sequence without reading desktops,
+		// so observation must still wait for a real desktop probe and time out on C.
+		QCOMPARE(observedCalls, 0);
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("timed-out");
+		    },
+		    1000
+		));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(observedCalls, 0);
+	}
+
+	void busySwitchAdvancesWorkspaceIntentWithoutCancellingPendingMove() {
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xbd));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		auto blocked = std::make_shared<BlockingCall>();
+		Unblock unblock {blocked};
+		this->old.manager.moveResult = S_OK;
+		this->old.manager.beforeMove = [blocked] { (*blocked)(); };
+
+		const auto moveIntent = this->desktops->beginWorkspaceIntent();
+		quint64 pendingSeq = 0;
+		QVERIFY(this->desktops->moveWindow(window, 1, &pendingSeq));
+		QVERIFY(pendingSeq != 0);
+		QVERIFY(nativeDesktopCommandPending());
+
+		QVERIFY(!this->desktops->switchTo(1));
+		QCOMPARE(
+		    this->desktops->lastCommand().value("reason").toString(),
+		    QStringLiteral("provider-busy")
+		);
+		QVERIFY(nativeDesktopCommandPending());
+		QVERIFY(this->desktops->workspaceIntentOrder() != moveIntent);
+
+		blocked->release();
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		this->old.manager.beforeMove = {};
+		QCOMPARE(this->old.manager.moves, 1);
 	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)
