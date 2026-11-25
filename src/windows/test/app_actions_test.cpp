@@ -14,6 +14,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <winioctl.h>
 #include <wrl/client.h>
 
 #include "../process_launch.hpp"
@@ -31,6 +32,7 @@ using ShellExecuteInvoker = std::function<qs::windows::process::LaunchResult(
     bool
 )>;
 using KnownFolderPathInvoker = std::function<HRESULT(const GUID&, DWORD, QString*)>;
+using ReparsePointInvoker = std::function<bool(const QString&, DWORD*, QString*, bool*)>;
 
 namespace qs::windows::sys::test {
 void setParsingNameForId(const QString& id, const QString& token);
@@ -42,6 +44,7 @@ void setShortcutRootsForTest(const QStringList& roots);
 void setDriveTypeInvokerForTest(const std::function<UINT(const QString&)>& invoker);
 void setFileAttributesInvokerForTest(const std::function<DWORD(const QString&)>& invoker);
 void setKnownFolderPathInvokerForTest(const KnownFolderPathInvoker& invoker);
+void setReparsePointInvokerForTest(const ReparsePointInvoker& invoker);
 void setShellExecuteTargetInvokerForTest(const ShellExecuteInvoker& invoker);
 void resetPropertiesTestHooks();
 } // namespace qs::windows::sys::test
@@ -471,6 +474,86 @@ private slots:
 		const auto id = QStringLiteral("fixture-network-root");
 		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), false);
 		QVERIFY(rootValidationCalls > 0);
+	}
+
+	void directorySymlinkToUncIsRejectedBeforeProbingBelowIt() {
+		const auto redirectedAncestor = QStringLiteral("C:\\Redirected");
+		const auto redirectedRoot = QStringLiteral("C:\\Redirected\\Start Menu");
+		const auto redirectedTarget = QStringLiteral("C:\\Redirected\\Start Menu\\app.exe");
+		auto ancestorChecked = 0;
+		auto probedBelowSymlink = 0;
+
+		qs::windows::sys::test::setDriveTypeInvokerForTest([](const QString& root) {
+			if (root.compare(QStringLiteral("C:\\"), Qt::CaseInsensitive) == 0) return UINT(DRIVE_FIXED);
+			return UINT(DRIVE_NO_ROOT_DIR);
+		});
+		qs::windows::sys::test::setFileAttributesInvokerForTest([&](const QString& path) {
+			if (path.compare(redirectedAncestor, Qt::CaseInsensitive) == 0) {
+				ancestorChecked++;
+				return DWORD(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT);
+			}
+			if (path.startsWith(redirectedAncestor + QStringLiteral("\\"), Qt::CaseInsensitive)) {
+				probedBelowSymlink++;
+			}
+			return DWORD(INVALID_FILE_ATTRIBUTES);
+		});
+		qs::windows::sys::test::setReparsePointInvokerForTest(
+		    [&](const QString& path, DWORD* tag, QString* target, bool* relative) {
+			    if (path.compare(redirectedAncestor, Qt::CaseInsensitive) != 0) return false;
+			    *tag = IO_REPARSE_TAG_SYMLINK;
+			    *target = QStringLiteral("\\??\\UNC\\nonexistent-network-host.invalid\\share");
+			    *relative = false;
+			    return true;
+		    }
+		);
+		qs::windows::sys::test::setShortcutRootsForTest({redirectedRoot});
+		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-symlink-unc"), redirectedTarget);
+		qs::windows::sys::test::setLinkTargetForId(QStringLiteral("fixture-symlink-unc"), redirectedTarget);
+
+		AppActions actions;
+		const auto id = QStringLiteral("fixture-symlink-unc");
+		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), false);
+		QVERIFY(!actions.openProperties(id));
+		QVERIFY(ancestorChecked > 0);
+		QCOMPARE(probedBelowSymlink, 0);
+	}
+
+	void directorySymlinkToLocalTargetStillAllowsProperties() {
+		QTemporaryDir directory;
+		QVERIFY(directory.isValid());
+		const auto realTarget = writeFile(directory, QStringLiteral("fixture.exe"));
+		QVERIFY(!realTarget.isEmpty());
+
+		const auto aliasAncestor = QStringLiteral("C:\\LocalAlias");
+		const auto aliasTarget = aliasAncestor + QStringLiteral("\\fixture.exe");
+		const auto realDir = QDir::toNativeSeparators(directory.path());
+
+		qs::windows::sys::test::setFileAttributesInvokerForTest([&](const QString& path) {
+			if (path.compare(aliasAncestor, Qt::CaseInsensitive) == 0) {
+				return DWORD(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT);
+			}
+			const auto wide = path.toStdWString();
+			return GetFileAttributesW(wide.c_str());
+		});
+		qs::windows::sys::test::setReparsePointInvokerForTest(
+		    [&](const QString& path, DWORD* tag, QString* target, bool* relative) {
+			    if (path.compare(aliasAncestor, Qt::CaseInsensitive) != 0) return false;
+			    *tag = IO_REPARSE_TAG_MOUNT_POINT;
+			    *target = QStringLiteral("\\??\\") + realDir;
+			    *relative = false;
+			    return true;
+		    }
+		);
+		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-symlink-local"), aliasTarget);
+
+		InvokeLog invoke;
+		installInvoker(invoke);
+		AppActions actions;
+		const auto id = QStringLiteral("fixture-symlink-local");
+		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), true);
+		QVERIFY(actions.openProperties(id));
+		QCOMPARE(invoke.calls, 1);
+		QCOMPARE(invoke.path, aliasTarget);
 	}
 
 	void remoteStartMenuShortcutIsRejectedForPropertiesButUsedForElevation() {

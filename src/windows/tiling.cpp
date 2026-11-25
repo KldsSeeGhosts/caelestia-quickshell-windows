@@ -3758,6 +3758,7 @@ TilingManager::setFloatingDetailed(TrackedWindow* window, bool floating, bool to
 		if (overrideMatches && stateMatches) return FloatingChangeResult::Noop;
 	}
 
+	const auto wasTiled = m.layout != nullptr;
 	m.override = floating ? Override::Float : Override::Tile;
 	if (!floating) m.autoFloat = false;
 	// A manual float or tile ends any automatic admission wait.
@@ -3765,7 +3766,7 @@ TilingManager::setFloatingDetailed(TrackedWindow* window, bool floating, bool to
 	m.terminalAdmissionAt = 0;
 
 	this->markWindow(window);
-	if (!floating) {
+	if (!floating && !wasTiled) {
 		const auto state = this->stateOf(m);
 		if (state == State::Hidden || state == State::Suspended) {
 			return FloatingChangeResult::Deferred;

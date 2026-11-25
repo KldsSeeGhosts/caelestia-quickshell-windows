@@ -1,5 +1,6 @@
 #include "app_actions.hpp"
 
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -31,6 +32,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <winioctl.h>
 #include <wrl/client.h>
 
 #include "../../core/desktopentry.hpp"
@@ -117,15 +119,30 @@ std::optional<QString> validFilesystemPath(const QString& path) {
 	return native;
 }
 
+#ifndef SYMLINK_FLAG_RELATIVE
+constexpr ULONG SYMLINK_FLAG_RELATIVE = 0x00000001UL;
+#endif
+#ifndef IO_REPARSE_TAG_WOF
+constexpr DWORD IO_REPARSE_TAG_WOF = 0x80000017UL;
+#endif
+
+struct ReparsePointInfo {
+	DWORD tag = 0;
+	QString substituteTarget;
+	bool relative = false;
+};
+
 #ifdef QS_TEST
 using PropertiesInvoker = std::function<DWORD(const QString&, HWND, DWORD)>;
 using DriveTypeInvoker = std::function<UINT(const QString&)>;
 using FileAttributesInvoker = std::function<DWORD(const QString&)>;
 using KnownFolderPathInvoker = std::function<HRESULT(const GUID&, DWORD, QString*)>;
+using ReparsePointInvoker = std::function<bool(const QString&, DWORD*, QString*, bool*)>;
 PropertiesInvoker propertiesInvokerForTest;
 DriveTypeInvoker driveTypeInvokerForTest;
 FileAttributesInvoker fileAttributesInvokerForTest;
 KnownFolderPathInvoker knownFolderPathInvokerForTest;
+ReparsePointInvoker reparsePointInvokerForTest;
 std::optional<QStringList> shortcutRootsForTest;
 #endif
 
@@ -137,6 +154,16 @@ UINT driveTypeForRoot(const QString& root) {
 	return GetDriveTypeW(wide.c_str());
 }
 
+bool isLocalDriveType(UINT driveType) {
+	switch (driveType) {
+	case DRIVE_FIXED:
+	case DRIVE_REMOVABLE:
+	case DRIVE_CDROM:
+	case DRIVE_RAMDISK: return true;
+	default: return false;
+	}
+}
+
 DWORD fileAttributes(const QString& path) {
 #ifdef QS_TEST
 	if (fileAttributesInvokerForTest) return fileAttributesInvokerForTest(path);
@@ -145,21 +172,168 @@ DWORD fileAttributes(const QString& path) {
 	return GetFileAttributesW(wide.c_str());
 }
 
-std::optional<QString> validLocalFilesystemPath(const QString& path) {
+std::optional<ReparsePointInfo> readReparsePoint(const QString& path) {
+#ifdef QS_TEST
+	if (reparsePointInvokerForTest) {
+		auto info = ReparsePointInfo();
+		if (!reparsePointInvokerForTest(path, &info.tag, &info.substituteTarget, &info.relative)) {
+			return std::nullopt;
+		}
+		return info;
+	}
+#endif
+	const auto wide = path.toStdWString();
+	auto* handle = CreateFileW(
+	    wide.c_str(),
+	    0,
+	    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+	    nullptr,
+	    OPEN_EXISTING,
+	    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+	    nullptr
+	);
+	if (handle == INVALID_HANDLE_VALUE) return std::nullopt;
+
+	auto buffer = QByteArray(MAXIMUM_REPARSE_DATA_BUFFER_SIZE, '\0');
+	DWORD returned = 0;
+	const auto ok = DeviceIoControl(
+	    handle,
+	    FSCTL_GET_REPARSE_POINT,
+	    nullptr,
+	    0,
+	    buffer.data(),
+	    static_cast<DWORD>(buffer.size()),
+	    &returned,
+	    nullptr
+	);
+	CloseHandle(handle);
+	if (!ok || returned < 8) return std::nullopt;
+
+	DWORD tag = 0;
+	USHORT dataLength = 0;
+	std::memcpy(&tag, buffer.constData(), sizeof(tag));
+	std::memcpy(&dataLength, buffer.constData() + 4, sizeof(dataLength));
+	const auto totalLength = DWORD(dataLength) + 8;
+	if (totalLength > returned) return std::nullopt;
+
+	auto info = ReparsePointInfo();
+	info.tag = tag;
+	if (tag == IO_REPARSE_TAG_SYMLINK || tag == IO_REPARSE_TAG_MOUNT_POINT) {
+		const auto headerSize = DWORD(tag == IO_REPARSE_TAG_SYMLINK ? 20 : 16);
+		if (totalLength < headerSize) return std::nullopt;
+
+		USHORT subOffset = 0;
+		USHORT subLength = 0;
+		std::memcpy(&subOffset, buffer.constData() + 8, sizeof(subOffset));
+		std::memcpy(&subLength, buffer.constData() + 10, sizeof(subLength));
+		if ((subOffset % 2) != 0 || (subLength % 2) != 0) return std::nullopt;
+
+		const auto start = headerSize + DWORD(subOffset);
+		if (start > totalLength || DWORD(subLength) > totalLength - start) return std::nullopt;
+
+		if (tag == IO_REPARSE_TAG_SYMLINK) {
+			ULONG flags = 0;
+			std::memcpy(&flags, buffer.constData() + 16, sizeof(flags));
+			info.relative = (flags & SYMLINK_FLAG_RELATIVE) != 0;
+		}
+		info.substituteTarget = QString::fromUtf16(
+		    reinterpret_cast<const char16_t*>(buffer.constData() + start),
+		    static_cast<qsizetype>(subLength / 2)
+		);
+	}
+	return info;
+}
+
+QString normalizeReparseTarget(const QString& parentDir, const ReparsePointInfo& info) {
+	auto target = info.substituteTarget;
+	if (target.isEmpty()) return {};
+
+	if (info.relative) {
+		const auto combined = parentDir + QStringLiteral("\\") + target;
+		return QDir::toNativeSeparators(QDir::cleanPath(combined));
+	}
+
+	if (target.startsWith(QStringLiteral("\\??\\UNC\\"), Qt::CaseInsensitive)) {
+		return QStringLiteral("\\\\?\\UNC\\") + target.mid(8);
+	}
+	if (target.startsWith(QStringLiteral("\\??\\"))) {
+		target = target.mid(4);
+	}
+	return QDir::toNativeSeparators(target);
+}
+
+std::optional<QString> resolveLocalFilesystemPath(const QString& path, int depth) {
+	constexpr int MAX_REPARSE_DEPTH = 8;
+	if (depth > MAX_REPARSE_DEPTH) return std::nullopt;
+
 	const auto valid = validFilesystemPath(path);
 	if (!valid.has_value()) return std::nullopt;
 	if (isUncFilesystemPath(*valid)) return std::nullopt;
 
 	const auto letter = driveLetterOfFilesystemPath(*valid);
 	if (!letter.has_value()) return std::nullopt;
-	const auto root = QString(*letter) + QStringLiteral(":\\");
-	switch (driveTypeForRoot(root)) {
-	case DRIVE_FIXED:
-	case DRIVE_REMOVABLE:
-	case DRIVE_CDROM:
-	case DRIVE_RAMDISK: return valid;
-	default: return std::nullopt;
+	const auto driveRoot = QString(*letter) + QStringLiteral(":\\");
+	if (!isLocalDriveType(driveTypeForRoot(driveRoot))) return std::nullopt;
+
+	const auto rootLength = valid->startsWith(QStringLiteral("\\\\?\\")) ? qsizetype(7) : qsizetype(3);
+	auto current = valid->left(rootLength);
+	const auto remainder = valid->mid(rootLength);
+	const auto segments = remainder.split(u'\\', Qt::SkipEmptyParts);
+
+	if (segments.isEmpty()) {
+		return fileAttributes(current) != INVALID_FILE_ATTRIBUTES ? std::optional<QString>(current)
+		                                                          : std::nullopt;
 	}
+
+	for (const auto& segment: segments) {
+		if (segment == QStringLiteral(".")) continue;
+		if (segment == QStringLiteral("..")) return std::nullopt;
+
+		const auto parentDir = current;
+		current = current.endsWith(u'\\') ? (current + segment) : (current + QStringLiteral("\\") + segment);
+
+		const auto attrs = fileAttributes(current);
+		if (attrs == INVALID_FILE_ATTRIBUTES) return std::nullopt;
+		if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0) continue;
+
+		const auto reparse = readReparsePoint(current);
+		if (!reparse.has_value()) return std::nullopt;
+
+		if (reparse->tag == IO_REPARSE_TAG_SYMLINK || reparse->tag == IO_REPARSE_TAG_MOUNT_POINT) {
+			if (!reparse->relative
+			    && reparse->substituteTarget.startsWith(QStringLiteral("\\??\\Volume{"), Qt::CaseInsensitive))
+			{
+				const auto closeBrace = reparse->substituteTarget.indexOf(u'}');
+				if (closeBrace < 0) return std::nullopt;
+				const auto volumeEnd = closeBrace + 1;
+				const auto trailing = reparse->substituteTarget.mid(volumeEnd);
+				if (!trailing.isEmpty() && trailing != QStringLiteral("\\")) return std::nullopt;
+				const auto volumeRoot = QStringLiteral("\\\\?\\")
+				    + reparse->substituteTarget.mid(4, volumeEnd - 4) + QStringLiteral("\\");
+				if (!isLocalDriveType(driveTypeForRoot(volumeRoot))) return std::nullopt;
+				continue;
+			}
+
+			const auto target = normalizeReparseTarget(parentDir, *reparse);
+			const auto resolved = resolveLocalFilesystemPath(target, depth + 1);
+			if (!resolved.has_value()) return std::nullopt;
+			current = *resolved;
+			continue;
+		}
+
+		const auto localFileTag = (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0
+		    && (reparse->tag == IO_REPARSE_TAG_WOF || reparse->tag == IO_REPARSE_TAG_APPEXECLINK
+		        || reparse->tag == IO_REPARSE_TAG_DEDUP);
+		if (!localFileTag) return std::nullopt;
+	}
+
+	return current;
+}
+
+std::optional<QString> validLocalFilesystemPath(const QString& path) {
+	const auto valid = validFilesystemPath(path);
+	if (!valid.has_value()) return std::nullopt;
+	return resolveLocalFilesystemPath(*valid, 0).has_value() ? valid : std::nullopt;
 }
 
 bool existingFilesystemPath(const QString& path) {
@@ -167,8 +341,7 @@ bool existingFilesystemPath(const QString& path) {
 }
 
 QString existingLocalFilesystemPath(const QString& path) {
-	const auto valid = validLocalFilesystemPath(path);
-	return valid.has_value() && existingFilesystemPath(*valid) ? *valid : QString();
+	return validLocalFilesystemPath(path).value_or(QString());
 }
 
 enum class ShortcutLookupMode : quint8 { Unfiltered, LocalOnly };
@@ -410,7 +583,7 @@ QStringList startMenuRoots(ShortcutLookupMode mode) {
 
 	auto roots = QStringList();
 	for (const auto& root: candidates) {
-		if (const auto local = validLocalFilesystemPath(root)) roots.append(*local);
+		if (const auto local = resolveLocalFilesystemPath(root, 0)) roots.append(*local);
 	}
 	return roots;
 }
@@ -420,6 +593,48 @@ QString findShortcut(const AppActionInfo& app, ShortcutLookupMode mode) {
 	auto others = QStringList();
 
 	for (const auto& root: startMenuRoots(mode)) {
+		if (mode == ShortcutLookupMode::LocalOnly) {
+			auto pending = QStringList {root};
+			while (!pending.isEmpty()) {
+				const auto dir = pending.takeLast();
+				const auto prefix = dir.endsWith(u'\\') ? dir : (dir + QStringLiteral("\\"));
+				const auto pattern = (prefix + QStringLiteral("*")).toStdWString();
+				WIN32_FIND_DATAW entry {};
+				auto* handle = FindFirstFileExW(
+				    pattern.c_str(),
+				    FindExInfoBasic,
+				    &entry,
+				    FindExSearchNameMatch,
+				    nullptr,
+				    FIND_FIRST_EX_LARGE_FETCH
+				);
+				if (handle == INVALID_HANDLE_VALUE) continue;
+
+				do {
+					const auto name = QString::fromWCharArray(entry.cFileName);
+					if (name == QStringLiteral(".") || name == QStringLiteral("..")) continue;
+					const auto entryPath = prefix + name;
+					const auto attrs = entry.dwFileAttributes;
+					if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+						if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) continue;
+						pending.append(entryPath);
+						continue;
+					}
+					if (!name.endsWith(QStringLiteral(".lnk"), Qt::CaseInsensitive)) continue;
+					if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+					    && !validLocalFilesystemPath(entryPath).has_value())
+					{
+						continue;
+					}
+					const auto baseName = QFileInfo(name).completeBaseName();
+					const auto isNamed = baseName.compare(app.name, Qt::CaseInsensitive) == 0;
+					(isNamed ? named : others).append(entryPath);
+				} while (FindNextFileW(handle, &entry));
+				FindClose(handle);
+			}
+			continue;
+		}
+
 		auto iter = QDirIterator(
 		    root,
 		    {QStringLiteral("*.lnk")},
@@ -716,11 +931,16 @@ void setKnownFolderPathInvokerForTest(const KnownFolderPathInvoker& invoker) {
 	knownFolderPathInvokerForTest = invoker;
 }
 
+void setReparsePointInvokerForTest(const ReparsePointInvoker& invoker) {
+	reparsePointInvokerForTest = invoker;
+}
+
 void resetPropertiesTestHooks() {
 	propertiesInvokerForTest = {};
 	driveTypeInvokerForTest = {};
 	fileAttributesInvokerForTest = {};
 	knownFolderPathInvokerForTest = {};
+	reparsePointInvokerForTest = {};
 	shortcutRootsForTest.reset();
 	clearShortcutCache();
 }
