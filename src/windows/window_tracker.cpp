@@ -32,6 +32,8 @@
 #include "activation_policy.hpp"
 #include "desktopentry_backend.hpp"
 #include "fullscreen_geometry.hpp"
+#include "hyprland/dispatch_refusals.hpp"
+#include "native_desktop_accessor.hpp"
 #include "process_image_name.hpp"
 #include "redact.hpp"
 #include "startup.hpp"
@@ -468,17 +470,25 @@ bool TrackedWindow::ensureCurrentOwner(const QString& action) {
 }
 
 bool TrackedWindow::activate() {
+	return this->activateImpl(true, activationSourceForCurrentState());
+}
+
+bool TrackedWindow::activateOnCurrentDesktop(ActivationSource source) {
+	return this->activateImpl(false, source);
+}
+
+bool TrackedWindow::activateImpl(bool switchDesktop, ActivationSource source) {
 	if (!this->ensureCurrentOwner(QStringLiteral("activate"))) return false;
-	auto* desktops = this->tracker->desktops();
-	auto desktop = desktops->windowDesktopIndex(this->mHwnd);
+	if (switchDesktop) {
+		auto* desktops = this->tracker->desktops();
+		auto desktop = desktops->windowDesktopIndex(this->mHwnd);
 
-	// switchTo() returns false without switching when the accessor is not
-	// loaded, so there is no completion event to wait for here.
-	if (desktop != -1 && desktop != desktops->currentIndex()) {
-		desktops->switchTo(desktop);
+		// switchTo() returns false without switching when the accessor is not
+		// loaded, so there is no completion event to wait for here.
+		if (desktop != -1 && desktop != desktops->currentIndex()) {
+			desktops->switchTo(desktop);
+		}
 	}
-
-	auto source = activationSourceForCurrentState();
 
 	if (IsIconic(this->mHwnd)) {
 		SetLastError(ERROR_SUCCESS);
@@ -512,27 +522,13 @@ bool TrackedWindow::activate() {
 void TrackedWindow::reportActionRefused(const QString& action, const QString& reason) {
 	auto elevated = isMoreElevated(this->mHwnd);
 	this->bElevated = elevated;
-	auto text = window_action_detail::errorText(action, reason);
-	if (this->mLastActionError != text) {
-		this->mLastActionError = text;
-		emit this->lastActionErrorChanged();
-	}
-	emit this->actionRefused(action, reason, elevated);
-	this->tracker->reportWindowActionRefused(this, action, reason, elevated);
+	this->reportActionRefused(action, reason, elevated);
 }
 
 void TrackedWindow::reportActionFailure(const QString& action, DWORD error) {
 	auto elevated = isMoreElevated(this->mHwnd);
 	if (!window_action_detail::shouldReportFailure(error, elevated)) return;
 	this->reportActionRefused(action, window_action_detail::refusalReason(error, elevated));
-}
-
-void TrackedWindow::clearActionError() {
-	if (!this->mLastActionError.isEmpty()) {
-		this->mLastActionError.clear();
-		emit this->lastActionErrorChanged();
-	}
-	this->tracker->clearWindowActionError(this);
 }
 
 void TrackedWindow::close() {
@@ -622,11 +618,147 @@ void TrackedWindow::fullscreenOn(QScreen* screen) {
 	}
 }
 
-bool TrackedWindow::moveToDesktop(qsizetype index) {
-	if (!this->ensureCurrentOwner(QStringLiteral("move-to-desktop"))) return false;
-	if (!this->tracker->desktops()->moveWindow(this->mHwnd, index)) return false;
-	this->refreshDesktop(true);
-	return true;
+bool TrackedWindow::isTrackedAndOwned() const {
+	return this->tracker != nullptr && this->tracker->windowFor(this->mHwnd) == this
+	    && this->hasCurrentOwner();
+}
+
+bool TrackedWindow::moveToDesktop(
+    qsizetype index,
+    quint64 existingMoveSequence,
+    std::function<void(quint64, GUID)> onConfirmedSuccess,
+    std::optional<GUID> requestedTargetId
+) {
+	const auto actionOrder = this->mActionOrder;
+	quint64 moveSequence = existingMoveSequence;
+	if (moveSequence != 0) {
+		if (actionOrder->latestMoveSequence != moveSequence
+		    || actionOrder->lastActionErrorSequence >= moveSequence)
+		{
+			return false;
+		}
+	} else {
+		moveSequence = this->beginMoveRequest();
+	}
+	if (!this->isTrackedAndOwned()) {
+		if (this->tracker->windowFor(this->mHwnd) == this) {
+			this->reportActionRefusedWithSequence(
+			    moveSequence,
+			    QStringLiteral("move"),
+			    qs::hyprland::ipc::moveRefusalReason(QStringLiteral("invalid-window"), false),
+			    false
+			);
+		} else {
+			this->tracker->reportActionRefusalWithSequence(
+			    moveSequence,
+			    QStringLiteral("move"),
+			    qs::hyprland::ipc::moveRefusalReason(QStringLiteral("invalid-window"), false),
+			    false,
+			    actionOrder
+			);
+		}
+		return false;
+	}
+	quint64 pendingSequence = 0;
+	bool pendingRegistered = false;
+	auto pendingOutcome = std::make_shared<std::optional<bool>>();
+	auto targetDesktop = std::make_shared<GUID>(GUID {});
+	QString failureCode;
+	QPointer<TrackedWindow> self(this);
+	QPointer<WindowTracker> guardedTracker(this->tracker);
+	auto finishConfirmed = [self,
+	                        actionOrder,
+	                        targetDesktop,
+	                        onConfirmedSuccess = std::move(onConfirmedSuccess)](
+	                           quint64 confirmedSequence
+	                       ) {
+		if (!self || !self->isTrackedAndOwned()
+		    || actionOrder->latestMoveSequence != confirmedSequence)
+		{
+			return;
+		}
+		self->refreshDesktop(true);
+		if (!self || !self->isTrackedAndOwned()
+		    || actionOrder->latestMoveSequence != confirmedSequence)
+		{
+			return;
+		}
+		if (onConfirmedSuccess) onConfirmedSuccess(confirmedSequence, *targetDesktop);
+	};
+	bool abortedBeforeMove = false;
+	bool lostWindowDuringRecovery = false;
+	const auto accepted = this->tracker->desktops()->moveWindow(
+	    this->mHwnd,
+	    index,
+	    &pendingSequence,
+	    &failureCode,
+	    [self,
+	     guardedTracker,
+	     actionOrder,
+	     moveSequence,
+	     pendingOutcome,
+	     finishConfirmed,
+	     &pendingRegistered](quint64 sequence) {
+		    if (!self || !guardedTracker || sequence == 0) return;
+		    if (actionOrder->latestMoveSequence != moveSequence
+		        || actionOrder->lastActionErrorSequence >= moveSequence)
+		    {
+			    return;
+		    }
+		    guardedTracker->notePendingUserMove(
+		        sequence, self.data(), moveSequence, pendingOutcome, finishConfirmed
+		    );
+		    pendingRegistered = true;
+	    },
+	    [self, actionOrder, moveSequence, &abortedBeforeMove, &lostWindowDuringRecovery] {
+		    if (actionOrder->latestMoveSequence != moveSequence
+		        || actionOrder->lastActionErrorSequence >= moveSequence)
+		    {
+			    abortedBeforeMove = true;
+			    return false;
+		    }
+		    if (!self || !self->isTrackedAndOwned()) {
+			    lostWindowDuringRecovery = true;
+			    return false;
+		    }
+		    return true;
+	    },
+	    targetDesktop.get(),
+	    requestedTargetId
+	);
+	if (abortedBeforeMove) return false;
+	if (lostWindowDuringRecovery) {
+		failureCode = QStringLiteral("invalid-window");
+		if (guardedTracker && guardedTracker->desktops() != nullptr) {
+			guardedTracker->desktops()->refuseCommand(QStringLiteral("move"), failureCode);
+		}
+	}
+	if (!self) {
+		if (!accepted && guardedTracker && actionOrder->latestMoveSequence == moveSequence
+		    && actionOrder->lastActionErrorSequence < moveSequence
+		    && guardedTracker->lastActionErrorSequence() < moveSequence)
+		{
+			guardedTracker->reportActionRefusalWithSequence(
+			    moveSequence,
+			    QStringLiteral("move"),
+			    qs::hyprland::ipc::moveRefusalReason(failureCode, false),
+			    false,
+			    actionOrder
+			);
+		}
+		return false;
+	}
+	return this->finishMoveRequest(
+	    accepted,
+	    pendingSequence,
+	    pendingRegistered,
+	    *pendingOutcome,
+	    failureCode,
+	    moveSequence,
+	    [](const TrackedWindow* window) { return window->hasCurrentOwner(); },
+	    [](HWND hwnd) { return isMoreElevated(hwnd); },
+	    finishConfirmed
+	);
 }
 
 void TrackedWindow::moveTo(const QPoint& logical) {
@@ -736,6 +868,13 @@ WindowTracker::WindowTracker() {
 			if (IsWindow(hwnd)) this->candidates.insert(hwnd);
 		this->onDesktopsChanged();
 	});
+
+	QObject::connect(
+	    this->mDesktops,
+	    &VirtualDesktops::moveWindowCompleted,
+	    this,
+	    &WindowTracker::onMoveWindowCompleted
+	);
 
 	QObject::connect(this->mDesktops, &VirtualDesktops::currentChanged, this, [this]() {
 		for (auto* window: this->mWindows) {
@@ -1226,6 +1365,22 @@ void WindowTracker::onScreensChanged() {
 	this->updateScreens();
 	for (auto* window: this->mWindows) this->dirty[window->hwnd()].state = true;
 	this->schedule();
+}
+
+void WindowTracker::onMoveWindowCompleted(
+    quint64 sequence,
+    quintptr rawHwnd,
+    bool succeeded,
+    const QString& code
+) {
+	this->completePendingUserMove(
+	    sequence,
+	    rawHwnd,
+	    succeeded,
+	    code,
+	    [](const TrackedWindow* window) { return window->hasCurrentOwner(); },
+	    [](HWND hwnd) { return isMoreElevated(hwnd); }
+	);
 }
 
 void WindowTracker::onDesktopsChanged() {

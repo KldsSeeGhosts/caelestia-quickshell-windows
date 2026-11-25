@@ -106,19 +106,119 @@ void launchCommandLine(const QString& line) {
 	}
 }
 
-void moveWindowTo(TrackedWindow* window, qsizetype index, bool follow) {
-	if (!window->moveToDesktop(index)) return;
+bool isNullDesktopGuid(const GUID& id) { return IsEqualGUID(id, GUID {}) != FALSE; }
 
-	auto* behavior = WorkspaceBehavior::instance();
-	if (!follow) {
-		behavior->expectFocus(VirtualDesktops::instance()->currentIndex());
+GUID desktopIdAt(const VirtualDesktops* desktops, qsizetype index) {
+	if (desktops == nullptr || index < 0 || index >= desktops->desktops().size()) return GUID {};
+	return desktops->desktops()[index].id;
+}
+
+void followMovedWindow(
+    const QPointer<VirtualDesktops>& guardedDesktops,
+    const QPointer<TrackedWindow>& guardedWindow,
+    qsizetype fallbackIndex,
+    bool follow,
+    quint64 moveSequence,
+    quint64 workspaceIntent,
+    qsizetype originIndex,
+    GUID originDesktopId,
+    GUID targetDesktopId,
+    ActivationSource activationSource
+) {
+	auto windowStillValid = [guardedWindow, moveSequence] {
+		return guardedWindow && guardedWindow->isTrackedAndOwned()
+		    && guardedWindow->latestMoveSequence() == moveSequence;
+	};
+	if (workspaceIntent == 0 || !guardedDesktops
+	    || guardedDesktops->workspaceIntentOrder() != workspaceIntent || !windowStillValid())
+	{
 		return;
 	}
 
-	behavior->prepareWarp(index, true);
-	if (!VirtualDesktops::instance()->switchTo(index)) return;
-	behavior->expectFocus(index);
-	window->activate();
+	auto* behavior = WorkspaceBehavior::instance();
+	const auto originStillActive = [&] {
+		const auto currentIndex = guardedDesktops->currentIndex();
+		if (currentIndex < 0 || currentIndex >= guardedDesktops->count()) return false;
+		const auto checkIndex = isNullDesktopGuid(originDesktopId) ? originIndex : currentIndex;
+		return guardedDesktops->isDesktopCurrentlyActive(checkIndex, originDesktopId);
+	};
+	if (!follow) {
+		if (!originStillActive()) return;
+		behavior->expectFocus(guardedDesktops->currentIndex(), activationSource);
+		return;
+	}
+
+	if (!originStillActive()) return;
+
+	qsizetype targetIndex = fallbackIndex;
+	if (!isNullDesktopGuid(targetDesktopId)) {
+		targetIndex = guardedDesktops->indexOf(targetDesktopId);
+		if (targetIndex < 0) return;
+	} else if (targetIndex < 0 || targetIndex >= guardedDesktops->count()) {
+		return;
+	}
+
+	(void)guardedDesktops->switchTo(
+	    targetIndex,
+	    windowStillValid,
+	    [guardedDesktops,
+	     windowStillValid,
+	     guardedWindow,
+	     targetDesktopId,
+	     activationSource](qsizetype observedIndex) {
+		    if (!windowStillValid() || !guardedDesktops) return;
+		    if (!guardedDesktops->isDesktopCurrentlyActive(observedIndex, targetDesktopId)) return;
+		    auto* workspaceBehavior = WorkspaceBehavior::instance();
+		    workspaceBehavior->prepareWarp(observedIndex, true);
+		    workspaceBehavior->expectFocus(observedIndex, activationSource);
+		    guardedWindow->activateOnCurrentDesktop(activationSource);
+	    },
+	    workspaceIntent,
+	    !isNullDesktopGuid(targetDesktopId) ? std::optional<GUID>(targetDesktopId) : std::nullopt,
+	    !isNullDesktopGuid(originDesktopId) ? std::optional<GUID>(originDesktopId) : std::nullopt
+	);
+}
+
+void moveWindowTo(
+    VirtualDesktops* desktops,
+    TrackedWindow* window,
+    qsizetype index,
+    bool follow,
+    quint64 existingMoveSequence,
+    quint64 workspaceIntent,
+    qsizetype originIndex,
+    GUID originDesktopId,
+    ActivationSource activationSource,
+    std::optional<GUID> requestedTargetId = std::nullopt
+) {
+	QPointer<VirtualDesktops> guardedDesktops(desktops);
+	QPointer<TrackedWindow> guardedWindow(window);
+	(void)window->moveToDesktop(
+	    index,
+	    existingMoveSequence,
+	    [guardedDesktops,
+	     guardedWindow,
+	     index,
+	     follow,
+	     workspaceIntent,
+	     originIndex,
+	     originDesktopId,
+	     activationSource](quint64 moveSequence, GUID targetDesktopId) {
+		    followMovedWindow(
+		        guardedDesktops,
+		        guardedWindow,
+		        index,
+		        follow,
+		        moveSequence,
+		        workspaceIntent,
+		        originIndex,
+		        originDesktopId,
+		        targetDesktopId,
+		        activationSource
+		    );
+	    },
+	    requestedTargetId
+	);
 }
 
 } // namespace
@@ -482,7 +582,10 @@ TrackedWindow* Dispatcher::resolveWindow(const QString& arg) const {
 
 void Dispatcher::focusWorkspace(const QString& arg) {
 	auto* desktops = this->ipc->desktops();
+	QPointer<VirtualDesktops> guardedDesktops(desktops);
+	const auto entryIntent = desktops->workspaceIntentOrder();
 	desktops->retryAccessor();
+	if (!guardedDesktops || guardedDesktops->workspaceIntentOrder() != entryIntent) return;
 	if (qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR") != "1"
 	    || qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR_DISPATCH") != "1"
 	    || !desktops->supports(DesktopOperation::Switch)) {
@@ -514,12 +617,20 @@ void Dispatcher::focusWorkspace(const QString& arg) {
 
 	auto* behavior = WorkspaceBehavior::instance();
 
-	if (index == desktops->currentIndex()) {
+	const auto initialTargetId = desktopIdAt(desktops, index);
+	if (desktops->isDesktopCurrentlyActive(index, initialTargetId)) {
 		auto previous = behavior->previousDesktop();
 		if (!behavior->backAndForth() || target.kind == WorkspaceTarget::Kind::Relative || previous < 0
 		    || previous == index)
 		{
-			desktops->switchTo(index);
+			const auto focusIntent = desktops->beginWorkspaceIntent();
+			desktops->switchTo(
+			    index,
+			    {},
+			    {},
+			    focusIntent,
+			    !isNullDesktopGuid(initialTargetId) ? std::optional<GUID>(initialTargetId) : std::nullopt
+			);
 			behavior->warpToActive();
 			return;
 		}
@@ -533,45 +644,90 @@ void Dispatcher::focusWorkspace(const QString& arg) {
 			return;
 		}
 
-		desktops->ensureCount(index + 1, [desktops, index](bool ok) {
-			if (!ok) return;
+		const auto focusIntent = desktops->beginWorkspaceIntent();
+		desktops->ensureCount(index + 1, [desktops = QPointer(desktops), index, focusIntent](bool ok) {
+			if (!ok || !desktops || desktops->workspaceIntentOrder() != focusIntent) return;
 			WorkspaceBehavior::instance()->prepareWarp(index);
 			WorkspaceBehavior::instance()->expectFocus(index);
-			desktops->switchTo(index);
+			desktops->switchTo(index, {}, {}, focusIntent);
 		});
 
 		return;
 	}
 
+	const auto targetId = desktopIdAt(desktops, index);
+	const auto focusIntent = desktops->beginWorkspaceIntent();
 	behavior->prepareWarp(index);
 	behavior->expectFocus(index);
-	desktops->switchTo(index);
+	desktops->switchTo(
+	    index,
+	    {},
+	    {},
+	    focusIntent,
+	    !isNullDesktopGuid(targetId) ? std::optional<GUID>(targetId) : std::nullopt
+	);
 }
 
 void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool follow) {
 	auto* desktops = this->ipc->desktops();
+	auto* tracker = this->actionTracker();
+	QPointer<VirtualDesktops> guardedDesktops(desktops);
+	QPointer<WindowTracker> guardedTracker(tracker);
+	QPointer<TrackedWindow> guardedWindow(window);
+	const auto actionOrder = window != nullptr ? window->actionOrderState() : nullptr;
+	const auto moveSequence = window != nullptr
+	    ? window->beginMoveRequest()
+	    : (tracker != nullptr ? tracker->nextActionSequence() : 0);
+	const auto entryIntent = desktops->workspaceIntentOrder();
+	auto originIndex = desktops->currentIndex();
+	auto originDesktopId = desktopIdAt(desktops, originIndex);
+	const auto activationSource = qs::windows::activationSourceForCurrentState();
+	auto windowSuperseded = [&] {
+		return actionOrder != nullptr
+		    && (actionOrder->latestMoveSequence != moveSequence
+		        || actionOrder->lastActionErrorSequence >= moveSequence);
+	};
+	auto refuseImmediate = [this, guardedDesktops, moveSequence, actionOrder](
+	                           TrackedWindow* target, const QString& code
+	                       ) {
+		this->refuseImmediateMove(
+		    target,
+		    code,
+		    [guardedDesktops, code] {
+			    if (guardedDesktops) guardedDesktops->refuseCommand(QStringLiteral("move"), code);
+		    },
+		    moveSequence,
+		    actionOrder
+		);
+	};
 	desktops->retryAccessor();
+	if (!guardedDesktops || windowSuperseded()) return;
+	if (originIndex < 0 && guardedDesktops->workspaceIntentOrder() == entryIntent) {
+		originIndex = guardedDesktops->currentIndex();
+		originDesktopId = desktopIdAt(guardedDesktops.data(), originIndex);
+	}
 	if (qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR") != "1"
 	    || qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR_DISPATCH") != "1"
-	    || !desktops->supports(DesktopOperation::Move)) {
-		desktops->refuseCommand(QStringLiteral("move"),
-		    desktops->availability() == DesktopAvailability::Available
-		        ? QStringLiteral("operation-unsupported")
-		        : desktopAvailabilityReason(desktops->availability()));
+	    || !guardedDesktops->supports(DesktopOperation::Move))
+	{
+		const auto code = guardedDesktops->availability() == DesktopAvailability::Available
+		    ? QStringLiteral("operation-unsupported")
+		    : desktopAvailabilityReason(guardedDesktops->availability());
+		refuseImmediate(guardedWindow.data(), code);
 		this->unsupported(
 		    "movetoworkspace " + arg.trimmed() + " (dispatch disabled or native control unavailable)"
 		);
 		return;
 	}
 
-	if (window == nullptr) {
-		desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-window"));
+	if (!guardedWindow || !guardedWindow->isTrackedAndOwned()) {
+		refuseImmediate(guardedWindow.data(), QStringLiteral("invalid-window"));
 		return;
 	}
 
 	auto target = parseWorkspaceTarget(arg);
 	if (target.kind == WorkspaceTarget::Kind::Special) {
-		desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("operation-unsupported"));
+		refuseImmediate(guardedWindow.data(), QStringLiteral("operation-unsupported"));
 		this->unsupported("movetoworkspace " + arg.trimmed() + " (Windows has no special workspaces)");
 		return;
 	}
@@ -580,27 +736,101 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 	auto index = this->resolveWorkspace(target, create);
 
 	if (index < 0) {
-		desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-target"));
+		refuseImmediate(guardedWindow.data(), QStringLiteral("invalid-target"));
 		if (target.kind != WorkspaceTarget::Kind::Previous) {
 			this->unsupported("movetoworkspace " + arg.trimmed());
 		}
 		return;
 	}
 
-	if (index >= desktops->count()) {
+	if (index >= guardedDesktops->count()) {
 		if (!create) {
-			desktops->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-target"));
+			refuseImmediate(guardedWindow.data(), QStringLiteral("invalid-target"));
 			return;
 		}
 
-		desktops->ensureCount(index + 1, [window = QPointer(window), index, follow](bool ok) {
-			if (ok && window) moveWindowTo(window, index, follow);
-		});
+		const auto workspaceIntent = guardedDesktops->workspaceIntentOrder() == entryIntent
+		    ? guardedDesktops->beginWorkspaceIntent()
+		    : quint64(0);
+		guardedDesktops->ensureCountWithReason(
+		    index + 1,
+		    [tracker = guardedTracker,
+		     desktops = guardedDesktops,
+		     window = guardedWindow,
+		     actionOrder,
+		     moveSequence,
+		     workspaceIntent,
+		     originIndex,
+		     originDesktopId,
+		     activationSource,
+		     index,
+		     follow](bool ok, const QString& reason) {
+			    if (actionOrder
+			        && (actionOrder->latestMoveSequence != moveSequence
+			            || actionOrder->lastActionErrorSequence >= moveSequence))
+			    {
+				    return;
+			    }
+			    if (ok && window && window->isTrackedAndOwned()) {
+				    const auto effectiveIntent =
+				        (workspaceIntent != 0 && desktops
+				         && desktops->workspaceIntentOrder() == workspaceIntent)
+				            ? workspaceIntent
+				            : quint64(0);
+				    moveWindowTo(
+				        desktops.data(),
+				        window,
+				        index,
+				        follow,
+				        moveSequence,
+				        effectiveIntent,
+				        originIndex,
+				        originDesktopId,
+				        activationSource
+				    );
+				    return;
+			    }
+			    if (!ok) {
+				    Dispatcher::refuseDeferredMove(
+				        tracker.data(), moveSequence, actionOrder, reason, {}
+				    );
+				    return;
+			    }
+			    Dispatcher::refuseDeferredMove(
+			        tracker.data(),
+			        moveSequence,
+			        actionOrder,
+			        QStringLiteral("invalid-window"),
+			        [desktops] {
+				        if (desktops) {
+					        desktops->refuseCommand(
+					            QStringLiteral("move"), QStringLiteral("invalid-window")
+					        );
+				        }
+			        }
+			    );
+		    }
+		);
 
 		return;
 	}
 
-	moveWindowTo(window, index, follow);
+	const auto requestedTargetId = desktopIdAt(guardedDesktops.data(), index);
+	const auto workspaceIntent = guardedDesktops->workspaceIntentOrder() == entryIntent
+	    ? guardedDesktops->beginWorkspaceIntent()
+	    : quint64(0);
+	moveWindowTo(
+	    guardedDesktops.data(),
+	    guardedWindow.data(),
+	    index,
+	    follow,
+	    moveSequence,
+	    workspaceIntent,
+	    originIndex,
+	    originDesktopId,
+	    activationSource,
+	    !isNullDesktopGuid(requestedTargetId) ? std::optional<GUID>(requestedTargetId) : std::nullopt
+	);
 }
 
 void Dispatcher::fullscreen(TrackedWindow* window, int mode) {

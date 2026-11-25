@@ -91,6 +91,7 @@ struct FakeManager: FakeCom<DesktopManager> {
 	bool faultOnCurrent = false;
 	bool faultOnCanMove = false;
 	bool faultOnMove = false;
+	bool canMove = true;
 	int canMoves = 0;
 	int moves = 0;
 	HRESULT moveResult = S_OK;
@@ -100,19 +101,22 @@ struct FakeManager: FakeCom<DesktopManager> {
 	ApplicationView* expectedView = nullptr;
 	FakeDesktop* current = nullptr;
 	FakeDesktop* created = nullptr;
-	std::function<void()> beforeEnumeration, beforeSwitch, beforeCreate, beforeMove;
+	FakeDesktop* lastMovedDesktop = nullptr;
+	std::function<void()> beforeEnumeration, beforeSwitch, beforeCreate, beforeCanMove, beforeMove;
 	HRESULT STDMETHODCALLTYPE GetCount(UINT* out) override { return this->array.GetCount(out); }
-	HRESULT STDMETHODCALLTYPE MoveViewToDesktop(ApplicationView* view, Desktop*) override {
+	HRESULT STDMETHODCALLTYPE MoveViewToDesktop(ApplicationView* view, Desktop* desktop) override {
 		if (this->beforeMove) this->beforeMove();
 		++this->moves;
+		this->lastMovedDesktop = static_cast<FakeDesktop*>(desktop);
 		if (this->faultOnMove) fault();
 		return view == this->expectedView ? this->moveResult : E_INVALIDARG;
 	}
 	HRESULT STDMETHODCALLTYPE CanViewMoveDesktops(ApplicationView* view, BOOL* out) override {
+		if (this->beforeCanMove) this->beforeCanMove();
 		++this->canMoves;
 		if (this->faultOnCanMove) fault();
 		if (view != this->expectedView) return E_INVALIDARG;
-		*out = TRUE;
+		*out = this->canMove ? TRUE : FALSE;
 		return S_OK;
 	}
 	HRESULT STDMETHODCALLTYPE GetCurrentDesktop(Desktop** out) override {
@@ -216,8 +220,9 @@ struct Fixture {
 	void clearFaults() {
 		this->manager.publishSwitch = this->manager.publishCreation = false;
 		this->manager.switchResult = this->manager.moveResult = S_OK;
+		this->manager.canMove = TRUE;
 		this->manager.beforeEnumeration = this->manager.beforeSwitch = {};
-		this->manager.beforeCreate = this->manager.beforeMove = {};
+		this->manager.beforeCreate = this->manager.beforeCanMove = this->manager.beforeMove = {};
 		this->manager.beforeRelease = this->manager.array.beforeRelease = {};
 		this->one.beforeRelease = this->two.beforeRelease = this->three.beforeRelease = {};
 		this->views.beforeRelease = this->views.view.beforeRelease = {};

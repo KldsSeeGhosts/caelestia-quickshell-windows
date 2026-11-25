@@ -88,8 +88,10 @@ struct Provider {
 	int current = -1;
 	bool structuredException = false;
 	bool privateEnabled = true;
+	bool desktopRefreshed = false;
 	DesktopAvailability availability = DesktopAvailability::MissingProvider;
 	HRESULT lastError = S_OK;
+	HRESULT operationError = S_OK;
 
 	void dropPrivate() {
 		release(this->snapshot);
@@ -108,6 +110,7 @@ struct Provider {
 		qCWarning(logNativeDesktops) << operation << "raised a structured exception";
 		this->structuredException = true;
 		this->lastError = E_UNEXPECTED;
+		this->operationError = E_UNEXPECTED;
 		this->availability = DesktopAvailability::Disconnected;
 		this->drop();
 	}
@@ -130,6 +133,7 @@ struct Provider {
 	bool check(HRESULT hr, const char* operation) {
 		if (SUCCEEDED(hr)) return true;
 		this->lastError = hr;
+		this->operationError = hr;
 		qCWarning(logNativeDesktops) << operation << "refused, HRESULT" << Qt::hex << hr;
 		if (hr == RPC_E_DISCONNECTED || hr == CO_E_OBJNOTCONNECTED
 		    || hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE))
@@ -278,6 +282,7 @@ struct Provider {
 		ok = this->releaseLocal(desktop) && ok;
 		ok = this->releaseLocal(desktops) && ok;
 		ok = this->releaseLocal(array) && ok;
+		if (ok) this->desktopRefreshed = true;
 		return ok;
 	}
 
@@ -331,6 +336,7 @@ int createDesktop() {
 
 int moveWindow(HWND window, int index) {
 	auto& p = provider();
+	p.lastError = S_OK;
 	auto desktop = p.desktop(index);
 	if (!desktop || !p.validWindow(window)) return -1;
 	ApplicationView* view = nullptr;
@@ -377,9 +383,11 @@ struct Snapshot {
 	QHash<quintptr, WindowSnapshot> windows;
 	DesktopAvailability availability = DesktopAvailability::MissingProvider;
 	HRESULT error = S_OK;
+	HRESULT operationError = S_OK;
 	int result = -1;
 	quint64 sequence = 0;
 	bool publicReady = false;
+	bool desktopRead = false;
 };
 
 struct Request {
@@ -468,7 +476,10 @@ struct Worker {
 			Snapshot snapshot;
 			snapshot.sequence = request->sequence;
 			try {
+				p.operationError = S_OK;
+				p.desktopRefreshed = false;
 				snapshot.result = FAILED(apartment) ? -1 : request->operation();
+				snapshot.operationError = FAILED(apartment) ? apartment : p.operationError;
 				for (const auto value: request->windows) {
 					auto hwnd = reinterpret_cast<HWND>(value);
 					WindowSnapshot window;
@@ -498,9 +509,11 @@ struct Worker {
 				snapshot.availability = p.availability;
 				snapshot.error = p.lastError;
 				snapshot.publicReady = p.publicApi != nullptr;
+				snapshot.desktopRead = p.desktopRefreshed;
 			} catch (...) {
 				snapshot.availability = DesktopAvailability::Disconnected;
 				snapshot.error = E_UNEXPECTED;
+				snapshot.operationError = E_UNEXPECTED;
 			}
 			request->completion.set_value(std::move(snapshot));
 			SetEvent(request->finished);
@@ -523,6 +536,9 @@ struct Channel {
 		std::future<Snapshot> result;
 		Kind kind = Kind::Command;
 		bool queryWindows = false;
+		bool publicOperation = false;
+		HWND moveTarget = nullptr;
+		bool switchCommand = false;
 	};
 	std::shared_ptr<Worker> worker;
 	Snapshot snapshot;
@@ -530,6 +546,7 @@ struct Channel {
 	QPointer<QObject> context;
 	std::function<void()> recovered;
 	std::function<void()> updated;
+	std::function<void(quint64, HWND, bool, DesktopAvailability, HRESULT)> moveCompleted;
 	QTimer deadline;
 	std::atomic<bool> completionWake = false;
 	std::optional<Pending> refresh;
@@ -542,6 +559,10 @@ struct Channel {
 	bool waiting = false;
 	quint64 sequence = 0;
 	quint64 applied = 0;
+	quint64 desktopReadApplied = 0;
+	quint64 cancelledCommandSequence = 0;
+	quint64 failedSwitchSequence = 0;
+	HRESULT failedSwitchError = S_OK;
 	quint64 windowRevision = 0;
 #ifdef QS_TEST
 	NativeDesktopFactory factory;
@@ -583,16 +604,65 @@ struct Channel {
 		if (this->context && this->updated) QTimer::singleShot(0, this->context, this->updated);
 	}
 
+	void notifyMoveCompleted(
+	    quint64 seq,
+	    HWND hwnd,
+	    bool succeeded,
+	    DesktopAvailability availability,
+	    HRESULT error
+	) {
+		if (hwnd == nullptr || !this->context || !this->moveCompleted) return;
+		QTimer::singleShot(0, this->context, [this, seq, hwnd, succeeded, availability, error] {
+			if (this->context && this->moveCompleted) {
+				this->moveCompleted(seq, hwnd, succeeded, availability, error);
+			}
+		});
+	}
+
 	void retire(HRESULT error) {
+		auto pendingMove = std::exchange(this->pending, std::nullopt);
 		if (auto previous = std::exchange(this->worker, {})) previous->stop();
 		this->refresh.reset();
-		this->pending.reset();
 		this->deadline.stop();
 		this->snapshot.availability = DesktopAvailability::Disconnected;
 		this->snapshot.error = error;
 		// Keep the last desktop/window values as explicitly stale state.
 		this->recovery.disconnected();
 		this->notify();
+		if (pendingMove && pendingMove->moveTarget != nullptr) {
+			const auto moveSequence = pendingMove->request ? pendingMove->request->sequence : 0;
+			if (pendingMove->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+				try {
+					auto value = pendingMove->result.get();
+					const auto available = value.availability == DesktopAvailability::Available;
+					const auto moveOk = value.result == 0
+					                 && (available || (pendingMove->publicOperation && value.publicReady));
+					this->notifyMoveCompleted(
+					    moveSequence,
+					    pendingMove->moveTarget,
+					    moveOk,
+					    value.availability,
+					    moveOk ? S_OK : value.operationError
+					);
+				} catch (...) {
+					this->notifyMoveCompleted(
+					    moveSequence,
+					    pendingMove->moveTarget,
+					    false,
+					    DesktopAvailability::Disconnected,
+					    E_UNEXPECTED
+					);
+				}
+			} else {
+				this->notifyMoveCompleted(
+				    moveSequence,
+				    pendingMove->moveTarget,
+				    false,
+				    DesktopAvailability::Disconnected,
+				    error
+				);
+			}
+		}
 	}
 
 	bool apply(Snapshot result) {
@@ -615,6 +685,9 @@ struct Channel {
 			this->snapshot.availability = state;
 			return false;
 		}
+		if (result.desktopRead && result.sequence > this->desktopReadApplied) {
+			this->desktopReadApplied = result.sequence;
+		}
 		this->snapshot = std::move(result);
 		return true;
 	}
@@ -623,8 +696,12 @@ struct Channel {
 	    std::function<int()> operation,
 	    bool queryWindows = false,
 	    bool publicOperation = false,
-	    Kind kind = Kind::Command
+	    Kind kind = Kind::Command,
+	    HWND moveTarget = nullptr,
+	    bool switchCommand = false,
+	    quint64* outSequence = nullptr
 	) {
+		if (outSequence) *outSequence = 0;
 		if (this->waiting) {
 			this->snapshot.error = HRESULT_FROM_WIN32(ERROR_BUSY);
 			return -1;
@@ -643,6 +720,7 @@ struct Channel {
 			return -1;
 		}
 		request->sequence = ++this->sequence;
+		if (outSequence) *outSequence = request->sequence;
 		request->operation = std::move(operation);
 		request->completed = [this] { this->wakeOnCompletion(); };
 		if (queryWindows) request->windows = this->watchedWindows.values();
@@ -678,7 +756,15 @@ struct Channel {
 			}
 			// The request is still owned by this generation, not failed.
 			// Keep its future so the GUI can apply the eventual result.
-			this->pending.emplace(Pending {request, std::move(result), kind, queryWindows});
+			this->pending.emplace(Pending {
+			    request,
+			    std::move(result),
+			    kind,
+			    queryWindows,
+			    publicOperation,
+			    moveTarget,
+			    switchCommand,
+			});
 			this->armDeadline();
 			return kind == Kind::Command ? 0 : -1;
 		}
@@ -823,10 +909,36 @@ struct Channel {
 		slot.reset();
 		try {
 			auto value = finished.result.get();
-			const auto success = value.result != -1;
+			const auto seq = value.sequence;
+			const auto outcome = value.result;
+			const auto success = outcome != -1;
+			const auto operationError = value.operationError;
+			const auto publicReady = value.publicReady;
+			if (finished.switchCommand && outcome == -2
+			    && operationError == HRESULT_FROM_WIN32(ERROR_CANCELLED)
+			    && seq > this->cancelledCommandSequence)
+			{
+				this->cancelledCommandSequence = seq;
+			}
+			if (finished.switchCommand && outcome == -1 && seq > this->failedSwitchSequence) {
+				this->failedSwitchSequence = seq;
+				this->failedSwitchError = operationError;
+			}
 			if (!finished.queryWindows) value.windows = this->snapshot.windows;
 			if (value.sequence < this->applied) this->refreshAgain = true;
 			const auto available = this->apply(std::move(value));
+			const auto availability = this->snapshot.availability;
+			if (finished.moveTarget != nullptr) {
+				const auto moveOk = outcome == 0 && (available || (finished.publicOperation && publicReady));
+				const auto moveSequence = finished.request ? finished.request->sequence : 0;
+				this->notifyMoveCompleted(
+				    moveSequence,
+				    finished.moveTarget,
+				    moveOk,
+				    availability,
+				    moveOk ? S_OK : operationError
+				);
+			}
 			if (finished.kind == Kind::Acquisition && success && available) {
 				++this->windowRevision;
 				this->recovery.reset();
@@ -843,7 +955,23 @@ struct Channel {
 			if (finished.kind == Kind::Command) this->refreshAgain = true;
 			this->notify();
 		} catch (...) {
+			if (finished.switchCommand && finished.request
+			    && finished.request->sequence > this->failedSwitchSequence)
+			{
+				this->failedSwitchSequence = finished.request->sequence;
+				this->failedSwitchError = E_UNEXPECTED;
+			}
 			this->retire(E_UNEXPECTED);
+			if (finished.moveTarget != nullptr) {
+				const auto moveSequence = finished.request ? finished.request->sequence : 0;
+				this->notifyMoveCompleted(
+				    moveSequence,
+				    finished.moveTarget,
+				    false,
+				    DesktopAvailability::Disconnected,
+				    E_UNEXPECTED
+				);
+			}
 		}
 	}
 
@@ -912,17 +1040,13 @@ int workerIndex(GUID id) {
 	return -1;
 }
 int boundedSwitch(int index) {
-	const auto id = cachedId(index);
-	return channel().execute([id] { return switchDesktop(workerIndex(id)); });
+	return switchNativeDesktopById(cachedId(index));
 }
 int boundedCreate() {
 	return channel().execute([] { return createDesktop(); });
 }
 int boundedMove(HWND hwnd, int index) {
-	const auto id = cachedId(index);
-	const auto result = channel().execute([hwnd, id] { return moveWindow(hwnd, workerIndex(id)); });
-	if (result == 0) channel().requestRefresh();
-	return result;
+	return moveNativeDesktopWindowById(hwnd, cachedId(index));
 }
 } // namespace
 
@@ -991,8 +1115,18 @@ void initializeNativeDesktopQueries(QObject* context, std::function<void()> upda
 		c.context = nullptr;
 		c.recovered = {};
 		c.updated = {};
+		c.moveCompleted = {};
 	});
 	if (!c.worker && !c.recovery.active() && !c.acquire() && !c.pending) c.recovery.disconnected();
+}
+
+void setNativeDesktopMoveObserver(
+    QObject* context,
+    std::function<void(quint64, HWND, bool, DesktopAvailability, HRESULT)> onMoveCompleted
+) {
+	auto& c = channel();
+	c.context = context;
+	c.moveCompleted = std::move(onMoveCompleted);
 }
 
 void requestNativeDesktopRefresh() { channel().requestRefresh(); }
@@ -1000,18 +1134,81 @@ bool nativeDesktopCommandPending() {
 	const auto& c = channel();
 	return c.waiting || (c.pending && c.pending->kind == Channel::Kind::Command);
 }
+quint64 nativeDesktopPendingMoveSequence(HWND hwnd) {
+	const auto& c = channel();
+	if (!c.pending || c.pending->moveTarget == nullptr || !c.pending->request) return 0;
+	if (hwnd != nullptr && c.pending->moveTarget != hwnd) return 0;
+	return c.pending->request->sequence;
+}
 bool nativeDesktopRequestPending() {
 	const auto& c = channel();
 	return c.waiting || c.pending.has_value() || c.refresh.has_value();
 }
+quint64 nativeDesktopSubmittedSequence() { return channel().sequence; }
+quint64 nativeDesktopReadSequence() { return channel().desktopReadApplied; }
+quint64 nativeDesktopCancelledSequence() { return channel().cancelledCommandSequence; }
+quint64 nativeDesktopFailedSwitchSequence() { return channel().failedSwitchSequence; }
+HRESULT nativeDesktopFailedSwitchError() { return channel().failedSwitchError; }
 quint64 nativeDesktopWindowSnapshotRevision() { return channel().windowRevision; }
 GUID nativeWindowDesktopId(HWND hwnd) { return channel().window(hwnd).id; }
 int nativeWindowOnCurrentDesktop(HWND hwnd) { return channel().window(hwnd).onCurrent; }
+int switchNativeDesktopById(GUID desktop, quint64* outSequence) {
+	return channel().execute(
+	    [desktop] { return switchDesktop(workerIndex(desktop)); },
+	    false,
+	    false,
+	    Channel::Kind::Command,
+	    nullptr,
+	    true,
+	    outSequence
+	);
+}
+int switchNativeDesktopByIdIfCurrent(
+    GUID desktop,
+    GUID expectedCurrent,
+    quint64* outSequence
+) {
+	return channel().execute(
+	    [desktop, expectedCurrent] {
+		    auto& p = provider();
+		    p.lastError = S_OK;
+		    if (!p.refresh()) return -1;
+		    if (p.current < 0 || p.current >= p.ids.size()
+		        || !IsEqualGUID(p.ids[p.current], expectedCurrent))
+		    {
+			    p.operationError = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+			    return -2;
+		    }
+		    if (IsEqualGUID(desktop, expectedCurrent)) return 0;
+		    p.desktopRefreshed = false;
+		    return switchDesktop(workerIndex(desktop));
+	    },
+	    false,
+	    false,
+	    Channel::Kind::Command,
+	    nullptr,
+	    true,
+	    outSequence
+	);
+}
+int moveNativeDesktopWindowById(HWND hwnd, GUID desktop) {
+	const auto result = channel().execute(
+	    [hwnd, desktop] { return moveWindow(hwnd, workerIndex(desktop)); },
+	    false,
+	    false,
+	    Channel::Kind::Command,
+	    hwnd
+	);
+	if (result == 0) channel().requestRefresh();
+	return result;
+}
+
 std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop) {
 	if (!channel().worker) return std::nullopt;
 	const auto result = channel().execute(
 	    [hwnd, desktop] {
 		    auto& p = provider();
+		    p.lastError = S_OK;
 		    if (!p.publicApi) return -2;
 		    return p.invoke(
 		               [&] { return p.publicApi->MoveWindowToDesktop(hwnd, desktop); },
@@ -1021,7 +1218,9 @@ std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop) {
 		             : -1;
 	    },
 	    false,
-	    true
+	    true,
+	    Channel::Kind::Command,
+	    hwnd
 	);
 	if (result == 0) channel().requestRefresh();
 	return result == -2 ? std::nullopt : std::optional<bool>(result == 0);
@@ -1042,10 +1241,15 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.context = nullptr;
 	p.recovered = {};
 	p.updated = {};
+	p.moveCompleted = {};
 	p.supported = false;
 	p.privateEnabled = false;
 	p.refusedBuild = false;
 	p.applied = 0;
+	p.desktopReadApplied = 0;
+	p.cancelledCommandSequence = 0;
+	p.failedSwitchSequence = 0;
+	p.failedSwitchError = S_OK;
 	p.windowRevision = 0;
 	p.snapshot = {};
 	p.watchedWindows.clear();
@@ -1073,6 +1277,10 @@ int refreshNativeDesktopForTest() {
 	return channel().execute([] { return desktopCount(); }, true, false, Channel::Kind::Probe);
 }
 int nativeDesktopWorkerCountForTest() { return liveWorkers().load(); }
+bool nativeDesktopPendingReadyForTest() {
+	const auto& c = channel();
+	return c.pending && c.pending->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+}
 void setNativeDesktopStuckBoundForTest(int milliseconds) {
 	channel().stallLimit = std::chrono::milliseconds(milliseconds);
 }

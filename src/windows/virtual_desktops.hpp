@@ -88,10 +88,31 @@ public:
 	[[nodiscard]] int workspaceLimit() const { return this->mWorkspaceLimit; }
 	void setWorkspaceLimit(int count) { this->mWorkspaceLimit = qBound(1, count, 20); }
 	void retryAccessor();
-	bool switchTo(qsizetype index);
+	[[nodiscard]] quint64 switchOrder() const { return this->mSwitchOrder; }
+	[[nodiscard]] quint64 workspaceIntentOrder() const { return this->mWorkspaceIntentOrder; }
+	[[nodiscard]] quint64 beginWorkspaceIntent() { return ++this->mWorkspaceIntentOrder; }
+	[[nodiscard]] bool isDesktopCurrentlyActive(qsizetype index, const GUID& targetGuid) const;
+	bool switchTo(
+	    qsizetype index,
+	    const std::function<bool()>& shouldProceed = {},
+	    std::function<void(qsizetype)> onObserved = {},
+	    std::optional<quint64> expectedIntent = std::nullopt,
+	    std::optional<GUID> targetDesktopId = std::nullopt,
+	    std::optional<GUID> expectedOriginDesktopId = std::nullopt
+	);
 	void ensureCount(qsizetype count, std::function<void(bool)> done);
+	void ensureCountWithReason(qsizetype count, std::function<void(bool, const QString&)> done);
 	bool removeDesktop(qsizetype index, qsizetype fallback);
-	bool moveWindow(HWND hwnd, qsizetype index);
+	bool moveWindow(
+	    HWND hwnd,
+	    qsizetype index,
+	    quint64* pendingSequence = nullptr,
+	    QString* failureReason = nullptr,
+	    const std::function<void(quint64)>& onPendingSequence = {},
+	    const std::function<bool()>& shouldProceed = {},
+	    GUID* targetDesktopId = nullptr,
+	    std::optional<GUID> requestedTargetId = std::nullopt
+	);
 	bool pinWindow(HWND hwnd, bool pinned);
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;
 	[[nodiscard]] DesktopAvailability availability() const;
@@ -132,6 +153,7 @@ signals:
 	void capabilityChanged();
 	void lastCommandChanged();
 	void commandResult(QVariantMap result);
+	void moveWindowCompleted(quint64 sequence, quintptr hwnd, bool succeeded, QString reason);
 
 private:
 #ifdef QS_TEST
@@ -145,6 +167,14 @@ private:
 	Q_DISABLE_COPY_MOVE(VirtualDesktops);
 
 	void loadAccessor();
+	void bindNativeDesktopQueries();
+	void onNativeMoveCompleted(
+	    quint64 sequence,
+	    HWND hwnd,
+	    bool succeeded,
+	    DesktopAvailability availability,
+	    HRESULT error
+	);
 	void applyNativeSnapshot();
 	void notifyCapability();
 	bool readRegistry(QList<GUID>& ids, GUID& current) const;
@@ -164,6 +194,8 @@ private:
 	void initCommandObservation();
 	void observeSwitch();
 	void finishSwitch(DesktopCommandOutcome outcome, const QString& reason = {});
+	void clearUnobservedNativeSwitch(bool requireFreshRead = false);
+	[[nodiscard]] static QString failureReasonForError(DesktopAvailability availability, HRESULT error);
 	[[nodiscard]] QString commandFailureReason() const;
 
 	template <typename R, typename... P, typename... A>
@@ -185,7 +217,7 @@ private:
 	struct CreationWaiter {
 		qsizetype count;
 		quint64 id;
-		std::function<void(bool)> done;
+		std::function<void(bool, const QString&)> done;
 	};
 	QList<CreationWaiter> creationWaiters;
 
@@ -202,10 +234,18 @@ private:
 		quint64 id;
 		qsizetype index;
 		GUID desktop;
+		quint64 intentOrder = 0;
+		std::function<void(qsizetype)> onObserved;
+		quint64 minObservationSequence = 0;
+		std::optional<GUID> expectedOrigin;
 	};
 	std::optional<PendingSwitch> pendingSwitch;
 	QTimer switchDeadline;
 	quint64 nextRequest = 0;
+	quint64 mSwitchOrder = 0;
+	quint64 mWorkspaceIntentOrder = 0;
+	quint64 mLastNativeSwitchSequence = 0;
+	bool mHasUnobservedNativeSwitch = false;
 };
 
 } // namespace qs::windows

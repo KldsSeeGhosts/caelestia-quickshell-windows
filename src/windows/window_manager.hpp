@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include <qt_windows.h>
 
 #include <qcolor.h>
@@ -35,7 +37,7 @@ public:
 	[[nodiscard]] qsizetype previousDesktop() const;
 	void prepareWarp(qsizetype desktop, bool fromActive = false);
 	void warpToActive();
-	void expectFocus(qsizetype desktop);
+	void expectFocus(qsizetype desktop, std::optional<ActivationSource> source = std::nullopt);
 
 signals:
 	void backAndForthChanged();

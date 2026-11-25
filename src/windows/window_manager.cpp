@@ -1,5 +1,6 @@
 #include "window_manager.hpp"
 #include <cwchar>
+#include <utility>
 
 #include <qcolor.h>
 #include <qcoreapplication.h>
@@ -209,18 +210,19 @@ void WorkspaceBehavior::warpToActive() {
 	WorkspaceBehavior::warpCursor(window->hwnd());
 }
 
-void WorkspaceBehavior::expectFocus(qsizetype desktop) {
+void WorkspaceBehavior::expectFocus(qsizetype desktop, std::optional<ActivationSource> source) {
 	this->focusDesktop = desktop;
 	// Keep the dispatch that started the switch. The switch's completion is a
 	// native event, so the source has to survive until the repair runs; only a
 	// hook-started switch may reach the accepted escalation.
-	this->focusSource = activationSourceForCurrentState();
+	this->focusSource = source.value_or(activationSourceForCurrentState());
 	this->focusTimer.start();
 }
 
 void WorkspaceBehavior::repairFocus() {
 	auto desktop = this->focusDesktop;
 	this->focusDesktop = -1;
+	const auto source = std::exchange(this->focusSource, ActivationSource::Ipc);
 	if (desktop < 0 || this->desktops->currentIndex() != desktop) return;
 
 	auto* foreground = GetForegroundWindow();
@@ -254,8 +256,7 @@ void WorkspaceBehavior::repairFocus() {
 	// hold the input event by the time this repair runs. Ask once under the
 	// documented foreground lock and report a refusal; only a switch started by
 	// a swallowed hook key may use the accepted escalation.
-	auto ok = requestForegroundWindow(search.found, this->focusSource);
-	this->focusSource = ActivationSource::Ipc;
+	auto ok = requestForegroundWindow(search.found, source);
 	this->tracker->refreshForeground();
 	qCDebug(logWorkspace) << "Nothing on this desktop had focus after a desktop change, moved it to"
 	                      << search.found << (ok ? "" : "(the foreground lock refused it)");

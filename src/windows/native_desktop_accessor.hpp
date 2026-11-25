@@ -17,13 +17,30 @@ void invalidateNativeDesktopAccessor(HRESULT error = S_OK);
 [[nodiscard]] DesktopAvailability nativeDesktopAvailability();
 [[nodiscard]] HRESULT nativeDesktopLastError();
 void initializeNativeDesktopQueries(QObject* context, std::function<void()> updated);
+void setNativeDesktopMoveObserver(
+    QObject* context,
+    std::function<void(quint64, HWND, bool, DesktopAvailability, HRESULT)> onMoveCompleted
+);
 void requestNativeDesktopRefresh();
 [[nodiscard]] bool nativeDesktopCommandPending();
+[[nodiscard]] quint64 nativeDesktopPendingMoveSequence(HWND hwnd = nullptr);
 // Observation must also wait for the snapshot that can confirm a command.
 [[nodiscard]] bool nativeDesktopRequestPending();
+[[nodiscard]] quint64 nativeDesktopSubmittedSequence();
+[[nodiscard]] quint64 nativeDesktopReadSequence();
+[[nodiscard]] quint64 nativeDesktopCancelledSequence();
+[[nodiscard]] quint64 nativeDesktopFailedSwitchSequence();
+[[nodiscard]] HRESULT nativeDesktopFailedSwitchError();
 [[nodiscard]] quint64 nativeDesktopWindowSnapshotRevision();
 [[nodiscard]] GUID nativeWindowDesktopId(HWND hwnd);
 [[nodiscard]] int nativeWindowOnCurrentDesktop(HWND hwnd);
+int switchNativeDesktopById(GUID desktop, quint64* outSequence = nullptr);
+int switchNativeDesktopByIdIfCurrent(
+    GUID desktop,
+    GUID expectedCurrent,
+    quint64* outSequence = nullptr
+);
+int moveNativeDesktopWindowById(HWND hwnd, GUID desktop);
 std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop);
 void shutdownNativeDesktopAccessor();
 
@@ -37,6 +54,7 @@ void setNativeDesktopRecoveryAgeForTest(std::function<qint64()> age);
 [[nodiscard]] int nativeDesktopRecoveryPendingDelayForTest();
 [[nodiscard]] int refreshNativeDesktopForTest();
 [[nodiscard]] int nativeDesktopWorkerCountForTest();
+[[nodiscard]] bool nativeDesktopPendingReadyForTest();
 void setNativeDesktopStuckBoundForTest(int milliseconds);
 #endif
 
