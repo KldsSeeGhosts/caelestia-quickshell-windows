@@ -24,6 +24,7 @@
 #include "known_folders.hpp"
 #include "process_launch.hpp"
 #include "redact.hpp"
+#include "system/shell_action_request.hpp"
 #include "util.hpp"
 
 using Microsoft::WRL::ComPtr;
@@ -344,47 +345,70 @@ QList<ParsedDesktopEntryData> WindowsDesktopEntryBackend::scan() {
 
 namespace {
 
-void launchToken(const QString& token, const QString& workingDirectory) {
+DWORD launchToken(
+    const QString& token,
+    const QString& workingDirectory,
+    const QString& arguments = QString()
+) {
+	if (token.isEmpty()) return ERROR_FILE_NOT_FOUND;
+
 	auto com = ComApartment(COINIT_APARTMENTTHREADED);
 	const auto shellPath = APPS_FOLDER_PREFIX + token;
 
-	// Explorer is the preferred parent for ordinary launches: its shell instance
-	// has the user's unmodified environment even when the shell process had to
-	// set Qt or config-specific variables for itself.
-	const auto shell = process::shellExecuteTarget(
-	    shellPath,
-	    QString(),
+	const auto error = sys::detail::launchAppsFolderTokenWithFallback(
+	    token,
 	    workingDirectory,
-	    QStringLiteral("open"),
-	    nullptr,
-	    false,
-	    true
+	    arguments,
+	    [&] {
+		    // Explorer is the preferred parent for ordinary launches: its shell instance
+		    // has the user's unmodified environment even when the shell process had to
+		    // set Qt or config-specific variables for itself.
+		    return process::shellExecuteTarget(
+		        shellPath,
+		        arguments,
+		        workingDirectory,
+		        QStringLiteral("open"),
+		        nullptr,
+		        false,
+		        true
+		    );
+	    },
+	    [&] {
+		    ComPtr<IApplicationActivationManager> activationManager;
+		    auto hr = CoCreateInstance(
+		        CLSID_ApplicationActivationManager,
+		        nullptr,
+		        CLSCTX_INPROC_SERVER,
+		        IID_PPV_ARGS(&activationManager)
+		    );
+
+		    if (SUCCEEDED(hr)) {
+			    DWORD pid = 0;
+			    const auto wtoken = token.toStdWString();
+			    const auto wargs = arguments.toStdWString();
+			    hr = activationManager->ActivateApplication(
+			        wtoken.c_str(),
+			        arguments.isEmpty() ? nullptr : wargs.c_str(),
+			        AO_NONE,
+			        &pid
+			    );
+			    if (SUCCEEDED(hr)) return true;
+
+			    qCDebug(logAppsFolder) << "ActivateApplication failed for"
+			                           << qs::windows::logId(token) << ":" << Qt::hex << hr;
+		    } else {
+			    qCDebug(logAppsFolder) << "CoCreateInstance(ApplicationActivationManager) failed:"
+			                           << Qt::hex << hr;
+		    }
+		    return false;
+	    }
 	);
-	if (shell.status != process::LaunchStatus::Failed) return;
 
-	ComPtr<IApplicationActivationManager> activationManager;
-	auto hr = CoCreateInstance(
-	    CLSID_ApplicationActivationManager,
-	    nullptr,
-	    CLSCTX_INPROC_SERVER,
-	    IID_PPV_ARGS(&activationManager)
-	);
-
-	if (SUCCEEDED(hr)) {
-		DWORD pid = 0;
-		auto wtoken = token.toStdWString();
-		hr = activationManager->ActivateApplication(wtoken.c_str(), nullptr, AO_NONE, &pid);
-		if (SUCCEEDED(hr)) return;
-
-		qCDebug(logAppsFolder) << "ActivateApplication failed for"
-		                       << qs::windows::logId(token) << ":" << Qt::hex << hr;
-	} else {
-		qCDebug(logAppsFolder) << "CoCreateInstance(ApplicationActivationManager) failed:"
-		                       << Qt::hex << hr;
+	if (error != ERROR_SUCCESS) {
+		qCWarning(logAppsFolder) << "Could not launch" << qs::windows::logId(token)
+		                         << ": shell error" << error;
 	}
-
-	qCWarning(logAppsFolder) << "Could not launch" << qs::windows::logId(token)
-	                         << ": shell error" << shell.error;
+	return error;
 }
 
 } // namespace
@@ -399,6 +423,14 @@ void WindowsDesktopEntryBackend::execute(
 	}
 
 	WindowsDesktopEntryBackend::launch(command.first(), workingDirectory);
+}
+
+unsigned long WindowsDesktopEntryBackend::launchSync(
+    const QString& token,
+    const QString& workingDirectory,
+    const QString& arguments
+) {
+	return launchToken(token, workingDirectory, arguments);
 }
 
 void WindowsDesktopEntryBackend::launch(const QString& token, const QString& workingDirectory) {

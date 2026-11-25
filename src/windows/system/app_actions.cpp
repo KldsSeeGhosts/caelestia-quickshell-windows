@@ -420,7 +420,13 @@ HWND hwndForObject(QObject* object) {
 
 	auto* window = qobject_cast<QWindow*>(object);
 	if (window == nullptr) {
-		if (auto* item = qobject_cast<QQuickItem*>(object)) window = item->window();
+		if (auto* item = qobject_cast<QQuickItem*>(object)) {
+			window = item->window();
+		} else if (auto* content = qobject_cast<QQuickItem*>(
+		               object->property("contentItem").value<QObject*>()
+		           )) {
+			window = content->window();
+		}
 	}
 
 	return hwndOf(window);
@@ -581,8 +587,12 @@ QVariantMap AppActions::launchShellAction(const QVariantMap& spec, QObject* pare
 	}
 
 	auto target = spec.value(QStringLiteral("target")).toString();
+	auto aumid = spec.value(QStringLiteral("aumid")).toString();
+	if (aumid.startsWith(QStringLiteral("shell:AppsFolder\\"), Qt::CaseInsensitive)) {
+		aumid = aumid.sliced(17);
+	}
 	auto invokeIdList = false;
-	if (const auto aumid = spec.value(QStringLiteral("aumid")).toString(); !aumid.isEmpty()) {
+	if (!aumid.isEmpty()) {
 		target = QStringLiteral("shell:AppsFolder\\") + aumid;
 		invokeIdList = true;
 	} else if (const auto uri = spec.value(QStringLiteral("uri")).toString(); !uri.isEmpty()) {
@@ -621,11 +631,13 @@ QVariantMap AppActions::launchShellAction(const QVariantMap& spec, QObject* pare
 			);
 		});
 		watcher->setFuture(promise->future());
-		runLauncher([target, arguments, directory, invokeIdList, promise] {
-			const auto result = process::shellExecuteTarget(
-			    target, arguments, directory, QStringLiteral("open"), nullptr, invokeIdList
-			);
-			promise->addResult(result.error);
+		runLauncher([target, aumid, arguments, directory, invokeIdList, promise] {
+			const auto error = !aumid.isEmpty()
+			    ? WindowsDesktopEntryBackend::launchSync(aumid, directory, arguments)
+			    : process::shellExecuteTarget(
+			          target, arguments, directory, QStringLiteral("open"), nullptr, invokeIdList
+			      ).error;
+			promise->addResult(error);
 			promise->finish();
 		});
 		this->setLastError({});

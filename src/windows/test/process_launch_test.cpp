@@ -1,3 +1,6 @@
+#include <array>
+#include <tuple>
+
 #include <qbuffer.h>
 #include <qcoreapplication.h>
 #include <qdir.h>
@@ -649,6 +652,127 @@ private slots:
 		auto queued = QVariantMap();
 		qs::windows::sys::detail::addShellActionRequestId(queued, second);
 		QCOMPARE(queued.value(QStringLiteral("requestId")).value<quint64>(), second);
+	}
+
+	void appsFolderFallbackPreservesActivationManagerRoute() {
+		using qs::windows::process::LaunchResult;
+		using qs::windows::process::LaunchStatus;
+		using qs::windows::sys::detail::launchAppsFolderTokenWithFallback;
+
+		const auto validToken = QStringLiteral("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App");
+		const auto validDir = QStringLiteral("C:\\Users\\Public");
+		const auto validArgs = QStringLiteral("--new-tab");
+
+		// Invalid inputs (empty token or embedded NUL in any field) never reach shell or activation.
+		int shellCalls = 0;
+		int activateCalls = 0;
+		const auto nulToken = QStringLiteral("App") + QChar(0) + QStringLiteral("Extra");
+		const auto nulDir = QStringLiteral("C:\\Dir") + QChar(0) + QStringLiteral("Extra");
+		const auto nulArgs = QStringLiteral("--flag") + QChar(0) + QStringLiteral("Extra");
+		QCOMPARE(
+		    launchAppsFolderTokenWithFallback(
+		        QString(),
+		        validDir,
+		        validArgs,
+		        [&] {
+			        ++shellCalls;
+			        return LaunchResult {.status = LaunchStatus::Started, .error = ERROR_SUCCESS};
+		        },
+		        [&] {
+			        ++activateCalls;
+			        return true;
+		        }
+		    ),
+		    static_cast<DWORD>(ERROR_FILE_NOT_FOUND)
+		);
+		for (const auto& [tok, dir, args]: std::array<std::tuple<QString, QString, QString>, 3> {{
+		         {nulToken, validDir, validArgs},
+		         {validToken, nulDir, validArgs},
+		         {validToken, validDir, nulArgs},
+		     }}) {
+			QCOMPARE(
+			    launchAppsFolderTokenWithFallback(
+			        tok,
+			        dir,
+			        args,
+			        [&] {
+				        ++shellCalls;
+				        return LaunchResult {.status = LaunchStatus::Failed, .error = ERROR_INVALID_PARAMETER};
+			        },
+			        [&] {
+				        ++activateCalls;
+				        return true;
+			        }
+			    ),
+			    static_cast<DWORD>(ERROR_INVALID_PARAMETER)
+			);
+		}
+		QCOMPARE(shellCalls, 0);
+		QCOMPARE(activateCalls, 0);
+
+		// ShellExecute success skips activation fallback.
+		const auto started = launchAppsFolderTokenWithFallback(
+		    validToken,
+		    validDir,
+		    validArgs,
+		    [] { return LaunchResult {.status = LaunchStatus::Started, .error = ERROR_SUCCESS}; },
+		    [&] {
+			    ++activateCalls;
+			    return true;
+		    }
+		);
+		QCOMPARE(started, static_cast<DWORD>(ERROR_SUCCESS));
+		QCOMPARE(activateCalls, 0);
+
+		// ShellExecute failure falls back to IApplicationActivationManager and succeeds.
+		const auto activated = launchAppsFolderTokenWithFallback(
+		    validToken,
+		    validDir,
+		    validArgs,
+		    [] { return LaunchResult {.status = LaunchStatus::Failed, .error = ERROR_FILE_NOT_FOUND}; },
+		    [&] {
+			    ++activateCalls;
+			    return true;
+		    }
+		);
+		QCOMPARE(activated, static_cast<DWORD>(ERROR_SUCCESS));
+		QCOMPARE(activateCalls, 1);
+
+		// Both routes failing preserves the shell error code.
+		const auto failed = launchAppsFolderTokenWithFallback(
+		    validToken,
+		    validDir,
+		    validArgs,
+		    [] { return LaunchResult {.status = LaunchStatus::Failed, .error = ERROR_ACCESS_DENIED}; },
+		    [&] {
+			    ++activateCalls;
+			    return false;
+		    }
+		);
+		QCOMPARE(failed, static_cast<DWORD>(ERROR_ACCESS_DENIED));
+		QCOMPARE(activateCalls, 2);
+
+		// Cancelled, indeterminate, and invalid-parameter rejections do not retry activation.
+		for (const auto& rejected: std::array<LaunchResult, 3> {{
+		         {.status = LaunchStatus::Cancelled, .error = ERROR_CANCELLED},
+		         {.status = LaunchStatus::Indeterminate, .error = ERROR_GEN_FAILURE},
+		         {.status = LaunchStatus::Failed, .error = ERROR_INVALID_PARAMETER},
+		     }}) {
+			QCOMPARE(
+			    launchAppsFolderTokenWithFallback(
+			        validToken,
+			        validDir,
+			        validArgs,
+			        [&] { return rejected; },
+			        [&] {
+				        ++activateCalls;
+				        return true;
+			        }
+			    ),
+			    rejected.error
+			);
+		}
+		QCOMPARE(activateCalls, 2);
 	}
 
 };
