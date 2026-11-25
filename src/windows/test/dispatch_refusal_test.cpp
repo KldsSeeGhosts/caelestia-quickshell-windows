@@ -1115,6 +1115,31 @@ private slots:
 		QCOMPARE(trackerRefused.size(), 0);
 		QCOMPARE(fixture.tracker->lastActionError(), QString());
 	}
+
+	void preReservedImmediateRefusalSuppressedWhenSupersededBeforePublish() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		const auto olderSeq = fixture.window->beginMoveRequest();
+		const auto actionOrder = fixture.window->actionOrderState();
+		// A newer move starts during provider recovery before the older move's
+		// immediate refusal runs.
+		(void)fixture.window->beginMoveRequest();
+
+		bool publishedCommand = false;
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+		fixture.dispatcher->refuseImmediateMoveForTest(
+		    fixture.window,
+		    QStringLiteral("invalid-target"),
+		    [&publishedCommand] { publishedCommand = true; },
+		    olderSeq,
+		    actionOrder
+		);
+
+		QVERIFY(!publishedCommand);
+		QCOMPARE(trackerRefused.size(), 0);
+		QCOMPARE(fixture.tracker->lastActionError(), QString());
+	}
 };
 
 } // namespace

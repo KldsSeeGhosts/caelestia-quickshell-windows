@@ -127,21 +127,27 @@ void Dispatcher::toggleFloating(TrackedWindow* window, const QString& action) {
 void Dispatcher::refuseImmediateMove(
     TrackedWindow* target,
     const QString& code,
-    const std::function<void()>& publishCommandResult
+    const std::function<void()>& publishCommandResult,
+    quint64 existingMoveSequence,
+    const std::shared_ptr<WindowActionOrderState>& existingActionOrder
 ) {
 	auto* tracker = this->actionTracker();
 	QPointer<WindowTracker> guardedTracker(tracker);
-	const auto actionOrder = target != nullptr ? target->actionOrderState() : nullptr;
-	const auto moveSequence = target != nullptr
-	    ? target->beginMoveRequest()
-	    : (tracker != nullptr ? tracker->nextActionSequence() : 0);
+	const auto actionOrder = existingActionOrder != nullptr
+	    ? existingActionOrder
+	    : (target != nullptr ? target->actionOrderState() : nullptr);
+	const auto moveSequence = existingMoveSequence != 0
+	    ? existingMoveSequence
+	    : (target != nullptr ? target->beginMoveRequest()
+	                         : (tracker != nullptr ? tracker->nextActionSequence() : 0));
+	auto orderSuperseded = [&] {
+		return actionOrder != nullptr
+		    && (actionOrder->latestMoveSequence != moveSequence
+		        || actionOrder->lastActionErrorSequence >= moveSequence);
+	};
+	if (orderSuperseded()) return;
 	if (publishCommandResult) publishCommandResult();
-	if (actionOrder != nullptr
-	    && (actionOrder->latestMoveSequence != moveSequence
-	        || actionOrder->lastActionErrorSequence >= moveSequence))
-	{
-		return;
-	}
+	if (orderSuperseded()) return;
 	if (!guardedTracker || guardedTracker->lastActionErrorSequence() >= moveSequence) return;
 	guardedTracker->reportActionRefusalWithSequence(
 	    moveSequence, QStringLiteral("move"), moveRefusalReason(code, false), false

@@ -853,6 +853,63 @@ private slots:
 		QVERIFY(!stillValid);
 		QCOMPARE(nativeSwitches, 0);
 	}
+
+	void reentrantSwitchDuringSupersededDoesNotOverrideNewerSwitch() {
+		this->old.manager.publishSwitch = false;
+		this->old.manager.beforeSwitch = [] { QThread::msleep(150); };
+		QVERIFY(this->desktops->switchTo(1));
+		QVERIFY(waitUntil([] { return !nativeDesktopCommandPending(); }, 1000));
+
+		int nativeSwitches = 0;
+		this->old.manager.beforeSwitch = [&nativeSwitches] { ++nativeSwitches; };
+		bool innerRan = false;
+		QVariantMap innerAccepted;
+		auto conn = QObject::connect(
+		    this->desktops,
+		    &VirtualDesktops::commandResult,
+		    this->desktops,
+		    [this, &innerRan, &innerAccepted](const QVariantMap& result) {
+			    if (!innerRan && result.value("outcome").toString() == QStringLiteral("superseded")) {
+				    innerRan = true;
+				    QVERIFY(this->desktops->switchTo(1));
+				    innerAccepted = this->desktops->lastCommand();
+			    }
+		    }
+		);
+
+		QVERIFY(!this->desktops->switchTo(1));
+		QObject::disconnect(conn);
+		this->old.manager.beforeSwitch = {};
+		QVERIFY(innerRan);
+		QCOMPARE(nativeSwitches, 1);
+		QCOMPARE(innerAccepted.value("outcome").toString(), QStringLiteral("accepted"));
+		QCOMPARE(this->desktops->lastCommand(), innerAccepted);
+
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("timed-out");
+		    },
+		    1000
+		));
+		QCOMPARE(this->desktops->lastCommand().value("requestId"), innerAccepted.value("requestId"));
+	}
+
+	void moveWindowShouldProceedAbortsWithoutNativeMoveOrRefusal() {
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb9));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		QSignalSpy results(this->desktops, &VirtualDesktops::commandResult);
+		quint64 pendingSeq = 99;
+		QString failureReason = QStringLiteral("stale");
+
+		QVERIFY(!this->desktops->moveWindow(
+		    window, 1, &pendingSeq, &failureReason, {}, [] { return false; }
+		));
+		QCOMPARE(pendingSeq, quint64(0));
+		QCOMPARE(failureReason, QString());
+		QCOMPARE(this->old.manager.moves, 0);
+		QCOMPARE(results.size(), 0);
+	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)
 #include "erm625_native_desktop_facade_test.moc"

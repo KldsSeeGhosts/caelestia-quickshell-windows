@@ -23,6 +23,7 @@
 #include <qtmetamacros.h>
 #include <qtypes.h>
 
+#include "activation_policy.hpp"
 #include "fullscreen_geometry.hpp"
 #include "fullscreen_ownership.hpp"
 #include "window_style_snapshot.hpp"
@@ -254,6 +255,9 @@ public:
 
 	// True when the shared foreground policy accepted this one request.
 	bool activate();
+	// Activate without switching desktops via cached membership, using the
+	// originating request's activation source (e.g. after a follow switch).
+	bool activateOnCurrentDesktop(ActivationSource source);
 	void close();
 	void setMinimized(bool minimized);
 	void setMaximized(bool maximized);
@@ -303,6 +307,7 @@ private:
 	void refreshState();
 	void refreshDesktop(bool askShell);
 	void releaseFullscreenOwnership();
+	bool activateImpl(bool switchDesktop, ActivationSource source);
 	[[nodiscard]] bool hasCurrentOwner() const;
 	bool ensureCurrentOwner(const QString& action);
 	void notifyActionErrorChanged();

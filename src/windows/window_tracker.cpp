@@ -470,17 +470,25 @@ bool TrackedWindow::ensureCurrentOwner(const QString& action) {
 }
 
 bool TrackedWindow::activate() {
+	return this->activateImpl(true, activationSourceForCurrentState());
+}
+
+bool TrackedWindow::activateOnCurrentDesktop(ActivationSource source) {
+	return this->activateImpl(false, source);
+}
+
+bool TrackedWindow::activateImpl(bool switchDesktop, ActivationSource source) {
 	if (!this->ensureCurrentOwner(QStringLiteral("activate"))) return false;
-	auto* desktops = this->tracker->desktops();
-	auto desktop = desktops->windowDesktopIndex(this->mHwnd);
+	if (switchDesktop) {
+		auto* desktops = this->tracker->desktops();
+		auto desktop = desktops->windowDesktopIndex(this->mHwnd);
 
-	// switchTo() returns false without switching when the accessor is not
-	// loaded, so there is no completion event to wait for here.
-	if (desktop != -1 && desktop != desktops->currentIndex()) {
-		desktops->switchTo(desktop);
+		// switchTo() returns false without switching when the accessor is not
+		// loaded, so there is no completion event to wait for here.
+		if (desktop != -1 && desktop != desktops->currentIndex()) {
+			desktops->switchTo(desktop);
+		}
 	}
-
-	auto source = activationSourceForCurrentState();
 
 	if (IsIconic(this->mHwnd)) {
 		SetLastError(ERROR_SUCCESS);
@@ -671,6 +679,8 @@ bool TrackedWindow::moveToDesktop(
 		}
 		if (onConfirmedSuccess) onConfirmedSuccess(confirmedSequence);
 	};
+	bool abortedBeforeMove = false;
+	bool lostWindowDuringRecovery = false;
 	const auto accepted = this->tracker->desktops()->moveWindow(
 	    this->mHwnd,
 	    index,
@@ -693,11 +703,32 @@ bool TrackedWindow::moveToDesktop(
 		        sequence, self.data(), moveSequence, pendingOutcome, finishConfirmed
 		    );
 		    pendingRegistered = true;
+	    },
+	    [self, actionOrder, moveSequence, &abortedBeforeMove, &lostWindowDuringRecovery] {
+		    if (actionOrder->latestMoveSequence != moveSequence
+		        || actionOrder->lastActionErrorSequence >= moveSequence)
+		    {
+			    abortedBeforeMove = true;
+			    return false;
+		    }
+		    if (!self || !self->isTrackedAndOwned()) {
+			    lostWindowDuringRecovery = true;
+			    return false;
+		    }
+		    return true;
 	    }
 	);
+	if (abortedBeforeMove) return false;
+	if (lostWindowDuringRecovery) {
+		failureCode = QStringLiteral("invalid-window");
+		if (guardedTracker && guardedTracker->desktops() != nullptr) {
+			guardedTracker->desktops()->refuseCommand(QStringLiteral("move"), failureCode);
+		}
+	}
 	if (!self) {
 		if (!accepted && guardedTracker && actionOrder->latestMoveSequence == moveSequence
-		    && actionOrder->lastActionErrorSequence < moveSequence)
+		    && actionOrder->lastActionErrorSequence < moveSequence
+		    && guardedTracker->lastActionErrorSequence() < moveSequence)
 		{
 			guardedTracker->reportActionRefusalWithSequence(
 			    moveSequence,

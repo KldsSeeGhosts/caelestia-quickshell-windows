@@ -110,7 +110,8 @@ void followMovedWindow(
     const QPointer<TrackedWindow>& guardedWindow,
     qsizetype index,
     bool follow,
-    quint64 moveSequence
+    quint64 moveSequence,
+    ActivationSource activationSource
 ) {
 	auto stillValid = [guardedWindow, moveSequence] {
 		return guardedWindow && guardedWindow->isTrackedAndOwned()
@@ -120,29 +121,32 @@ void followMovedWindow(
 
 	auto* behavior = WorkspaceBehavior::instance();
 	if (!follow) {
-		behavior->expectFocus(VirtualDesktops::instance()->currentIndex());
+		behavior->expectFocus(VirtualDesktops::instance()->currentIndex(), activationSource);
 		return;
 	}
 
+	auto* desktops = VirtualDesktops::instance();
+	const auto expectedSwitchOrder = desktops->switchOrder() + 1;
 	behavior->prepareWarp(index, true);
-	if (!VirtualDesktops::instance()->switchTo(index, stillValid)) return;
-	if (!stillValid()) return;
-	behavior->expectFocus(index);
-	guardedWindow->activate();
+	if (!desktops->switchTo(index, stillValid)) return;
+	if (!stillValid() || desktops->switchOrder() != expectedSwitchOrder) return;
+	behavior->expectFocus(index, activationSource);
+	guardedWindow->activateOnCurrentDesktop(activationSource);
 }
 
 void moveWindowTo(
     TrackedWindow* window,
     qsizetype index,
     bool follow,
-    quint64 existingMoveSequence = 0
+    quint64 existingMoveSequence,
+    ActivationSource activationSource
 ) {
 	QPointer<TrackedWindow> guardedWindow(window);
 	(void)window->moveToDesktop(
 	    index,
 	    existingMoveSequence,
-	    [guardedWindow, index, follow](quint64 moveSequence) {
-		    followMovedWindow(guardedWindow, index, follow, moveSequence);
+	    [guardedWindow, index, follow, activationSource](quint64 moveSequence) {
+		    followMovedWindow(guardedWindow, index, follow, moveSequence, activationSource);
 	    }
 	);
 }
@@ -577,33 +581,56 @@ void Dispatcher::focusWorkspace(const QString& arg) {
 void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool follow) {
 	auto* desktops = this->ipc->desktops();
 	auto* tracker = this->actionTracker();
-	auto refuseImmediate = [this, desktops](TrackedWindow* target, const QString& code) {
-		this->refuseImmediateMove(target, code, [desktops, &code] {
-			desktops->refuseCommand(QStringLiteral("move"), code);
-		});
+	QPointer<VirtualDesktops> guardedDesktops(desktops);
+	QPointer<WindowTracker> guardedTracker(tracker);
+	QPointer<TrackedWindow> guardedWindow(window);
+	const auto actionOrder = window != nullptr ? window->actionOrderState() : nullptr;
+	const auto moveSequence = window != nullptr
+	    ? window->beginMoveRequest()
+	    : (tracker != nullptr ? tracker->nextActionSequence() : 0);
+	const auto activationSource = qs::windows::activationSourceForCurrentState();
+	auto windowSuperseded = [&] {
+		return actionOrder != nullptr
+		    && (actionOrder->latestMoveSequence != moveSequence
+		        || actionOrder->lastActionErrorSequence >= moveSequence);
+	};
+	auto refuseImmediate = [this, guardedDesktops, moveSequence, actionOrder](
+	                           TrackedWindow* target, const QString& code
+	                       ) {
+		this->refuseImmediateMove(
+		    target,
+		    code,
+		    [guardedDesktops, code] {
+			    if (guardedDesktops) guardedDesktops->refuseCommand(QStringLiteral("move"), code);
+		    },
+		    moveSequence,
+		    actionOrder
+		);
 	};
 	desktops->retryAccessor();
+	if (!guardedDesktops || windowSuperseded()) return;
 	if (qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR") != "1"
 	    || qEnvironmentVariable("CAELESTIA_WINDOWS_HYPR_DISPATCH") != "1"
-	    || !desktops->supports(DesktopOperation::Move)) {
-		const auto code = desktops->availability() == DesktopAvailability::Available
+	    || !guardedDesktops->supports(DesktopOperation::Move))
+	{
+		const auto code = guardedDesktops->availability() == DesktopAvailability::Available
 		    ? QStringLiteral("operation-unsupported")
-		    : desktopAvailabilityReason(desktops->availability());
-		refuseImmediate(window, code);
+		    : desktopAvailabilityReason(guardedDesktops->availability());
+		refuseImmediate(guardedWindow.data(), code);
 		this->unsupported(
 		    "movetoworkspace " + arg.trimmed() + " (dispatch disabled or native control unavailable)"
 		);
 		return;
 	}
 
-	if (window == nullptr) {
-		refuseImmediate(nullptr, QStringLiteral("invalid-window"));
+	if (!guardedWindow || !guardedWindow->isTrackedAndOwned()) {
+		refuseImmediate(guardedWindow.data(), QStringLiteral("invalid-window"));
 		return;
 	}
 
 	auto target = parseWorkspaceTarget(arg);
 	if (target.kind == WorkspaceTarget::Kind::Special) {
-		refuseImmediate(window, QStringLiteral("operation-unsupported"));
+		refuseImmediate(guardedWindow.data(), QStringLiteral("operation-unsupported"));
 		this->unsupported("movetoworkspace " + arg.trimmed() + " (Windows has no special workspaces)");
 		return;
 	}
@@ -612,28 +639,27 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 	auto index = this->resolveWorkspace(target, create);
 
 	if (index < 0) {
-		refuseImmediate(window, QStringLiteral("invalid-target"));
+		refuseImmediate(guardedWindow.data(), QStringLiteral("invalid-target"));
 		if (target.kind != WorkspaceTarget::Kind::Previous) {
 			this->unsupported("movetoworkspace " + arg.trimmed());
 		}
 		return;
 	}
 
-	if (index >= desktops->count()) {
+	if (index >= guardedDesktops->count()) {
 		if (!create) {
-			refuseImmediate(window, QStringLiteral("invalid-target"));
+			refuseImmediate(guardedWindow.data(), QStringLiteral("invalid-target"));
 			return;
 		}
 
-		const auto actionOrder = window->actionOrderState();
-		const auto moveSequence = window->beginMoveRequest();
-		desktops->ensureCountWithReason(
+		guardedDesktops->ensureCountWithReason(
 		    index + 1,
-		    [tracker = QPointer(tracker),
-		     desktops = QPointer(desktops),
-		     window = QPointer(window),
+		    [tracker = guardedTracker,
+		     desktops = guardedDesktops,
+		     window = guardedWindow,
 		     actionOrder,
 		     moveSequence,
+		     activationSource,
 		     index,
 		     follow](bool ok, const QString& reason) {
 			    if (actionOrder
@@ -643,7 +669,7 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 				    return;
 			    }
 			    if (ok && window && window->isTrackedAndOwned()) {
-				    moveWindowTo(window, index, follow, moveSequence);
+				    moveWindowTo(window, index, follow, moveSequence, activationSource);
 				    return;
 			    }
 			    if (tracker && tracker->lastActionErrorSequence() >= moveSequence) return;
@@ -682,7 +708,7 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 		return;
 	}
 
-	moveWindowTo(window, index, follow);
+	moveWindowTo(guardedWindow.data(), index, follow, moveSequence, activationSource);
 }
 
 void Dispatcher::fullscreen(TrackedWindow* window, int mode) {

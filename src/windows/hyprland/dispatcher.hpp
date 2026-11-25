@@ -41,9 +41,13 @@ public:
 	void refuseImmediateMoveForTest(
 	    qs::windows::TrackedWindow* target,
 	    const QString& code,
-	    const std::function<void()>& publishCommandResult
+	    const std::function<void()>& publishCommandResult,
+	    quint64 existingMoveSequence = 0,
+	    const std::shared_ptr<qs::windows::WindowActionOrderState>& existingActionOrder = {}
 	) {
-		this->refuseImmediateMove(target, code, publishCommandResult);
+		this->refuseImmediateMove(
+		    target, code, publishCommandResult, existingMoveSequence, existingActionOrder
+		);
 	}
 #endif
 
@@ -73,7 +77,9 @@ private:
 	void refuseImmediateMove(
 	    qs::windows::TrackedWindow* target,
 	    const QString& code,
-	    const std::function<void()>& publishCommandResult
+	    const std::function<void()>& publishCommandResult,
+	    quint64 existingMoveSequence = 0,
+	    const std::shared_ptr<qs::windows::WindowActionOrderState>& existingActionOrder = {}
 	);
 	void moveToWorkspace(qs::windows::TrackedWindow* window, const QString& arg, bool follow);
 	void fullscreen(qs::windows::TrackedWindow* window, int mode);

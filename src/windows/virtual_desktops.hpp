@@ -88,6 +88,7 @@ public:
 	[[nodiscard]] int workspaceLimit() const { return this->mWorkspaceLimit; }
 	void setWorkspaceLimit(int count) { this->mWorkspaceLimit = qBound(1, count, 20); }
 	void retryAccessor();
+	[[nodiscard]] quint64 switchOrder() const { return this->mSwitchOrder; }
 	bool switchTo(qsizetype index, const std::function<bool()>& shouldProceed = {});
 	void ensureCount(qsizetype count, std::function<void(bool)> done);
 	void ensureCountWithReason(qsizetype count, std::function<void(bool, const QString&)> done);
@@ -97,7 +98,8 @@ public:
 	    qsizetype index,
 	    quint64* pendingSequence = nullptr,
 	    QString* failureReason = nullptr,
-	    const std::function<void(quint64)>& onPendingSequence = {}
+	    const std::function<void(quint64)>& onPendingSequence = {},
+	    const std::function<bool()>& shouldProceed = {}
 	);
 	bool pinWindow(HWND hwnd, bool pinned);
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;
@@ -223,6 +225,7 @@ private:
 	std::optional<PendingSwitch> pendingSwitch;
 	QTimer switchDeadline;
 	quint64 nextRequest = 0;
+	quint64 mSwitchOrder = 0;
 };
 
 } // namespace qs::windows

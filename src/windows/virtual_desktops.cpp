@@ -8,6 +8,7 @@
 #include <qlogging.h>
 #include <qloggingcategory.h>
 #include <qobject.h>
+#include <qpointer.h>
 #include <qstring.h>
 #include <qthread.h>
 #include <qtimer.h>
@@ -708,7 +709,11 @@ void VirtualDesktops::observeSwitch() {
 }
 
 bool VirtualDesktops::switchTo(qsizetype index, const std::function<bool()>& shouldProceed) {
+	QPointer<VirtualDesktops> self(this);
+	const auto switchOrder = ++this->mSwitchOrder;
 	this->retryAccessor();
+	if (!self || self->mSwitchOrder != switchOrder) return false;
+	if (shouldProceed && !shouldProceed()) return false;
 	if (this->nativeAccessor && nativeDesktopCommandPending()) {
 		this->refuseCommand(QStringLiteral("switch"), QStringLiteral("provider-busy"));
 		return false;
@@ -726,6 +731,7 @@ bool VirtualDesktops::switchTo(qsizetype index, const std::function<bool()>& sho
 	}
 
 	this->finishSwitch(DesktopCommandOutcome::Superseded, QStringLiteral("newer-request"));
+	if (!self || self->mSwitchOrder != switchOrder) return false;
 	if (shouldProceed && !shouldProceed()) return false;
 	if (this->nativeAccessor && nativeDesktopCommandPending()) {
 		this->refuseCommand(QStringLiteral("switch"), QStringLiteral("provider-busy"));
@@ -758,7 +764,7 @@ bool VirtualDesktops::switchTo(qsizetype index, const std::function<bool()>& sho
 	this->pendingSwitch = PendingSwitch {id, index, this->mDesktops[index].id};
 	if (!this->nativeAccessor || !nativeDesktopRequestPending()) this->switchDeadline.start();
 	this->publishCommand(DesktopRequestResult {id, QStringLiteral("switch"), DesktopCommandOutcome::Accepted, {}});
-	this->refresh();
+	if (self && self->mSwitchOrder == switchOrder) this->refresh();
 	return true;
 }
 
@@ -898,11 +904,13 @@ bool VirtualDesktops::moveWindow(
     qsizetype index,
     quint64* pendingSequence,
     QString* failureReason,
-    const std::function<void(quint64)>& onPendingSequence
+    const std::function<void(quint64)>& onPendingSequence,
+    const std::function<bool()>& shouldProceed
 ) {
 	if (pendingSequence != nullptr) *pendingSequence = 0;
 	if (failureReason != nullptr) failureReason->clear();
 	this->retryAccessor();
+	if (shouldProceed && !shouldProceed()) return false;
 	if (hwnd == nullptr || index < 0 || index >= this->count()) {
 		if (failureReason != nullptr) *failureReason = QStringLiteral("invalid-target");
 		this->refuseCommand(QStringLiteral("move"), QStringLiteral("invalid-target"));
