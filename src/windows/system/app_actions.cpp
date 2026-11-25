@@ -432,6 +432,21 @@ HWND hwndForObject(QObject* object) {
 	return hwndOf(window);
 }
 
+DWORD showProperties(const QString& path, HWND owner) {
+	auto wpath = path.toStdWString();
+	auto info = SHELLEXECUTEINFOW {};
+	info.cbSize = sizeof(info);
+	info.fMask = SEE_MASK_INVOKEIDLIST | SEE_MASK_ASYNCOK | SEE_MASK_FLAG_NO_UI;
+	info.hwnd = owner;
+	info.lpVerb = L"properties";
+	info.lpFile = wpath.c_str();
+	info.nShow = SW_SHOWNORMAL;
+
+	if (ShellExecuteExW(&info)) return ERROR_SUCCESS;
+	const auto error = GetLastError();
+	return error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error;
+}
+
 bool selectInExplorer(const QString& id, const QString& path) {
 	auto wpath = path.toStdWString();
 	PIDLIST_ABSOLUTE pidl = nullptr;
@@ -525,6 +540,7 @@ AppActionInfo AppActions::details(const QString& entryId) {
 
 		app.canRunAsAdmin = canElevate(app.target);
 		app.canOpenLocation = !app.target.isEmpty();
+		app.canOpenProperties = !app.target.isEmpty();
 		app.canUninstall = !app.target.isEmpty() && !isUnderWindows(app.target);
 	}
 
@@ -539,6 +555,7 @@ QVariantMap AppActions::info(const QString& entryId) {
 	    {QStringLiteral("packaged"), app.packaged},
 	    {QStringLiteral("canRunAsAdmin"), app.canRunAsAdmin},
 	    {QStringLiteral("canOpenLocation"), app.canOpenLocation},
+	    {QStringLiteral("canOpenProperties"), app.canOpenProperties},
 	    {QStringLiteral("canUninstall"), app.canUninstall},
 	    {QStringLiteral("packageFamilyName"), app.packageFamilyName},
 	};
@@ -675,6 +692,28 @@ bool AppActions::openFileLocation(const QString& entryId) {
 
 	runLauncher([id = entryId, app]() { openLocation(id, app); });
 	return true;
+}
+
+bool AppActions::openProperties(const QString& entryId, QObject* parentWindow) {
+	auto app = this->details(entryId);
+	if (!app.canOpenProperties) {
+		const auto message = app.token.isEmpty()
+		    ? QStringLiteral("The application entry is not available")
+		    : QStringLiteral("Properties is not supported for this application");
+		this->setLastError(message);
+		return false;
+	}
+
+	auto target = startMenuShortcut(app);
+	if (target.isEmpty() || !QFileInfo::exists(target)) target = app.target;
+	if (target.isEmpty() || target.contains(QChar::Null)) {
+		this->setLastError(QStringLiteral("The application entry is not available"));
+		return false;
+	}
+
+	const auto error = showProperties(target, hwndForObject(parentWindow));
+	this->setLastError(windowsErrorString(error));
+	return error == ERROR_SUCCESS;
 }
 
 bool AppActions::openAppSettings(const QString& entryId) {

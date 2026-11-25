@@ -25,6 +25,7 @@
 #include "../window_manager.hpp"
 #include "../window_tracker.hpp"
 #include "connection.hpp"
+#include "dispatch_refusals.hpp"
 #include "hyprland_toplevel.hpp"
 #include "monitor.hpp"
 #include "monitor_focus.hpp"
@@ -625,11 +626,13 @@ void Dispatcher::pin(TrackedWindow* window, PinRequest request) {
 	auto result = dispatchPin(*desktops, window->hwnd(), request);
 	if (result == PinDispatchResult::Unsupported) {
 		this->unsupported("pin (needs VirtualDesktopAccessor.dll with pin exports)");
+		reportPinRefusal(this->ipc->tracker(), result, window->elevated());
 		return;
 	}
 
 	if (result == PinDispatchResult::Failed) {
 		this->unsupported("pin (VirtualDesktopAccessor call failed)");
+		reportPinRefusal(this->ipc->tracker(), result, window->elevated());
 		return;
 	}
 
@@ -836,11 +839,16 @@ void Dispatcher::toggleFloating(TrackedWindow* window, const QString& action) {
 	auto* tiling = TilingManager::active();
 	if (tiling == nullptr) {
 		this->unsupported("togglefloating (without tiling)");
+		reportToggleFloatingDisabled(
+		    this->ipc->tracker(), window != nullptr && window->elevated()
+		);
 		return;
 	}
 
 	if (window == nullptr) return;
-	tiling->setFloating(window, action == "float", action == "toggle");
+	if (!tiling->setFloating(window, action == "float", action == "toggle")) {
+		reportToggleFloatingFailure(this->ipc->tracker(), window->elevated());
+	}
 }
 
 void Dispatcher::toggleSplit() {

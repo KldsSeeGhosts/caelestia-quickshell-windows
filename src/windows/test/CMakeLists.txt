@@ -421,6 +421,51 @@ target_compile_definitions(qs_suite_process_launch PRIVATE NOMINMAX WIN32_LEAN_A
 target_include_directories(qs_suite_process_launch PRIVATE ${QS_WINDOWS_SRC})
 target_link_libraries(qs_suite_process_launch PRIVATE Qt6::Core Qt6::Test ole32 oleaut32 shell32)
 
+qs_add_portable_suite(app_actions
+	app_actions_test.cpp
+	app_actions_test_stubs.cpp
+	${QS_WINDOWS_SRC}/system/app_actions.cpp
+	${QS_WINDOWS_SRC}/system/app_actions.hpp
+	${QS_WINDOWS_SRC}/../core/desktopentry.hpp
+	${QS_WINDOWS_SRC}/../core/model.cpp
+	${QS_WINDOWS_SRC}/../core/redact.cpp
+)
+target_compile_definitions(qs_suite_app_actions PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(qs_suite_app_actions PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(qs_suite_app_actions PRIVATE
+	Qt6::Core Qt6::Gui Qt6::Quick Qt6::Qml Qt6::Test shell32 ole32 user32 advapi32
+)
+
+qs_add_portable_suite(dispatch_refusal
+	dispatch_refusal_test.cpp
+	${QS_WINDOWS_SRC}/window_action_refusal.cpp
+	${QS_WINDOWS_SRC}/window_tracker.hpp
+)
+target_compile_definitions(qs_suite_dispatch_refusal PRIVATE QS_TEST NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(qs_suite_dispatch_refusal PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(qs_suite_dispatch_refusal PRIVATE Qt6::Core Qt6::Gui Qt6::Test)
+
+qs_add_portable_suite(hyprland_qml
+	hyprland_qml_test.cpp
+	hyprland_qml_test_stubs.cpp
+	${QS_WINDOWS_SRC}/hyprland/qml.cpp
+	${QS_WINDOWS_SRC}/hyprland/qml.hpp
+	${QS_WINDOWS_SRC}/hyprland/connection.hpp
+	${QS_WINDOWS_SRC}/hyprland/monitor.hpp
+	${QS_WINDOWS_SRC}/hyprland/workspace.hpp
+	${QS_WINDOWS_SRC}/hyprland/pin_support.hpp
+	${QS_WINDOWS_SRC}/accessor_state.hpp
+	${QS_WINDOWS_SRC}/window_tracker.hpp
+	${QS_WINDOWS_SRC}/window_action_refusal.cpp
+	${QS_WINDOWS_SRC}/screen_identity.cpp
+	${QS_WINDOWS_SRC}/../core/model.cpp
+	${QS_WINDOWS_SRC}/../core/qmlscreen.cpp
+	${QS_WINDOWS_SRC}/../core/redact.cpp
+)
+target_compile_definitions(qs_suite_hyprland_qml PRIVATE QS_TEST NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(qs_suite_hyprland_qml PRIVATE ${QS_WINDOWS_SRC})
+target_link_libraries(qs_suite_hyprland_qml PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Test user32)
+
 # Compile the native dispatcher and toplevel adaptors too: the pure fixture
 # above deliberately does not link their platform singletons or execute activation.
 add_library(dispatcher_compile_check OBJECT ${QS_WINDOWS_SRC}/hyprland/dispatcher.cpp)
@@ -997,6 +1042,7 @@ set(QS_PANEL_REEMBED_TEST_SOURCES
 	${QS_WINDOWS_SRC}/virtual_desktops.cpp
 	${QS_WINDOWS_SRC}/virtual_desktops.hpp
 	${QS_WINDOWS_SRC}/window_tracker.cpp
+	${QS_WINDOWS_SRC}/window_action_refusal.cpp
 	${QS_WINDOWS_SRC}/window_tracker.hpp
 	${QS_WINDOWS_SRC}/window_selectors.cpp
 	${QS_WINDOWS_SRC}/window_selectors.hpp
@@ -1324,6 +1370,9 @@ add_test(NAME clipboard_writer COMMAND portable_clipboard --suite clipboard_writ
 set_tests_properties(clipboard_capture clipboard_writer PROPERTIES
 	RESOURCE_LOCK clipboard-fixture-data)
 
+qs_add_portable_runner(portable_app_actions SUITES app_actions)
+qs_add_portable_runner(portable_dispatch_refusal SUITES dispatch_refusal)
+qs_add_portable_runner(portable_hyprland_qml SUITES hyprland_qml)
 qs_add_portable_runner(portable_hooks SUITES
 	hotkeys_routing process_launch wallpaper_target fileview_transaction
 )
@@ -1384,7 +1433,7 @@ set(QS_TESTS_PORTABLE
 	equalizer_apo window_action
 	native_desktop_recovery pw_session_worker idle_request launcher_exit input_settle
 	super_drag_wait process_image_name explorer_hang_hardening process_launch
-	network_wifi_route runtime_paths lazyloader
+	network_wifi_route runtime_paths lazyloader app_actions dispatch_refusal hyprland_qml
 	fullscreen_ownership display_transaction clipboard_capture clipboard_writer capture_dimensions
 	erm625_native_desktop_facade network_wifi_identity capture_affinity window_stack
 	fileview_transaction desktop_embedding

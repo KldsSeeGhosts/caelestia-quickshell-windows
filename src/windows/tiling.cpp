@@ -133,6 +133,12 @@ bool borderColoursSupported() {
 
 TilingManager* gManager = nullptr; // NOLINT
 
+void notifyTilingActiveChanged(bool wasActive) {
+	if ((TilingManager::active() != nullptr) != wasActive) {
+		if (auto* tracker = WindowTracker::instanceIfCreated()) emit tracker->tilingActiveChanged();
+	}
+}
+
 int rightOf(const QRect& rect) { return rect.left() + rect.width(); }
 int bottomOf(const QRect& rect) { return rect.top() + rect.height(); }
 
@@ -461,7 +467,9 @@ TilingManager* TilingManager::active() {
 }
 
 TilingManager::TilingManager(QString mutexName): mutexName(std::move(mutexName)) {
+	const auto wasActive = TilingManager::active() != nullptr;
 	gManager = this;
+	notifyTilingActiveChanged(wasActive);
 	this->mTelemetry = new tiling::TilingTelemetry(this);
 
 	this->syncTimer.setSingleShot(true);
@@ -508,11 +516,14 @@ TilingManager::TilingManager(QString mutexName): mutexName(std::move(mutexName))
 TilingManager::~TilingManager() {
 	if (this->mEnabled) this->stop();
 	this->restoreBorderColours();
+	const auto wasActive = TilingManager::active() != nullptr;
 	if (gManager == this) gManager = nullptr;
+	notifyTilingActiveChanged(wasActive);
 }
 
 void TilingManager::setEnabled(bool enabled) {
 	if (enabled == this->mEnabled) return;
+	const auto wasActive = TilingManager::active() != nullptr;
 	this->mEnabled = enabled;
 
 	if (enabled) {
@@ -521,6 +532,7 @@ void TilingManager::setEnabled(bool enabled) {
 			this->mEnabled = false;
 			qCWarning(logTiling) << "Enabling tiling was refused:" << error;
 			this->mTelemetry->refuseEnable(error);
+			notifyTilingActiveChanged(wasActive);
 			return;
 		}
 		this->mTelemetry->enableSucceeded();
@@ -528,6 +540,7 @@ void TilingManager::setEnabled(bool enabled) {
 		this->stop();
 	}
 
+	notifyTilingActiveChanged(wasActive);
 	emit this->enabledChanged();
 }
 

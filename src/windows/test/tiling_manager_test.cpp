@@ -1527,6 +1527,19 @@ private slots:
 		WindowTracker::instance()->fixtures.clear();
 	}
 
+	void tilingActiveNotifierFollowsManager() {
+		QSignalSpy activeChanges(WindowTracker::instance(), &WindowTracker::tilingActiveChanged);
+		QCOMPARE(TilingManager::active(), nullptr);
+
+		manager->setEnabled(true);
+		QCOMPARE(TilingManager::active(), manager);
+		QCOMPARE(activeChanges.size(), 1);
+
+		manager->setEnabled(false);
+		QCOMPARE(TilingManager::active(), nullptr);
+		QCOMPARE(activeChanges.size(), 2);
+	}
+
 	void enableAppliesInitialLayout() {
 		auto* a = add(1);
 		auto* b = add(2);

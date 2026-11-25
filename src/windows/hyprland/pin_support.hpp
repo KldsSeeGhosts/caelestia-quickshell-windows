@@ -42,6 +42,7 @@ class PinSupport: public QObject {
 
 public:
 	explicit PinSupport(qs::windows::AccessorState* state): state(state) {
+		if (state == nullptr) return;
 		QObject::connect(
 		    state,
 		    &qs::windows::AccessorState::accessorStateChanged,

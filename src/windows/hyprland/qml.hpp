@@ -22,6 +22,7 @@ class HyprlandIpcQml: public QObject {
 	Q_PROPERTY(bool usingLua READ usingLua CONSTANT);
 	Q_PROPERTY(int workspaceLimit READ workspaceLimit WRITE setWorkspaceLimit NOTIFY workspaceLimitChanged);
 	Q_PROPERTY(bool pinSupported READ pinSupported NOTIFY pinSupportedChanged);
+	Q_PROPERTY(bool tilingActive READ tilingActive NOTIFY tilingActiveChanged);
 	Q_PROPERTY(bool desktopControlSupported READ desktopControlSupported NOTIFY desktopControlSupportedChanged);
 	Q_PROPERTY(QObject* desktopControl READ desktopControl CONSTANT);
 	Q_PROPERTY(QString lastActionError READ lastActionError NOTIFY lastActionErrorChanged);
@@ -77,6 +78,7 @@ public:
 	void setWorkspaceLimit(int count);
 	[[nodiscard]] static bool usingLua() { return false; }
 	[[nodiscard]] bool pinSupported() const { return this->pinSupport.pinSupported(); }
+	[[nodiscard]] bool tilingActive() const;
 	// Requires a compatible in-process provider or loaded desktop accessor.
 	[[nodiscard]] bool desktopControlSupported() const {
 		return this->pinSupport.desktopControlSupported();
@@ -99,6 +101,7 @@ signals:
 	void focusedWorkspaceChanged();
 	void activeToplevelChanged();
 	void pinSupportedChanged();
+	void tilingActiveChanged();
 	void lastActionErrorChanged();
 	void actionRefused(const QString& action, const QString& reason, bool elevated);
 
