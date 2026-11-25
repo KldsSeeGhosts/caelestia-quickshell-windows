@@ -581,6 +581,7 @@ struct PinRequest {
 	std::promise<PinResult> completion;
 	Clock::time_point submitted = Clock::now();
 	std::atomic<Clock::duration::rep> started = 0;
+	std::atomic<bool> cancelled {false};
 
 	bool stalled(std::chrono::milliseconds bound) const {
 		const auto ticks = this->started.load();
@@ -702,24 +703,43 @@ struct PinProvider {
 			return;
 		}
 #endif
+		IServiceProvider* rawShell = nullptr;
+		ViewCollection* rawViews = nullptr;
 		ComPtr<IServiceProvider> shell;
 		auto ok = this->invoke(
-		              [&] {
-			              return CoCreateInstance(
-			                  immersiveShell,
-			                  nullptr,
-			                  CLSCTX_LOCAL_SERVER,
-			                  IID_PPV_ARGS(&shell)
-			              );
-		              },
-		              "Pin ImmersiveShell"
-		          )
-		       && this->invoke(
-		           [&] {
-			           return shell->QueryService(__uuidof(ViewCollection), IID_PPV_ARGS(&this->views));
-		           },
-		           "Pin ApplicationViewCollection GUID"
-		       );
+		    [&] {
+			    return CoCreateInstance(
+			        immersiveShell,
+			        nullptr,
+			        CLSCTX_LOCAL_SERVER,
+			        __uuidof(IServiceProvider),
+			        reinterpret_cast<void**>(&rawShell)
+			    );
+		    },
+		    "Pin ImmersiveShell"
+		);
+		if (ok && rawShell != nullptr) {
+			shell.Attach(rawShell);
+		} else {
+			ok = false;
+		}
+		if (ok) {
+			ok = this->invoke(
+			    [&] {
+				    return shell->QueryService(
+				        __uuidof(ViewCollection),
+				        __uuidof(ViewCollection),
+				        reinterpret_cast<void**>(&rawViews)
+				    );
+			    },
+			    "Pin ApplicationViewCollection GUID"
+			);
+			if (ok && rawViews != nullptr) {
+				this->views.Attach(rawViews);
+			} else {
+				ok = false;
+			}
+		}
 		if (ok) ok = this->acquirePinnedApps(shell.Get());
 		ok = this->releaseLocal(shell) && ok;
 		if (!ok && !this->disconnected && !this->optionalPinnedAppsFaulted) {
@@ -735,16 +755,20 @@ struct PinProvider {
 		return IsWindow(window);
 	}
 
-	PinResult pin(HWND window) {
+	PinResult pin(HWND window, const std::atomic<bool>& cancelled) {
 		this->lastError = S_OK;
-		this->ensureAcquired();
 		PinResult out;
+		if (cancelled.load()) {
+			out.result = -2;
+			return out;
+		}
+		this->ensureAcquired();
 		out.serviceAvailable = this->serviceAvailable;
 		out.disconnected = this->disconnected;
 		out.optionalPinnedAppsFaulted = this->optionalPinnedAppsFaulted;
 		out.error = this->lastError;
-		if (this->optionalPinnedAppsFaulted || this->disconnected || !this->serviceAvailable
-		    || !this->pinnedApps || !this->views)
+		if (cancelled.load() || this->optionalPinnedAppsFaulted || this->disconnected
+		    || !this->serviceAvailable || !this->pinnedApps || !this->views)
 		{
 			out.result = -2;
 			return out;
@@ -767,16 +791,28 @@ struct PinProvider {
 		ComPtr<IUnknown> unknown;
 		unknown.Attach(reinterpret_cast<IUnknown*>(view));
 		BOOL pinned = FALSE;
-		// Query first so a repeated call never toggles anything.
-		auto ok =
-		    this->invoke([&] { return this->pinnedApps->IsViewPinned(view, &pinned); }, "IsViewPinned")
-		    && (pinned || this->invoke([&] { return this->pinnedApps->PinView(view); }, "PinView"));
+		// Query first so a repeated call never toggles anything. Never start
+		// PinView after the GUI has already retired or canceled this request.
+		auto ok = !cancelled.load()
+		       && this->invoke(
+		           [&] { return this->pinnedApps->IsViewPinned(view, &pinned); },
+		           "IsViewPinned"
+		       );
+		if (ok && !pinned) {
+			if (cancelled.load()) {
+				ok = false;
+			} else {
+				ok = this->invoke([&] { return this->pinnedApps->PinView(view); }, "PinView");
+			}
+		}
 		ok = this->releaseLocal(unknown) && ok;
 		out.disconnected = this->disconnected;
 		out.optionalPinnedAppsFaulted = this->optionalPinnedAppsFaulted;
 		out.serviceAvailable = this->serviceAvailable;
 		out.error = this->lastError;
-		if (this->disconnected || this->optionalPinnedAppsFaulted || !this->pinnedApps) {
+		if (cancelled.load() || this->disconnected || this->optionalPinnedAppsFaulted
+		    || !this->pinnedApps)
+		{
 			out.result = -2;
 		} else {
 			out.result = ok ? 0 : -1;
@@ -848,7 +884,7 @@ struct PinWorker {
 					result.error = apartment;
 					result.serviceAvailable = false;
 				} else {
-					result = p.pin(request->window);
+					result = p.pin(request->window, request->cancelled);
 				}
 			} catch (...) {
 				result.result = -2;
@@ -951,6 +987,7 @@ struct Channel {
 		this->deadline.stop();
 		this->pinDeadline.stop();
 		this->recovery.reset();
+		if (this->pin && this->pin->request) this->pin->request->cancelled.store(true);
 		if (auto previous = std::exchange(this->worker, {})) previous->stop();
 		if (auto previousPin = std::exchange(this->pinWorker, {})) previousPin->stop();
 		this->refresh.reset();
@@ -992,6 +1029,7 @@ struct Channel {
 	void retirePinWorker(bool disableOptional = false) {
 		if (disableOptional) this->skipOptionalPinnedApps = true;
 		auto pendingPin = std::exchange(this->pin, std::nullopt);
+		if (pendingPin && pendingPin->request) pendingPin->request->cancelled.store(true);
 		if (auto previousPin = std::exchange(this->pinWorker, {})) previousPin->stop();
 		this->pinDeadline.stop();
 		if (pendingPin && pendingPin->target != nullptr) {
@@ -1500,7 +1538,10 @@ struct Channel {
 					return;
 				}
 				if (value.disconnected) {
-					this->retire(value.error);
+					qCWarning(logNativeDesktops)
+					    << "Optional desktop pinning disconnected, HRESULT" << Qt::hex << value.error
+					    << "; retiring pin worker without interrupting desktop control";
+					this->retirePinWorker(false);
 					this->notifyPinCompleted(
 					    finished.requestId,
 					    finished.target,

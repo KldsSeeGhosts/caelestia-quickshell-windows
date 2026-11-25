@@ -282,9 +282,16 @@ private:
 	DWORD explorerTaskbarPid = 0;
 	DWORD explorerTaskbarThread = 0;
 	QTimer explorerRecoveryTimer;
+	void clearPendingFollowMove() {
+		this->pendingFollowMoveSeq = 0;
+		this->pendingFollowMoveHwnd = nullptr;
+		this->pendingFollowMoveDesktop = -1;
+	}
 	HWND stuckHwnd = nullptr;
 	qsizetype stuckDesktop = -1;
 	quint64 pendingFollowMoveSeq = 0;
+	HWND pendingFollowMoveHwnd = nullptr;
+	qsizetype pendingFollowMoveDesktop = -1;
 
 	HWND mEmbedParent = nullptr;
 	HWND mEmbedInsertAfter = nullptr;

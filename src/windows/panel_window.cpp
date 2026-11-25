@@ -83,6 +83,10 @@ bool forceLayeredDesktopPanels() {
 constexpr int MAX_RESTACKS = 20;
 constexpr int FOLLOW_RETRY_MS = 200;
 constexpr int FOLLOW_RETRY_MAX = 15;
+// Exceeds the desktop worker's 5 s stall bound so sibling panels waiting on
+// provider-busy do not exhaust retries while an earlier move is still in flight.
+constexpr qint64 FOLLOW_BUSY_WAIT_BUDGET_MS = 6000;
+constexpr qint64 FOLLOW_MAX_TOTAL_BUSY_WAIT_MS = 30000;
 constexpr DWORD RESTACK_WINDOW_MS = 5000;
 constexpr int FOCUS_EXPOSE_FALLBACK_MS = 500;
 constexpr int CLOSE_FRAMES = 2;
@@ -273,6 +277,8 @@ public:
 			    VirtualDesktops::instance(),
 			    [] {
 				    stack->mFollowRetryCount = 0;
+				    stack->mFollowBusySinceMs.reset();
+				    stack->mFollowFirstBusyMs.reset();
 				    stack->mFollowRetryTimer.stop();
 				    stack->followCurrentDesktop();
 				    DesktopHost::instance()->refreshAfterDesktopSwitch();
@@ -292,30 +298,55 @@ public:
 				    auto* target = reinterpret_cast<HWND>(hwndValue);
 				    auto* desktops = VirtualDesktops::instance();
 				    auto matched = false;
-				    auto failed = false;
-				    for (auto* panel: stack->mPanels) {
-					    if (panel->hwnd() != target) continue;
-					    if (panel->pendingFollowMoveSeq != 0 && panel->pendingFollowMoveSeq == sequence) {
-						    panel->pendingFollowMoveSeq = 0;
-					    }
-					    matched = true;
-					    if (succeeded) {
-						    if (!panel->isEmbedded() && !panel->pinnedHere(target)) {
-							    panel->stuckHwnd = target;
-							    panel->stuckDesktop = desktops->currentIndex();
+				    auto needsRetry = false;
+				    if (sequence != 0 && target != nullptr) {
+					    for (auto* panel: stack->mPanels) {
+						    if (panel->pendingFollowMoveSeq != sequence
+						        || panel->pendingFollowMoveHwnd != target)
+						    {
+							    continue;
 						    }
-					    } else if (!panel->isEmbedded() && !panel->pinnedHere(target)) {
-						    panel->stuckHwnd = nullptr;
-						    panel->stuckDesktop = -1;
-						    failed = true;
+						    const auto targetDesktop = panel->pendingFollowMoveDesktop;
+						    panel->clearPendingFollowMove();
+						    matched = true;
+						    if (panel->hwnd() != target || panel->isEmbedded() || panel->pinnedHere(target)) {
+							    break;
+						    }
+						    if (succeeded && targetDesktop == desktops->currentIndex()) {
+							    panel->stuckHwnd = target;
+							    panel->stuckDesktop = targetDesktop;
+						    } else {
+							    panel->stuckHwnd = nullptr;
+							    panel->stuckDesktop = -1;
+							    needsRetry = true;
+						    }
+						    break;
 					    }
-					    break;
+				    }
+				    if (needsRetry) {
+					    stack->mFollowBusySinceMs.reset();
+					    if (stack->mFollowRetryCount < FOLLOW_RETRY_MAX) {
+						    ++stack->mFollowRetryCount;
+						    stack->mFollowRetryTimer.start(
+						        stack->mFollowRetryTimer.isActive() ? 0 : FOLLOW_RETRY_MS
+						    );
+					    } else {
+						    stack->mFollowRetryTimer.stop();
+					    }
+					    return;
+				    }
+				    // Any completed move frees the desktop worker slot: renew the
+				    // per-handoff busy wait window and immediately wake waiting panels.
+				    if (stack->mFollowRetryTimer.isActive()) {
+					    stack->mFollowBusySinceMs.reset();
+					    stack->mFollowRetryTimer.start(0);
+					    return;
 				    }
 				    if (!matched) return;
-				    if (failed) {
-					    stack->scheduleFollowRetry();
-				    } else if (!stack->hasPendingFollowMove() && !stack->mFollowRetryTimer.isActive()) {
+				    if (!stack->hasPendingFollowMove()) {
 					    stack->mFollowRetryCount = 0;
+					    stack->mFollowBusySinceMs.reset();
+					    stack->mFollowFirstBusyMs.reset();
 				    }
 			    }
 			);
@@ -388,8 +419,25 @@ public:
 		});
 	}
 
-	void scheduleFollowRetry() {
-		if (this->mFollowRetryTimer.isActive() || this->mFollowRetryCount >= FOLLOW_RETRY_MAX) return;
+	void scheduleFollowRetry(bool busyOnly) {
+		if (this->mFollowRetryTimer.isActive()) return;
+		if (busyOnly) {
+			const auto now = static_cast<qint64>(GetTickCount64());
+			if (!this->mFollowFirstBusyMs) this->mFollowFirstBusyMs = now;
+			if (!this->mFollowBusySinceMs) this->mFollowBusySinceMs = now;
+			if (now - *this->mFollowBusySinceMs >= FOLLOW_BUSY_WAIT_BUDGET_MS
+			    || now - *this->mFollowFirstBusyMs >= FOLLOW_MAX_TOTAL_BUSY_WAIT_MS)
+			{
+				this->mFollowBusySinceMs.reset();
+				this->mFollowFirstBusyMs.reset();
+				return;
+			}
+			this->mFollowRetryTimer.start(FOLLOW_RETRY_MS);
+			return;
+		}
+		this->mFollowBusySinceMs.reset();
+		this->mFollowFirstBusyMs.reset();
+		if (this->mFollowRetryCount >= FOLLOW_RETRY_MAX) return;
 		++this->mFollowRetryCount;
 		this->mFollowRetryTimer.start(FOLLOW_RETRY_MS);
 	}
@@ -398,6 +446,7 @@ public:
 		auto* desktops = VirtualDesktops::instance();
 		const auto current = desktops->currentIndex();
 		auto needsRetry = false;
+		auto nonBusyFailure = false;
 		auto anyPending = false;
 
 		for (auto* panel: this->mPanels) {
@@ -405,37 +454,51 @@ public:
 			auto* hwnd = panel->hwnd();
 			if (hwnd == nullptr || panel->pinnedHere(hwnd)) continue;
 			if (desktops->isWindowOnCurrent(hwnd)) {
-				panel->pendingFollowMoveSeq = 0;
+				panel->clearPendingFollowMove();
 				panel->stuckHwnd = hwnd;
 				panel->stuckDesktop = current;
 				continue;
 			}
+			if (panel->pendingFollowMoveSeq != 0 && panel->pendingFollowMoveHwnd == hwnd
+			    && panel->pendingFollowMoveDesktop == current)
+			{
+				anyPending = true;
+				continue;
+			}
 			quint64 pendingSeq = 0;
-			if (desktops->moveWindow(hwnd, current, &pendingSeq)) {
+			QString failureReason;
+			if (desktops->moveWindow(hwnd, current, &pendingSeq, &failureReason)) {
 				if (pendingSeq != 0) {
 					// Async acceptance is not confirmation: preserve the retry
 					// budget until moveWindowCompleted or a fresh snapshot.
 					panel->pendingFollowMoveSeq = pendingSeq;
+					panel->pendingFollowMoveHwnd = hwnd;
+					panel->pendingFollowMoveDesktop = current;
 					panel->stuckHwnd = nullptr;
 					panel->stuckDesktop = -1;
 					anyPending = true;
 				} else {
-					panel->pendingFollowMoveSeq = 0;
+					panel->clearPendingFollowMove();
 					panel->stuckHwnd = hwnd;
 					panel->stuckDesktop = current;
 				}
 			} else {
-				panel->pendingFollowMoveSeq = 0;
+				// Preserve any accepted move sequence so its completion can still
+				// be matched or discarded against its original target desktop.
+				if (panel->pendingFollowMoveHwnd != hwnd) panel->clearPendingFollowMove();
 				panel->stuckHwnd = nullptr;
 				panel->stuckDesktop = -1;
 				needsRetry = true;
+				if (failureReason != QStringLiteral("provider-busy")) nonBusyFailure = true;
 			}
 		}
 
 		if (needsRetry) {
-			this->scheduleFollowRetry();
+			this->scheduleFollowRetry(!nonBusyFailure);
 		} else if (!anyPending) {
 			this->mFollowRetryCount = 0;
+			this->mFollowBusySinceMs.reset();
+			this->mFollowFirstBusyMs.reset();
 			this->mFollowRetryTimer.stop();
 		} else {
 			this->mFollowRetryTimer.stop();
@@ -464,6 +527,8 @@ public:
 		if (this->mPanels.isEmpty()) {
 			this->mFollowRetryTimer.stop();
 			this->mFollowRetryCount = 0;
+			this->mFollowBusySinceMs.reset();
+			this->mFollowFirstBusyMs.reset();
 		}
 
 		// Forget monitors with no panel left: a replugged display can reuse the
@@ -733,6 +798,8 @@ private:
 	QHash<WinPanelWindow*, TopmostRepair> mTopmostRepairs;
 	QTimer mFollowRetryTimer;
 	int mFollowRetryCount = 0;
+	std::optional<qint64> mFollowBusySinceMs;
+	std::optional<qint64> mFollowFirstBusyMs;
 	bool mRepairPending = false;
 };
 
@@ -1028,7 +1095,7 @@ void WinPanelWindow::releaseNativeState() {
 	this->resetPinState(true);
 	this->stuckHwnd = nullptr;
 	this->stuckDesktop = -1;
-	this->pendingFollowMoveSeq = 0;
+	this->clearPendingFollowMove();
 	WinPanelStack::instance()->removePanel(this);
 
 	this->mEmbedParent = nullptr;
@@ -1256,6 +1323,7 @@ void WinPanelWindow::stickToAllDesktops() {
 	auto* hwnd = this->hwnd();
 	if (hwnd == nullptr || this->mEmbedParent != nullptr) {
 		this->resetPinState(true);
+		this->clearPendingFollowMove();
 		return;
 	}
 	if (this->pinnedHere(hwnd)) return;
@@ -1264,26 +1332,35 @@ void WinPanelWindow::stickToAllDesktops() {
 	const auto current = desktops->currentIndex();
 
 	if (desktops->isWindowOnCurrent(hwnd)) {
-		this->pendingFollowMoveSeq = 0;
+		this->clearPendingFollowMove();
 		this->stuckHwnd = hwnd;
 		this->stuckDesktop = current;
 	} else if (this->stuckHwnd != hwnd || this->stuckDesktop != current) {
-		quint64 pendingSeq = 0;
-		if (desktops->moveWindow(hwnd, current, &pendingSeq)) {
-			if (pendingSeq != 0) {
-				this->pendingFollowMoveSeq = pendingSeq;
+		if (this->pendingFollowMoveSeq == 0 || this->pendingFollowMoveHwnd != hwnd
+		    || this->pendingFollowMoveDesktop != current)
+		{
+			quint64 pendingSeq = 0;
+			QString failureReason;
+			if (desktops->moveWindow(hwnd, current, &pendingSeq, &failureReason)) {
+				if (pendingSeq != 0) {
+					this->pendingFollowMoveSeq = pendingSeq;
+					this->pendingFollowMoveHwnd = hwnd;
+					this->pendingFollowMoveDesktop = current;
+					this->stuckHwnd = nullptr;
+					this->stuckDesktop = -1;
+				} else {
+					this->clearPendingFollowMove();
+					this->stuckHwnd = hwnd;
+					this->stuckDesktop = current;
+				}
+			} else {
+				if (this->pendingFollowMoveHwnd != hwnd) this->clearPendingFollowMove();
 				this->stuckHwnd = nullptr;
 				this->stuckDesktop = -1;
-			} else {
-				this->pendingFollowMoveSeq = 0;
-				this->stuckHwnd = hwnd;
-				this->stuckDesktop = current;
+				WinPanelStack::instance()->scheduleFollowRetry(
+				    failureReason == QStringLiteral("provider-busy")
+				);
 			}
-		} else {
-			this->pendingFollowMoveSeq = 0;
-			this->stuckHwnd = nullptr;
-			this->stuckDesktop = -1;
-			WinPanelStack::instance()->scheduleFollowRetry();
 		}
 	}
 
@@ -1381,6 +1458,7 @@ void WinPanelWindow::onDesktopAccessorReady() {
 	// taskbar HWND did not change) may have lost Explorer's pin table or may
 	// offer pinning again. Re-verify via IsViewPinned before PinView.
 	this->resetPinState(true);
+	this->clearPendingFollowMove();
 	if (this->window != nullptr && this->window->isVisible()) this->stickToAllDesktops();
 }
 
@@ -1394,7 +1472,7 @@ bool WinPanelWindow::recoverExplorer(HWND taskbar, DWORD pid, DWORD thread) {
 	this->resetPinState(true);
 	this->stuckHwnd = nullptr;
 	this->stuckDesktop = -1;
-	this->pendingFollowMoveSeq = 0;
+	this->clearPendingFollowMove();
 	this->appBar.invalidate();
 	this->scheduleUpdateDimensions();
 	this->blur->syncPlacement();
@@ -1799,6 +1877,7 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 	this->embedRefusedBy = nullptr;
 	this->restackCount = 0;
 	this->resetPinState(true);
+	this->clearPendingFollowMove();
 	this->appBar.remove();
 	this->applyNativeStyles();
 	this->placeEmbedded();
