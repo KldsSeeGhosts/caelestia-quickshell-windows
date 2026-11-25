@@ -6,6 +6,7 @@
 #include <qsignalspy.h>
 #include <qtemporarydir.h>
 #include <qtest.h>
+#include <qvector.h>
 
 #include <qt_windows.h>
 
@@ -15,9 +16,21 @@
 #include <shobjidl.h>
 #include <wrl/client.h>
 
+#include "../process_launch.hpp"
 #include "../system/app_actions.hpp"
 
 using Microsoft::WRL::ComPtr;
+
+using ShellExecuteInvoker = std::function<qs::windows::process::LaunchResult(
+    const QString&,
+    const QString&,
+    const QString&,
+    const QString&,
+    HWND,
+    bool,
+    bool
+)>;
+using KnownFolderPathInvoker = std::function<HRESULT(const GUID&, DWORD, QString*)>;
 
 namespace qs::windows::sys::test {
 void setParsingNameForId(const QString& id, const QString& token);
@@ -28,6 +41,8 @@ void setPropertiesInvokerForTest(const std::function<DWORD(const QString&, HWND,
 void setShortcutRootsForTest(const QStringList& roots);
 void setDriveTypeInvokerForTest(const std::function<UINT(const QString&)>& invoker);
 void setFileAttributesInvokerForTest(const std::function<DWORD(const QString&)>& invoker);
+void setKnownFolderPathInvokerForTest(const KnownFolderPathInvoker& invoker);
+void setShellExecuteTargetInvokerForTest(const ShellExecuteInvoker& invoker);
 void resetPropertiesTestHooks();
 } // namespace qs::windows::sys::test
 
@@ -40,6 +55,13 @@ struct InvokeLog {
 	QString path;
 	DWORD flags = 0;
 	DWORD error = ERROR_SUCCESS;
+};
+
+struct ShellExecuteLog {
+	int calls = 0;
+	QString target;
+	QString verb;
+	bool invokeIdList = false;
 };
 
 QString writeFile(QTemporaryDir& directory, const QString& name) {
@@ -106,12 +128,14 @@ private slots:
 	void init() {
 		qs::windows::sys::test::resetPropertiesTestHooks();
 		qs::windows::sys::test::clearParsingNames();
+		qs::windows::sys::test::setShellExecuteTargetInvokerForTest({});
 		qs::windows::sys::test::setShortcutRootsForTest({});
 	}
 
 	void cleanup() {
 		qs::windows::sys::test::resetPropertiesTestHooks();
 		qs::windows::sys::test::clearParsingNames();
+		qs::windows::sys::test::setShellExecuteTargetInvokerForTest({});
 	}
 
 	void unknownEntryRejectsProperties() {
@@ -127,6 +151,28 @@ private slots:
 		        .toBool(),
 		    false
 		);
+	}
+
+	void propertiesStartMenuRootsDoNotVerifyKnownFolders() {
+		qs::windows::sys::test::resetPropertiesTestHooks();
+		QTemporaryDir directory;
+		QVERIFY(directory.isValid());
+		const auto target = writeFile(directory, QStringLiteral("fixture.exe"));
+		QVERIFY(!target.isEmpty());
+		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-known-folder"), target);
+
+		QVector<DWORD> folderFlags;
+		qs::windows::sys::test::setKnownFolderPathInvokerForTest(
+		    [&](const GUID&, DWORD flags, QString*) {
+			    folderFlags.append(flags);
+			    return E_FAIL;
+		    }
+		);
+
+		AppActions actions;
+		(void)actions.info(QStringLiteral("fixture-known-folder"));
+		QCOMPARE(folderFlags.size(), 2);
+		for (const auto flags: folderFlags) QCOMPARE(flags, DWORD(KF_FLAG_DONT_VERIFY));
 	}
 
 	void existingFilePublishesAndInvokesPropertiesSynchronously() {
@@ -425,6 +471,57 @@ private slots:
 		const auto id = QStringLiteral("fixture-network-root");
 		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), false);
 		QVERIFY(rootValidationCalls > 0);
+	}
+
+	void remoteStartMenuShortcutIsRejectedForPropertiesButUsedForElevation() {
+		QTemporaryDir directory;
+		QVERIFY(directory.isValid());
+		const auto target = writeFile(directory, QStringLiteral("fixture.exe"));
+		const auto shortcut = QDir::toNativeSeparators(directory.filePath(QStringLiteral("Fixture.lnk")));
+		QVERIFY(!target.isEmpty());
+		QVERIFY(createShortcut(shortcut, target));
+
+		const auto nativeRoot = QDir::toNativeSeparators(directory.path());
+		const auto driveRoot = nativeRoot.left(2) + QStringLiteral("\\");
+		qs::windows::sys::test::setDriveTypeInvokerForTest([&](const QString& root) {
+			if (root.compare(driveRoot, Qt::CaseInsensitive) == 0) return UINT(DRIVE_REMOTE);
+			const auto wide = root.toStdWString();
+			return GetDriveTypeW(wide.c_str());
+		});
+		qs::windows::sys::test::setShortcutRootsForTest({nativeRoot});
+		qs::windows::sys::test::setParsingNameForId(QStringLiteral("fixture-remote-shortcut"), target);
+		qs::windows::sys::test::setLinkTargetForId(QStringLiteral("fixture-remote-shortcut"), target);
+
+		InvokeLog properties;
+		installInvoker(properties);
+		ShellExecuteLog shell;
+		qs::windows::sys::test::setShellExecuteTargetInvokerForTest(
+		    [&](const QString& shellTarget,
+		        const QString&,
+		        const QString&,
+		        const QString& verb,
+		        HWND,
+		        bool invokeIdList,
+		        bool) {
+			    shell.calls++;
+			    shell.target = shellTarget;
+			    shell.verb = verb;
+			    shell.invokeIdList = invokeIdList;
+			    return qs::windows::process::detail::launchResultForError(ERROR_SUCCESS);
+		    }
+		);
+
+		AppActions actions;
+		const auto id = QStringLiteral("fixture-remote-shortcut");
+		QCOMPARE(actions.info(id).value(QStringLiteral("canOpenProperties")).toBool(), false);
+		QVERIFY(!actions.openProperties(id));
+		QCOMPARE(properties.calls, 0);
+
+		QVERIFY(actions.runAsAdmin(id));
+		QCOMPARE(shell.calls, 1);
+		QCOMPARE(shell.target, shortcut);
+		QCOMPARE(shell.verb, QStringLiteral("runas"));
+		QVERIFY(shell.invokeIdList);
 	}
 
 	void synchronousInvocationFailureIsReported() {

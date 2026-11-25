@@ -121,9 +121,11 @@ std::optional<QString> validFilesystemPath(const QString& path) {
 using PropertiesInvoker = std::function<DWORD(const QString&, HWND, DWORD)>;
 using DriveTypeInvoker = std::function<UINT(const QString&)>;
 using FileAttributesInvoker = std::function<DWORD(const QString&)>;
+using KnownFolderPathInvoker = std::function<HRESULT(const GUID&, DWORD, QString*)>;
 PropertiesInvoker propertiesInvokerForTest;
 DriveTypeInvoker driveTypeInvokerForTest;
 FileAttributesInvoker fileAttributesInvokerForTest;
+KnownFolderPathInvoker knownFolderPathInvokerForTest;
 std::optional<QStringList> shortcutRootsForTest;
 #endif
 
@@ -167,6 +169,24 @@ bool existingFilesystemPath(const QString& path) {
 QString existingLocalFilesystemPath(const QString& path) {
 	const auto valid = validLocalFilesystemPath(path);
 	return valid.has_value() && existingFilesystemPath(*valid) ? *valid : QString();
+}
+
+enum class ShortcutLookupMode : quint8 { Unfiltered, LocalOnly };
+
+QString existingCandidatePath(const QString& path, ShortcutLookupMode mode) {
+	if (mode == ShortcutLookupMode::LocalOnly) return existingLocalFilesystemPath(path);
+	const auto valid = validFilesystemPath(path);
+	return valid.has_value() && existingFilesystemPath(*valid) ? *valid : QString();
+}
+
+HRESULT knownFolderPath(const KNOWNFOLDERID& folderId, DWORD flags, QString* path) {
+#ifdef QS_TEST
+	if (knownFolderPathInvokerForTest) return knownFolderPathInvokerForTest(folderId, flags, path);
+#endif
+	PWSTR raw = nullptr;
+	const auto hr = SHGetKnownFolderPath(folderId, flags, nullptr, &raw);
+	*path = takeComString(raw);
+	return hr;
 }
 
 bool canElevate(const QString& path) {
@@ -368,7 +388,7 @@ LinkIdentity readLink(const QString& path) {
 	return link;
 }
 
-QStringList startMenuRoots() {
+QStringList startMenuRoots(ShortcutLookupMode mode) {
 	auto candidates = QStringList();
 	auto useTestRoots = false;
 #ifdef QS_TEST
@@ -377,13 +397,16 @@ QStringList startMenuRoots() {
 #endif
 
 	if (!useTestRoots) {
+		const auto localOnly = mode == ShortcutLookupMode::LocalOnly;
+		const auto flags = localOnly ? DWORD(KF_FLAG_DONT_VERIFY) : DWORD(KF_FLAG_DEFAULT);
 		for (const auto& folderId: {FOLDERID_StartMenu, FOLDERID_CommonStartMenu}) {
-			PWSTR raw = nullptr;
-			auto hr = SHGetKnownFolderPath(folderId, KF_FLAG_DEFAULT, nullptr, &raw);
-			auto root = takeComString(raw);
+			auto root = QString();
+			const auto hr = knownFolderPath(folderId, flags, &root);
 			if (SUCCEEDED(hr) && !root.isEmpty()) candidates.append(root);
 		}
 	}
+
+	if (mode == ShortcutLookupMode::Unfiltered) return candidates;
 
 	auto roots = QStringList();
 	for (const auto& root: candidates) {
@@ -392,11 +415,11 @@ QStringList startMenuRoots() {
 	return roots;
 }
 
-QString findShortcut(const AppActionInfo& app) {
+QString findShortcut(const AppActionInfo& app, ShortcutLookupMode mode) {
 	auto named = QStringList();
 	auto others = QStringList();
 
-	for (const auto& root: startMenuRoots()) {
+	for (const auto& root: startMenuRoots(mode)) {
 		auto iter = QDirIterator(
 		    root,
 		    {QStringLiteral("*.lnk")},
@@ -439,6 +462,7 @@ QString findShortcut(const AppActionInfo& app) {
 struct ShortcutCache {
 	QMutex mutex;
 	QHash<QString, QString> paths;
+	QHash<QString, QString> localPaths;
 };
 
 ShortcutCache& shortcutCache() {
@@ -450,37 +474,41 @@ void clearShortcutCache() {
 	auto& cache = shortcutCache();
 	QMutexLocker locker(&cache.mutex);
 	cache.paths.clear();
+	cache.localPaths.clear();
 }
 
-QString startMenuShortcut(const AppActionInfo& app) {
-	const auto registered = existingLocalFilesystemPath(app.shortcutPath);
+QString startMenuShortcut(const AppActionInfo& app, ShortcutLookupMode mode) {
+	const auto registered = existingCandidatePath(app.shortcutPath, mode);
 	if (!registered.isEmpty()) return registered;
 
 	auto& cache = shortcutCache();
+	auto* paths = mode == ShortcutLookupMode::LocalOnly ? &cache.localPaths : &cache.paths;
 	auto cached = QString();
 
 	{
 		QMutexLocker locker(&cache.mutex);
-		cached = cache.paths.value(app.token);
+		cached = paths->value(app.token);
 	}
 
 	if (!cached.isEmpty()) {
-		const auto existing = existingLocalFilesystemPath(cached);
+		const auto existing = existingCandidatePath(cached, mode);
 		if (!existing.isEmpty()) return existing;
 	}
 
-	auto path = findShortcut(app);
+	auto path = findShortcut(app, mode);
 
 	QMutexLocker locker(&cache.mutex);
-	if (path.isEmpty()) cache.paths.remove(app.token);
-	else cache.paths.insert(app.token, path);
+	if (path.isEmpty()) paths->remove(app.token);
+	else paths->insert(app.token, path);
 	return path;
 }
 
 QString resolvePropertiesTarget(const AppActionInfo& app) {
 	if (app.token.isEmpty() || app.packaged) return {};
 
-	for (const auto& candidate: {startMenuShortcut(app), app.target}) {
+	for (const auto& candidate:
+	     {startMenuShortcut(app, ShortcutLookupMode::LocalOnly), app.target})
+	{
 		const auto existing = existingLocalFilesystemPath(candidate);
 		if (!existing.isEmpty()) return existing;
 	}
@@ -514,7 +542,7 @@ DWORD runElevated(const QString& id, const AppActionInfo& app, HWND owner) {
 			return launch(install->elevationTarget, false);
 		});
 	} else {
-		const auto shortcut = startMenuShortcut(app);
+		const auto shortcut = startMenuShortcut(app, ShortcutLookupMode::Unfiltered);
 		if (!shortcut.isEmpty()) result = launch(shortcut, true);
 		result = process::detail::fallbackOnFailure(result, [&] {
 			const auto directory = QDir::toNativeSeparators(QFileInfo(app.target).absolutePath());
@@ -644,7 +672,7 @@ bool selectInExplorer(const QString& id, const QString& path) {
 }
 
 void openLocation(const QString& id, const AppActionInfo& app) {
-	auto shortcut = startMenuShortcut(app);
+	auto shortcut = startMenuShortcut(app, ShortcutLookupMode::Unfiltered);
 	if (!shortcut.isEmpty() && selectInExplorer(id, shortcut)) return;
 	if (selectInExplorer(id, app.target)) return;
 
@@ -684,10 +712,15 @@ void setFileAttributesInvokerForTest(const FileAttributesInvoker& invoker) {
 	fileAttributesInvokerForTest = invoker;
 }
 
+void setKnownFolderPathInvokerForTest(const KnownFolderPathInvoker& invoker) {
+	knownFolderPathInvokerForTest = invoker;
+}
+
 void resetPropertiesTestHooks() {
 	propertiesInvokerForTest = {};
 	driveTypeInvokerForTest = {};
 	fileAttributesInvokerForTest = {};
+	knownFolderPathInvokerForTest = {};
 	shortcutRootsForTest.reset();
 	clearShortcutCache();
 }

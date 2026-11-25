@@ -3755,15 +3755,7 @@ TilingManager::setFloatingDetailed(TrackedWindow* window, bool floating, bool to
 		const auto overrideMatches = floating ? m.override == Override::Float
 		                                      : m.override == Override::Tile;
 		const auto stateMatches = floating ? m.layout == nullptr : m.layout != nullptr;
-		if (overrideMatches && stateMatches) {
-			if (!floating) {
-				const auto state = this->stateOf(m);
-				if (state == State::Hidden || state == State::Suspended) {
-					return FloatingChangeResult::Deferred;
-				}
-			}
-			return FloatingChangeResult::Noop;
-		}
+		if (overrideMatches && stateMatches) return FloatingChangeResult::Noop;
 	}
 
 	m.override = floating ? Override::Float : Override::Tile;

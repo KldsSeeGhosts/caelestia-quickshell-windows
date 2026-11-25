@@ -15,6 +15,17 @@ QHash<QString, QString> gParsingNames;
 QHash<QString, QString> gLinkTargets;
 QHash<QString, QString> gShortcutPaths;
 
+using ShellExecuteInvoker = std::function<qs::windows::process::LaunchResult(
+    const QString&,
+    const QString&,
+    const QString&,
+    const QString&,
+    HWND,
+    bool,
+    bool
+)>;
+ShellExecuteInvoker gShellExecuteInvoker;
+
 } // namespace
 
 namespace qs::windows::sys::test {
@@ -35,6 +46,10 @@ void clearParsingNames() {
 	gParsingNames.clear();
 	gLinkTargets.clear();
 	gShortcutPaths.clear();
+}
+
+void setShellExecuteTargetInvokerForTest(const ShellExecuteInvoker& invoker) {
+	gShellExecuteInvoker = invoker;
 }
 
 } // namespace qs::windows::sys::test
@@ -92,14 +107,19 @@ void runLauncher(std::function<void()>) {}
 namespace process {
 
 LaunchResult shellExecuteTarget(
-    const QString&,
-    const QString&,
-    const QString&,
-    const QString&,
-    HWND,
-    bool,
-    bool
+    const QString& target,
+    const QString& arguments,
+    const QString& workingDirectory,
+    const QString& verb,
+    HWND owner,
+    bool invokeIdList,
+    bool useExplorer
 ) {
+	if (gShellExecuteInvoker) {
+		return gShellExecuteInvoker(
+		    target, arguments, workingDirectory, verb, owner, invokeIdList, useExplorer
+		);
+	}
 	return detail::launchResultForError(ERROR_NOT_SUPPORTED);
 }
 

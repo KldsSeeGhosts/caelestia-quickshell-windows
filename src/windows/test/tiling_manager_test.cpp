@@ -2011,6 +2011,36 @@ private slots:
 		QVERIFY(!manager->isTiled(inside));
 	}
 
+	void satisfiedTileWhilePlacementIsSuspendedIsNoop_data() {
+		QTest::addColumn<QString>("state");
+		QTest::newRow("maximized") << QStringLiteral("maximized");
+		QTest::newRow("minimized") << QStringLiteral("minimized");
+	}
+
+	void satisfiedTileWhilePlacementIsSuspendedIsNoop() {
+		QFETCH(QString, state);
+		auto* window = add(1);
+		enable();
+		QCOMPARE(manager->setFloatingDetailed(window, true, false), FloatingChangeResult::Changed);
+		manager->sync();
+		QCOMPARE(manager->setFloatingDetailed(window, false, false), FloatingChangeResult::Changed);
+		manager->sync();
+		QVERIFY(manager->isTiled(window));
+
+		auto& native = fakeWindow(window->hwnd());
+		if (state == "maximized") {
+			native.maximized = true;
+			emit window->maximizedChanged();
+		} else {
+			native.minimized = true;
+			emit window->minimizedChanged();
+		}
+		manager->sync();
+		QVERIFY(manager->isTiled(window));
+
+		QCOMPARE(manager->setFloatingDetailed(window, false, false), FloatingChangeResult::Noop);
+	}
+
 	void deferredTileWhilePlacementIsSuspended_data() {
 		QTest::addColumn<QString>("state");
 		QTest::newRow("maximized") << QStringLiteral("maximized");
