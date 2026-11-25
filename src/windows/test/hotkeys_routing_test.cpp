@@ -88,6 +88,7 @@ private slots:
 		qs::windows::hotkeys::KeyboardHook::stop();
 		hotkey_fixture::registerChords = false;
 		hotkey_fixture::canStart = true;
+		hotkey_fixture::generation = 1;
 	}
 
 	void submapMembershipRoutesOnlyTheGlobalMapInitially() {
@@ -121,7 +122,11 @@ private slots:
 		manager->registerAll();
 		auto deliver = [&](HookEvent event, quint32 id, quint32 serial) {
 			HotkeyManager::messageWindowProc(
-			    manager->messageWindow, WM_APP + 16 + event, id, serial);
+			    manager->messageWindow,
+			    WM_APP + 16 + event,
+			    hookEventWParam(id, hotkey_fixture::generation),
+			    hookEventLParam(serial, hotkey_fixture::generation)
+			);
 		};
 		const auto oldSerial = manager->serial;
 		deliver(HookPressed, 0, oldSerial);
@@ -157,6 +162,36 @@ private slots:
 		QCOMPARE(manager->triggers.size(), 1);
 	}
 
+	void staleHookGenerationEventsAreDroppedAfterReset() {
+		using namespace qs::windows::hotkeys;
+		auto* manager = HotkeyManager::instance();
+		manager->parse(R"({"binds":[
+			{"keys":"Super+R","action":"global","name":"global"}
+		]})", "fixture");
+		RoutingShortcut global("global");
+		manager->registerShortcut(&global);
+		manager->registerAll();
+		auto deliver = [&](HookEvent event, quint32 id, uint64_t generation) {
+			HotkeyManager::messageWindowProc(
+			    manager->messageWindow,
+			    WM_APP + 16 + event,
+			    hookEventWParam(id, generation),
+			    hookEventLParam(manager->serial, generation)
+			);
+		};
+
+		const auto oldGeneration = hotkey_fixture::generation;
+		deliver(HookPressed, 0, oldGeneration);
+		QCOMPARE(global.presses, 1);
+		// Teardown invalidates the active generation before publishing reset.
+		hotkey_fixture::generation++;
+		deliver(HookReset, 0, hotkey_fixture::generation);
+		deliver(HookPressed, 0, oldGeneration);
+		QCOMPARE(global.presses, 1);
+		deliver(HookPressed, 0, hotkey_fixture::generation);
+		QCOMPARE(global.presses, 2);
+	}
+
 	void submapRegisteredHotkeysAndLifecycleUseTheSameWindowCallback() {
 		using namespace qs::windows::hotkeys;
 		auto* manager = HotkeyManager::instance();
@@ -175,7 +210,11 @@ private slots:
 		QCOMPARE(resize.presses, 1);
 		QCOMPARE(resize.source, std::optional(qs::windows::ActivationSource::Hotkey));
 		HotkeyManager::messageWindowProc(
-		    manager->messageWindow, WM_APP + 16 + HookReset, 0, manager->serial);
+		    manager->messageWindow,
+		    WM_APP + 16 + HookReset,
+		    hookEventWParam(0, hotkey_fixture::generation),
+		    hookEventLParam(manager->serial, hotkey_fixture::generation)
+		);
 		QVERIFY(manager->activeSubmap().isEmpty());
 		QCOMPARE(resize.releases, 1);
 		QVERIFY(manager->setSubmap("resize"));
@@ -259,7 +298,11 @@ private slots:
 		QCOMPARE(manager->triggers.size(), 4);
 		auto deliver = [&](HookEvent event, quint32 id, quint32 serial) {
 			HotkeyManager::messageWindowProc(
-			    manager->messageWindow, WM_APP + 16 + event, id, serial);
+			    manager->messageWindow,
+			    WM_APP + 16 + event,
+			    hookEventWParam(id, hotkey_fixture::generation),
+			    hookEventLParam(serial, hotkey_fixture::generation)
+			);
 		};
 
 		// A stale serial (the map changed under the hook) and a trigger index

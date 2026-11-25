@@ -286,6 +286,27 @@ private:
 	bool mRouting = false;
 };
 
+
+// Hook events split the monotonic 64-bit hook generation across both message
+// parameters. Trigger id and serial each keep their low 32 bits.
+[[nodiscard]] constexpr WPARAM hookEventWParam(uint32_t triggerId, uint64_t generation) {
+	return static_cast<WPARAM>((generation << 32) | triggerId);
+}
+[[nodiscard]] constexpr LPARAM hookEventLParam(uint32_t serial, uint64_t generation) {
+	return static_cast<LPARAM>(((generation >> 32) << 32) | serial);
+}
+[[nodiscard]] constexpr uint32_t hookEventTriggerId(WPARAM wParam) {
+	return static_cast<uint32_t>(wParam);
+}
+[[nodiscard]] constexpr uint32_t hookEventSerial(LPARAM lParam) {
+	return static_cast<uint32_t>(lParam);
+}
+[[nodiscard]] constexpr uint64_t hookEventGeneration(WPARAM wParam, LPARAM lParam) {
+	const auto low = static_cast<uint64_t>(wParam) >> 32;
+	const auto high = static_cast<uint64_t>(lParam) >> 32;
+	return (high << 32) | low;
+}
+
 namespace hookwatch {
 
 namespace detail {
@@ -330,6 +351,7 @@ public:
 	static void stop();
 	[[nodiscard]] static bool isRunning();
 	[[nodiscard]] static bool foregroundBlocked();
+	[[nodiscard]] static uint64_t activeHookGeneration();
 	// Physical Win state also includes downs deferred by the keyboard hook.
 	[[nodiscard]] static bool superDown();
 

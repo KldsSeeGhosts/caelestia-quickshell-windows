@@ -266,7 +266,7 @@ private slots:
 		physical('B', true, 120);
 		physical(VK_LWIN, true, 130);
 		QCOMPARE(desktop.posted, (std::vector<HookEvent> {HookPressed, HookReleased}));
-		QCOMPARE(desktop.hookPosts.front().wParam, WPARAM(25));
+		QCOMPARE(desktop.hookPosts.front().wParam, hookEventWParam(25, gHookGeneration.load()));
 		QVERIFY(desktop.delivered.empty());
 		QVERIFY(!desktop.startOpened);
 	}
@@ -535,8 +535,8 @@ private slots:
 		QCOMPARE(taps(), 1);
 		QCOMPARE(desktop.hookPosts.size(), size_t(1));
 		QCOMPARE(desktop.hookPosts[0].message, UINT(WM_APP + HookTapped));
-		QCOMPARE(desktop.hookPosts[0].wParam, WPARAM(27));
-		QCOMPARE(desktop.hookPosts[0].lParam, LPARAM(613));
+		QCOMPARE(desktop.hookPosts[0].wParam, hookEventWParam(27, gHookGeneration.load()));
+		QCOMPARE(hookEventSerial(desktop.hookPosts[0].lParam), uint32_t(613));
 		QVERIFY(!desktop.down.at(vk));
 	}
 
@@ -555,8 +555,8 @@ private slots:
 		physical(VK_LMENU, false, 300);
 		physical(VK_LMENU, true, 400);
 		QCOMPARE(taps(), 1);
-		QCOMPARE(desktop.hookPosts.back().wParam, WPARAM(2));
-		QCOMPARE(desktop.hookPosts.back().lParam, LPARAM(614));
+		QCOMPARE(desktop.hookPosts.back().wParam, hookEventWParam(2, gHookGeneration.load()));
+		QCOMPARE(hookEventSerial(desktop.hookPosts.back().lParam), uint32_t(614));
 		QVERIFY(!desktop.down[VK_LWIN]);
 		QVERIFY(!desktop.down[VK_LMENU]); // Failed injection passes physical Alt-up.
 	}
@@ -577,8 +577,8 @@ private slots:
 		physical('R', true, 120);
 		physical(VK_LWIN, true, 130);
 		QCOMPARE(desktop.posted, (std::vector<HookEvent>{HookPressed, HookReleased}));
-		QCOMPARE(desktop.hookPosts.back().wParam, WPARAM(7));
-		QCOMPARE(desktop.hookPosts.back().lParam, LPARAM(615));
+		QCOMPARE(desktop.hookPosts.back().wParam, hookEventWParam(7, gHookGeneration.load()));
+		QCOMPARE(hookEventSerial(desktop.hookPosts.back().lParam), uint32_t(615));
 		QVERIFY(desktop.delivered.empty());
 		QVERIFY(!desktop.down[VK_LWIN]);
 		physical(VK_LWIN, false, 200);
@@ -616,6 +616,51 @@ private slots:
 		QVERIFY(!hookMissedInput(zero + 501, install, zero + 502));
 	}
 
+	void rawInputMessageTimeCrossesZeroWithoutBecomingNewer() {
+		constexpr uint64_t zero = 1ULL << 32;
+		constexpr DWORD beforeZero = 0xffffff00; // 256 ms before the 32-bit zero.
+		QCOMPARE(tick64FromMessageTime(beforeZero, zero + 100), zero - 256);
+		QCOMPARE(tick64FromMessageTime(100, zero - 256), zero + 100);
+	}
+
+	void unmatchedRawInputNeedsAGraceWindowBeforeRearming() {
+		hookwatch::detail::HookState hook;
+		hook.active = hook.needed = true;
+		hook.installTick.store(100);
+		hook.callbackTick.store(100);
+		auto recovery = HookRecovery {.rawTick = 2000};
+		auto attempts = 0;
+		auto attempt = [&] {
+			attempts++;
+			return 4000;
+		};
+		QVERIFY(!recovery.poll(hook, 2000, true, attempt));
+		QCOMPARE(recovery.unmatchedSince, uint64_t(2000));
+		QVERIFY(!recovery.poll(hook, 3999, true, attempt));
+		QVERIFY(recovery.poll(hook, 4000, true, attempt));
+		QCOMPARE(attempts, 1);
+	}
+
+	void delayedRawInputMatchingAHookCallbackDoesNotRearm() {
+		constexpr uint64_t zero = 1ULL << 32;
+		constexpr auto queued = zero - 100;
+		constexpr auto delivered = zero + 3000;
+		const auto original = tick64FromMessageTime(static_cast<DWORD>(queued), delivered);
+		hookwatch::detail::HookState hook;
+		hook.active = hook.needed = true;
+		hook.installTick.store(zero - 1000);
+		hook.callbackTick.store(original + 1); // The healthy hook saw it before delivery.
+		auto recovery = HookRecovery {.rawTick = original, .unmatchedSince = delivered - HOOK_UNMATCHED_GRACE_MS};
+		auto attempts = 0;
+		auto attempt = [&] {
+			attempts++;
+			return delivered;
+		};
+		QVERIFY(!recovery.poll(hook, delivered, true, attempt));
+		QCOMPARE(attempts, 0);
+		QCOMPARE(recovery.unmatchedSince, uint64_t(0));
+	}
+
 	void watchdogFindsAnEvictedDeviceWithoutTheOtherHook_data() {
 		QTest::addColumn<bool>("keyboardStale");
 		QTest::addColumn<bool>("otherActive");
@@ -646,14 +691,18 @@ private slots:
 		auto attempt = [] { return 2200; };
 		QVERIFY(!staleRecovery.poll(stale, 2200, true, attempt));
 		staleRecovery.rawTick = 2201;
-		QCOMPARE(keyboardRecovery.poll(keyboardState, 2201, true, attempt), keyboardStale);
-		QCOMPARE(mouseRecovery.poll(mouseState, 2201, true, attempt), !keyboardStale);
+		// First tick only starts the unmatched-input grace window.
+		QVERIFY(!keyboardRecovery.poll(keyboardState, 2201, true, attempt));
+		QVERIFY(!mouseRecovery.poll(mouseState, 2201, true, attempt));
+		const auto afterGrace = 2201 + HOOK_UNMATCHED_GRACE_MS;
+		QCOMPARE(keyboardRecovery.poll(keyboardState, afterGrace, true, attempt), keyboardStale);
+		QCOMPARE(mouseRecovery.poll(mouseState, afterGrace, true, attempt), !keyboardStale);
 	}
 
 	void watchdogBacksOffAfterFailedRearmerUntilOwnerLeaves() {
 		hookwatch::detail::HookState hook;
 		hook.active = hook.needed = true;
-		auto recovery = HookRecovery {.rawTick = 3000};
+		auto recovery = HookRecovery {.rawTick = 3000, .unmatchedSince = 1000};
 		uint64_t now = 3000;
 		auto attempts = 0;
 		auto attempt = [&] {
@@ -695,6 +744,55 @@ private slots:
 		QVERIFY(recovery.take(21500, true));
 		QVERIFY(recovery.request(25000)); // Standalone reconnect.
 		QVERIFY(recovery.take(25500, true));
+	}
+
+	void rearmInvalidatesTheHookGenerationBeforePostingReset() {
+		gHookGenerationLive.store(true);
+		const auto before = gHookGeneration.load();
+		auto snapshot = gSnapshot.load();
+		stopHookThread(true);
+		const auto active = gHookGeneration.load();
+		QCOMPARE(active, before + 1);
+		QVERIFY(!desktop.hookPosts.empty());
+		const auto& reset = desktop.hookPosts.front();
+		QCOMPARE(reset.message, UINT(WM_APP + HookReset));
+		QCOMPARE(hookEventGeneration(reset.wParam, reset.lParam), active);
+		QCOMPARE(hookEventSerial(reset.lParam), snapshot->serial);
+
+		// A key event queued by the old generation is distinguishable from the
+		// reset and from every event posted by the next hook generation.
+		const auto stale = hookEventWParam(12, before);
+		QVERIFY(hookEventGeneration(stale, hookEventLParam(0, before)) != active);
+		QCOMPARE(hookEventTriggerId(stale), uint32_t(12));
+
+		constexpr uint64_t highGeneration = 0x123456789abcdef0;
+		QCOMPARE(
+		    hookEventGeneration(
+		        hookEventWParam(12, highGeneration),
+		        hookEventLParam(99, highGeneration)
+		    ),
+		    highGeneration
+		);
+		QCOMPARE(hookEventSerial(hookEventLParam(99, highGeneration)), uint32_t(99));
+	}
+
+	void disconnectedSessionKeepsRecoveryPendingUntilReconnect() {
+		auto connected = true;
+		SessionRecovery recovery;
+		QVERIFY(recovery.resume(1000, true));
+		connected = sessionConnectedAfterEvent(connected, WTS_REMOTE_DISCONNECT);
+		QVERIFY(!connected);
+		QVERIFY(!recovery.take(2000, connected));
+		QVERIFY(!recovery.take(60000, connected));
+		connected = sessionConnectedAfterEvent(connected, WTS_REMOTE_CONNECT);
+		QVERIFY(connected);
+		QVERIFY(recovery.take(60000, connected));
+
+		QVERIFY(recovery.request(70000));
+		connected = sessionConnectedAfterEvent(connected, WTS_SESSION_LOCK);
+		QVERIFY(!recovery.take(70500, connected));
+		connected = sessionConnectedAfterEvent(connected, WTS_SESSION_UNLOCK);
+		QVERIFY(recovery.take(70500, connected));
 	}
 
 	void keyboardRearmResetsRoutingAndObserverBeforeDetaching() {
@@ -900,6 +998,8 @@ private slots:
 		publishForegroundIntegrity(nullptr, false);
 		gThreadId.store(0);
 		gStopRequested.store(false);
+		gHookGeneration.store(1);
+		gHookGenerationLive.store(false);
 		gOwnership = {};
 		keyboardHookState.active = false;
 		gThread = nullptr;
@@ -1424,7 +1524,7 @@ private slots:
 		QCOMPARE(desktop.observerPosts[0].message, UINT(WM_APP + 51));
 		QCOMPARE(gInputObserver.load(), reinterpret_cast<HWND>(2));
 		QCOMPARE(desktop.hookPosts.back().message, UINT(WM_APP + HookReset));
-		QCOMPARE(desktop.hookPosts.back().lParam, LPARAM(snapshot->serial));
+		QCOMPARE(hookEventSerial(desktop.hookPosts.back().lParam), snapshot->serial);
 	}
 
 	void nonSuperSnapshotDoesNotClaimWin() {

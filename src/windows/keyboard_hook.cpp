@@ -41,6 +41,9 @@ using hookwatch::detail::keyboardHookState;
 using hookwatch::detail::mouseHookState;
 
 std::thread* gThread = nullptr; // NOLINT
+std::atomic<uint64_t> gHookGeneration = 1; // NOLINT
+std::atomic<bool> gHookGenerationLive = false;     // NOLINT
+thread_local uint64_t tHookGeneration = 0;         // NOLINT
 
 struct HeldKey {
 	uint32_t id = 0;
@@ -182,6 +185,7 @@ bool foregroundAllowsReplay();
 constexpr int HOOK_WATCHDOG_INTERVAL_MS = 2000;
 constexpr uint64_t HOOK_STALE_INPUT_MS = 1500;
 constexpr uint64_t HOOK_MAX_RETRY_MS = 16000;
+constexpr uint64_t HOOK_UNMATCHED_GRACE_MS = HOOK_WATCHDOG_INTERVAL_MS;
 constexpr int SESSION_SETTLE_MS = 500;
 constexpr auto HOOK_MONITOR_CLASS = L"QuickshellLowLevelHookMonitor";
 
@@ -189,8 +193,24 @@ constexpr auto HOOK_MONITOR_CLASS = L"QuickshellLowLevelHookMonitor";
 	return rawTick > installTick && rawTick > callbackTick && rawTick - callbackTick > HOOK_STALE_INPUT_MS;
 }
 
+// GetMessageTime is a 32-bit tick. Choose the 64-bit tick closest to now so
+// queued input keeps its original timestamp across a zero crossing.
+[[nodiscard]] constexpr uint64_t tick64FromMessageTime(DWORD messageTime, uint64_t now) {
+	const auto delta = static_cast<int32_t>(messageTime - static_cast<DWORD>(now));
+	return static_cast<uint64_t>(static_cast<int64_t>(now) + delta);
+}
+
+[[nodiscard]] constexpr bool sessionConnectedAfterEvent(bool connected, WPARAM event) {
+	if (event == WTS_CONSOLE_DISCONNECT || event == WTS_REMOTE_DISCONNECT || event == WTS_SESSION_LOCK)
+		return false;
+	if (event == WTS_CONSOLE_CONNECT || event == WTS_REMOTE_CONNECT || event == WTS_SESSION_UNLOCK)
+		return true;
+	return connected;
+}
+
 struct HookRecovery {
 	uint64_t rawTick = 0;
+	uint64_t unmatchedSince = 0;
 	uint64_t nextAttempt = 0;
 	uint64_t retryDelay = HOOK_WATCHDOG_INTERVAL_MS;
 	bool sessionPending = false;
@@ -208,13 +228,26 @@ struct HookRecovery {
 		if (hook.active) {
 			this->nextAttempt = 0;
 			this->retryDelay = HOOK_WATCHDOG_INTERVAL_MS;
-			if (!this->sessionPending
-			    && !hookMissedInput(this->rawTick, hook.callbackTick.load(), hook.installTick.load()))
-				return false;
+			if (!this->sessionPending) {
+				const auto missed = hookMissedInput(this->rawTick, hook.callbackTick.load(), hook.installTick.load());
+				if (!missed) {
+					this->unmatchedSince = 0;
+					return false;
+				}
+				// A stalled GUI can deliver old raw input long after the hook saw
+				// it. Require the unmatched evidence to survive a watchdog grace
+				// window before reinstalling either hook.
+				if (this->unmatchedSince == 0) {
+					this->unmatchedSince = now;
+					return false;
+				}
+				if (now - this->unmatchedSince < HOOK_UNMATCHED_GRACE_MS) return false;
+			}
 		}
 		if (now < this->nextAttempt) return false;
 		this->sessionPending = false;
 		this->rawTick = 0;
+		this->unmatchedSince = 0;
 		this->nextAttempt = attempt() + this->retryDelay;
 		if (this->retryDelay < HOOK_MAX_RETRY_MS) this->retryDelay *= 2;
 		return true;
@@ -276,8 +309,8 @@ public:
 	}
 
 private:
-	static bool safeToRearm() {
-		if (inputDesktopIsForeign()) return false;
+	bool safeToRearm() const {
+		if (!this->sessionConnected || inputDesktopIsForeign()) return false;
 		auto* foreground = GetForegroundWindow();
 		return foreground != nullptr && !isHiddenFromUs(foreground);
 	}
@@ -309,7 +342,7 @@ private:
 		return RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE)) != 0;
 	}
 
-	void noteRawInput(HRAWINPUT input) {
+	void noteRawInput(HRAWINPUT input, uint64_t messageTick) {
 		RAWINPUTHEADER header {};
 		UINT size = sizeof(header);
 		if (GetRawInputData(input, RID_HEADER, &header, &size, sizeof(header)) != sizeof(header))
@@ -317,9 +350,26 @@ private:
 		// Never read the payload. Without raw input, use session recovery and
 		// failed-install retries alone. LASTINPUTINFO cannot identify a device.
 		if (header.dwType == RIM_TYPEKEYBOARD && keyboardHookState.needed && foregroundAllowsReplay())
-			this->keyboardRecovery.rawTick = GetTickCount64();
+			this->keyboardRecovery.rawTick = messageTick;
 		else if (header.dwType == RIM_TYPEMOUSE && mouseHookState.needed && foregroundAllowsReplay())
-			this->mouseRecovery.rawTick = GetTickCount64();
+			this->mouseRecovery.rawTick = messageTick;
+	}
+
+	void applyQueriedSessionState() {
+		if (this->querySessionInformation == nullptr || this->freeWtsMemory == nullptr) return;
+		WTS_CONNECTSTATE_CLASS* state = nullptr;
+		DWORD bytes = 0;
+		if (!this->querySessionInformation(
+		        WTS_CURRENT_SERVER_HANDLE,
+		        WTS_CURRENT_SESSION,
+		        WTSConnectState,
+		        reinterpret_cast<LPWSTR*>(&state),
+		        &bytes
+		    )
+		    || state == nullptr)
+			return;
+		this->sessionConnected = *state == WTSActive;
+		this->freeWtsMemory(state);
 	}
 
 	void createListener() {
@@ -371,6 +421,13 @@ private:
 		this->unregisterSession = reinterpret_cast<BOOL(WINAPI*)(HWND)>(
 		    GetProcAddress(this->wtsModule, "WTSUnRegisterSessionNotification")
 		);
+		this->querySessionInformation = reinterpret_cast<BOOL(WINAPI*)(HANDLE, DWORD, WTS_INFO_CLASS, LPWSTR*, DWORD*)>(
+		    GetProcAddress(this->wtsModule, "WTSQuerySessionInformationW")
+		);
+		this->freeWtsMemory = reinterpret_cast<void(WINAPI*)(PVOID)>(
+		    GetProcAddress(this->wtsModule, "WTSFreeMemory")
+		);
+		this->applyQueriedSessionState();
 		if (registerSession != nullptr && this->unregisterSession != nullptr)
 			this->sessionRegistered = registerSession(this->window, NOTIFY_FOR_THIS_SESSION) != 0;
 		if (!this->sessionRegistered) {
@@ -386,18 +443,23 @@ private:
 		auto* self = reinterpret_cast<LowLevelHookMonitor*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
 		if (self != nullptr) {
 			if (message == WM_INPUT) {
-				self->noteRawInput(reinterpret_cast<HRAWINPUT>(lParam));
+				self->noteRawInput(
+				    reinterpret_cast<HRAWINPUT>(lParam),
+				    tick64FromMessageTime(static_cast<DWORD>(GetMessageTime()), GetTickCount64())
+				);
 			} else if (message == WM_POWERBROADCAST) {
 				if (wParam == PBT_APMSUSPEND) self->sessionRecovery.resumed = false;
 				else if ((wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND)
 				         && self->sessionRecovery.resume(GetTickCount64(), wParam == PBT_APMRESUMEAUTOMATIC))
 					self->sessionTimer.start();
 				return TRUE;
-			} else if (message == WM_WTSSESSION_CHANGE
-			           && (wParam == WTS_SESSION_UNLOCK || wParam == WTS_CONSOLE_CONNECT
-			               || wParam == WTS_REMOTE_CONNECT))
-			{
-				if (self->sessionRecovery.request(GetTickCount64())) self->sessionTimer.start();
+			} else if (message == WM_WTSSESSION_CHANGE) {
+				self->sessionConnected = sessionConnectedAfterEvent(self->sessionConnected, wParam);
+				if (self->sessionConnected
+				    && (wParam == WTS_SESSION_UNLOCK || wParam == WTS_CONSOLE_CONNECT
+				        || wParam == WTS_REMOTE_CONNECT)
+				    && self->sessionRecovery.request(GetTickCount64()))
+					self->sessionTimer.start();
 				return 0;
 			}
 		}
@@ -412,9 +474,12 @@ private:
 	HWND window = nullptr;
 	HMODULE wtsModule = nullptr;
 	BOOL (WINAPI* unregisterSession)(HWND) = nullptr;
+	BOOL (WINAPI* querySessionInformation)(HANDLE, DWORD, WTS_INFO_CLASS, LPWSTR*, DWORD*) = nullptr;
+	void (WINAPI* freeWtsMemory)(PVOID) = nullptr;
 	bool classRegistered = false;
 	bool rawRegistered = false;
 	bool sessionRegistered = false;
+	bool sessionConnected = true;
 };
 
 QPointer<LowLevelHookMonitor> gHookMonitor; // NOLINT
@@ -614,7 +679,13 @@ void post(HookEvent event, uint32_t id, uint32_t serial) {
 	if (gStopRequested.load() && event != HookReset && event != HookStatusChanged) return;
 	auto* target = gTarget.load();
 	if (target == nullptr) return;
-	PostMessageW(target, gMessageBase.load() + event, id, static_cast<LPARAM>(serial));
+	const auto generation = tHookGeneration != 0 ? tHookGeneration : gHookGeneration.load();
+	PostMessageW(
+	    target,
+	    gMessageBase.load() + event,
+	    hookEventWParam(id, generation),
+	    hookEventLParam(serial, generation)
+	);
 }
 
 void postAll(
@@ -1314,10 +1385,11 @@ void signalReady() {
 	if (auto ready = gReadyEvent.load(); ready != nullptr) SetEvent(ready);
 }
 
-void hookThreadMain() {
+void hookThreadMain(uint64_t generation) {
 	MSG msg {};
 	PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 	gThreadId.store(GetCurrentThreadId());
+	tHookGeneration = generation;
 
 	if (gStopRequested.load()) {
 		gThreadId.store(0);
@@ -1341,6 +1413,7 @@ void hookThreadMain() {
 		return;
 	}
 
+	gHookGenerationLive.store(true, std::memory_order_release);
 	hookwatch::noteInstalled(keyboardHookState);
 
 	// A secure desktop (lock screen, UAC, switch user) takes every hold away
@@ -1399,6 +1472,11 @@ void setKeyboardActive(bool active) {
 
 void stopHookThread(bool notifyReset) {
 	gStopRequested.store(true);
+	// Invalidate queued hook input before publishing the reset. Events posted
+	// by a thread that outlives its join deadline keep its older generation.
+	// Repeated teardown of the same hook must not invalidate the reset itself.
+	if (gHookGenerationLive.exchange(false, std::memory_order_acq_rel))
+		gHookGeneration.fetch_add(1, std::memory_order_acq_rel);
 	auto threadId = gThreadId.load();
 	if (threadId != 0) PostThreadMessageW(threadId, WM_QUIT, 0, 0);
 	if (!reapHookThread(HOOK_STOP_TIMEOUT_MS))
@@ -1430,7 +1508,7 @@ bool startHookThread() {
 	gStopRequested.store(false);
 	gFailed.store(false);
 	try {
-		gThread = new std::thread(&hookThreadMain);
+		gThread = new std::thread(&hookThreadMain, gHookGeneration.load());
 	} catch (...) {
 		CloseHandle(gReadyEvent.exchange(nullptr));
 		CloseHandle(gExitEvent.exchange(nullptr));
@@ -1542,6 +1620,7 @@ bool KeyboardHook::isRunning() {
 	return keyboardHookState.active && gThreadId.load() != 0 && !gStopRequested.load();
 }
 bool KeyboardHook::foregroundBlocked() { return foregroundIsBlocked(); }
+uint64_t KeyboardHook::activeHookGeneration() { return gHookGeneration.load(); }
 bool KeyboardHook::superDown() {
 	return gWinDown.load() || isDown(VK_LWIN) || isDown(VK_RWIN);
 }

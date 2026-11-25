@@ -1238,10 +1238,11 @@ LRESULT CALLBACK HotkeyManager::messageWindowProc(HWND hwnd, UINT msg, WPARAM wP
 	}
 
 	if (msg >= WM_QS_HOOK_BASE && msg < WM_QS_HOOK_BASE + HookEventCount) {
+		if (hookEventGeneration(wParam, lParam) != KeyboardHook::activeHookGeneration()) return 0;
 		HotkeyManager::instance()->onHookEvent(
 		    static_cast<HookEvent>(msg - WM_QS_HOOK_BASE),
-		    static_cast<quint32>(wParam),
-		    static_cast<quint32>(lParam)
+		    hookEventTriggerId(wParam),
+		    hookEventSerial(lParam)
 		);
 
 		return 0;
