@@ -1537,6 +1537,40 @@ private slots:
 		QCOMPARE(fake.writtenMethods(), QList<BrightnessMethod>({BrightnessMethod::Wmi}));
 		QCOMPARE(brightness.methodFor(SCREEN), QStringLiteral("software"));
 	}
+
+	void eventWatchFailurePolicyResetsAfterAHealthyRun() {
+		using namespace brightness_detail;
+		QVERIFY(!healthyRunResetsFailures(std::chrono::milliseconds(29999)));
+		QVERIFY(healthyRunResetsFailures(std::chrono::seconds(30)));
+		QCOMPARE(eventRetryDelayMs(1), DWORD(5000));
+		QCOMPARE(eventRetryDelayMs(5), DWORD(25000));
+		// Backoff is capped even though the watcher never gives up permanently.
+		QCOMPARE(eventRetryDelayMs(99), DWORD(25000));
+	}
+
+	void eventWatchThreadStopsAndJoinsAFinitePollingWorker() {
+		brightness_detail::EventWatchThread watch;
+		std::atomic<bool> entered = false;
+		std::atomic<bool> sawStop = false;
+		QVERIFY(watch.start([&](HANDLE stop) {
+			entered = true;
+			while (WaitForSingleObject(stop, 5) == WAIT_TIMEOUT) {}
+			sawStop = true;
+		}));
+		QVERIFY(watch.running());
+
+		QElapsedTimer elapsed;
+		elapsed.start();
+		watch.stop();
+		QVERIFY(elapsed.elapsed() < brightness_detail::EVENT_JOIN_TIMEOUT_MS);
+		QVERIFY(!watch.running());
+		QVERIFY(entered.load());
+		QVERIFY(sawStop.load());
+
+		// A second lifecycle is independent and starts cleanly after the first join.
+		QVERIFY(watch.start([](HANDLE stop) { WaitForSingleObject(stop, 50); }));
+		watch.stop();
+	}
 };
 
 QTEST_GUILESS_MAIN(BrightnessRouteTest)

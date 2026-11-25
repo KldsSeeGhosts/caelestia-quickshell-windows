@@ -285,6 +285,7 @@ class DisplayIdentityTest: public QObject {
 
 private slots:
 	void init() {
+		GammaController::clearCrashSnapshots();
 		this->displays = {
 		    {QStringLiteral("DISPLAY1"),
 		     QStringLiteral("generic-path-b"),
@@ -293,6 +294,11 @@ private slots:
 		     QStringLiteral("generic-path-a"),
 		     QStringLiteral("Generic Monitor")},
 		};
+	}
+
+	void cleanup() {
+		GammaController::clearCrashSnapshots();
+		fixtureMonitors.clear();
 	}
 
 	void identicalLabelsRouteBrightnessAndGammaIndependently() {
@@ -618,6 +624,74 @@ private slots:
 		QVERIFY(gammaApi.rampFor(QStringLiteral("DISPLAY1")) != originalRamp());
 		QVERIFY(gamma.trySetBrightness(reconnectedName, 1.0));
 		QCOMPARE(gammaApi.rampFor(QStringLiteral("DISPLAY1")), originalRamp());
+	}
+
+	void gammaReapplyResolvesStableIdAfterDisplayReorder() {
+		auto* platform = new FakeScreen;
+		platform->geometryName = QStringLiteral("reorder-fixture");
+		QWindowSystemInterface::handleScreenAdded(platform);
+		auto* screen = platform->screen();
+		auto source = QStringLiteral("DISPLAY1");
+		QList<DisplayIdentity> topology {
+		    {source, QStringLiteral("fixture-path-reorder"), QStringLiteral("Fixture Monitor")}
+		};
+		ScreenIdentityRegistry registry(
+		    [&topology] { return topology; },
+		    [&source, screen](QScreen* target) { return target == screen ? source : QString(); }
+		);
+		QuickshellScreenInfo info(nullptr, screen, &registry);
+		const auto stableId = registry.identity(screen).stableId;
+		QVERIFY(stableId.startsWith(QStringLiteral("path:")));
+
+		FakeGammaApi gammaApi;
+		GammaController gamma(gammaApi.api(), registry);
+		QVERIFY(gamma.trySetBrightness(info.name(), 0.5));
+		const auto dimmed = gammaApi.rampFor(QStringLiteral("DISPLAY1"));
+		QVERIFY(!dimmed.isEmpty());
+		QVERIFY(dimmed != originalRamp());
+
+		// The same interface path is enumerated behind another GDI source. The
+		// stable id must survive and reapplication must resolve DISPLAY2, not
+		// rewrite the old source or give up because the key is opaque.
+		source = QStringLiteral("DISPLAY2");
+		topology[0].deviceName = source;
+		registry.refresh();
+		QCOMPARE(registry.identity(screen).stableId, stableId);
+		QCOMPARE(registry.identity(screen).deviceName, QStringLiteral("DISPLAY2"));
+
+		gammaApi.createdDevices.clear();
+		gamma.reapplyActive();
+		QVERIFY(gammaApi.createdDevices.contains(QStringLiteral("DISPLAY2")));
+		QVERIFY(!gammaApi.createdDevices.contains(QStringLiteral("DISPLAY1")));
+		QCOMPARE(gammaApi.rampFor(QStringLiteral("DISPLAY2")), dimmed);
+
+		gamma.restoreAll();
+		QWindowSystemInterface::handleScreenRemoved(platform);
+		fixtureMonitors.clear();
+	}
+
+	void gammaCrashSnapshotRestoresTheOriginalRamp() {
+		GammaController::clearCrashSnapshots();
+		TestScreen fixture(0x3007, true);
+		ScreenIdentityRegistry registry(
+		    [&fixture] { return fixture.display; },
+		    [&fixture](QScreen* target) { return fixture.sourceOf(target); }
+		);
+		const auto name = registry.identity(fixture.screen).uniqueName;
+		FakeGammaApi gammaApi;
+		GammaController gamma(gammaApi.api(), registry);
+		QVERIFY(gamma.trySetBrightness(name, 0.5));
+		QVERIFY(gammaApi.rampFor(QStringLiteral("DISPLAY1")) != originalRamp());
+		QCOMPARE(GammaController::crashSnapshotCount(), quintptr(1));
+
+		// The crash path is plain static data plus injected native calls. It puts
+		// back the original ramp without consulting Qt screen state.
+		GammaController::restoreSnapshots(gammaApi.api());
+		QCOMPARE(gammaApi.rampFor(QStringLiteral("DISPLAY1")), originalRamp());
+
+		gamma.restoreAll();
+		QCOMPARE(GammaController::crashSnapshotCount(), quintptr(0));
+		GammaController::clearCrashSnapshots();
 	}
 
 private:

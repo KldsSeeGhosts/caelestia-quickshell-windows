@@ -37,6 +37,24 @@ struct WindowEvent {
 	quint64 sequence = 0;
 };
 
+namespace window_action_detail {
+
+[[nodiscard]] inline bool shouldReportFailure(DWORD error, bool elevated) {
+	return error == ERROR_ACCESS_DENIED || elevated;
+}
+
+[[nodiscard]] inline QString refusalReason(DWORD error, bool elevated) {
+	return elevated ? QStringLiteral("elevated-window")
+	     : error == ERROR_ACCESS_DENIED ? QStringLiteral("access-denied")
+	                                    : QString();
+}
+
+[[nodiscard]] inline QString errorText(const QString& action, const QString& reason) {
+	return action + QLatin1Char(':') + reason;
+}
+
+} // namespace window_action_detail
+
 class TrackedWindow: public QObject {
 	Q_OBJECT;
 
@@ -51,6 +69,8 @@ public:
 	[[nodiscard]] QBindable<QString> bindableTitle() { return &this->bTitle; }
 	[[nodiscard]] QBindable<QString> bindableAppId() { return &this->bAppId; }
 	[[nodiscard]] QBindable<QString> bindableExePath() { return &this->bExePath; }
+	[[nodiscard]] QBindable<QString> bindableAumid() { return &this->bAumid; }
+	[[nodiscard]] QBindable<bool> bindableElevated() { return &this->bElevated; }
 	[[nodiscard]] QBindable<quint32> bindablePid() { return &this->bPid; }
 	[[nodiscard]] QBindable<QScreen*> bindableScreen() { return &this->bScreen; }
 	[[nodiscard]] QBindable<QRect> bindableRect() { return &this->bRect; }
@@ -66,6 +86,14 @@ public:
 	[[nodiscard]] QString title() const { return this->bTitle.value(); }
 	[[nodiscard]] QString appId() const { return this->bAppId.value(); }
 	[[nodiscard]] QString exePath() const { return this->bExePath.value(); }
+	// Full process image path. This aliases exePath so downstream window models
+	// expose the explicit Hyprland-style name without a second cached copy.
+	[[nodiscard]] QString imagePath() const { return this->exePath(); }
+	// The real AppUserModelID when Windows supplies one. appId() may be a
+	// process-name fallback and is not a substitute for this value.
+	[[nodiscard]] QString aumid() const { return this->bAumid.value(); }
+	[[nodiscard]] bool elevated() const { return this->bElevated.value(); }
+	[[nodiscard]] QString lastActionError() const { return this->mLastActionError; }
 	[[nodiscard]] quint32 pid() const { return this->bPid.value(); }
 	// Process and thread of the frame window itself, recorded when the tracker
 	// adopted it (pid() is the core process for a UWP frame). A consumer that
@@ -106,6 +134,9 @@ signals:
 	void titleChanged();
 	void appIdChanged();
 	void exePathChanged();
+	void imagePathChanged();
+	void aumidChanged();
+	void elevatedChanged();
 	void pidChanged();
 	void screenChanged();
 	void rectChanged();
@@ -117,6 +148,10 @@ signals:
 	void styleChanged();
 	void activatedChanged();
 	void desktopChanged();
+	void lastActionErrorChanged();
+	// Structured refusal for UI surfaces. reason is stable machine text such as
+	// "elevated-window" or "access-denied", never a path or window title.
+	void actionRefused(const QString& action, const QString& reason, bool elevated);
 
 private:
 	friend class WindowTracker;
@@ -130,8 +165,12 @@ private:
 	void refreshState();
 	void refreshDesktop(bool askShell);
 	void releaseFullscreenOwnership();
+	void reportActionRefused(const QString& action, const QString& reason);
+	void reportActionFailure(const QString& action, DWORD error);
+	void clearActionError();
 
 	WindowTracker* tracker;
+	QString mLastActionError;
 	HWND mHwnd;
 	bool uwpFrame = false;
 	quint32 mFrameProcessId = 0;
@@ -155,6 +194,8 @@ private:
 	Q_OBJECT_BINDABLE_PROPERTY(TrackedWindow, QString, bTitle, &TrackedWindow::titleChanged);
 	Q_OBJECT_BINDABLE_PROPERTY(TrackedWindow, QString, bAppId, &TrackedWindow::appIdChanged);
 	Q_OBJECT_BINDABLE_PROPERTY(TrackedWindow, QString, bExePath, &TrackedWindow::exePathChanged);
+	Q_OBJECT_BINDABLE_PROPERTY(TrackedWindow, QString, bAumid, &TrackedWindow::aumidChanged);
+	Q_OBJECT_BINDABLE_PROPERTY(TrackedWindow, bool, bElevated, &TrackedWindow::elevatedChanged);
 	Q_OBJECT_BINDABLE_PROPERTY(TrackedWindow, quint32, bPid, &TrackedWindow::pidChanged);
 	Q_OBJECT_BINDABLE_PROPERTY(TrackedWindow, QScreen*, bScreen, &TrackedWindow::screenChanged);
 	Q_OBJECT_BINDABLE_PROPERTY(TrackedWindow, QRect, bRect, &TrackedWindow::rectChanged);
@@ -170,6 +211,7 @@ private:
 
 class WindowTracker: public QObject {
 	Q_OBJECT;
+	Q_PROPERTY(QString lastActionError READ lastActionError NOTIFY lastActionErrorChanged);
 
 public:
 	static WindowTracker* instance();
@@ -189,6 +231,7 @@ public:
 	[[nodiscard]] TrackedWindow* activeWindow() const { return this->mActive; }
 	[[nodiscard]] TrackedWindow* windowFor(HWND hwnd) const { return this->byHwnd.value(hwnd); }
 	[[nodiscard]] VirtualDesktops* desktops() const { return this->mDesktops; }
+	[[nodiscard]] QString lastActionError() const { return this->mLastActionError; }
 
 	[[nodiscard]] QScreen* screenFor(HMONITOR monitor) const;
 	[[nodiscard]] static qsizetype screenIndex(QScreen* screen);
@@ -220,8 +263,13 @@ signals:
 	// application. The foreground observer uses this instead of sampling titles.
 	void foregroundNameChanged(HWND hwnd);
 	void stackingChanged();
+	void lastActionErrorChanged();
+	// Broadcast form of TrackedWindow::actionRefused for shell-level toast UI.
+	void windowActionRefused(const QString& action, const QString& reason, bool elevated);
 
 private:
+	friend class TrackedWindow;
+
 	explicit WindowTracker();
 	~WindowTracker() override;
 	Q_DISABLE_COPY_MOVE(WindowTracker);
@@ -249,8 +297,17 @@ private:
 	void updateScreens();
 	void onScreensChanged();
 	void onDesktopsChanged();
+	void reportWindowActionRefused(
+	    const TrackedWindow* window,
+	    const QString& action,
+	    const QString& reason,
+	    bool elevated
+	);
+	void clearWindowActionError(const TrackedWindow* window);
 
 	QList<TrackedWindow*> mWindows;
+	QString mLastActionError;
+	const TrackedWindow* mLastActionErrorWindow = nullptr;
 	QHash<HWND, TrackedWindow*> byHwnd;
 	TrackedWindow* mActive = nullptr;
 	VirtualDesktops* mDesktops = nullptr;

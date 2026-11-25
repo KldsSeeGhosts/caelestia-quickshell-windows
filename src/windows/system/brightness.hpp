@@ -1,5 +1,13 @@
 #pragma once
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
+
 #include <qabstractnativeeventfilter.h>
 #include <qhash.h>
 #include <qobject.h>
@@ -43,6 +51,47 @@ struct BrightnessRoute {
 };
 
 class BrightnessBackend;
+
+namespace brightness_detail {
+
+using EventClock = std::chrono::steady_clock;
+constexpr auto EVENT_HEALTHY_RESET = std::chrono::seconds(30);
+constexpr DWORD EVENT_POLL_WAIT_MS = 1000;
+constexpr DWORD EVENT_JOIN_TIMEOUT_MS = 2000;
+constexpr int EVENT_BACKOFF_CAP = 5;
+constexpr DWORD EVENT_RETRY_BASE_MS = 5000;
+
+[[nodiscard]] inline bool healthyRunResetsFailures(EventClock::duration healthyFor) {
+	return healthyFor >= EVENT_HEALTHY_RESET;
+}
+
+[[nodiscard]] inline DWORD eventRetryDelayMs(int consecutiveFailures) {
+	const auto factor = std::clamp(consecutiveFailures, 1, EVENT_BACKOFF_CAP);
+	return EVENT_RETRY_BASE_MS * static_cast<DWORD>(factor);
+}
+
+// Owns the stop event and watcher thread. stop() signals the event and joins a
+// finitely polling worker with a bounded wait, so application teardown cannot hang.
+class EventWatchThread {
+public:
+	EventWatchThread() = default;
+	~EventWatchThread();
+	Q_DISABLE_COPY_MOVE(EventWatchThread);
+
+	bool start(const std::function<void(HANDLE)>& worker);
+	void stop();
+	[[nodiscard]] bool running() const;
+
+private:
+	mutable std::mutex mutex;
+	HANDLE stopEvent = nullptr;
+	std::thread thread;
+	// Shared with the worker so the bounded-stop fallback can never leave a
+	// detached thread writing into this object's storage.
+	std::shared_ptr<std::atomic<bool>> finished = std::make_shared<std::atomic<bool>>(false);
+};
+
+} // namespace brightness_detail
 
 class Brightness
     : public QObject

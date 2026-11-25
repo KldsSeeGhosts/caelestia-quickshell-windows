@@ -25,6 +25,7 @@
 #include "../../core/logcat.hpp"
 #include "../../core/paths.hpp"
 #include "../redact.hpp"
+#include "../system/gamma.hpp"
 #include "../tiling.hpp"
 #include "../window_decorations.hpp"
 #include "relaunch_policy.hpp"
@@ -177,6 +178,7 @@ void handleCrash(const wchar_t* reason, EXCEPTION_POINTERS* ep) {
 			CloseHandle(dumpFile);
 		}
 
+		qs::windows::sys::GammaController::restoreForCrash();
 		qs::windows::DecorationManager::restoreForCrash();
 		qs::windows::TilingManager::restoreForCrash();
 

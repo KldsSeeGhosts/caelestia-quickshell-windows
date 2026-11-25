@@ -1,6 +1,9 @@
 #include "gamma.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <utility>
 
 #include <qcoreapplication.h>
@@ -10,6 +13,8 @@
 #include <qpointer.h>
 #include <qscreen.h>
 #include <qstring.h>
+
+#include <powrprof.h>
 
 #include "../../core/logcat.hpp"
 #include "../redact.hpp"
@@ -21,6 +26,35 @@ namespace {
 QS_LOGGING_CATEGORY(logGamma, "quickshell.windows.gamma", QtInfoMsg);
 
 constexpr qreal BRIGHTNESS_STEP = 0.05;
+constexpr int REAPPLY_DEBOUNCE_MS = 400;
+constexpr size_t CRASH_SNAPSHOT_COUNT = 32;
+constexpr size_t CRASH_KEY_CHARS = 384;
+constexpr size_t CRASH_DEVICE_CHARS = 32;
+
+struct CrashSnapshot {
+	std::atomic<quint64> sequence {0};
+	wchar_t key[CRASH_KEY_CHARS] {};
+	wchar_t device[CRASH_DEVICE_CHARS] {};
+	WORD ramp[3][256] {}; // NOLINT
+};
+
+CrashSnapshot gCrashSnapshots[CRASH_SNAPSHOT_COUNT]; // NOLINT
+std::atomic<bool> gExitRestoreRegistered = false;     // NOLINT
+
+void copyWide(wchar_t* target, size_t capacity, const std::wstring& value) {
+	if (capacity == 0) return;
+	auto length = std::min(value.size(), capacity - 1);
+	std::memcpy(target, value.data(), length * sizeof(wchar_t));
+	target[length] = L'\0';
+}
+
+void writeSnapshotKey(CrashSnapshot& snapshot, const QString& key) {
+	copyWide(snapshot.key, CRASH_KEY_CHARS, key.toStdWString());
+}
+
+bool snapshotKeyIs(const CrashSnapshot& snapshot, const QString& key) {
+	return key.compare(QString::fromWCharArray(snapshot.key), Qt::CaseInsensitive) == 0;
+}
 
 void factorsForTemperature(int kelvin, double factors[3]) { // NOLINT
 	auto temp = std::clamp(kelvin, 1000, 40000) / 100.0;
@@ -45,6 +79,67 @@ void factorsForTemperature(int kelvin, double factors[3]) { // NOLINT
 
 } // namespace
 
+struct GammaController::PowerNotifications {
+	explicit PowerNotifications(GammaController* controller) {
+		constexpr auto windowClass = L"QuickshellGammaPowerNotifications";
+		WNDCLASSW wc {};
+		wc.lpfnWndProc = &PowerNotifications::windowProc;
+		wc.hInstance = GetModuleHandleW(nullptr);
+		wc.lpszClassName = windowClass;
+		RegisterClassW(&wc);
+		this->window = CreateWindowExW(
+		    0,
+		    windowClass,
+		    L"",
+		    0,
+		    0,
+		    0,
+		    0,
+		    0,
+		    HWND_MESSAGE,
+		    nullptr,
+		    wc.hInstance,
+		    controller
+		);
+		if (this->window == nullptr) return;
+		this->consoleDisplay = RegisterPowerSettingNotification(
+		    this->window,
+		    &GUID_CONSOLE_DISPLAY_STATE,
+		    DEVICE_NOTIFY_WINDOW_HANDLE
+		);
+		this->monitorPower = RegisterPowerSettingNotification(
+		    this->window,
+		    &GUID_MONITOR_POWER_ON,
+		    DEVICE_NOTIFY_WINDOW_HANDLE
+		);
+	}
+
+	~PowerNotifications() {
+		if (this->consoleDisplay != nullptr) UnregisterPowerSettingNotification(this->consoleDisplay);
+		if (this->monitorPower != nullptr) UnregisterPowerSettingNotification(this->monitorPower);
+		if (this->window != nullptr) DestroyWindow(this->window);
+	}
+
+	static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+		if (message == WM_NCCREATE) {
+			auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+			SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+		} else if (message == WM_POWERBROADCAST
+		           && (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND
+		               || wParam == PBT_POWERSETTINGCHANGE))
+		{
+			auto* controller =
+			    reinterpret_cast<GammaController*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+			if (controller != nullptr) controller->scheduleReapply();
+		}
+		return DefWindowProcW(hwnd, message, wParam, lParam);
+	}
+
+	HWND window = nullptr;
+	HPOWERNOTIFY consoleDisplay = nullptr;
+	HPOWERNOTIFY monitorPower = nullptr;
+};
+
 GammaController* GammaController::instance() {
 	static QPointer<GammaController> controller; // NOLINT
 
@@ -56,7 +151,9 @@ GammaController* GammaController::instance() {
 }
 
 GammaController::GammaController(QObject* parent)
-    : GammaController({&CreateDCW, &DeleteDC, &GetDeviceGammaRamp, &SetDeviceGammaRamp}, parent) {}
+    : GammaController({&CreateDCW, &DeleteDC, &GetDeviceGammaRamp, &SetDeviceGammaRamp}, parent) {
+	this->powerNotifications = std::make_unique<PowerNotifications>(this);
+}
 
 GammaController::GammaController(NativeApi api, QObject* parent)
     : QObject(parent)
@@ -66,13 +163,7 @@ GammaController::GammaController(NativeApi api, QObject* parent)
               ? ScreenIdentityRegistry::instance()
               : nullptr
       ) {
-	QObject::connect(
-	    QCoreApplication::instance(),
-	    &QCoreApplication::aboutToQuit,
-	    this,
-	    &GammaController::restoreAll
-	);
-	if (this->identities != nullptr) this->watchIdentities();
+	this->init();
 }
 
 GammaController::GammaController(
@@ -83,13 +174,125 @@ GammaController::GammaController(
     : QObject(parent)
     , api(api)
     , identities(&identities) {
-	QObject::connect(
-	    QCoreApplication::instance(),
-	    &QCoreApplication::aboutToQuit,
-	    this,
-	    &GammaController::restoreAll
-	);
-	this->watchIdentities();
+	this->init();
+}
+
+void GammaController::init() {
+	this->reapplyTimer.setSingleShot(true);
+	this->reapplyTimer.setInterval(REAPPLY_DEBOUNCE_MS);
+	QObject::connect(&this->reapplyTimer, &QTimer::timeout, this, &GammaController::reapplyActive);
+	if (auto* app = QCoreApplication::instance()) {
+		app->installNativeEventFilter(this);
+		QObject::connect(app, &QCoreApplication::aboutToQuit, this, &GammaController::restoreAll);
+	}
+	if (!gExitRestoreRegistered.exchange(true)) {
+		std::atexit(&GammaController::restoreForCrash);
+	}
+	if (this->identities != nullptr) this->watchIdentities();
+}
+
+GammaController::~GammaController() {
+	if (auto* app = QCoreApplication::instance()) app->removeNativeEventFilter(this);
+}
+
+bool GammaController::nativeEventFilter(const QByteArray&, void* message, qintptr*) {
+	auto* msg = static_cast<MSG*>(message);
+	if (msg == nullptr) return false;
+	if (msg->message == WM_DISPLAYCHANGE
+	    || (msg->message == WM_POWERBROADCAST
+	        && (msg->wParam == PBT_APMRESUMEAUTOMATIC || msg->wParam == PBT_APMRESUMESUSPEND
+	            || msg->wParam == PBT_POWERSETTINGCHANGE)))
+	{
+		this->scheduleReapply();
+	}
+	return false;
+}
+
+void GammaController::scheduleReapply() { this->reapplyTimer.start(); }
+
+void GammaController::reapplyActive() {
+	// `written` is the ownership set: a display reset does not remove the duty to
+	// put this process's desired ramp back. Resolve every id again because GDI
+	// display numbers may have been reordered underneath the same stable ids.
+	auto keys = this->written;
+	for (const auto& key: keys) this->reapply(key);
+}
+
+void GammaController::updateCrashSnapshot(const QString& key, const Ramp& ramp) {
+	auto device = this->deviceFor(key);
+	if (device.isEmpty()) return;
+
+	CrashSnapshot* empty = nullptr;
+	CrashSnapshot* target = nullptr;
+	for (auto& snapshot: gCrashSnapshots) {
+		if (snapshotKeyIs(snapshot, key)) {
+			target = &snapshot;
+			break;
+		}
+		if (empty == nullptr && snapshot.key[0] == L'\0') empty = &snapshot;
+	}
+	if (target == nullptr) target = empty;
+	if (target == nullptr) return;
+
+	// Odd means a partial update. A crash reader only accepts an unchanged even
+	// sequence, so a crash during this copy loses this entry but never applies a
+	// torn ramp to the wrong display.
+	target->sequence.fetch_add(1, std::memory_order_acq_rel);
+	writeSnapshotKey(*target, key);
+	copyWide(target->device, CRASH_DEVICE_CHARS, device.toStdWString());
+	std::memcpy(target->ramp, ramp.values, sizeof(target->ramp));
+	target->sequence.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void GammaController::removeCrashSnapshot(const QString& key) {
+	for (auto& snapshot: gCrashSnapshots) {
+		if (!snapshotKeyIs(snapshot, key)) continue;
+		snapshot.sequence.fetch_add(1, std::memory_order_acq_rel);
+		snapshot.key[0] = L'\0';
+		snapshot.device[0] = L'\0';
+		snapshot.sequence.fetch_add(1, std::memory_order_acq_rel);
+	}
+}
+
+quintptr GammaController::crashSnapshotCount() {
+	quintptr count = 0;
+	for (const auto& snapshot: gCrashSnapshots) {
+		auto sequence = snapshot.sequence.load(std::memory_order_acquire);
+		if (sequence != 0 && sequence % 2 == 0 && snapshot.key[0] != L'\0') ++count;
+	}
+	return count;
+}
+
+void GammaController::clearCrashSnapshots() {
+	for (auto& snapshot: gCrashSnapshots) {
+		snapshot.sequence.fetch_add(1, std::memory_order_acq_rel);
+		snapshot.key[0] = L'\0';
+		snapshot.device[0] = L'\0';
+		snapshot.sequence.fetch_add(1, std::memory_order_acq_rel);
+	}
+}
+
+void GammaController::restoreSnapshots(const NativeApi& api) {
+	for (auto& snapshot: gCrashSnapshots) {
+		auto before = snapshot.sequence.load(std::memory_order_acquire);
+		if (before == 0 || before % 2 != 0) continue;
+
+		wchar_t device[CRASH_DEVICE_CHARS] {};
+		WORD ramp[3][256] {}; // NOLINT
+		std::memcpy(device, snapshot.device, sizeof(device));
+		std::memcpy(ramp, snapshot.ramp, sizeof(ramp));
+		auto after = snapshot.sequence.load(std::memory_order_acquire);
+		if (before != after || device[0] == L'\0') continue;
+
+		auto* hdc = api.createDc(L"DISPLAY", device, nullptr, nullptr);
+		if (hdc == nullptr) continue;
+		api.setRamp(hdc, ramp);
+		api.deleteDc(hdc);
+	}
+}
+
+void GammaController::restoreForCrash() {
+	restoreSnapshots({&CreateDCW, &DeleteDC, &GetDeviceGammaRamp, &SetDeviceGammaRamp});
 }
 
 void GammaController::watchIdentities() {
@@ -98,6 +301,12 @@ void GammaController::watchIdentities() {
 	    &ScreenIdentityRegistry::identityRetired,
 	    this,
 	    [this](const QString& id, QScreen*) { this->retire(id); }
+	);
+	QObject::connect(
+	    this->identities,
+	    &ScreenIdentityRegistry::screenChanged,
+	    this,
+	    [this](QScreen*) { this->scheduleReapply(); }
 	);
 }
 
@@ -269,6 +478,7 @@ bool GammaController::apply(const QString& key, qreal brightness) {
 			ok = false;
 		} else if (ok) {
 			this->written.insert(key);
+			this->updateCrashSnapshot(key, saved);
 		}
 		if (!ok)
 			qCDebug(logGamma) << "SetDeviceGammaRamp refused for" << qs::windows::logId(key)
@@ -279,7 +489,7 @@ bool GammaController::apply(const QString& key, qreal brightness) {
 	return ok;
 }
 
-HDC GammaController::screenDc(const QString& key) const {
+QString GammaController::deviceFor(const QString& key) const {
 	auto device = key;
 	if (this->identities != nullptr) {
 		if (auto* screen = this->identities->screenById(key)) {
@@ -291,9 +501,15 @@ HDC GammaController::screenDc(const QString& key) const {
 		           || key.startsWith(QStringLiteral("unresolved:")))
 		{
 			// The target is gone. Never hand an opaque identity to GDI.
-			return nullptr;
+			return {};
 		}
 	}
+	return device;
+}
+
+HDC GammaController::screenDc(const QString& key) const {
+	auto device = this->deviceFor(key);
+	if (device.isEmpty()) return nullptr;
 	// GDI needs the current DISPLAY source, not its friendly monitor label.
 	auto name = device.toStdWString();
 	return this->api.createDc(L"DISPLAY", name.c_str(), nullptr, nullptr);
@@ -330,6 +546,7 @@ bool GammaController::restore(const QString& key) {
 	if (ok) {
 		this->written.remove(key);
 		this->originals.remove(key);
+		this->removeCrashSnapshot(key);
 	}
 	return ok;
 }
@@ -346,6 +563,7 @@ void GammaController::retire(const QString& id) {
 	this->floors.remove(id);
 	this->originals.remove(id);
 	this->written.remove(id);
+	this->removeCrashSnapshot(id);
 }
 
 quint64 GammaController::lifetimeOf(const QString& key) const {
