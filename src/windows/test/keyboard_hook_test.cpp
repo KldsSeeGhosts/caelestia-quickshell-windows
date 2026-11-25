@@ -641,6 +641,56 @@ private slots:
 		QCOMPARE(attempts, 1);
 	}
 
+	void unsafePollClearsTheUnmatchedGraceWindow() {
+		hookwatch::detail::HookState hook;
+		hook.active = hook.needed = true;
+		hook.installTick.store(100);
+		hook.callbackTick.store(100);
+		auto recovery = HookRecovery {.rawTick = 2000};
+		auto attempts = 0;
+		auto attempt = [&] {
+			attempts++;
+			return 4000;
+		};
+		QVERIFY(!recovery.poll(hook, 2000, true, attempt));
+		QCOMPARE(recovery.unmatchedSince, uint64_t(2000));
+		QVERIFY(!recovery.poll(hook, 2100, false, attempt));
+		QCOMPARE(recovery.unmatchedSince, uint64_t(0));
+		QCOMPARE(recovery.unmatchedCallbackTick, uint64_t(0));
+
+		// Later unmatched input starts a new grace window instead of inheriting
+		// the expired one from before the unsafe poll.
+		recovery.rawTick = 2101;
+		QVERIFY(!recovery.poll(hook, 2101, true, attempt));
+		QCOMPARE(recovery.unmatchedSince, uint64_t(2101));
+		QCOMPARE(attempts, 0);
+	}
+
+	void hookCallbackSupersedingEvidenceRestartsTheGraceWindow() {
+		hookwatch::detail::HookState hook;
+		hook.active = hook.needed = true;
+		hook.installTick.store(100);
+		hook.callbackTick.store(100);
+		auto recovery = HookRecovery {.rawTick = 2000};
+		auto attempts = 0;
+		auto attempt = [&] {
+			attempts++;
+			return 6100;
+		};
+		QVERIFY(!recovery.poll(hook, 2000, true, attempt));
+		QCOMPARE(recovery.unmatchedSince, uint64_t(2000));
+
+		// The hook later saw input at 2100, superseding the original evidence.
+		// Input at 4100 is the first evidence unmatched after that callback.
+		hook.callbackTick.store(2100);
+		recovery.rawTick = 4100;
+		QVERIFY(!recovery.poll(hook, 4100, true, attempt));
+		QCOMPARE(recovery.unmatchedSince, uint64_t(4100));
+		QVERIFY(!recovery.poll(hook, 6099, true, attempt));
+		QVERIFY(recovery.poll(hook, 6100, true, attempt));
+		QCOMPARE(attempts, 1);
+	}
+
 	void delayedRawInputMatchingAHookCallbackDoesNotRearm() {
 		constexpr uint64_t zero = 1ULL << 32;
 		constexpr auto queued = zero - 100;
@@ -778,21 +828,29 @@ private slots:
 
 	void disconnectedSessionKeepsRecoveryPendingUntilReconnect() {
 		auto connected = true;
+		auto locked = false;
 		SessionRecovery recovery;
 		QVERIFY(recovery.resume(1000, true));
 		connected = sessionConnectedAfterEvent(connected, WTS_REMOTE_DISCONNECT);
 		QVERIFY(!connected);
-		QVERIFY(!recovery.take(2000, connected));
-		QVERIFY(!recovery.take(60000, connected));
+		QVERIFY(!recovery.take(2000, connected && !locked));
+		QVERIFY(!recovery.take(60000, connected && !locked));
 		connected = sessionConnectedAfterEvent(connected, WTS_REMOTE_CONNECT);
 		QVERIFY(connected);
-		QVERIFY(recovery.take(60000, connected));
+		QVERIFY(recovery.take(60000, connected && !locked));
 
+		// A reconnect while the session is still locked is not enough. Only the
+		// later unlock makes the pending recovery safe to execute.
 		QVERIFY(recovery.request(70000));
-		connected = sessionConnectedAfterEvent(connected, WTS_SESSION_LOCK);
-		QVERIFY(!recovery.take(70500, connected));
-		connected = sessionConnectedAfterEvent(connected, WTS_SESSION_UNLOCK);
-		QVERIFY(recovery.take(70500, connected));
+		connected = sessionConnectedAfterEvent(connected, WTS_REMOTE_DISCONNECT);
+		locked = sessionLockedAfterEvent(locked, WTS_SESSION_LOCK);
+		connected = sessionConnectedAfterEvent(connected, WTS_REMOTE_CONNECT);
+		QVERIFY(connected);
+		QVERIFY(locked);
+		QVERIFY(!recovery.take(70500, connected && !locked));
+		QVERIFY(!recovery.take(90000, connected && !locked));
+		locked = sessionLockedAfterEvent(locked, WTS_SESSION_UNLOCK);
+		QVERIFY(recovery.take(90000, connected && !locked));
 	}
 
 	void keyboardRearmResetsRoutingAndObserverBeforeDetaching() {
@@ -1442,8 +1500,12 @@ private slots:
 		physical('O', true, 120);
 		QCOMPARE(desktop.observerPosts.size(), size_t(1));
 		QCOMPARE(desktop.observerPosts[0].message, UINT(WM_APP + 50));
-		QCOMPARE(desktop.observerPosts[0].wParam, WPARAM('O'));
-		QCOMPARE(desktop.observerPosts[0].lParam, LPARAM(1));
+		QCOMPARE(inputObserverKey(desktop.observerPosts[0].wParam), uint8_t('O'));
+		QVERIFY(inputObserverUp(desktop.observerPosts[0].wParam));
+		QCOMPARE(
+		    hookEventGeneration(desktop.observerPosts[0].wParam, desktop.observerPosts[0].lParam),
+		    gHookGeneration.load()
+		);
 	}
 
 	void rearmDropsAReleaseTheHookMissed() {

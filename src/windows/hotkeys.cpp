@@ -1225,14 +1225,13 @@ LRESULT CALLBACK HotkeyManager::messageWindowProc(HWND hwnd, UINT msg, WPARAM wP
 	}
 
 	if (msg == WM_QS_INPUT_KEY) {
-		HotkeyManager::instance()->onPhysicalKey(
-		    static_cast<quint8>(wParam),
-		    static_cast<LPARAM>(lParam) != 0
-		);
+		if (hookEventGeneration(wParam, lParam) != KeyboardHook::activeHookGeneration()) return 0;
+		HotkeyManager::instance()->onPhysicalKey(inputObserverKey(wParam), inputObserverUp(wParam));
 		return 0;
 	}
 
 	if (msg == WM_QS_INPUT_RESET) {
+		if (hookEventGeneration(wParam, lParam) != KeyboardHook::activeHookGeneration()) return 0;
 		HotkeyManager::instance()->onInputLifecycleLost();
 		return 0;
 	}

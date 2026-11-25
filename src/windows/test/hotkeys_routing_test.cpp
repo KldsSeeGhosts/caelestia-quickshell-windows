@@ -85,6 +85,8 @@ private slots:
 		// Reset the fake hook between cases. With the taskbar policy enabled,
 		// an empty map intentionally keeps the production hook running.
 		manager->hookRequested = false;
+		manager->gateActive = false;
+		manager->inputSettle.cancel();
 		qs::windows::hotkeys::KeyboardHook::stop();
 		hotkey_fixture::registerChords = false;
 		hotkey_fixture::canStart = true;
@@ -190,6 +192,45 @@ private slots:
 		QCOMPARE(global.presses, 1);
 		deliver(HookPressed, 0, hotkey_fixture::generation);
 		QCOMPARE(global.presses, 2);
+	}
+
+	void staleGenerationInputObserverMessagesAreIgnored() {
+		using namespace qs::windows::hotkeys;
+		auto* manager = HotkeyManager::instance();
+		QCOMPARE(manager->inputSettle.arm({'A'}), InputSettle::Result::Waiting);
+		manager->gateActive = true;
+		QSignalSpy settled(manager, &HotkeyManager::chordReleaseSettled);
+		QSignalSpy cancelled(manager, &HotkeyManager::chordReleaseCancelled);
+		const auto oldGeneration = hotkey_fixture::generation;
+		hotkey_fixture::generation++;
+		auto sendKey = [&](uint8_t vk, bool up, uint64_t generation) {
+			HotkeyManager::messageWindowProc(
+			    manager->messageWindow,
+			    WM_APP + 32,
+			    inputObserverWParam(vk, up, generation),
+			    hookEventLParam(0, generation)
+			);
+		};
+		auto sendReset = [&](uint64_t generation) {
+			HotkeyManager::messageWindowProc(
+			    manager->messageWindow,
+			    WM_APP + 33,
+			    inputObserverWParam(0, false, generation),
+			    hookEventLParam(0, generation)
+			);
+		};
+
+		sendKey('A', true, oldGeneration);
+		sendReset(oldGeneration);
+		QVERIFY(manager->gateActive);
+		QVERIFY(manager->inputSettle.pending());
+		QCOMPARE(settled.count(), 0);
+		QCOMPARE(cancelled.count(), 0);
+
+		sendKey('A', true, hotkey_fixture::generation);
+		QVERIFY(!manager->gateActive);
+		QCOMPARE(settled.count(), 1);
+		QCOMPARE(cancelled.count(), 0);
 	}
 
 	void submapRegisteredHotkeysAndLifecycleUseTheSameWindowCallback() {

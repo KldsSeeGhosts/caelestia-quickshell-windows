@@ -201,16 +201,21 @@ constexpr auto HOOK_MONITOR_CLASS = L"QuickshellLowLevelHookMonitor";
 }
 
 [[nodiscard]] constexpr bool sessionConnectedAfterEvent(bool connected, WPARAM event) {
-	if (event == WTS_CONSOLE_DISCONNECT || event == WTS_REMOTE_DISCONNECT || event == WTS_SESSION_LOCK)
-		return false;
-	if (event == WTS_CONSOLE_CONNECT || event == WTS_REMOTE_CONNECT || event == WTS_SESSION_UNLOCK)
-		return true;
+	if (event == WTS_CONSOLE_DISCONNECT || event == WTS_REMOTE_DISCONNECT) return false;
+	if (event == WTS_CONSOLE_CONNECT || event == WTS_REMOTE_CONNECT) return true;
 	return connected;
+}
+
+[[nodiscard]] constexpr bool sessionLockedAfterEvent(bool locked, WPARAM event) {
+	if (event == WTS_SESSION_LOCK) return true;
+	if (event == WTS_SESSION_UNLOCK) return false;
+	return locked;
 }
 
 struct HookRecovery {
 	uint64_t rawTick = 0;
 	uint64_t unmatchedSince = 0;
+	uint64_t unmatchedCallbackTick = 0;
 	uint64_t nextAttempt = 0;
 	uint64_t retryDelay = HOOK_WATCHDOG_INTERVAL_MS;
 	bool sessionPending = false;
@@ -223,22 +228,29 @@ struct HookRecovery {
 		if (!safe) {
 			// Input while a protected window has focus is not evidence of eviction.
 			this->rawTick = 0;
+			this->unmatchedSince = 0;
+			this->unmatchedCallbackTick = 0;
 			return false;
 		}
 		if (hook.active) {
 			this->nextAttempt = 0;
 			this->retryDelay = HOOK_WATCHDOG_INTERVAL_MS;
 			if (!this->sessionPending) {
-				const auto missed = hookMissedInput(this->rawTick, hook.callbackTick.load(), hook.installTick.load());
+				const auto callbackTick = hook.callbackTick.load();
+				const auto missed = hookMissedInput(this->rawTick, callbackTick, hook.installTick.load());
 				if (!missed) {
 					this->unmatchedSince = 0;
+					this->unmatchedCallbackTick = 0;
 					return false;
 				}
 				// A stalled GUI can deliver old raw input long after the hook saw
 				// it. Require the unmatched evidence to survive a watchdog grace
-				// window before reinstalling either hook.
-				if (this->unmatchedSince == 0) {
+				// window before reinstalling either hook. If a callback supersedes
+				// the original evidence, unmatched input after it starts a fresh
+				// grace window instead of inheriting the expired one.
+				if (this->unmatchedSince == 0 || this->unmatchedCallbackTick != callbackTick) {
 					this->unmatchedSince = now;
+					this->unmatchedCallbackTick = callbackTick;
 					return false;
 				}
 				if (now - this->unmatchedSince < HOOK_UNMATCHED_GRACE_MS) return false;
@@ -248,6 +260,7 @@ struct HookRecovery {
 		this->sessionPending = false;
 		this->rawTick = 0;
 		this->unmatchedSince = 0;
+		this->unmatchedCallbackTick = 0;
 		this->nextAttempt = attempt() + this->retryDelay;
 		if (this->retryDelay < HOOK_MAX_RETRY_MS) this->retryDelay *= 2;
 		return true;
@@ -310,13 +323,14 @@ public:
 
 private:
 	bool safeToRearm() const {
-		if (!this->sessionConnected || inputDesktopIsForeign()) return false;
+		if (!this->sessionConnected || this->sessionLocked || inputDesktopIsForeign()) return false;
 		auto* foreground = GetForegroundWindow();
 		return foreground != nullptr && !isHiddenFromUs(foreground);
 	}
 
 	void poll() {
 		startForegroundIntegrityWorker();
+		if (!this->sessionRegistered || !this->sessionStateKnown) this->applyQueriedSessionState();
 		auto safe = safeToRearm();
 		auto now = GetTickCount64();
 		if (this->sessionRecovery.take(now, safe)) {
@@ -369,6 +383,7 @@ private:
 		    || state == nullptr)
 			return;
 		this->sessionConnected = *state == WTSActive;
+		this->sessionStateKnown = true;
 		this->freeWtsMemory(state);
 	}
 
@@ -427,12 +442,13 @@ private:
 		this->freeWtsMemory = reinterpret_cast<void(WINAPI*)(PVOID)>(
 		    GetProcAddress(this->wtsModule, "WTSFreeMemory")
 		);
-		this->applyQueriedSessionState();
+		// Register before querying so a reconnect cannot slip between the two.
 		if (registerSession != nullptr && this->unregisterSession != nullptr)
 			this->sessionRegistered = registerSession(this->window, NOTIFY_FOR_THIS_SESSION) != 0;
 		if (!this->sessionRegistered) {
 			qCWarning(logKeyboardHook) << "Could not observe session changes for hook recovery:" << GetLastError();
 		}
+		this->applyQueriedSessionState();
 	}
 
 	static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -455,7 +471,8 @@ private:
 				return TRUE;
 			} else if (message == WM_WTSSESSION_CHANGE) {
 				self->sessionConnected = sessionConnectedAfterEvent(self->sessionConnected, wParam);
-				if (self->sessionConnected
+				self->sessionLocked = sessionLockedAfterEvent(self->sessionLocked, wParam);
+				if (self->sessionConnected && !self->sessionLocked
 				    && (wParam == WTS_SESSION_UNLOCK || wParam == WTS_CONSOLE_CONNECT
 				        || wParam == WTS_REMOTE_CONNECT)
 				    && self->sessionRecovery.request(GetTickCount64()))
@@ -479,7 +496,9 @@ private:
 	bool classRegistered = false;
 	bool rawRegistered = false;
 	bool sessionRegistered = false;
-	bool sessionConnected = true;
+	bool sessionConnected = false;
+	bool sessionLocked = false;
+	bool sessionStateKnown = false;
 };
 
 QPointer<LowLevelHookMonitor> gHookMonitor; // NOLINT
@@ -675,16 +694,30 @@ bool injectMaskedRelease(const KBDLLHOOKSTRUCT* original) {
 	    && SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT)) == inputs.size();
 }
 
+uint64_t postGeneration() {
+	return tHookGeneration != 0 ? tHookGeneration : gHookGeneration.load();
+}
+
 void post(HookEvent event, uint32_t id, uint32_t serial) {
 	if (gStopRequested.load() && event != HookReset && event != HookStatusChanged) return;
 	auto* target = gTarget.load();
 	if (target == nullptr) return;
-	const auto generation = tHookGeneration != 0 ? tHookGeneration : gHookGeneration.load();
+	const auto generation = postGeneration();
 	PostMessageW(
 	    target,
 	    gMessageBase.load() + event,
 	    hookEventWParam(id, generation),
 	    hookEventLParam(serial, generation)
+	);
+}
+
+void postObserverMessage(HWND observer, UINT message, uint8_t vk, bool up) {
+	const auto generation = postGeneration();
+	PostMessageW(
+	    observer,
+	    message,
+	    inputObserverWParam(vk, up, generation),
+	    hookEventLParam(0, generation)
 	);
 }
 
@@ -826,12 +859,7 @@ void notifyInputReset() {
 	}
 
 	if (auto* observer = gInputObserver.load(std::memory_order_acquire); observer != nullptr) {
-		PostMessageW(
-		    observer,
-		    gInputObserverResetMessage.load(std::memory_order_relaxed),
-		    0,
-		    0
-		);
+		postObserverMessage(observer, gInputObserverResetMessage.load(std::memory_order_relaxed), 0, false);
 	}
 }
 
@@ -1367,11 +1395,11 @@ LRESULT CALLBACK hookProc(int code, WPARAM wParam, LPARAM lParam) {
 		if (auto* observer = gInputObserver.load(std::memory_order_acquire);
 		    observer != nullptr && !gStopRequested.load())
 		{
-			PostMessageW(
+			postObserverMessage(
 			    observer,
 			    gInputObserverMessage.load(std::memory_order_relaxed),
-			    info->vkCode,
-			    up ? 1 : 0
+			    static_cast<uint8_t>(info->vkCode),
+			    up
 			);
 		}
 	}

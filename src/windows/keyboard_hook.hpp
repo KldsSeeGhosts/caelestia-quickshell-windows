@@ -307,6 +307,18 @@ private:
 	return (high << 32) | low;
 }
 
+constexpr uint32_t INPUT_OBSERVER_UP = 0x100;
+
+[[nodiscard]] constexpr WPARAM inputObserverWParam(uint8_t vk, bool up, uint64_t generation) {
+	return hookEventWParam(static_cast<uint32_t>(vk) | (up ? INPUT_OBSERVER_UP : 0), generation);
+}
+[[nodiscard]] constexpr uint8_t inputObserverKey(WPARAM wParam) {
+	return static_cast<uint8_t>(hookEventTriggerId(wParam) & 0xff);
+}
+[[nodiscard]] constexpr bool inputObserverUp(WPARAM wParam) {
+	return (hookEventTriggerId(wParam) & INPUT_OBSERVER_UP) != 0;
+}
+
 namespace hookwatch {
 
 namespace detail {
