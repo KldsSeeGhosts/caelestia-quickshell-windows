@@ -26,6 +26,8 @@ void requestNativeDesktopRefresh();
 [[nodiscard]] quint64 nativeDesktopPendingMoveSequence(HWND hwnd = nullptr);
 // Observation must also wait for the snapshot that can confirm a command.
 [[nodiscard]] bool nativeDesktopRequestPending();
+[[nodiscard]] quint64 nativeDesktopSubmittedSequence();
+[[nodiscard]] quint64 nativeDesktopAppliedSequence();
 [[nodiscard]] quint64 nativeDesktopWindowSnapshotRevision();
 [[nodiscard]] GUID nativeWindowDesktopId(HWND hwnd);
 [[nodiscard]] int nativeWindowOnCurrentDesktop(HWND hwnd);

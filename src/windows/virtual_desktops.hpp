@@ -234,6 +234,7 @@ private:
 		GUID desktop;
 		quint64 intentOrder = 0;
 		std::function<void(qsizetype)> onObserved;
+		quint64 minObservationSequence = 0;
 	};
 	std::optional<PendingSwitch> pendingSwitch;
 	QTimer switchDeadline;

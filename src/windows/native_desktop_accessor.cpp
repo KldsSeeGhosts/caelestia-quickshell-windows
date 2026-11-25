@@ -1104,6 +1104,8 @@ bool nativeDesktopRequestPending() {
 	const auto& c = channel();
 	return c.waiting || c.pending.has_value() || c.refresh.has_value();
 }
+quint64 nativeDesktopSubmittedSequence() { return channel().sequence; }
+quint64 nativeDesktopAppliedSequence() { return channel().applied; }
 quint64 nativeDesktopWindowSnapshotRevision() { return channel().windowRevision; }
 GUID nativeWindowDesktopId(HWND hwnd) { return channel().window(hwnd).id; }
 int nativeWindowOnCurrentDesktop(HWND hwnd) { return channel().window(hwnd).onCurrent; }

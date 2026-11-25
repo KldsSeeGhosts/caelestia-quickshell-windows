@@ -1046,8 +1046,9 @@ private slots:
 		    this->old.two.id
 		));
 		// Must switch to B (this->old.two), never C (this->old.three).
-		QCOMPARE(this->old.manager.current, &this->old.two);
 		QVERIFY(waitUntil([&observedCalls] { return observedCalls == 1; }, 1000));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->old.manager.current, &this->old.two);
 		QCOMPARE(observedCalls, 1);
 		QCOMPARE(observedIndex, qsizetype(2));
 		QCOMPARE(this->desktops->currentIndex(), qsizetype(2));
@@ -1078,9 +1079,9 @@ private slots:
 		QVERIFY(this->desktops->moveWindow(
 		    window, 1, nullptr, nullptr, {}, {}, &targetGuid, this->old.two.id
 		));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
 		QCOMPARE(this->old.manager.lastMovedDesktop, &this->old.two);
 		QVERIFY(IsEqualGUID(targetGuid, this->old.two.id) != FALSE);
-		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
 	}
 
 	void switchToDoesNotSkipSwitchWhenNativeCacheDisagreesWithStaleFacade() {
@@ -1114,11 +1115,55 @@ private slots:
 		// Must not treat stale facade state as alreadyCurrent or run onObserved before observation.
 		QCOMPARE(observedCalls, 0);
 		QVERIFY(waitUntil([&observedCalls] { return observedCalls == 1; }, 1000));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
 		this->old.manager.beforeSwitch = {};
 		QCOMPARE(this->old.manager.switches, 1);
 		QCOMPARE(this->old.manager.current, &this->old.two);
 		QCOMPARE(observedIndex, qsizetype(1));
 		QCOMPARE(this->desktops->currentIndex(), qsizetype(1));
+	}
+
+	void pendingSwitchDoesNotObservePreCommandNativeSnapshot() {
+		this->old.manager.array.desktops = {&this->old.one, &this->old.two, &this->old.three};
+		this->old.manager.current = &this->old.three;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		this->desktops->refresh();
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(2));
+
+		// Populate native cache with B without updating facade (facade says C, native cache says B),
+		// then move provider back to C and fail the pending switch to B.
+		this->old.manager.current = &this->old.two;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(2));
+		QCOMPARE(this->accessor.getCurrentDesktopNumber(), 1);
+
+		this->old.manager.current = &this->old.three;
+		this->old.manager.publishSwitch = false;
+		this->old.manager.switchResult = E_ACCESSDENIED;
+		this->old.manager.beforeSwitch = [] { QThread::msleep(150); };
+		int observedCalls = 0;
+		QVERIFY(this->desktops->switchTo(
+		    1,
+		    {},
+		    [&observedCalls](qsizetype) { ++observedCalls; },
+		    std::nullopt,
+		    this->old.two.id
+		));
+		// Synchronous refresh during switchTo copies stale pre-command B snapshot;
+		// observation must wait for a post-command refresh and never fire on the refused switch.
+		QCOMPARE(observedCalls, 0);
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("timed-out");
+		    },
+		    1000
+		));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		this->old.manager.beforeSwitch = {};
+		this->old.manager.switchResult = S_OK;
+		QCOMPARE(observedCalls, 0);
 	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)

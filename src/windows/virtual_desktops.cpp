@@ -742,6 +742,13 @@ void VirtualDesktops::finishSwitch(DesktopCommandOutcome outcome, const QString&
 void VirtualDesktops::observeSwitch() {
 	if (!this->pendingSwitch) return;
 	auto& pending = *this->pendingSwitch;
+	if (this->nativeAccessor && pending.minObservationSequence != 0) {
+		if (nativeDesktopCommandPending()
+		    || nativeDesktopAppliedSequence() <= pending.minObservationSequence)
+		{
+			return;
+		}
+	}
 	if (!guidIsNull(pending.desktop)) {
 		if (this->mCurrent >= 0 && this->mCurrent < this->count()
 		    && IsEqualGUID(pending.desktop, this->mDesktops[this->mCurrent].id))
@@ -837,8 +844,16 @@ bool VirtualDesktops::switchTo(
 	}
 
 	const auto id = ++this->nextRequest;
-	this->pendingSwitch =
-	    PendingSwitch {id, index, targetGuid, switchIntent, std::move(onObserved)};
+	const auto minObservationSequence =
+	    this->nativeAccessor ? nativeDesktopSubmittedSequence() : quint64(0);
+	this->pendingSwitch = PendingSwitch {
+	    id,
+	    index,
+	    targetGuid,
+	    switchIntent,
+	    std::move(onObserved),
+	    minObservationSequence,
+	};
 	if (!this->nativeAccessor || !nativeDesktopRequestPending()) this->switchDeadline.start();
 	this->publishCommand(DesktopRequestResult {id, QStringLiteral("switch"), DesktopCommandOutcome::Accepted, {}});
 	if (self && self->pendingSwitch && self->pendingSwitch->id == id) this->refresh();

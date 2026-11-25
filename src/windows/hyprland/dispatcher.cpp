@@ -607,18 +607,18 @@ void Dispatcher::focusWorkspace(const QString& arg) {
 
 	auto* behavior = WorkspaceBehavior::instance();
 
-	if (index == desktops->currentIndex()) {
+	const auto initialTargetId = desktopIdAt(desktops, index);
+	if (desktops->isDesktopCurrentlyActive(index, initialTargetId)) {
 		auto previous = behavior->previousDesktop();
 		if (!behavior->backAndForth() || target.kind == WorkspaceTarget::Kind::Relative || previous < 0
 		    || previous == index)
 		{
-			const auto targetId = desktopIdAt(desktops, index);
 			desktops->switchTo(
 			    index,
 			    {},
 			    {},
 			    std::nullopt,
-			    !isNullDesktopGuid(targetId) ? std::optional<GUID>(targetId) : std::nullopt
+			    !isNullDesktopGuid(initialTargetId) ? std::optional<GUID>(initialTargetId) : std::nullopt
 			);
 			behavior->warpToActive();
 			return;
