@@ -353,7 +353,7 @@ public:
 		}
 	}
 	void notePendingUserMoveForTest(quint64 sequence, TrackedWindow* window) {
-		this->notePendingUserMove(sequence, window);
+		this->notePendingUserMove(sequence, window, this->mActionErrorGeneration);
 	}
 	void completePendingUserMoveForTest(
 	    quint64 sequence,
@@ -458,7 +458,11 @@ private:
 		quint64 trackerErrorGeneration = 0;
 	};
 
-	void notePendingUserMove(quint64 sequence, TrackedWindow* window);
+	void notePendingUserMove(
+	    quint64 sequence,
+	    TrackedWindow* window,
+	    quint64 trackerErrorGeneration
+	);
 	void completePendingUserMove(
 	    quint64 sequence,
 	    quintptr rawHwnd,

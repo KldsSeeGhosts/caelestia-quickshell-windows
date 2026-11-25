@@ -575,6 +575,39 @@ private slots:
 		);
 	}
 
+	void reentrantTrackerOnlyRefusalDuringPendingMovePreventsStaleOverwrite() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+
+		const auto windowGenBefore = fixture.window->actionErrorGeneration();
+		const auto trackerGenBefore = fixture.tracker->actionErrorGeneration();
+
+		// Simulate a synchronous commandResult handler recording a tracker-only
+		// refusal before the pending move registers its sequence.
+		qs::hyprland::ipc::reportMoveRefusal(fixture.tracker, QStringLiteral("invalid-target"), false);
+		const auto newerError = fixture.tracker->lastActionError();
+		QCOMPARE(newerError, QStringLiteral("move:The target workspace is not available"));
+
+		QVERIFY(fixture.window->finishMoveRequestForTest(
+		    true, 71, QString(), windowGenBefore, trackerGenBefore, [](HWND) { return false; }
+		));
+
+		QSignalSpy windowRefused(fixture.window, &TrackedWindow::actionRefused);
+		QSignalSpy trackerRefused(fixture.tracker, &WindowTracker::windowActionRefused);
+		fixture.tracker->completePendingUserMoveForTest(
+		    71,
+		    reinterpret_cast<quintptr>(fixture.window->hwnd()),
+		    false,
+		    QStringLiteral("permission-denied"),
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return true; }
+		);
+
+		QCOMPARE(windowRefused.size(), 0);
+		QCOMPARE(trackerRefused.size(), 0);
+		QCOMPARE(fixture.tracker->lastActionError(), newerError);
+	}
+
 	void lateMoveCompletionIgnoresUntrackedMove() {
 		DispatcherFixture fixture;
 		fixture.tracker->registerWindowForTest(fixture.window);

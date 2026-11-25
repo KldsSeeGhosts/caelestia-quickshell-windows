@@ -54,7 +54,7 @@ bool TrackedWindow::finishMoveRequest(
 
 	if (this->mActionErrorGeneration == windowErrorGenerationBefore) {
 		if (pendingSequence != 0) {
-			this->tracker->notePendingUserMove(pendingSequence, this);
+			this->tracker->notePendingUserMove(pendingSequence, this, trackerErrorGenerationBefore);
 		} else {
 			this->clearActionError();
 		}
@@ -89,7 +89,11 @@ void WindowTracker::clearWindowActionError(const TrackedWindow* window) {
 	emit this->lastActionErrorChanged();
 }
 
-void WindowTracker::notePendingUserMove(quint64 sequence, TrackedWindow* window) {
+void WindowTracker::notePendingUserMove(
+    quint64 sequence,
+    TrackedWindow* window,
+    quint64 trackerErrorGeneration
+) {
 	if (sequence == 0 || window == nullptr || window->hwnd() == nullptr) return;
 	++window->mActionErrorGeneration;
 	this->mPendingUserMoves.insert(
@@ -98,7 +102,7 @@ void WindowTracker::notePendingUserMove(quint64 sequence, TrackedWindow* window)
 	        .window = window,
 	        .hwnd = window->hwnd(),
 	        .windowErrorGeneration = window->mActionErrorGeneration,
-	        .trackerErrorGeneration = this->mActionErrorGeneration,
+	        .trackerErrorGeneration = trackerErrorGeneration,
 	    }
 	);
 }
