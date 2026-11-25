@@ -354,6 +354,7 @@ public:
 	[[nodiscard]] TrackedWindow* windowFor(HWND hwnd) const { return this->byHwnd.value(hwnd); }
 	[[nodiscard]] VirtualDesktops* desktops() const { return this->mDesktops; }
 	[[nodiscard]] QString lastActionError() const { return this->mLastActionError; }
+	[[nodiscard]] quint64 actionErrorGeneration() const { return this->mActionErrorGeneration; }
 
 	[[nodiscard]] QScreen* screenFor(HMONITOR monitor) const;
 	[[nodiscard]] static qsizetype screenIndex(QScreen* screen);

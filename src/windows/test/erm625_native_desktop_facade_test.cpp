@@ -672,6 +672,29 @@ private slots:
 		this->old.manager.canMove = true;
 		this->old.manager.beforeCanMove = {};
 	}
+
+	void invalidationAfterCompletedMoveReportsActualOutcome() {
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xb4));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		QSignalSpy moveCompleted(this->desktops, &VirtualDesktops::moveWindowCompleted);
+		this->old.manager.moveResult = S_OK;
+		this->old.manager.beforeMove = [] { QThread::msleep(150); };
+		QVERIFY(this->desktops->moveWindow(window, 1));
+		const auto seq = nativeDesktopPendingMoveSequence();
+		QVERIFY(seq != 0);
+		QElapsedTimer waitWorker;
+		waitWorker.start();
+		while (!nativeDesktopPendingReadyForTest() && waitWorker.elapsed() < 1000) QThread::msleep(5);
+		QVERIFY(nativeDesktopPendingReadyForTest());
+
+		invalidateNativeDesktopAccessor(RPC_E_DISCONNECTED);
+		QVERIFY(waitUntil([&moveCompleted] { return moveCompleted.size() == 1; }, 1000));
+		QCOMPARE(moveCompleted.size(), 1);
+		QCOMPARE(moveCompleted.first().at(0).toULongLong(), seq);
+		QCOMPARE(moveCompleted.first().at(2).toBool(), true);
+		QCOMPARE(moveCompleted.first().at(3).toString(), QString());
+		this->old.manager.beforeMove = {};
+	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)
 #include "erm625_native_desktop_facade_test.moc"

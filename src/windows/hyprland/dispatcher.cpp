@@ -599,17 +599,20 @@ void Dispatcher::moveToWorkspace(TrackedWindow* window, const QString& arg, bool
 			return;
 		}
 
+		const auto errorGeneration = tracker ? tracker->actionErrorGeneration() : 0;
 		desktops->ensureCount(
 		    index + 1,
 		    [tracker = QPointer(tracker),
 		     desktops = QPointer(desktops),
 		     window = QPointer(window),
+		     errorGeneration,
 		     index,
 		     follow](bool ok) {
 			    if (ok && window) {
 				    moveWindowTo(window, index, follow);
 				    return;
 			    }
+			    if (tracker && tracker->actionErrorGeneration() != errorGeneration) return;
 			    if (!ok) {
 				    const auto code = desktops
 				        ? desktops->lastCommand().value(QStringLiteral("reason")).toString()

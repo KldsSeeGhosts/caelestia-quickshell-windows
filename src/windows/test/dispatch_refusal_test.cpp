@@ -494,6 +494,46 @@ private slots:
 		QCOMPARE(fixture.tracker->lastActionError(), invalidTargetError);
 	}
 
+	void lateMoveSuccessClearsOwnErrorDespiteUnrelatedRefusal() {
+		DispatcherFixture fixture;
+		fixture.tracker->registerWindowForTest(fixture.window);
+		auto* other = TrackedWindow::createForTest(
+		    fixture.tracker, reinterpret_cast<HWND>(static_cast<quintptr>(0x99))
+		);
+		fixture.tracker->registerWindowForTest(other);
+
+		// Window A has a prior error, starts move A, then an unrelated window B
+		// reports a refusal before move A succeeds.
+		fixture.window->reportActionRefusedForTest(
+		    QStringLiteral("move"),
+		    qs::hyprland::ipc::moveRefusalReason(QStringLiteral("command-rejected"), false),
+		    false
+		);
+		QVERIFY(!fixture.window->lastActionError().isEmpty());
+		fixture.tracker->notePendingUserMoveForTest(51, fixture.window);
+
+		other->reportActionRefusedForTest(
+		    QStringLiteral("close"),
+		    QStringLiteral("access-denied"),
+		    false
+		);
+		const auto otherError = other->lastActionError();
+		QCOMPARE(fixture.tracker->lastActionError(), otherError);
+
+		fixture.tracker->completePendingUserMoveForTest(
+		    51,
+		    reinterpret_cast<quintptr>(fixture.window->hwnd()),
+		    true,
+		    QString(),
+		    [](const TrackedWindow*) { return true; },
+		    [](HWND) { return false; }
+		);
+
+		QCOMPARE(fixture.window->lastActionError(), QString());
+		QCOMPARE(other->lastActionError(), otherError);
+		QCOMPARE(fixture.tracker->lastActionError(), otherError);
+	}
+
 	void lateMoveCompletionIgnoresUntrackedMove() {
 		DispatcherFixture fixture;
 		fixture.tracker->registerWindowForTest(fixture.window);

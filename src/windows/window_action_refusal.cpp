@@ -86,15 +86,18 @@ void WindowTracker::completePendingUserMove(
 
 	auto* window = entry.window.data();
 	const auto sameTracked = window != nullptr && this->byHwnd.value(hwnd) == window;
+	if (succeeded) {
+		if (sameTracked && window->mActionErrorGeneration == entry.windowErrorGeneration
+		    && ownerMatches && ownerMatches(window))
+		{
+			window->clearActionError();
+		}
+		return;
+	}
+
 	if (this->mActionErrorGeneration != entry.trackerErrorGeneration
 	    || (sameTracked && window->mActionErrorGeneration != entry.windowErrorGeneration))
 	{
-		return;
-	}
-	if (succeeded) {
-		if (sameTracked && ownerMatches && ownerMatches(window)) {
-			window->clearActionError();
-		}
 		return;
 	}
 

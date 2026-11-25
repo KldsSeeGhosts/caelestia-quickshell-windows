@@ -610,27 +610,48 @@ struct Channel {
 	}
 
 	void retire(HRESULT error) {
-		const auto pendingMove =
-		    this->pending && this->pending->moveTarget != nullptr ? this->pending->moveTarget : nullptr;
-		const auto pendingSequence =
-		    this->pending && this->pending->request ? this->pending->request->sequence : 0;
+		auto pendingMove = std::exchange(this->pending, std::nullopt);
 		if (auto previous = std::exchange(this->worker, {})) previous->stop();
 		this->refresh.reset();
-		this->pending.reset();
 		this->deadline.stop();
 		this->snapshot.availability = DesktopAvailability::Disconnected;
 		this->snapshot.error = error;
 		// Keep the last desktop/window values as explicitly stale state.
 		this->recovery.disconnected();
 		this->notify();
-		if (pendingMove != nullptr) {
-			this->notifyMoveCompleted(
-			    pendingSequence,
-			    pendingMove,
-			    false,
-			    DesktopAvailability::Disconnected,
-			    error
-			);
+		if (pendingMove && pendingMove->moveTarget != nullptr) {
+			const auto moveSequence = pendingMove->request ? pendingMove->request->sequence : 0;
+			if (pendingMove->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+				try {
+					auto value = pendingMove->result.get();
+					const auto available = value.availability == DesktopAvailability::Available;
+					const auto moveOk = value.result == 0
+					                 && (available || (pendingMove->publicOperation && value.publicReady));
+					this->notifyMoveCompleted(
+					    moveSequence,
+					    pendingMove->moveTarget,
+					    moveOk,
+					    value.availability,
+					    moveOk ? S_OK : value.operationError
+					);
+				} catch (...) {
+					this->notifyMoveCompleted(
+					    moveSequence,
+					    pendingMove->moveTarget,
+					    false,
+					    DesktopAvailability::Disconnected,
+					    E_UNEXPECTED
+					);
+				}
+			} else {
+				this->notifyMoveCompleted(
+				    moveSequence,
+				    pendingMove->moveTarget,
+				    false,
+				    DesktopAvailability::Disconnected,
+				    error
+				);
+			}
 		}
 	}
 
