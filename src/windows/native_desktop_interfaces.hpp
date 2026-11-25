@@ -63,5 +63,8 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory);
 // Installs a pinned-apps fake in the live provider, after acquisition, like
 // the window validator. A recovery or a new factory drops it again.
 void setNativeDesktopPinnedAppsForTest(native_desktop::PinnedApps* pinned);
+// Installs an IServiceProvider fake queried by acquirePinnedApps() during
+// acquisition so tests can exercise QueryService failures, SEH faults and stalls.
+void setNativeDesktopPinnedAppsShellForTest(IServiceProvider* shell);
 } // namespace qs::windows
 #endif

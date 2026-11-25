@@ -35,6 +35,7 @@
 #include "panel_animation.hpp"
 #include "panel_effects.hpp"
 #include "panel_focus_style.hpp"
+#include "panel_pin_state.hpp"
 #include "screen_surface_guard.hpp"
 #include "util.hpp"
 
@@ -176,6 +177,7 @@ private slots:
 	void onSurfaceCreated();
 	void onWindowVisibleChanged();
 	void onDesktopAccessorReady();
+	void onOwnWindowPinCompleted(quintptr hwnd, qs::windows::OwnWindowPin result);
 	void updateScreen();
 	void followFocusedScreen();
 	void scheduleUpdateDimensions();
@@ -205,6 +207,10 @@ private:
 	void takeFocusOnExpose();
 	void grabKeyboardFocus();
 	void stickToAllDesktops();
+	void attemptPin(quint64 expectedGeneration);
+	void finishPinAttempt(HWND hwnd, quint64 expectedGeneration, bool pinned);
+	void resetPinState(bool clearPinned);
+	void schedulePinRetry(int delayMs);
 	bool recoverExplorer(HWND taskbar, DWORD pid, DWORD thread);
 	[[nodiscard]] bool reservesSpace() const;
 	[[nodiscard]] bool wantsEmbedding() const;
@@ -269,16 +275,9 @@ private:
 	quint32 focusRequest = 0;
 	bool maskRouted = false;
 	bool appBarDeferred = false;
-	bool pinnedToAllDesktops = false;
-	// The HWND the pin belongs to. A recreated native window starts unpinned.
-	HWND pinnedHwnd = nullptr;
-	HWND pinFailedHwnd = nullptr;
-	// The HWND the busy retries are counted for.
-	HWND pinAttemptHwnd = nullptr;
-	int pinBusyRetries = 0;
-	[[nodiscard]] bool pinnedHere(HWND hwnd) const {
-		return this->pinnedToAllDesktops && hwnd != nullptr && this->pinnedHwnd == hwnd;
-	}
+	PanelPinState pinState;
+	QTimer pinRetryTimer;
+	[[nodiscard]] bool pinnedHere(HWND hwnd) const { return this->pinState.pinnedHere(hwnd); }
 	HWND explorerTaskbar = nullptr;
 	DWORD explorerTaskbarPid = 0;
 	DWORD explorerTaskbarThread = 0;

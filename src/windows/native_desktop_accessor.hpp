@@ -21,6 +21,10 @@ void setNativeDesktopMoveObserver(
     QObject* context,
     std::function<void(quint64, HWND, bool, DesktopAvailability, HRESULT)> onMoveCompleted
 );
+void setNativeDesktopPinObserver(
+    QObject* context,
+    std::function<void(HWND, OwnWindowPin)> onPinCompleted
+);
 void requestNativeDesktopRefresh();
 [[nodiscard]] bool nativeDesktopCommandPending();
 [[nodiscard]] quint64 nativeDesktopPendingMoveSequence(HWND hwnd = nullptr);
@@ -42,8 +46,10 @@ int switchNativeDesktopByIdIfCurrent(
 );
 int moveNativeDesktopWindowById(HWND hwnd, GUID desktop);
 std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop);
-// Pins one of this process's windows to every desktop. Waits at most 100 ms;
-// a call still in flight, or one queued behind another, reports Busy.
+// Submits an asynchronous pin for one of this process's windows without
+// blocking the GUI thread or occupying the desktop command slot. Returns
+// Pending when submitted (result delivered to the pin observer), Busy if
+// another request holds priority, or Unavailable when pinning is absent.
 [[nodiscard]] OwnWindowPin pinNativeDesktopOwnWindow(HWND hwnd);
 void shutdownNativeDesktopAccessor();
 

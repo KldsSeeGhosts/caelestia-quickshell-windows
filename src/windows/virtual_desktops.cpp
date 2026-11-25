@@ -300,7 +300,14 @@ void VirtualDesktops::bindNativeDesktopQueries() {
 	        HRESULT error
 	    ) { this->onNativeMoveCompleted(sequence, hwnd, succeeded, availability, error); }
 	);
+	setNativeDesktopPinObserver(this, [this](HWND hwnd, OwnWindowPin result) {
+		this->onNativePinCompleted(hwnd, result);
+	});
 	initializeNativeDesktopQueries(this, [this] { this->applyNativeSnapshot(); });
+}
+
+void VirtualDesktops::onNativePinCompleted(HWND hwnd, OwnWindowPin result) {
+	emit this->ownWindowPinCompleted(reinterpret_cast<quintptr>(hwnd), result);
 }
 
 void VirtualDesktops::onNativeMoveCompleted(

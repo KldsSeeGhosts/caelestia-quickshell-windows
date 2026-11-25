@@ -4,6 +4,7 @@
 
 #include <objectarray.h>
 #include <qlist.h>
+#include <servprov.h>
 
 #include "native_desktop_interfaces.hpp"
 
@@ -185,13 +186,20 @@ struct FakePinnedApps: FakeCom<PinnedApps> {
 	BOOL pinned = FALSE;
 	int queries = 0;
 	int pins = 0;
+	HRESULT queryResult = S_OK;
 	HRESULT pinResult = S_OK;
+	bool faultOnQuery = false;
+	bool faultOnPin = false;
+	std::function<void()> beforeQuery;
 	std::function<void()> beforePin;
 	HRESULT STDMETHODCALLTYPE IsAppIdPinned(PCWSTR, BOOL*) override { return E_NOTIMPL; }
 	HRESULT STDMETHODCALLTYPE PinAppID(PCWSTR) override { return E_NOTIMPL; }
 	HRESULT STDMETHODCALLTYPE UnpinAppID(PCWSTR) override { return E_NOTIMPL; }
 	HRESULT STDMETHODCALLTYPE IsViewPinned(ApplicationView* view, BOOL* out) override {
+		if (this->beforeQuery) this->beforeQuery();
 		++this->queries;
+		if (this->faultOnQuery) fault();
+		if (FAILED(this->queryResult)) return this->queryResult;
 		if (view != this->expectedView) return E_INVALIDARG;
 		*out = this->pinned;
 		return S_OK;
@@ -199,11 +207,37 @@ struct FakePinnedApps: FakeCom<PinnedApps> {
 	HRESULT STDMETHODCALLTYPE PinView(ApplicationView* view) override {
 		if (this->beforePin) this->beforePin();
 		++this->pins;
+		if (this->faultOnPin) fault();
 		if (view != this->expectedView) return E_INVALIDARG;
 		if (SUCCEEDED(this->pinResult)) this->pinned = TRUE;
 		return this->pinResult;
 	}
 	HRESULT STDMETHODCALLTYPE UnpinView(ApplicationView*) override { return E_NOTIMPL; }
+};
+struct FakePinnedAppsShell: FakeCom<IServiceProvider> {
+	FakePinnedApps* pinnedApps = nullptr;
+	HRESULT result = S_OK;
+	int queries = 0;
+	bool faultOnQuery = false;
+	bool writeBogusOnFail = false;
+	std::function<void()> beforeQuery;
+	HRESULT STDMETHODCALLTYPE QueryService(REFGUID, REFIID, void** out) override {
+		if (this->beforeQuery) this->beforeQuery();
+		++this->queries;
+		if (this->writeBogusOnFail) {
+			// Deliberately write a non-owning pointer on failure or SEH so the
+			// caller must not adopt or Release it without a successful return.
+			*out = this->pinnedApps;
+		}
+		if (this->faultOnQuery) fault();
+		if (FAILED(this->result) || !this->pinnedApps) {
+			if (!this->writeBogusOnFail) *out = nullptr;
+			return FAILED(this->result) ? this->result : E_NOINTERFACE;
+		}
+		this->pinnedApps->AddRef();
+		*out = this->pinnedApps;
+		return S_OK;
+	}
 };
 struct FakePublic: FakeCom<IVirtualDesktopManager> {
 	bool faultOnRead = false;

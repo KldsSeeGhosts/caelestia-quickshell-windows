@@ -82,6 +82,7 @@ struct Provider {
 #ifdef QS_TEST
 	NativeDesktopFactory factory;
 	std::function<bool(HWND)> windowValidator;
+	IServiceProvider* pinnedAppsShell = nullptr;
 #endif
 	ComPtr<DesktopManager> manager;
 	ComPtr<ViewCollection> views;
@@ -94,6 +95,9 @@ struct Provider {
 	bool structuredException = false;
 	bool privateEnabled = true;
 	bool desktopRefreshed = false;
+	bool skipOptionalPinnedApps = false;
+	bool optionalPinnedAppsFaulted = false;
+	std::atomic<bool>* inOptionalPinnedApps = nullptr;
 	DesktopAvailability availability = DesktopAvailability::MissingProvider;
 	HRESULT lastError = S_OK;
 	HRESULT operationError = S_OK;
@@ -171,6 +175,11 @@ struct Provider {
 			    "Test desktop acquisition"
 			);
 			publicAcquired = ok && this->publicApi;
+			if (ok && this->privateEnabled && this->pinnedAppsShell != nullptr
+			    && !this->skipOptionalPinnedApps)
+			{
+				ok = this->acquirePinnedApps(this->pinnedAppsShell);
+			}
 		} else
 #endif
 		{
@@ -217,7 +226,9 @@ struct Provider {
 			             "ApplicationViewCollection GUID"
 			         )));
 			ok = publicOk && privateOk;
-			if (ok && this->privateEnabled) ok = this->acquirePinnedApps(shell.Get());
+			if (ok && this->privateEnabled && !this->skipOptionalPinnedApps) {
+				ok = this->acquirePinnedApps(shell.Get());
+			}
 		}
 		ok = ok && (!this->privateEnabled || this->refresh());
 		// Finish local cleanup before publishing acquisition success, including
@@ -245,21 +256,40 @@ struct Provider {
 	}
 
 	// Pinning is optional: a refusal keeps desktop control available and leaves
-	// the shell's panels following the current desktop. Only a structured
-	// exception, which already invalidates the apartment, fails acquisition.
+	// the shell's panels following the current desktop. A structured exception
+	// invalidates the apartment and marks optional pinning faulted so recovery
+	// restores desktop control without retrying this service.
 	bool acquirePinnedApps(IServiceProvider* shell) {
+		if (!shell) return true;
+		struct OptionalPinScope {
+			std::atomic<bool>* flag;
+			~OptionalPinScope() {
+				if (this->flag) this->flag->store(false);
+			}
+		} scope {this->inOptionalPinnedApps};
+		if (this->inOptionalPinnedApps) this->inOptionalPinnedApps->store(true);
 		HRESULT hr = S_OK;
+		PinnedApps* raw = nullptr;
 		if (!sehCall(
-		        [&] { return shell->QueryService(pinnedAppsService, IID_PPV_ARGS(&this->pinnedApps)); },
+		        [&] {
+			        return shell->QueryService(
+			            pinnedAppsService,
+			            __uuidof(PinnedApps),
+			            reinterpret_cast<void**>(&raw)
+			        );
+		        },
 		        hr
 		    ))
 		{
+			// Never adopt a half-written out pointer after a structured exception.
+			this->optionalPinnedAppsFaulted = true;
 			this->exception("PinnedApps 24H2 GUID");
 			return false;
 		}
-		if (FAILED(hr) || !this->pinnedApps) {
-			// QueryService does not transfer a half-written output on failure.
-			this->pinnedApps.Detach();
+		if (SUCCEEDED(hr) && raw != nullptr) {
+			this->pinnedApps.Attach(raw);
+		} else {
+			// QueryService does not transfer ownership on failure.
 			qCWarning(logNativeDesktops) << "Desktop pinning unavailable, HRESULT" << Qt::hex << hr
 			                             << "; panels will follow the current desktop";
 		}
@@ -437,6 +467,8 @@ struct Snapshot {
 	quint64 sequence = 0;
 	bool publicReady = false;
 	bool desktopRead = false;
+	bool pinnedAppsReady = false;
+	bool optionalPinnedAppsFaulted = false;
 };
 
 struct Request {
@@ -450,6 +482,7 @@ struct Request {
 	std::promise<Snapshot> completion;
 	Clock::time_point submitted = Clock::now();
 	std::atomic<Clock::duration::rep> started = 0;
+	std::atomic<bool> inOptionalPinnedApps {false};
 	quint64 sequence = 0;
 
 	bool stalled(std::chrono::milliseconds bound) const {
@@ -487,8 +520,8 @@ struct Worker {
 		auto result = request->completion.get_future();
 		{
 			std::lock_guard lock(this->mutex);
-			// The GUI permits only one refresh and one synchronous command.
-			Q_ASSERT(this->queue.size() < 2);
+			// The GUI permits at most one refresh, one async pin, and one command.
+			Q_ASSERT(this->queue.size() < 3);
 			if (!this->stopping) this->queue.push_back(request);
 		}
 		this->wake.notify_one();
@@ -496,20 +529,24 @@ struct Worker {
 	}
 
 	void
-	run(bool privateEnabled
+	run(bool privateEnabled,
+	    bool skipOptionalPinnedApps
 #ifdef QS_TEST
 	    ,
 	    NativeDesktopFactory factory,
-	    std::function<bool(HWND)> validator
+	    std::function<bool(HWND)> validator,
+	    IServiceProvider* pinnedAppsShell
 #endif
 	) {
 		const auto apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 		Provider p;
 		p.privateEnabled = privateEnabled;
+		p.skipOptionalPinnedApps = skipOptionalPinnedApps;
 		if (FAILED(apartment)) p.lastError = apartment;
 #ifdef QS_TEST
 		p.factory = std::move(factory);
 		p.windowValidator = std::move(validator);
+		p.pinnedAppsShell = pinnedAppsShell;
 #endif
 		activeProvider = &p;
 		for (;;) {
@@ -527,6 +564,12 @@ struct Worker {
 			try {
 				p.operationError = S_OK;
 				p.desktopRefreshed = false;
+				p.optionalPinnedAppsFaulted = false;
+				p.inOptionalPinnedApps = &request->inOptionalPinnedApps;
+				struct FlagClear {
+					Provider* provider;
+					~FlagClear() { this->provider->inOptionalPinnedApps = nullptr; }
+				} clearFlag {&p};
 				snapshot.result = FAILED(apartment) ? -1 : request->operation();
 				snapshot.operationError = FAILED(apartment) ? apartment : p.operationError;
 				for (const auto value: request->windows) {
@@ -559,6 +602,8 @@ struct Worker {
 				snapshot.error = p.lastError;
 				snapshot.publicReady = p.publicApi != nullptr;
 				snapshot.desktopRead = p.desktopRefreshed;
+				snapshot.pinnedAppsReady = p.pinnedApps != nullptr;
+				snapshot.optionalPinnedAppsFaulted = p.optionalPinnedAppsFaulted;
 			} catch (...) {
 				snapshot.availability = DesktopAvailability::Disconnected;
 				snapshot.error = E_UNEXPECTED;
@@ -589,6 +634,11 @@ struct Channel {
 		HWND moveTarget = nullptr;
 		bool switchCommand = false;
 	};
+	struct PinPending {
+		std::shared_ptr<Request> request;
+		std::future<Snapshot> result;
+		HWND target = nullptr;
+	};
 	std::shared_ptr<Worker> worker;
 	Snapshot snapshot;
 	QSet<quintptr> watchedWindows;
@@ -596,14 +646,17 @@ struct Channel {
 	std::function<void()> recovered;
 	std::function<void()> updated;
 	std::function<void(quint64, HWND, bool, DesktopAvailability, HRESULT)> moveCompleted;
+	std::function<void(HWND, OwnWindowPin)> pinCompleted;
 	QTimer deadline;
 	std::atomic<bool> completionWake = false;
 	std::optional<Pending> refresh;
 	std::optional<Pending> pending;
+	std::optional<PinPending> pin;
 	std::chrono::milliseconds stallLimit = stuckBound;
 	bool supported = false;
 	bool privateEnabled = false;
 	bool refusedBuild = false;
+	bool skipOptionalPinnedApps = false;
 	bool refreshAgain = false;
 	bool waiting = false;
 	quint64 sequence = 0;
@@ -616,6 +669,7 @@ struct Channel {
 #ifdef QS_TEST
 	NativeDesktopFactory factory;
 	std::function<bool(HWND)> validator;
+	IServiceProvider* pinnedAppsShell = nullptr;
 #endif
 	DesktopRecovery recovery {
 	    [this] { return this->acquire(); },
@@ -644,6 +698,7 @@ struct Channel {
 		if (auto previous = std::exchange(this->worker, {})) previous->stop();
 		this->refresh.reset();
 		this->pending.reset();
+		this->pin.reset();
 		this->refreshAgain = false;
 	}
 
@@ -668,13 +723,32 @@ struct Channel {
 		});
 	}
 
+	void notifyPinCompleted(HWND hwnd, OwnWindowPin result) {
+		if (hwnd == nullptr || !this->context || !this->pinCompleted) return;
+		QTimer::singleShot(0, this->context, [this, hwnd, result] {
+			if (this->context && this->pinCompleted) {
+				this->pinCompleted(hwnd, result);
+			}
+		});
+	}
+
 	void retire(HRESULT error) {
+		if (error == HRESULT_FROM_WIN32(ERROR_TIMEOUT) && this->pending
+		    && this->pending->kind == Kind::Acquisition && this->pending->request
+		    && this->pending->request->inOptionalPinnedApps.load())
+		{
+			this->skipOptionalPinnedApps = true;
+			qCWarning(logNativeDesktops)
+			    << "Optional desktop pinning acquisition stalled; disabling pinning for recovery";
+		}
 		auto pendingMove = std::exchange(this->pending, std::nullopt);
+		auto pendingPin = std::exchange(this->pin, std::nullopt);
 		if (auto previous = std::exchange(this->worker, {})) previous->stop();
 		this->refresh.reset();
 		this->deadline.stop();
 		this->snapshot.availability = DesktopAvailability::Disconnected;
 		this->snapshot.error = error;
+		this->snapshot.pinnedAppsReady = false;
 		// Keep the last desktop/window values as explicitly stale state.
 		this->recovery.disconnected();
 		this->notify();
@@ -712,9 +786,31 @@ struct Channel {
 				);
 			}
 		}
+		if (pendingPin && pendingPin->target != nullptr) {
+			auto pinOutcome = OwnWindowPin::Unavailable;
+			if (pendingPin->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+				try {
+					auto value = pendingPin->result.get();
+					if (value.availability == DesktopAvailability::Available) {
+						pinOutcome = value.result == 0
+						               ? OwnWindowPin::Pinned
+						               : (value.result == -2 ? OwnWindowPin::Unavailable
+						                                     : OwnWindowPin::Refused);
+					}
+				} catch (...) {
+					pinOutcome = OwnWindowPin::Unavailable;
+				}
+			}
+			this->notifyPinCompleted(pendingPin->target, pinOutcome);
+		}
 	}
 
 	bool apply(Snapshot result) {
+		if (result.optionalPinnedAppsFaulted) {
+			this->skipOptionalPinnedApps = true;
+			qCWarning(logNativeDesktops)
+			    << "Optional desktop pinning faulted; disabling pinning for recovery";
+		}
 		if (result.sequence < this->applied) return true;
 		this->applied = result.sequence;
 		if ((result.availability == DesktopAvailability::Available || result.publicReady)
@@ -727,6 +823,7 @@ struct Channel {
 				this->snapshot.windows = std::move(result.windows);
 				this->snapshot.availability = state;
 				this->snapshot.error = error;
+				this->snapshot.pinnedAppsReady = false;
 				this->recovery.disconnected();
 				return false;
 			}
@@ -800,6 +897,11 @@ struct Channel {
 		if (owner != this->worker) return -1;
 		if (result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
 			if (request->stalled(this->stallLimit) || this->stalled()) {
+				if (kind == Kind::Acquisition && request->inOptionalPinnedApps.load()) {
+					this->skipOptionalPinnedApps = true;
+					qCWarning(logNativeDesktops)
+					    << "Optional desktop pinning acquisition stalled; disabling pinning for recovery";
+				}
 				this->retire(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
 				return -1;
 			}
@@ -833,11 +935,27 @@ struct Channel {
 	}
 
 	bool acquire() {
-		if (this->pending) return false;
+		if (this->pending || this->pin) return false;
 		if (this->worker) {
 			if (this->snapshot.availability == DesktopAvailability::Available) return true;
+			const auto skipOptional = this->skipOptionalPinnedApps;
+#ifdef QS_TEST
+			auto* pinnedShell = this->pinnedAppsShell;
+#endif
 			return this->execute(
-			           [] { return provider().acquire() ? 0 : -1; },
+			           [skipOptional
+#ifdef QS_TEST
+			            ,
+			            pinnedShell
+#endif
+			           ] {
+				           auto& p = provider();
+				           p.skipOptionalPinnedApps = skipOptional;
+#ifdef QS_TEST
+				           p.pinnedAppsShell = pinnedShell;
+#endif
+				           return p.acquire() ? 0 : -1;
+			           },
 			           true,
 			           false,
 			           Kind::Acquisition
@@ -855,19 +973,23 @@ struct Channel {
 		try {
 			next = std::make_shared<Worker>();
 			std::thread([next,
-			             enabled = this->privateEnabled
+			             enabled = this->privateEnabled,
+			             skipOptional = this->skipOptionalPinnedApps
 #ifdef QS_TEST
 			             ,
 			             factory = this->factory,
-			             validator = this->validator
+			             validator = this->validator,
+			             pinnedShell = this->pinnedAppsShell
 #endif
 			] {
 				next->run(
-				    enabled
+				    enabled,
+				    skipOptional
 #ifdef QS_TEST
 				    ,
 				    factory,
-				    validator
+				    validator,
+				    pinnedShell
 #endif
 				);
 			}).detach();
@@ -884,6 +1006,30 @@ struct Channel {
 		           Kind::Acquisition
 		       )
 		    == 0;
+	}
+
+	OwnWindowPin requestPin(HWND hwnd) {
+		if (this->waiting) return OwnWindowPin::Busy;
+		this->collect();
+		if (!this->worker || !this->privateEnabled
+		    || this->snapshot.availability != DesktopAvailability::Available
+		    || !this->snapshot.pinnedAppsReady)
+		{
+			return OwnWindowPin::Unavailable;
+		}
+		// Keep desktop switches and moves ahead of panel pinning, and allow
+		// only one in-flight pin on the worker at a time.
+		if (this->pending || this->pin) return OwnWindowPin::Busy;
+		auto request = std::make_shared<Request>();
+		if (!request->finished) {
+			this->retire(HRESULT_FROM_WIN32(GetLastError()));
+			return OwnWindowPin::Unavailable;
+		}
+		request->operation = [hwnd] { return pinOwnWindow(hwnd); };
+		request->completed = [this] { this->wakeOnCompletion(); };
+		this->pin.emplace(PinPending {request, this->worker->submit(request), hwnd});
+		this->armDeadline();
+		return OwnWindowPin::Pending;
 	}
 
 	void pruneWindows() {
@@ -929,13 +1075,14 @@ struct Channel {
 
 	void armDeadline() {
 		auto next = Clock::time_point::max();
-		for (auto* job: {&this->refresh, &this->pending}) {
-			if (!*job) continue;
-			const auto& request = (*job)->request;
+		const auto consider = [&](const std::shared_ptr<Request>& request) {
 			const auto ticks = request->started.load();
 			const auto since = ticks ? Clock::time_point(Clock::duration(ticks)) : request->submitted;
 			next = std::min(next, since + this->stallLimit);
-		}
+		};
+		if (this->refresh) consider(this->refresh->request);
+		if (this->pending) consider(this->pending->request);
+		if (this->pin) consider(this->pin->request);
 		if (next == Clock::time_point::max()) this->deadline.stop();
 		else this->deadline.start(std::max(
 		    std::chrono::ceil<std::chrono::milliseconds>(next - Clock::now()),
@@ -944,11 +1091,11 @@ struct Channel {
 	}
 
 	bool stalled() const {
-		const auto stalled = [this](const std::optional<Pending>& job) {
+		const auto jobStalled = [this](const auto& job) {
 			return job && job->result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready
 			    && job->request->stalled(this->stallLimit);
 		};
-		return stalled(this->refresh) || stalled(this->pending);
+		return jobStalled(this->refresh) || jobStalled(this->pending) || jobStalled(this->pin);
 	}
 
 	void collectOne(std::optional<Pending>& slot) {
@@ -1024,9 +1171,46 @@ struct Channel {
 		}
 	}
 
+	void collectPin() {
+		if (!this->pin
+		    || this->pin->result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+			return;
+		auto finished = std::move(*this->pin);
+		this->pin.reset();
+		try {
+			auto value = finished.result.get();
+			if (value.availability != DesktopAvailability::Available) {
+				const auto state = value.availability;
+				const auto error = value.error;
+				if (value.publicReady) {
+					this->snapshot.availability = state;
+					this->snapshot.error = error;
+					this->snapshot.pinnedAppsReady = false;
+					this->recovery.disconnected();
+					this->notify();
+				} else {
+					this->retire(error);
+					this->snapshot.availability = state;
+				}
+				this->notifyPinCompleted(finished.target, OwnWindowPin::Unavailable);
+				return;
+			}
+			this->snapshot.pinnedAppsReady = value.pinnedAppsReady;
+			const auto outcome = value.result == 0
+			                       ? OwnWindowPin::Pinned
+			                       : (value.result == -2 ? OwnWindowPin::Unavailable
+			                                             : OwnWindowPin::Refused);
+			this->notifyPinCompleted(finished.target, outcome);
+		} catch (...) {
+			this->retire(E_UNEXPECTED);
+			this->notifyPinCompleted(finished.target, OwnWindowPin::Unavailable);
+		}
+	}
+
 	void collect() {
 		this->collectOne(this->refresh);
 		this->collectOne(this->pending);
+		this->collectPin();
 		if (this->stalled()) {
 			this->retire(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
 			return;
@@ -1134,6 +1318,7 @@ bool loadNativeDesktopAccessor(
 	// pinNativeDesktopOwnWindow, so toplevel queries never wait on COM.
 	p.shutdown();
 	p.privateEnabled = true;
+	p.skipOptionalPinnedApps = false;
 	if (p.acquire()) return true;
 	if (!p.pending) p.recovery.disconnected();
 	return false;
@@ -1167,6 +1352,7 @@ void initializeNativeDesktopQueries(QObject* context, std::function<void()> upda
 		c.recovered = {};
 		c.updated = {};
 		c.moveCompleted = {};
+		c.pinCompleted = {};
 	});
 	if (!c.worker && !c.recovery.active() && !c.acquire() && !c.pending) c.recovery.disconnected();
 }
@@ -1178,6 +1364,15 @@ void setNativeDesktopMoveObserver(
 	auto& c = channel();
 	c.context = context;
 	c.moveCompleted = std::move(onMoveCompleted);
+}
+
+void setNativeDesktopPinObserver(
+    QObject* context,
+    std::function<void(HWND, OwnWindowPin)> onPinCompleted
+) {
+	auto& c = channel();
+	c.context = context;
+	c.pinCompleted = std::move(onPinCompleted);
 }
 
 void requestNativeDesktopRefresh() { channel().requestRefresh(); }
@@ -1193,7 +1388,7 @@ quint64 nativeDesktopPendingMoveSequence(HWND hwnd) {
 }
 bool nativeDesktopRequestPending() {
 	const auto& c = channel();
-	return c.waiting || c.pending.has_value() || c.refresh.has_value();
+	return c.waiting || c.pending.has_value() || c.refresh.has_value() || c.pin.has_value();
 }
 quint64 nativeDesktopSubmittedSequence() { return channel().sequence; }
 quint64 nativeDesktopReadSequence() { return channel().desktopReadApplied; }
@@ -1277,18 +1472,7 @@ std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop) {
 	return result == -2 ? std::nullopt : std::optional<bool>(result == 0);
 }
 OwnWindowPin pinNativeDesktopOwnWindow(HWND hwnd) {
-	auto& c = channel();
-	if (!c.worker || !c.privateEnabled || c.snapshot.availability != DesktopAvailability::Available)
-		return OwnWindowPin::Unavailable;
-	if (c.waiting || c.pending) return OwnWindowPin::Busy;
-	// A probe, not a command: a pin past the GUI bound is reported busy rather
-	// than optimistically accepted, and never makes a switch provider-busy.
-	const auto result =
-	    c.execute([hwnd] { return pinOwnWindow(hwnd); }, false, false, Channel::Kind::Probe);
-	if (result == 0) return OwnWindowPin::Pinned;
-	if (result == -2) return OwnWindowPin::Unavailable;
-	if (c.pending || c.waiting) return OwnWindowPin::Busy;
-	return OwnWindowPin::Refused;
+	return channel().requestPin(hwnd);
 }
 void shutdownNativeDesktopAccessor() { channel().shutdown(); }
 
@@ -1307,9 +1491,11 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.recovered = {};
 	p.updated = {};
 	p.moveCompleted = {};
+	p.pinCompleted = {};
 	p.supported = false;
 	p.privateEnabled = false;
 	p.refusedBuild = false;
+	p.skipOptionalPinnedApps = false;
 	p.applied = 0;
 	p.desktopReadApplied = 0;
 	p.cancelledCommandSequence = 0;
@@ -1320,14 +1506,24 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.watchedWindows.clear();
 	p.factory = std::move(factory);
 	p.validator = {};
+	p.pinnedAppsShell = nullptr;
 	p.stallLimit = stuckBound;
 }
 
 void setNativeDesktopPinnedAppsForTest(PinnedApps* pinned) {
-	channel().execute([pinned] {
-		provider().pinnedApps = pinned;
-		return 0;
-	});
+	channel().execute(
+	    [pinned] {
+		    provider().pinnedApps = pinned;
+		    return 0;
+	    },
+	    false,
+	    false,
+	    Channel::Kind::Probe
+	);
+}
+
+void setNativeDesktopPinnedAppsShellForTest(IServiceProvider* shell) {
+	channel().pinnedAppsShell = shell;
 }
 
 void setNativeDesktopWindowValidatorForTest(std::function<bool(HWND)> validator) {

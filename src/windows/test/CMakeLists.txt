@@ -1034,6 +1034,7 @@ set(QS_PANEL_REEMBED_TEST_SOURCES
 	${QS_WINDOWS_SRC}/panel_animation.hpp
 	${QS_WINDOWS_SRC}/panel_effects.cpp
 	${QS_WINDOWS_SRC}/panel_effects.hpp
+	${QS_WINDOWS_SRC}/panel_pin_state.hpp
 	${QS_WINDOWS_SRC}/panel_topmost.hpp
 	${QS_WINDOWS_SRC}/layer_rules.cpp
 	${QS_WINDOWS_SRC}/fullscreen_occluders.cpp

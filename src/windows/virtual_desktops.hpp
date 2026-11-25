@@ -20,9 +20,11 @@
 namespace qs::windows {
 
 // Result of pinning one of the shell's own windows to every desktop.
-// Unavailable means the native pinning service is absent, so a caller may
-// fall back to the accessor table (tests) or follow the current desktop.
-enum class OwnWindowPin : quint8 { Pinned, Refused, Busy, Unavailable };
+// Pending means the native pin was submitted asynchronously and will finish via
+// ownWindowPinCompleted(). Unavailable means the native pinning service is
+// absent, so a caller may fall back to the accessor table (tests) or follow the
+// current desktop.
+enum class OwnWindowPin : quint8 { Pinned, Pending, Refused, Busy, Unavailable };
 
 class RegistryWatcher: public QThread {
 	Q_OBJECT;
@@ -162,6 +164,7 @@ signals:
 	void lastCommandChanged();
 	void commandResult(QVariantMap result);
 	void moveWindowCompleted(quint64 sequence, quintptr hwnd, bool succeeded, QString reason);
+	void ownWindowPinCompleted(quintptr hwnd, qs::windows::OwnWindowPin result);
 
 private:
 #ifdef QS_TEST
@@ -183,6 +186,7 @@ private:
 	    DesktopAvailability availability,
 	    HRESULT error
 	);
+	void onNativePinCompleted(HWND hwnd, OwnWindowPin result);
 	void applyNativeSnapshot();
 	void notifyCapability();
 	bool readRegistry(QList<GUID>& ids, GUID& current) const;
