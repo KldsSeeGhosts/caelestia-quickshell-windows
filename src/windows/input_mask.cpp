@@ -36,6 +36,8 @@ constexpr UINT WM_QS_MONITOR_CHANGED = WM_APP + 4;
 constexpr UINT WM_QS_HOOK_READY = WM_APP + 5;
 constexpr auto MESSAGE_WINDOW_CLASS = L"QuickshellInputMaskTracker";
 constexpr int CURSOR_INTERVAL_MS = 33;
+constexpr quint64 HOOK_READY_TIMEOUT_MS = 5000;
+using hotkeys::hookwatch::detail::mouseHookState;
 
 struct MaskedWindow {
 	HWND hwnd = nullptr;
@@ -258,18 +260,22 @@ InputMaskTracker* InputMaskTracker::instance() {
 	return tracker.data();
 }
 
-bool InputMaskTracker::restartActiveMouseHook() {
+void InputMaskTracker::recoverMouseHook() {
 	auto* tracker = trackerInstanceRef().data();
-	if (tracker == nullptr || !tracker->hookRunning) return false;
+	if (tracker == nullptr || !mouseHookState.needed) return;
 
-	tracker->stopHook(false);
-	tracker->hookFailed = false;
-	if (!tracker->startHook()) {
-		hotkeys::hookwatch::setMouseActive(false);
-		return false;
+	if (tracker->hookRunning && !mouseHookState.active
+	    && GetTickCount64() - tracker->hookStartTick < HOOK_READY_TIMEOUT_MS)
+		return; // Let the current install answer first.
+
+	if (tracker->hookRunning) {
+		qCWarning(logInputMask) << "Re-arming the mouse low-level hook";
+		tracker->stopHook();
 	}
-	tracker->updateHookState();
-	return true;
+	if (!tracker->startHook()) {
+		qCWarning(logInputMask) << "Could not re-arm the mouse low-level hook";
+	}
+	tracker->updateCursorFallback();
 }
 
 InputMaskTracker::InputMaskTracker(QObject* parent): QObject(parent) {
@@ -323,7 +329,8 @@ InputMaskTracker::InputMaskTracker(QObject* parent): QObject(parent) {
 
 InputMaskTracker::~InputMaskTracker() {
 	lateReportOwner.store(nullptr, std::memory_order_release);
-	this->stopHook();
+	this->stopHook(INFINITE);
+	hotkeys::hookwatch::setNeeded(mouseHookState, false);
 	publishMasks(nullptr);
 
 	if (this->messageWindow != nullptr) {
@@ -548,81 +555,92 @@ void InputMaskTracker::updateHookState() {
 	auto needed = !this->entries.isEmpty() || buttonWatchers.load() > 0 || this->cursorWatchers > 0
 	           || this->monitorWatchers > 0 || this->hookHolders > 0;
 
-	if (needed && !this->hookRunning && !this->hookFailed) {
-		if (this->messageWindow == nullptr || !this->startHook()) {
-			qCWarning(logInputMask) << "Mouse hook unavailable, polling the cursor instead.";
-			this->hookFailed = true;
-		}
-	}
-
-	cursorWatched.store(this->hookRunning && this->cursorWatchers > 0);
-	monitorWatched.store(this->hookRunning && this->monitorWatchers > 0);
-	if (this->cursorWatchers <= 0) this->cursorTrailTimer.stop();
-
-	if (needed && this->hookFailed && (!this->entries.isEmpty() || this->cursorWatchers > 0)
-	    && !this->pollTimer.isActive())
-	{
-		this->pollTimer.start();
-	}
-
-	if (!needed) {
+	if (!needed && mouseHookState.needed) {
 		this->stopHook();
-		this->pollTimer.stop();
+	} else if (needed && !mouseHookState.needed && !this->startHook()) {
+		qCWarning(logInputMask) << "Mouse hook unavailable, polling the cursor instead.";
 	}
+	hotkeys::hookwatch::setNeeded(mouseHookState, needed);
+	this->updateCursorFallback();
+}
+
+void InputMaskTracker::updateCursorFallback() {
+	cursorWatched.store(mouseHookState.active && this->cursorWatchers > 0);
+	monitorWatched.store(mouseHookState.active && this->monitorWatchers > 0);
+	if (!cursorWatched.load()) this->cursorTrailTimer.stop();
+
+	auto polling = !mouseHookState.active && (!this->entries.isEmpty() || this->cursorWatchers > 0);
+	if (polling && !this->pollTimer.isActive()) this->pollTimer.start();
+	else if (!polling) this->pollTimer.stop();
 }
 
 bool InputMaskTracker::startHook() {
 	if (this->hookRunning) return true;
+	if (this->messageWindow == nullptr || !this->reapHook(0)) return false;
 
 	this->hookGeneration++;
+	this->hookStartTick = GetTickCount64();
 	hookTarget.store(this->messageWindow);
 	hookThreadId.store(0);
 	hookStopRequested.store(false);
-	this->hookThread = std::thread(&InputMaskTracker::hookThreadMain, this->hookGeneration);
+	try {
+		this->hookThread = std::thread(&InputMaskTracker::hookThreadMain, this->hookGeneration);
+	} catch (...) {
+		hookTarget.store(nullptr);
+		return false;
+	}
 
 	this->hookRunning = true;
 	qCDebug(logInputMask) << "Mouse hook thread started.";
 	return true;
 }
 
-void InputMaskTracker::stopHook(bool deactivate) {
-	if (!this->hookRunning) return;
+bool InputMaskTracker::reapHook(DWORD wait) {
+	if (!this->hookThread.joinable()) return true;
+	if (WaitForSingleObject(this->hookThread.native_handle(), wait) != WAIT_OBJECT_0) return false;
 
-	if (deactivate) hotkeys::hookwatch::setMouseActive(false);
+	this->hookThread.join();
+	return true;
+}
+
+void InputMaskTracker::stopHook(DWORD wait) {
 	hookStopRequested.store(true);
 	auto threadId = hookThreadId.load();
 	if (threadId != 0) PostThreadMessageW(threadId, WM_QUIT, 0, 0);
 
-	this->hookThread.join();
 	this->hookRunning = false;
+	mouseHookState.active = false;
 	hookTarget.store(nullptr);
-	cursorWatched.store(false);
-	this->cursorTrailTimer.stop();
+	this->updateCursorFallback();
+	if (!this->reapHook(wait))
+		qCWarning(logInputMask) << "Mouse hook did not stop within its deadline";
+}
+
+void InputMaskTracker::onHookReady(quint32 generation) {
+	if (!this->hookRunning || generation != this->hookGeneration) return;
+
+	mouseHookState.active = true;
+	this->updateCursorFallback();
 }
 
 void InputMaskTracker::onHookFailed(DWORD error, quint32 generation) {
 	if (!this->hookRunning || generation != this->hookGeneration) return;
 
-	hotkeys::hookwatch::setMouseActive(false);
-	this->hookThread.join();
-	this->hookRunning = false;
-	this->hookFailed = true;
-	hookTarget.store(nullptr);
-	cursorWatched.store(false);
-	this->cursorTrailTimer.stop();
+	this->stopHook();
 
 	qCWarning(logInputMask).nospace()
 	    << "Mouse hook unavailable (error " << error << "), polling the cursor instead. "
 	    << "Mouse button presses and Super drags can't be observed.";
-
-	this->updateHookState();
 }
 
 void InputMaskTracker::hookThreadMain(quint32 generation) {
 	MSG msg {};
 	PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 	hookThreadId.store(GetCurrentThreadId());
-	if (hookStopRequested.load()) return;
+	if (hookStopRequested.load()) {
+		hookThreadId.store(0);
+		return;
+	}
 
 	prioritizeInputThread(THREAD_PRIORITY_TIME_CRITICAL);
 
@@ -634,29 +652,36 @@ void InputMaskTracker::hookThreadMain(quint32 generation) {
 		if (auto* target = hookTarget.load()) {
 			PostMessageW(target, WM_QS_HOOK_FAILED, error, static_cast<LPARAM>(generation));
 		}
-
+		hookThreadId.store(0);
 		return;
 	}
 
-	hotkeys::hookwatch::noteMouseInstalled();
+	hotkeys::hookwatch::noteInstalled(mouseHookState);
 	if (auto* target = hookTarget.load()) {
 		PostMessageW(target, WM_QS_HOOK_READY, 0, static_cast<LPARAM>(generation));
 	}
 
-	while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+	BOOL result = 0;
+	while (!hookStopRequested.load() && (result = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
 		TranslateMessage(&msg);
 		DispatchMessageW(&msg);
 	}
 
+	auto error = result < 0 ? GetLastError() : ERROR_OPERATION_ABORTED;
 	UnhookWindowsHookEx(hook);
 	SuperDragManager::onHookStopped();
+	hookThreadId.store(0);
+	if (!hookStopRequested.load()) {
+		if (auto* target = hookTarget.load())
+			PostMessageW(target, WM_QS_HOOK_FAILED, error, static_cast<LPARAM>(generation));
+	}
 }
 
 LRESULT CALLBACK InputMaskTracker::mouseHookProc(int code, WPARAM wParam, LPARAM lParam) {
-	if (code == HC_ACTION) {
+	if (code == HC_ACTION && !hookStopRequested.load()) {
 		auto* info = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam); // NOLINT(performance-no-int-to-ptr)
 		noteHookDelay(false, info->time);
-		hotkeys::hookwatch::noteMouseInput();
+		if ((info->flags & LLMHF_INJECTED) == 0) hotkeys::hookwatch::noteInput(mouseHookState);
 		cursorX.store(info->pt.x);
 		cursorY.store(info->pt.y);
 
@@ -708,18 +733,14 @@ InputMaskTracker::messageWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 	}
 
 	if (msg == WM_QS_HOOK_READY) {
-		auto* tracker = InputMaskTracker::instance();
-		if (tracker->hookRunning && static_cast<quint32>(lParam) == tracker->hookGeneration) {
-			hotkeys::hookwatch::setMouseActive(true);
-		}
+		if (auto* tracker = trackerInstanceRef().data())
+			tracker->onHookReady(static_cast<quint32>(lParam));
 		return 0;
 	}
 
 	if (msg == WM_QS_HOOK_FAILED) {
-		InputMaskTracker::instance()->onHookFailed(
-		    static_cast<DWORD>(wParam),
-		    static_cast<quint32>(lParam)
-		);
+		if (auto* tracker = trackerInstanceRef().data())
+			tracker->onHookFailed(static_cast<DWORD>(wParam), static_cast<quint32>(lParam));
 		return 0;
 	}
 

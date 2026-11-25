@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <deque>
+#include <semaphore>
 #include <vector>
 
 #include <qcoreapplication.h>
@@ -83,6 +84,7 @@ struct FakeDesktop {
 	int timersKilled = 0;
 	HWND foreground = nullptr;
 	DWORD foregroundPid = 0;
+	std::deque<HWND> foregroundReads;
 };
 
 FakeDesktop desktop;
@@ -98,7 +100,12 @@ BOOL WINAPI fakeKillTimer(HWND, UINT_PTR timer) {
 	return TRUE;
 }
 
-HWND WINAPI fakeGetForegroundWindow() { return desktop.foreground; }
+HWND WINAPI fakeGetForegroundWindow() {
+	if (desktop.foregroundReads.empty()) return desktop.foreground;
+	auto* foreground = desktop.foregroundReads.front();
+	desktop.foregroundReads.pop_front();
+	return foreground;
+}
 
 DWORD WINAPI fakeGetWindowThreadProcessId(HWND, LPDWORD processId) {
 	if (processId != nullptr) *processId = desktop.foregroundPid;
@@ -396,12 +403,15 @@ private slots:
 		physical('O', false, 110);
 		QVERIFY(KeyboardHook::superDown());
 
-		// unregisterAll removes the snapshot, then stops the hook's routing.
+		// A feature still owns the physical hook when unregisterAll removes
+		// the routing snapshot.
+		gOwnership.hold();
 		KeyboardHook::setSnapshot(nullptr);
 		KeyboardHook::stop();
 
 		physical('O', true, 120);
 		physical(VK_LWIN, true, 130);
+		gOwnership.drop();
 		QVERIFY(!KeyboardHook::superDown());
 	}
 
@@ -415,6 +425,7 @@ private slots:
 		KeyboardHook::setSnapshot(first);
 		physical(VK_LWIN, false, 100);
 		physical('O', false, 110);
+		gOwnership.hold();
 		KeyboardHook::setSnapshot(nullptr);
 		KeyboardHook::stop();
 		physical('O', true, 120);
@@ -432,6 +443,7 @@ private slots:
 		auto delivered = std::ranges::any_of(desktop.delivered, [](const KBDLLHOOKSTRUCT& info) {
 			return info.vkCode == 'O' && (info.flags & LLKHF_UP) == 0;
 		});
+		gOwnership.drop();
 		QVERIFY2(delivered, "an unbound O after restart was consumed as the old bind's repeat");
 
 		physical('O', true, 210);
@@ -592,47 +604,163 @@ private slots:
 		QVERIFY(!desktop.down[VK_LCONTROL]);
 	}
 
-	void watchdogDecisionHandlesWraparoundAndInstallIdlePeriods() {
-		constexpr DWORD install = 0xfffff000;
-		auto reading = HookWatchdogReading {
-			.active = true,
-			.lastInputTime = install,
-			.lastHookTick = install,
-			.hookInstallTick = install,
-		};
-
-		QCOMPARE(static_cast<int>(evaluateHookWatchdog(reading)), static_cast<int>(HookWatchdogDecision::Waiting));
-		reading.lastInputTime = static_cast<DWORD>(install + HOOK_STALE_INPUT_MS);
-		QCOMPARE(static_cast<int>(evaluateHookWatchdog(reading)), static_cast<int>(HookWatchdogDecision::Waiting));
-		reading.lastInputTime = static_cast<DWORD>(install + HOOK_STALE_INPUT_MS + 1);
-		QCOMPARE(static_cast<int>(evaluateHookWatchdog(reading)), static_cast<int>(HookWatchdogDecision::Rearm));
-
-		reading.lastInputTime = static_cast<DWORD>(install - 1);
-		QCOMPARE(static_cast<int>(evaluateHookWatchdog(reading)), static_cast<int>(HookWatchdogDecision::NoInputSinceInstall));
-
-		reading.lastInputTime = static_cast<DWORD>(install + HOOK_STALE_INPUT_MS + 1);
-		reading.foregroundHidden = true;
-		QCOMPARE(static_cast<int>(evaluateHookWatchdog(reading)), static_cast<int>(HookWatchdogDecision::Protected));
-		reading.foregroundHidden = false;
-		reading.foreignDesktop = true;
-		QCOMPARE(static_cast<int>(evaluateHookWatchdog(reading)), static_cast<int>(HookWatchdogDecision::Protected));
-		reading.foreignDesktop = false;
-		reading.active = false;
-		QCOMPARE(static_cast<int>(evaluateHookWatchdog(reading)), static_cast<int>(HookWatchdogDecision::Inactive));
+	void watchdogTimestampsCrossThe32BitZeroWithoutWrapping() {
+		constexpr uint64_t zero = 1ULL << 32;
+		constexpr auto install = zero - 1000;
+		QVERIFY(!hookMissedInput(0, install, install));
+		QVERIFY(!hookMissedInput(install - 1, install, install));
+		QVERIFY(!hookMissedInput(zero, install, install));
+		QVERIFY(!hookMissedInput(install + HOOK_STALE_INPUT_MS, install, install));
+		QVERIFY(hookMissedInput(install + HOOK_STALE_INPUT_MS + 1, install, install));
+		QVERIFY(!hookMissedInput(zero + 501, zero + 502, install));
+		QVERIFY(!hookMissedInput(zero + 501, install, zero + 502));
 	}
 
-	void watchdogActivityBaselineStartsAtHookInstallation() {
-		hookwatch::setKeyboardActive(true);
-		QVERIFY(gKeyboardHookActive.load());
-		QCOMPARE(gHookTick.load(), gKeyboardHookInstallTick.load());
-		hookwatch::setKeyboardActive(false);
-		QVERIFY(!gKeyboardHookActive.load());
+	void watchdogFindsAnEvictedDeviceWithoutTheOtherHook_data() {
+		QTest::addColumn<bool>("keyboardStale");
+		QTest::addColumn<bool>("otherActive");
+		QTest::newRow("keyboard alone") << true << false;
+		QTest::newRow("mouse alone") << false << false;
+		QTest::newRow("keyboard while mouse is active") << true << true;
+		QTest::newRow("mouse while keyboard is active") << false << true;
+	}
 
-		hookwatch::setMouseActive(true);
-		QVERIFY(gMouseHookActive.load());
-		QCOMPARE(gHookTick.load(), gMouseHookInstallTick.load());
-		hookwatch::setMouseActive(false);
-		QVERIFY(!gMouseHookActive.load());
+	void watchdogFindsAnEvictedDeviceWithoutTheOtherHook() {
+		QFETCH(bool, keyboardStale);
+		QFETCH(bool, otherActive);
+		hookwatch::detail::HookState keyboardState;
+		hookwatch::detail::HookState mouseState;
+		auto& stale = keyboardStale ? keyboardState : mouseState;
+		auto& other = keyboardStale ? mouseState : keyboardState;
+		stale.active = stale.needed = true;
+		stale.callbackTick.store(100);
+		stale.installTick.store(100);
+		other.active = other.needed = otherActive;
+		other.callbackTick.store(2200);
+		auto keyboardRecovery = HookRecovery {.rawTick = 2200};
+		auto mouseRecovery = HookRecovery {.rawTick = 2200};
+		auto& staleRecovery = keyboardStale ? keyboardRecovery : mouseRecovery;
+		// No device-specific evidence of an evicted hook, despite activity
+		// on the other device. The missing callback alone is not evidence.
+		staleRecovery.rawTick = 100;
+		auto attempt = [] { return 2200; };
+		QVERIFY(!staleRecovery.poll(stale, 2200, true, attempt));
+		staleRecovery.rawTick = 2201;
+		QCOMPARE(keyboardRecovery.poll(keyboardState, 2201, true, attempt), keyboardStale);
+		QCOMPARE(mouseRecovery.poll(mouseState, 2201, true, attempt), !keyboardStale);
+	}
+
+	void watchdogBacksOffAfterFailedRearmerUntilOwnerLeaves() {
+		hookwatch::detail::HookState hook;
+		hook.active = hook.needed = true;
+		auto recovery = HookRecovery {.rawTick = 3000};
+		uint64_t now = 3000;
+		auto attempts = 0;
+		auto attempt = [&] {
+			attempts++;
+			hook.active = false; // Re-arm failed; the owner still needs it.
+			return now;
+		};
+		QVERIFY(recovery.poll(hook, now, true, attempt));
+		for (uint64_t delay: {2000, 4000, 8000, 16000, 16000}) {
+			now += delay - 1;
+			QVERIFY(!recovery.poll(hook, now, true, attempt));
+			QVERIFY(recovery.poll(hook, ++now, true, attempt));
+		}
+		QCOMPARE(attempts, 6);
+		QVERIFY(hook.needed);
+		hook.active = true; // A successful install restores the base delay.
+		QVERIFY(!recovery.poll(hook, ++now, true, attempt));
+		recovery.sessionPending = true;
+		QVERIFY(recovery.poll(hook, ++now, true, attempt));
+		QCOMPARE(recovery.nextAttempt, now + 2000);
+		hook.needed = false;
+		QVERIFY(!recovery.poll(hook, now + 16000, true, attempt));
+		QCOMPARE(recovery.nextAttempt, uint64_t(0));
+	}
+
+	void sessionRecoveryCoalescesAndWaitsPastProtectedForeground() {
+		SessionRecovery recovery;
+		QVERIFY(recovery.resume(1000, true)); // Automatic resume.
+		QVERIFY(!recovery.resume(1100, false)); // User-present resume.
+		QVERIFY(!recovery.request(1200)); // Unlock or reconnect.
+		QVERIFY(!recovery.take(1499, true));
+		QVERIFY(!recovery.take(1500, false));
+		QVERIFY(!recovery.take(10000, false));
+		QVERIFY(recovery.take(12000, true));
+		QVERIFY(!recovery.take(12000, true));
+		QVERIFY(!recovery.request(12100));
+		QVERIFY(!recovery.resume(20000, false)); // Late user-present broadcast.
+		QVERIFY(recovery.resume(21000, true)); // A new automatic resume, even if suspend was missed.
+		QVERIFY(recovery.take(21500, true));
+		QVERIFY(recovery.request(25000)); // Standalone reconnect.
+		QVERIFY(recovery.take(25500, true));
+	}
+
+	void keyboardRearmResetsRoutingAndObserverBeforeDetaching() {
+		keyboardHookState.active = true;
+		gInputObserver.store(reinterpret_cast<HWND>(2));
+		constexpr auto observerReset = WM_APP + 32;
+		gInputObserverResetMessage.store(observerReset);
+		auto* routingTarget = gTarget.load();
+		stopHookThread(true);
+		QVERIFY(!keyboardHookState.active);
+		QVERIFY(gInputObserver.load() == nullptr);
+		QCOMPARE(gTarget.load(), routingTarget);
+		QCOMPARE(desktop.hookPosts.front().message, UINT(WM_APP + HookReset));
+		QCOMPARE(desktop.observerPosts.size(), size_t(1));
+		QCOMPARE(desktop.observerPosts.front().message, UINT(observerReset));
+	}
+
+	void foregroundReaderRejectsAnInProgressPublication() {
+		ForegroundIntegrityPublication publication;
+		auto* before = reinterpret_cast<HWND>(0x1000);
+		auto* after = reinterpret_cast<HWND>(0x2000);
+		publication.publish(before, false);
+		std::binary_semaphore writing(0);
+		std::binary_semaphore finish(0);
+		auto writer = std::thread([&] {
+			publication.publish(after, true, [&] {
+				writing.release();
+				finish.acquire();
+			});
+		});
+		writing.acquire();
+		auto during = publication.load();
+		finish.release();
+		writer.join();
+		QVERIFY(!during.valid);
+		auto complete = publication.load();
+		QVERIFY(complete.valid);
+		QCOMPARE(complete.hwnd, after);
+		QVERIFY(complete.blocked);
+	}
+
+	void foregroundWorkerStopsBeforeItsMessageQueueExists() {
+		std::binary_semaphore creatingQueue(0);
+		std::binary_semaphore createQueue(0);
+		gForegroundStopRequested.store(false);
+		gForegroundExitEvent.store(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+		gForegroundReadyEvent.store(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+		gForegroundThread = new std::thread([&] {
+			runForegroundIntegrityWorker([&](MSG* msg) {
+				creatingQueue.release();
+				createQueue.acquire();
+				PeekMessageW(msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+			});
+		});
+		creatingQueue.acquire();
+		stopForegroundIntegrityWorker(0);
+		auto acceptedStoppingWorker = startForegroundIntegrityWorker();
+		auto queueId = gForegroundThreadId.load();
+		createQueue.release();
+		auto exitedWithoutAnotherStop = WaitForSingleObject(gForegroundExitEvent.load(), 1000);
+		stopForegroundIntegrityWorker(INFINITE);
+		QCOMPARE(queueId, DWORD(0));
+		QCOMPARE(exitedWithoutAnotherStop, DWORD(WAIT_OBJECT_0));
+		QVERIFY(!acceptedStoppingWorker);
+		QVERIFY(!gForegroundRunning.load());
+		QVERIFY(gForegroundThread == nullptr);
 	}
 
 	void foregroundIntegrityPublicationSuppliesConsistentStateToHook() {
@@ -715,6 +843,46 @@ private slots:
 		QCOMPARE(desktop.delivered.size(), size_t(2));
 	}
 
+	void foregroundChangesBetweenReleaseDecisionAndReplay_data() {
+		QTest::addColumn<bool>("win");
+		QTest::addColumn<bool>("nullForeground");
+		QTest::newRow("Win to unknown window") << true << false;
+		QTest::newRow("Alt to unknown window") << false << false;
+		QTest::newRow("Win to no foreground") << true << true;
+		QTest::newRow("Alt to no foreground") << false << true;
+	}
+
+	void foregroundChangesBetweenReleaseDecisionAndReplay() {
+		QFETCH(bool, win);
+		QFETCH(bool, nullForeground);
+		auto bit = win ? ModSuper : ModAlt;
+		auto vk = win ? VK_LWIN : VK_LMENU;
+		auto snapshot = std::make_shared<HookSnapshot>();
+		snapshot->triggers.push_back({.kind = HookTrigger::Tap, .combo = {.lone = bit}, .id = 31});
+		snapshot->triggers.push_back({.kind = HookTrigger::Hold, .combo = {.lone = bit}, .id = 32});
+		KeyboardHook::setSnapshot(snapshot);
+		physical(vk, false, 100);
+		if (win) {
+			physical('E', false, 120);
+			physical('E', true, 150);
+		}
+		QVERIFY(desktop.down[vk]);
+		auto* allowed = reinterpret_cast<HWND>(0x1000);
+		desktop.foreground = nullForeground ? nullptr : reinterpret_cast<HWND>(0x2000);
+		desktop.foregroundPid = 12345;
+		desktop.foregroundReads = {allowed, allowed};
+		publishForegroundIntegrity(allowed, false);
+		gThreadId.store(123);
+		auto injections = desktop.injections;
+		physical(vk, true, 200);
+		QVERIFY(desktop.foregroundReads.empty());
+		QCOMPARE(desktop.injections, injections);
+		QCOMPARE(taps(), 0);
+		QVERIFY(!desktop.down[vk]);
+		QVERIFY((desktop.delivered.back().flags & LLKHF_INJECTED) == 0);
+		QCOMPARE(std::ranges::count(desktop.posted, HookReleased), 1);
+	}
+
 	void init() {
 		desktop = {};
 		gTaskbarFilter.reset();
@@ -731,11 +899,9 @@ private slots:
 		gSuppressLoneSuperTap.store(false);
 		publishForegroundIntegrity(nullptr, false);
 		gThreadId.store(0);
-		gHookTick.store(0);
-		gKeyboardHookInstallTick.store(0);
-		gMouseHookInstallTick.store(0);
-		gKeyboardHookActive.store(false);
-		gMouseHookActive.store(false);
+		gStopRequested.store(false);
+		gOwnership = {};
+		keyboardHookState.active = false;
 		gThread = nullptr;
 		gFailed.store(false);
 		for (auto& down: gPhysicalDown) down.store(false);

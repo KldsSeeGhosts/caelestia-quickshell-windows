@@ -162,7 +162,7 @@ private:
 	QString mActiveSubmap;
 	QList<Trigger> triggers;
 	quint32 serial = 0;
-	bool hookRunning = false;
+	bool hookRequested = false;
 	bool dispatching = false;
 	bool gateActive = false;
 	bool gateButtonEvents = false;

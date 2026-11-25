@@ -84,7 +84,7 @@ private slots:
 		manager->binds.clear();
 		// Reset the fake hook between cases. With the taskbar policy enabled,
 		// an empty map intentionally keeps the production hook running.
-		manager->hookRunning = false;
+		manager->hookRequested = false;
 		qs::windows::hotkeys::KeyboardHook::stop();
 		hotkey_fixture::registerChords = false;
 		hotkey_fixture::canStart = true;
@@ -219,6 +219,25 @@ private slots:
 		QVERIFY(manager->activeSubmap().isEmpty());
 		QCOMPARE(manager->triggers.size(), 1);
 		QCOMPARE(manager->triggers.at(0).combo.vk, uint8_t(VK_F10));
+	}
+
+	void hookBindsBecomeAvailableAfterRecoveryWithoutReloading() {
+		using namespace qs::windows::hotkeys;
+		auto* manager = HotkeyManager::instance();
+		hotkey_fixture::canStart = false;
+		manager->parse(R"({"binds":[{"keys":"Super+R","action":"global","name":"fixture"}]})", "fixture");
+		manager->registerAll();
+		QVERIFY(manager->hookRequested);
+		QVERIFY(!manager->hookActive());
+		QCOMPARE(manager->bindsInfo().front().toMap()["mechanism"].toString(), QString("unavailable"));
+		auto snapshot = hotkey_fixture::snapshot;
+		QSignalSpy changed(manager, &HotkeyManager::bindsChanged);
+		hotkey_fixture::running = true;
+		manager->onHookEvent(HookStatusChanged, 0, 0);
+		QCOMPARE(changed.count(), 1);
+		QVERIFY(manager->hookActive());
+		QCOMPARE(manager->bindsInfo().front().toMap()["mechanism"].toString(), QString("hook"));
+		QVERIFY(hotkey_fixture::snapshot == snapshot);
 	}
 
 	void hookTappedDeliversEveryModifierTapCallback() {

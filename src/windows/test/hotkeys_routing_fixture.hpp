@@ -82,6 +82,8 @@ bool KeyboardHook::start(HWND, UINT) {
 	return hotkey_fixture::running = hotkey_fixture::canStart;
 }
 void KeyboardHook::stop() { hotkey_fixture::running = false; }
+bool KeyboardHook::retain() { return hotkey_fixture::running; }
+void KeyboardHook::release() {}
 bool KeyboardHook::isRunning() { return hotkey_fixture::running; }
 void KeyboardHook::setSnapshot(std::shared_ptr<const HookSnapshot> value) {
 	hotkey_fixture::snapshot = std::move(value);

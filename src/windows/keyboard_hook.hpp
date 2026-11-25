@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include <windows.h>
@@ -249,7 +250,8 @@ enum HookEvent : UINT {
 	HookReleased = 2,
 	HookTapped = 3,
 	HookReset = 4,
-	HookEventCount = 5,
+	HookStatusChanged = 5,
+	HookEventCount = 6,
 };
 
 /// Shared ownership of the one WH_KEYBOARD_LL hook.
@@ -288,66 +290,42 @@ namespace hookwatch {
 
 namespace detail {
 
-// Low-level input activity shared by the keyboard and mouse hook threads. The
-// GUI-thread watchdog uses these atomics; hook callbacks must stay lock-free.
-// LASTINPUTINFO has no device-type field, so separate keyboard and mouse input
-// ticks would mistake input on the other device for a dead hook. Both hook
-// procs therefore update one shared activity tick. These variables live in the
-// header because input_mask.cpp can be linked in contexts that stub out the
-// keyboard implementation; inline variables keep one process-wide state
-// without adding a link dependency in the opposite direction.
-inline std::atomic<DWORD> hookTick = 0;                // NOLINT
-inline std::atomic<DWORD> keyboardHookInstallTick = 0; // NOLINT
-inline std::atomic<DWORD> mouseHookInstallTick = 0;    // NOLINT
-inline std::atomic<bool> keyboardHookActive = false;   // NOLINT
-inline std::atomic<bool> mouseHookActive = false;      // NOLINT
-inline std::atomic<void (*)()> activeStateChanged = nullptr; // NOLINT
+// Only the timestamps are written by the hook threads. Demand and readiness
+// belong to the GUI thread. Keep this inline for fixtures that stub out the
+// keyboard hook but still compile input_mask.cpp.
+struct HookState {
+	std::atomic<uint64_t> callbackTick = 0;
+	std::atomic<uint64_t> installTick = 0;
+	bool needed = false;
+	bool active = false;
+};
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
+inline HookState keyboardHookState; // NOLINT
+inline HookState mouseHookState;    // NOLINT
+inline void (*stateChanged)() = nullptr; // NOLINT
 
 } // namespace detail
 
-inline void noteKeyboardInput() { detail::hookTick.store(GetTickCount(), std::memory_order_relaxed); }
-inline void noteMouseInput() { detail::hookTick.store(GetTickCount(), std::memory_order_relaxed); }
-
-inline void noteKeyboardInstalled() {
-	const auto now = GetTickCount();
-	detail::keyboardHookInstallTick.store(now, std::memory_order_relaxed);
-	detail::hookTick.store(now, std::memory_order_relaxed);
-	detail::keyboardHookActive.store(true, std::memory_order_release);
+inline void noteInput(detail::HookState& hook) {
+	hook.callbackTick.store(GetTickCount64(), std::memory_order_relaxed);
 }
 
-inline void noteMouseInstalled() {
-	const auto now = GetTickCount();
-	detail::mouseHookInstallTick.store(now, std::memory_order_relaxed);
-	detail::hookTick.store(now, std::memory_order_relaxed);
-	detail::mouseHookActive.store(true, std::memory_order_release);
+inline void noteInstalled(detail::HookState& hook) {
+	const auto now = GetTickCount64();
+	hook.installTick.store(now, std::memory_order_relaxed);
+	hook.callbackTick.store(now, std::memory_order_relaxed);
 }
 
-inline void notifyActiveStateChanged() {
-	if (auto* callback = detail::activeStateChanged.load(std::memory_order_acquire)) callback();
-}
-
-inline void setKeyboardActive(bool active) {
-	if (active) {
-		if (!detail::keyboardHookActive.load(std::memory_order_acquire)) noteKeyboardInstalled();
-	} else {
-		detail::keyboardHookActive.store(false, std::memory_order_release);
-	}
-	notifyActiveStateChanged();
-}
-
-inline void setMouseActive(bool active) {
-	if (active) {
-		if (!detail::mouseHookActive.load(std::memory_order_acquire)) noteMouseInstalled();
-	} else {
-		detail::mouseHookActive.store(false, std::memory_order_release);
-	}
-	notifyActiveStateChanged();
+inline void setNeeded(detail::HookState& hook, bool needed) {
+	if (std::exchange(hook.needed, needed) != needed && detail::stateChanged != nullptr)
+		detail::stateChanged();
 }
 
 } // namespace hookwatch
 
 class KeyboardHook {
 public:
+	// Keeps routing requested until stop(), even if installation must retry.
 	static bool start(HWND target, UINT messageBase);
 	static void stop();
 	[[nodiscard]] static bool isRunning();
@@ -357,7 +335,7 @@ public:
 
 	// Shared ownership independent of the hotkey manager's binds. `retain`
 	// starts the hook when nothing else has it running, `release` stops it only
-	// when no owner is left. Both are safe to call regardless of start/stop.
+	// when no owner is left. Pair retain() with release() even on failure.
 	static bool retain();
 	static void release();
 
@@ -365,8 +343,9 @@ public:
 	// the physical keys that are down (excluding mouse buttons and the generic
 	// modifier aliases) and subscribes `target` to every later transition.
 	// `keyMessage` carries wParam = virtual key and lParam = 1 for key-up;
-	// `resetMessage` is posted when the input desktop changes and every hold is
-	// gone. Returns false when the hook did not answer.
+	// `resetMessage` is posted when the desktop changes or the hook re-arms,
+	// because the observer can no longer rely on receiving releases.
+	// Returns false when the hook did not answer.
 	static bool armInputObserver(
 	    HWND target,
 	    UINT keyMessage,

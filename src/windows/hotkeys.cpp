@@ -563,7 +563,7 @@ HotkeyManager::HotkeyManager(QObject* parent): QObject(parent) {
 	QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, this, [this] {
 		this->unregisterAll();
 		KeyboardHook::stop();
-		this->hookRunning = false;
+		this->hookRequested = false;
 	});
 }
 
@@ -610,7 +610,7 @@ bool HotkeyManager::setSubmap(const QString& name, QString* refusal) {
 	this->unregisterAll(false);
 	this->mActiveSubmap = target;
 	this->registerAll();
-	if (!target.isEmpty() && !this->hookRunning) {
+	if (!target.isEmpty() && !this->hookActive()) {
 		// Without the hook's desktop-switch event, even registered-only maps
 		// could survive a session lock. Refuse entry and restore global routing.
 		this->unregisterAll();
@@ -1049,23 +1049,16 @@ void HotkeyManager::registerTriggers() {
 	    && this->mActiveSubmap.isEmpty() && !taskbarShortcutFilterEnabled())
 	{
 		KeyboardHook::stop();
-		this->hookRunning = false;
+		this->hookRequested = false;
 	} else {
 		KeyboardHook::setSnapshot(snapshot);
 
-		if (!this->hookRunning) {
-			this->hookRunning = KeyboardHook::start(this->messageWindow, WM_QS_HOOK_BASE);
-			if (this->hookRunning) qCInfo(logHotkeys) << "Keyboard hook installed.";
-		}
-
-		if (!this->hookRunning) {
-			qCWarning(logHotkeys) << "Failed to install the keyboard hook (error" << GetLastError()
-			                      << "), hook-backed binds are unavailable.";
-
-			for (auto& trigger: this->triggers) {
-				if (trigger.mechanism == Bind::Mechanism::Hook) {
-					trigger.mechanism = Bind::Mechanism::Unavailable;
-				}
+		if (!this->hookRequested) {
+			this->hookRequested = true;
+			if (KeyboardHook::start(this->messageWindow, WM_QS_HOOK_BASE)) {
+				qCInfo(logHotkeys) << "Keyboard hook installed.";
+			} else {
+				qCWarning(logHotkeys) << "Keyboard hook unavailable, hook-backed binds will wait for recovery.";
 			}
 		}
 	}
@@ -1075,17 +1068,21 @@ void HotkeyManager::registerTriggers() {
 	}
 }
 
-bool HotkeyManager::hookActive() const { return this->hookRunning; }
+bool HotkeyManager::hookActive() const { return this->hookRequested && KeyboardHook::isRunning(); }
 
 QVariantList HotkeyManager::bindsInfo() const {
 	QVariantList list;
+	const auto hookActive = this->hookActive();
 
 	for (const auto& bind: this->binds) {
 		QVariantMap map;
 		map["keys"] = bind.keys;
 		map["submap"] = bind.submap;
 		map["action"] = actionName(bind.action);
-		map["mechanism"] = mechanismName(bind.mechanism);
+		map["mechanism"] = mechanismName(
+		    bind.mechanism == Bind::Mechanism::Hook && !hookActive ? Bind::Mechanism::Unavailable
+		                                                           : bind.mechanism
+		);
 		map["description"] = bind.description;
 		map["onRelease"] = bind.onRelease;
 		map["repeat"] = bind.repeat;
@@ -1134,18 +1131,12 @@ bool HotkeyManager::beginChordReleaseWait() {
 	case ChordRequest::Wait: break;
 	}
 
-	// Every bind may be a RegisterHotKey chord, in which case the hook was
-	// stopped. Start it for this wait only, with no stale trigger snapshot; it
-	// is stopped again when the wait finishes unless a bind needs it.
-	auto startedHook = false;
-	if (!KeyboardHook::isRunning()) {
-		KeyboardHook::setSnapshot(nullptr);
-		if (!KeyboardHook::start(this->messageWindow, WM_QS_HOOK_BASE)) {
-			qCWarning(logHotkeys) << "Keyboard hook unavailable, display off can't wait for the chord "
-			                         "release.";
-			return false;
-		}
-		startedHook = true;
+	// The display-off wait owns its reference independently of the key map.
+	// If recovery is in progress, failing this wait must not drop map demand.
+	if (!KeyboardHook::retain()) {
+		KeyboardHook::release();
+		qCWarning(logHotkeys) << "Keyboard hook unavailable, display off can't wait for the chord release.";
+		return false;
 	}
 
 	// The hook thread takes the snapshot and subscribes in one step, so a
@@ -1158,10 +1149,7 @@ bool HotkeyManager::beginChordReleaseWait() {
 	        keys
 	    ))
 	{
-		if (startedHook) {
-			KeyboardHook::stop();
-			KeyboardHook::setSnapshot(nullptr);
-		}
+		KeyboardHook::release();
 		qCWarning(logHotkeys) << "Keyboard hook did not answer, display off can't wait for the chord "
 		                         "release.";
 		return false;
@@ -1170,10 +1158,7 @@ bool HotkeyManager::beginChordReleaseWait() {
 	auto result = this->inputSettle.arm(keys);
 	if (result != InputSettle::Result::Waiting) {
 		KeyboardHook::clearInputObserver();
-		if (startedHook) {
-			KeyboardHook::stop();
-			KeyboardHook::setSnapshot(nullptr);
-		}
+		KeyboardHook::release();
 		return false;
 	}
 
@@ -1214,10 +1199,7 @@ void HotkeyManager::finishInputSettle(bool settled) {
 		this->gateButtonEvents = false;
 	}
 
-	if (!this->hookRunning && KeyboardHook::isRunning()) {
-		KeyboardHook::stop();
-		KeyboardHook::setSnapshot(nullptr);
-	}
+	KeyboardHook::release();
 
 	if (settled) emit this->chordReleaseSettled();
 	else emit this->chordReleaseCancelled();
@@ -1311,6 +1293,10 @@ void HotkeyManager::pollReleases() {
 }
 
 void HotkeyManager::onHookEvent(HookEvent event, quint32 triggerId, quint32 serial) {
+	if (event == HookStatusChanged) {
+		emit this->bindsChanged();
+		return;
+	}
 	if (event == HookReset) {
 		if (serial == this->serial) this->onInputLifecycleLost();
 		return;
