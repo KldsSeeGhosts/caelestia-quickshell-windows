@@ -538,6 +538,7 @@ struct Channel {
 		bool queryWindows = false;
 		bool publicOperation = false;
 		HWND moveTarget = nullptr;
+		bool switchCommand = false;
 	};
 	std::shared_ptr<Worker> worker;
 	Snapshot snapshot;
@@ -560,6 +561,8 @@ struct Channel {
 	quint64 applied = 0;
 	quint64 desktopReadApplied = 0;
 	quint64 cancelledCommandSequence = 0;
+	quint64 failedSwitchSequence = 0;
+	HRESULT failedSwitchError = S_OK;
 	quint64 windowRevision = 0;
 #ifdef QS_TEST
 	NativeDesktopFactory factory;
@@ -699,7 +702,8 @@ struct Channel {
 	    bool queryWindows = false,
 	    bool publicOperation = false,
 	    Kind kind = Kind::Command,
-	    HWND moveTarget = nullptr
+	    HWND moveTarget = nullptr,
+	    bool switchCommand = false
 	) {
 		if (this->waiting) {
 			this->snapshot.error = HRESULT_FROM_WIN32(ERROR_BUSY);
@@ -754,9 +758,15 @@ struct Channel {
 			}
 			// The request is still owned by this generation, not failed.
 			// Keep its future so the GUI can apply the eventual result.
-			this->pending.emplace(
-			    Pending {request, std::move(result), kind, queryWindows, publicOperation, moveTarget}
-			);
+			this->pending.emplace(Pending {
+			    request,
+			    std::move(result),
+			    kind,
+			    queryWindows,
+			    publicOperation,
+			    moveTarget,
+			    switchCommand,
+			});
 			this->armDeadline();
 			return kind == Kind::Command ? 0 : -1;
 		}
@@ -901,10 +911,15 @@ struct Channel {
 		slot.reset();
 		try {
 			auto value = finished.result.get();
+			const auto seq = value.sequence;
 			const auto outcome = value.result;
 			const auto success = outcome != -1;
 			const auto operationError = value.operationError;
 			const auto publicReady = value.publicReady;
+			if (finished.switchCommand && outcome == -1 && seq > this->failedSwitchSequence) {
+				this->failedSwitchSequence = seq;
+				this->failedSwitchError = operationError;
+			}
 			if (!finished.queryWindows) value.windows = this->snapshot.windows;
 			if (value.sequence < this->applied) this->refreshAgain = true;
 			const auto available = this->apply(std::move(value));
@@ -936,6 +951,12 @@ struct Channel {
 			if (finished.kind == Kind::Command) this->refreshAgain = true;
 			this->notify();
 		} catch (...) {
+			if (finished.switchCommand && finished.request
+			    && finished.request->sequence > this->failedSwitchSequence)
+			{
+				this->failedSwitchSequence = finished.request->sequence;
+				this->failedSwitchError = E_UNEXPECTED;
+			}
 			this->retire(E_UNEXPECTED);
 			if (finished.moveTarget != nullptr) {
 				const auto moveSequence = finished.request ? finished.request->sequence : 0;
@@ -1122,27 +1143,43 @@ bool nativeDesktopRequestPending() {
 quint64 nativeDesktopSubmittedSequence() { return channel().sequence; }
 quint64 nativeDesktopReadSequence() { return channel().desktopReadApplied; }
 quint64 nativeDesktopCancelledSequence() { return channel().cancelledCommandSequence; }
+quint64 nativeDesktopFailedSwitchSequence() { return channel().failedSwitchSequence; }
+HRESULT nativeDesktopFailedSwitchError() { return channel().failedSwitchError; }
 quint64 nativeDesktopWindowSnapshotRevision() { return channel().windowRevision; }
 GUID nativeWindowDesktopId(HWND hwnd) { return channel().window(hwnd).id; }
 int nativeWindowOnCurrentDesktop(HWND hwnd) { return channel().window(hwnd).onCurrent; }
 int switchNativeDesktopById(GUID desktop) {
-	return channel().execute([desktop] { return switchDesktop(workerIndex(desktop)); });
+	return channel().execute(
+	    [desktop] { return switchDesktop(workerIndex(desktop)); },
+	    false,
+	    false,
+	    Channel::Kind::Command,
+	    nullptr,
+	    true
+	);
 }
 int switchNativeDesktopByIdIfCurrent(GUID desktop, GUID expectedCurrent) {
-	return channel().execute([desktop, expectedCurrent] {
-		auto& p = provider();
-		p.lastError = S_OK;
-		if (!p.refresh()) return -1;
-		if (p.current < 0 || p.current >= p.ids.size()
-		    || !IsEqualGUID(p.ids[p.current], expectedCurrent))
-		{
-			p.operationError = HRESULT_FROM_WIN32(ERROR_CANCELLED);
-			return -2;
-		}
-		if (IsEqualGUID(desktop, expectedCurrent)) return 0;
-		p.desktopRefreshed = false;
-		return switchDesktop(workerIndex(desktop));
-	});
+	return channel().execute(
+	    [desktop, expectedCurrent] {
+		    auto& p = provider();
+		    p.lastError = S_OK;
+		    if (!p.refresh()) return -1;
+		    if (p.current < 0 || p.current >= p.ids.size()
+		        || !IsEqualGUID(p.ids[p.current], expectedCurrent))
+		    {
+			    p.operationError = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+			    return -2;
+		    }
+		    if (IsEqualGUID(desktop, expectedCurrent)) return 0;
+		    p.desktopRefreshed = false;
+		    return switchDesktop(workerIndex(desktop));
+	    },
+	    false,
+	    false,
+	    Channel::Kind::Command,
+	    nullptr,
+	    true
+	);
 }
 int moveNativeDesktopWindowById(HWND hwnd, GUID desktop) {
 	const auto result = channel().execute(
@@ -1201,6 +1238,8 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.applied = 0;
 	p.desktopReadApplied = 0;
 	p.cancelledCommandSequence = 0;
+	p.failedSwitchSequence = 0;
+	p.failedSwitchError = S_OK;
 	p.windowRevision = 0;
 	p.snapshot = {};
 	p.watchedWindows.clear();

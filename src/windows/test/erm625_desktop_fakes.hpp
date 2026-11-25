@@ -220,8 +220,9 @@ struct Fixture {
 	void clearFaults() {
 		this->manager.publishSwitch = this->manager.publishCreation = false;
 		this->manager.switchResult = this->manager.moveResult = S_OK;
+		this->manager.canMove = TRUE;
 		this->manager.beforeEnumeration = this->manager.beforeSwitch = {};
-		this->manager.beforeCreate = this->manager.beforeMove = {};
+		this->manager.beforeCreate = this->manager.beforeCanMove = this->manager.beforeMove = {};
 		this->manager.beforeRelease = this->manager.array.beforeRelease = {};
 		this->one.beforeRelease = this->two.beforeRelease = this->three.beforeRelease = {};
 		this->views.beforeRelease = this->views.view.beforeRelease = {};

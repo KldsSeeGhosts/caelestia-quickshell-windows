@@ -403,23 +403,22 @@ private slots:
 			QCoreApplication::processEvents();
 			if (!succeed) QCOMPARE(membership.count(), 0); // No unchanged signal that reissues a panel move.
 		} else {
+			const auto expectedOutcome = succeed
+			                               ? QStringLiteral("observed")
+			                               : (operation == "switch" ? QStringLiteral("denied")
+			                                                        : QStringLiteral("timed-out"));
+			const auto expectedReason = operation == "switch" ? QStringLiteral("permission-denied")
+			                                                  : QStringLiteral("observation-timeout");
 			QVERIFY(waitUntil(
-			    [this, succeed] {
-				    return this->desktops->lastCommand().value("outcome").toString()
-				        == (succeed ? QStringLiteral("observed") : QStringLiteral("timed-out"));
+			    [this, expectedOutcome] {
+				    return this->desktops->lastCommand().value("outcome").toString() == expectedOutcome;
 			    },
 			    2500
 			));
-			QCOMPARE(
-			    this->desktops->lastCommand().value("outcome").toString(),
-			    succeed ? QStringLiteral("observed") : QStringLiteral("timed-out")
-			);
+			QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), expectedOutcome);
 			QCOMPARE(this->desktops->lastCommand().value("requestId"), accepted.value("requestId"));
 			if (!succeed)
-				QCOMPARE(
-				    this->desktops->lastCommand().value("reason").toString(),
-				    QStringLiteral("observation-timeout")
-				);
+				QCOMPARE(this->desktops->lastCommand().value("reason").toString(), expectedReason);
 		}
 		if (operation == "create") {
 			QCOMPARE(completion->calls, 1);
@@ -1206,10 +1205,14 @@ private slots:
 		QVERIFY(waitUntil(
 		    [this] {
 			    return this->desktops->lastCommand().value("outcome").toString()
-			        == QStringLiteral("timed-out");
+			        == QStringLiteral("denied");
 		    },
 		    1000
 		));
+		QCOMPARE(
+		    this->desktops->lastCommand().value("reason").toString(),
+		    QStringLiteral("permission-denied")
+		);
 		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
 		this->old.manager.beforeSwitch = {};
 		this->old.manager.switchResult = S_OK;
@@ -1510,14 +1513,16 @@ private slots:
 	void originChangedOnThirdDesktopStillAllowsSubsequentConditionalFollow() {
 		this->old.manager.array.desktops = {&this->old.one, &this->old.two, &this->old.three};
 		this->old.manager.current = &this->old.one;
-		this->old.manager.publishSwitch = true;
+		// Keep publishSwitch false so SwitchDesktop(B) succeeds without publishing B,
+		// allowing the post-command refresh to report C and hit the third-desktop branch.
+		this->old.manager.publishSwitch = false;
 		QCOMPARE(refreshNativeDesktopForTest(), 3);
 		this->desktops->refresh();
 		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
 
 		auto blocked = std::make_shared<BlockingCall>();
 		Unblock unblock {blocked};
-		this->old.manager.beforeEnumeration = [blocked] { (*blocked)(); };
+		this->old.manager.beforeSwitch = [blocked] { (*blocked)(); };
 
 		const auto firstIntent = this->desktops->beginWorkspaceIntent();
 		int firstObserved = 0;
@@ -1531,6 +1536,7 @@ private slots:
 		));
 		QVERIFY(nativeDesktopCommandPending());
 
+		// Origin check on A passed and SwitchDesktop(B) is in flight; Task View moves to C.
 		this->old.manager.current = &this->old.three;
 		blocked->release();
 		QVERIFY(waitUntil(
@@ -1541,12 +1547,18 @@ private slots:
 		    1000
 		));
 		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
-		this->old.manager.beforeEnumeration = {};
+		this->old.manager.beforeSwitch = {};
+		QCOMPARE(
+		    this->desktops->lastCommand().value("reason").toString(),
+		    QStringLiteral("origin-changed")
+		);
 		QCOMPARE(firstObserved, 0);
-		QCOMPARE(this->old.manager.switches, 0);
+		QCOMPARE(this->old.manager.switches, 1);
 		QCOMPARE(this->desktops->currentIndex(), qsizetype(2));
+		QVERIFY(this->desktops->isDesktopCurrentlyActive(2, this->old.three.id));
 
 		// A subsequent conditional follow from C to B must still succeed.
+		this->old.manager.publishSwitch = true;
 		const auto nextIntent = this->desktops->beginWorkspaceIntent();
 		int nextObserved = 0;
 		QVERIFY(this->desktops->switchTo(
@@ -1559,9 +1571,104 @@ private slots:
 		));
 		QVERIFY(waitUntil([&nextObserved] { return nextObserved == 1; }, 1000));
 		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
-		QCOMPARE(this->old.manager.switches, 1);
+		QCOMPARE(this->old.manager.switches, 2);
 		QCOMPARE(this->old.manager.current, &this->old.two);
 		QCOMPARE(this->desktops->currentIndex(), qsizetype(1));
+	}
+
+	void moveAndFollowSucceedsAfterObservationTimeout() {
+		this->old.manager.array.desktops = {&this->old.one, &this->old.two};
+		this->old.manager.current = &this->old.one;
+		this->old.manager.publishSwitch = false;
+		QCOMPARE(refreshNativeDesktopForTest(), 2);
+		this->desktops->refresh();
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));
+
+		// Explicit switch accepted synchronously, never observed -> times out after 1500 ms.
+		QVERIFY(this->desktops->switchTo(1));
+		QCOMPARE(this->desktops->lastCommand().value("outcome").toString(), QStringLiteral("accepted"));
+		QVERIFY(!this->desktops->isDesktopCurrentlyActive(0, this->old.one.id));
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("timed-out");
+		    },
+		    2500
+		));
+		QCOMPARE(
+		    this->desktops->lastCommand().value("reason").toString(),
+		    QStringLiteral("observation-timeout")
+		);
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QVERIFY(this->desktops->isDesktopCurrentlyActive(0, this->old.one.id));
+
+		// A subsequent conditional move-and-follow from A to B must succeed after timeout recovery.
+		this->old.manager.publishSwitch = true;
+		const auto followIntent = this->desktops->beginWorkspaceIntent();
+		int observedCalls = 0;
+		QVERIFY(this->desktops->switchTo(
+		    1,
+		    {},
+		    [&observedCalls](qsizetype) { ++observedCalls; },
+		    followIntent,
+		    this->old.two.id,
+		    this->old.one.id
+		));
+		QVERIFY(waitUntil([&observedCalls] { return observedCalls == 1; }, 1000));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->old.manager.current, &this->old.two);
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(1));
+	}
+
+	void lateDeniedSwitchWhenTaskViewLandsOnDestinationSkipsFollow() {
+		this->old.manager.array.desktops = {&this->old.one, &this->old.two, &this->old.three};
+		this->old.manager.current = &this->old.one;
+		this->old.manager.publishSwitch = true;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		this->desktops->refresh();
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));
+
+		auto blocked = std::make_shared<BlockingCall>();
+		Unblock unblock {blocked};
+		this->old.manager.beforeSwitch = [blocked] { (*blocked)(); };
+		this->old.manager.switchResult = E_ACCESSDENIED;
+
+		const auto followIntent = this->desktops->beginWorkspaceIntent();
+		int observedCalls = 0;
+		QVERIFY(this->desktops->switchTo(
+		    1,
+		    {},
+		    [&observedCalls](qsizetype) { ++observedCalls; },
+		    followIntent,
+		    this->old.two.id,
+		    this->old.one.id
+		));
+		QVERIFY(nativeDesktopCommandPending());
+
+		// Origin check on A passed; SwitchDesktop(B) will return E_ACCESSDENIED after 100 ms,
+		// while Task View independently switches directly to destination B.
+		this->old.manager.current = &this->old.two;
+		blocked->release();
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("denied");
+		    },
+		    1000
+		));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		this->old.manager.beforeSwitch = {};
+		this->old.manager.switchResult = S_OK;
+		QCOMPARE(
+		    this->desktops->lastCommand().value("reason").toString(),
+		    QStringLiteral("permission-denied")
+		);
+		QCOMPARE(this->old.manager.switches, 1);
+		QCOMPARE(observedCalls, 0);
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(1));
+		QVERIFY(this->desktops->isDesktopCurrentlyActive(1, this->old.two.id));
 	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)

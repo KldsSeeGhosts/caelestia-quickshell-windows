@@ -29,6 +29,8 @@ void requestNativeDesktopRefresh();
 [[nodiscard]] quint64 nativeDesktopSubmittedSequence();
 [[nodiscard]] quint64 nativeDesktopReadSequence();
 [[nodiscard]] quint64 nativeDesktopCancelledSequence();
+[[nodiscard]] quint64 nativeDesktopFailedSwitchSequence();
+[[nodiscard]] HRESULT nativeDesktopFailedSwitchError();
 [[nodiscard]] quint64 nativeDesktopWindowSnapshotRevision();
 [[nodiscard]] GUID nativeWindowDesktopId(HWND hwnd);
 [[nodiscard]] int nativeWindowOnCurrentDesktop(HWND hwnd);

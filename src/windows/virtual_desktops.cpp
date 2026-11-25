@@ -665,7 +665,11 @@ void VirtualDesktops::initCommandObservation() {
 			this->switchDeadline.start();
 			return;
 		}
-		this->finishSwitch(DesktopCommandOutcome::TimedOut, QStringLiteral("observation-timeout"));
+		if (this->pendingSwitch) {
+			this->finishSwitch(DesktopCommandOutcome::TimedOut, QStringLiteral("observation-timeout"));
+		} else if (this->mHasUnobservedNativeSwitch) {
+			this->clearUnobservedNativeSwitch(true);
+		}
 	});
 	QObject::connect(this, &AccessorState::accessorStateChanged, this, [this] {
 		this->notifyCapability();
@@ -748,6 +752,17 @@ bool VirtualDesktops::isDesktopCurrentlyActive(qsizetype index, const GUID& targ
 	return nativeCurrent == index;
 }
 
+void VirtualDesktops::clearUnobservedNativeSwitch(bool requireFreshRead) {
+	this->mHasUnobservedNativeSwitch = false;
+	if (requireFreshRead && this->nativeAccessor) {
+		const auto barrier = nativeDesktopSubmittedSequence();
+		if (barrier > this->mLastNativeSwitchSequence) {
+			this->mLastNativeSwitchSequence = barrier;
+		}
+		requestNativeDesktopRefresh();
+	}
+}
+
 void VirtualDesktops::finishSwitch(DesktopCommandOutcome outcome, const QString& reason) {
 	if (!this->pendingSwitch) return;
 	QPointer<VirtualDesktops> self(this);
@@ -756,6 +771,11 @@ void VirtualDesktops::finishSwitch(DesktopCommandOutcome outcome, const QString&
 	this->switchDeadline.stop();
 	if (outcome == DesktopCommandOutcome::Observed) {
 		this->mHasUnobservedNativeSwitch = false;
+	} else if ((outcome == DesktopCommandOutcome::TimedOut || outcome == DesktopCommandOutcome::Denied)
+	           && (!this->nativeAccessor
+	               || this->mLastNativeSwitchSequence == pending.minObservationSequence))
+	{
+		this->clearUnobservedNativeSwitch(outcome == DesktopCommandOutcome::TimedOut);
 	}
 	this->publishCommand(DesktopRequestResult {pending.id, QStringLiteral("switch"), outcome, reason});
 	if (self && outcome == DesktopCommandOutcome::Observed
@@ -776,6 +796,15 @@ void VirtualDesktops::observeSwitch() {
 				this->mHasUnobservedNativeSwitch = false;
 			}
 			this->finishSwitch(DesktopCommandOutcome::Superseded, QStringLiteral("origin-changed"));
+			return;
+		}
+		if (nativeDesktopFailedSwitchSequence() == pending.minObservationSequence) {
+			this->finishSwitch(
+			    DesktopCommandOutcome::Denied,
+			    VirtualDesktops::failureReasonForError(
+			        this->availability(), nativeDesktopFailedSwitchError()
+			    )
+			);
 			return;
 		}
 		if (nativeDesktopReadSequence() <= pending.minObservationSequence) {
@@ -854,6 +883,16 @@ bool VirtualDesktops::switchTo(
 	const auto switchOrder = ++this->mSwitchOrder;
 	const auto switchIntent = ++this->mWorkspaceIntentOrder;
 	this->finishSwitch(DesktopCommandOutcome::Superseded, QStringLiteral("newer-request"));
+	struct DeadlineGuard {
+		QPointer<VirtualDesktops> self;
+		~DeadlineGuard() {
+			if (this->self && this->self->mHasUnobservedNativeSwitch && !this->self->pendingSwitch
+			    && !this->self->switchDeadline.isActive())
+			{
+				this->self->switchDeadline.start();
+			}
+		}
+	} deadlineGuard {self};
 	if (!self || self->mSwitchOrder != switchOrder || self->mWorkspaceIntentOrder != switchIntent) {
 		return false;
 	}

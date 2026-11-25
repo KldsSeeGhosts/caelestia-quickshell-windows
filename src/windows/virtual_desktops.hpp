@@ -194,6 +194,7 @@ private:
 	void initCommandObservation();
 	void observeSwitch();
 	void finishSwitch(DesktopCommandOutcome outcome, const QString& reason = {});
+	void clearUnobservedNativeSwitch(bool requireFreshRead = false);
 	[[nodiscard]] static QString failureReasonForError(DesktopAvailability availability, HRESULT error);
 	[[nodiscard]] QString commandFailureReason() const;
 
