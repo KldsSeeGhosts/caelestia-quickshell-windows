@@ -559,6 +559,7 @@ struct Channel {
 	quint64 sequence = 0;
 	quint64 applied = 0;
 	quint64 desktopReadApplied = 0;
+	quint64 cancelledCommandSequence = 0;
 	quint64 windowRevision = 0;
 #ifdef QS_TEST
 	NativeDesktopFactory factory;
@@ -683,6 +684,11 @@ struct Channel {
 		}
 		if (result.desktopRead && result.sequence > this->desktopReadApplied) {
 			this->desktopReadApplied = result.sequence;
+		}
+		if (result.result == -2 && result.operationError == HRESULT_FROM_WIN32(ERROR_CANCELLED)
+		    && result.sequence > this->cancelledCommandSequence)
+		{
+			this->cancelledCommandSequence = result.sequence;
 		}
 		this->snapshot = std::move(result);
 		return true;
@@ -1115,6 +1121,7 @@ bool nativeDesktopRequestPending() {
 }
 quint64 nativeDesktopSubmittedSequence() { return channel().sequence; }
 quint64 nativeDesktopReadSequence() { return channel().desktopReadApplied; }
+quint64 nativeDesktopCancelledSequence() { return channel().cancelledCommandSequence; }
 quint64 nativeDesktopWindowSnapshotRevision() { return channel().windowRevision; }
 GUID nativeWindowDesktopId(HWND hwnd) { return channel().window(hwnd).id; }
 int nativeWindowOnCurrentDesktop(HWND hwnd) { return channel().window(hwnd).onCurrent; }
@@ -1193,6 +1200,7 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.refusedBuild = false;
 	p.applied = 0;
 	p.desktopReadApplied = 0;
+	p.cancelledCommandSequence = 0;
 	p.windowRevision = 0;
 	p.snapshot = {};
 	p.watchedWindows.clear();

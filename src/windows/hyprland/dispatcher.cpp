@@ -158,7 +158,6 @@ void followMovedWindow(
 		return;
 	}
 
-	behavior->prepareWarp(targetIndex, true);
 	(void)guardedDesktops->switchTo(
 	    targetIndex,
 	    windowStillValid,
@@ -169,7 +168,9 @@ void followMovedWindow(
 	     activationSource](qsizetype observedIndex) {
 		    if (!windowStillValid() || !guardedDesktops) return;
 		    if (!guardedDesktops->isDesktopCurrentlyActive(observedIndex, targetDesktopId)) return;
-		    WorkspaceBehavior::instance()->expectFocus(observedIndex, activationSource);
+		    auto* workspaceBehavior = WorkspaceBehavior::instance();
+		    workspaceBehavior->prepareWarp(observedIndex, true);
+		    workspaceBehavior->expectFocus(observedIndex, activationSource);
 		    guardedWindow->activateOnCurrentDesktop(activationSource);
 	    },
 	    workspaceIntent,

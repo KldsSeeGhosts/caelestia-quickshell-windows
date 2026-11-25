@@ -770,9 +770,15 @@ void VirtualDesktops::observeSwitch() {
 	if (!this->pendingSwitch) return;
 	auto& pending = *this->pendingSwitch;
 	if (this->nativeAccessor && pending.minObservationSequence != 0) {
-		if (nativeDesktopCommandPending()
-		    || nativeDesktopReadSequence() <= pending.minObservationSequence)
-		{
+		if (nativeDesktopCommandPending()) return;
+		if (nativeDesktopCancelledSequence() == pending.minObservationSequence) {
+			if (this->mLastNativeSwitchSequence == pending.minObservationSequence) {
+				this->mHasUnobservedNativeSwitch = false;
+			}
+			this->finishSwitch(DesktopCommandOutcome::Superseded, QStringLiteral("origin-changed"));
+			return;
+		}
+		if (nativeDesktopReadSequence() <= pending.minObservationSequence) {
 			return;
 		}
 	}
@@ -781,6 +787,11 @@ void VirtualDesktops::observeSwitch() {
 	    && !IsEqualGUID(this->mDesktops[this->mCurrent].id, *pending.expectedOrigin)
 	    && !IsEqualGUID(this->mDesktops[this->mCurrent].id, pending.desktop))
 	{
+		if (this->nativeAccessor
+		    && this->mLastNativeSwitchSequence == pending.minObservationSequence)
+		{
+			this->mHasUnobservedNativeSwitch = false;
+		}
 		this->finishSwitch(DesktopCommandOutcome::Superseded, QStringLiteral("origin-changed"));
 		return;
 	}

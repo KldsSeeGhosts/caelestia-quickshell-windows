@@ -1459,6 +1459,110 @@ private slots:
 		QCOMPARE(this->desktops->currentIndex(), qsizetype(2));
 		QCOMPARE(observedCalls, 0);
 	}
+
+	void slowOriginCheckCancelledWhenTaskViewSwitchedToDestinationSkipsFollow() {
+		this->old.manager.array.desktops = {&this->old.one, &this->old.two, &this->old.three};
+		this->old.manager.current = &this->old.one;
+		this->old.manager.publishSwitch = true;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		this->desktops->refresh();
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(0));
+
+		auto blocked = std::make_shared<BlockingCall>();
+		Unblock unblock {blocked};
+		this->old.manager.beforeEnumeration = [blocked] { (*blocked)(); };
+
+		const auto moveIntent = this->desktops->beginWorkspaceIntent();
+		int observedCalls = 0;
+		QVERIFY(this->desktops->switchTo(
+		    1,
+		    {},
+		    [&observedCalls](qsizetype) { ++observedCalls; },
+		    moveIntent,
+		    this->old.two.id,
+		    this->old.one.id
+		));
+		QVERIFY(nativeDesktopCommandPending());
+
+		// User switched directly to destination B in Task View while the origin check was slow.
+		this->old.manager.current = &this->old.two;
+		blocked->release();
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("superseded");
+		    },
+		    1000
+		));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		this->old.manager.beforeEnumeration = {};
+		QCOMPARE(
+		    this->desktops->lastCommand().value("reason").toString(),
+		    QStringLiteral("origin-changed")
+		);
+		QCOMPARE(this->old.manager.switches, 0);
+		QCOMPARE(observedCalls, 0);
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(1));
+		QVERIFY(this->desktops->isDesktopCurrentlyActive(1, this->old.two.id));
+	}
+
+	void originChangedOnThirdDesktopStillAllowsSubsequentConditionalFollow() {
+		this->old.manager.array.desktops = {&this->old.one, &this->old.two, &this->old.three};
+		this->old.manager.current = &this->old.one;
+		this->old.manager.publishSwitch = true;
+		QCOMPARE(refreshNativeDesktopForTest(), 3);
+		this->desktops->refresh();
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+
+		auto blocked = std::make_shared<BlockingCall>();
+		Unblock unblock {blocked};
+		this->old.manager.beforeEnumeration = [blocked] { (*blocked)(); };
+
+		const auto firstIntent = this->desktops->beginWorkspaceIntent();
+		int firstObserved = 0;
+		QVERIFY(this->desktops->switchTo(
+		    1,
+		    {},
+		    [&firstObserved](qsizetype) { ++firstObserved; },
+		    firstIntent,
+		    this->old.two.id,
+		    this->old.one.id
+		));
+		QVERIFY(nativeDesktopCommandPending());
+
+		this->old.manager.current = &this->old.three;
+		blocked->release();
+		QVERIFY(waitUntil(
+		    [this] {
+			    return this->desktops->lastCommand().value("outcome").toString()
+			        == QStringLiteral("superseded");
+		    },
+		    1000
+		));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		this->old.manager.beforeEnumeration = {};
+		QCOMPARE(firstObserved, 0);
+		QCOMPARE(this->old.manager.switches, 0);
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(2));
+
+		// A subsequent conditional follow from C to B must still succeed.
+		const auto nextIntent = this->desktops->beginWorkspaceIntent();
+		int nextObserved = 0;
+		QVERIFY(this->desktops->switchTo(
+		    1,
+		    {},
+		    [&nextObserved](qsizetype) { ++nextObserved; },
+		    nextIntent,
+		    this->old.two.id,
+		    this->old.three.id
+		));
+		QVERIFY(waitUntil([&nextObserved] { return nextObserved == 1; }, 1000));
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(this->old.manager.switches, 1);
+		QCOMPARE(this->old.manager.current, &this->old.two);
+		QCOMPARE(this->desktops->currentIndex(), qsizetype(1));
+	}
 };
 QTEST_GUILESS_MAIN(Erm625NativeDesktopFacadeTest)
 #include "erm625_native_desktop_facade_test.moc"
