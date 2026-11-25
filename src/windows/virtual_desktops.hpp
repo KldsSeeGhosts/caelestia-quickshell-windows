@@ -19,6 +19,11 @@
 
 namespace qs::windows {
 
+// Result of pinning one of the shell's own windows to every desktop.
+// Unavailable means the native pinning service is absent, so a caller may
+// fall back to the accessor table (tests) or follow the current desktop.
+enum class OwnWindowPin : quint8 { Pinned, Refused, Busy, Unavailable };
+
 class RegistryWatcher: public QThread {
 	Q_OBJECT;
 
@@ -114,6 +119,9 @@ public:
 	    std::optional<GUID> requestedTargetId = std::nullopt
 	);
 	bool pinWindow(HWND hwnd, bool pinned);
+	// Own panels only. Never exposed as Hyprland pin support, so toplevel
+	// queries keep reading cached state instead of waiting on COM.
+	OwnWindowPin pinOwnWindow(HWND hwnd);
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;
 	[[nodiscard]] DesktopAvailability availability() const;
 	[[nodiscard]] bool supports(DesktopOperation operation) const;

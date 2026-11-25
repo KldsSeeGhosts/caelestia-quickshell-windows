@@ -270,7 +270,15 @@ private:
 	bool maskRouted = false;
 	bool appBarDeferred = false;
 	bool pinnedToAllDesktops = false;
+	// The HWND the pin belongs to. A recreated native window starts unpinned.
+	HWND pinnedHwnd = nullptr;
 	HWND pinFailedHwnd = nullptr;
+	// The HWND the busy retries are counted for.
+	HWND pinAttemptHwnd = nullptr;
+	int pinBusyRetries = 0;
+	[[nodiscard]] bool pinnedHere(HWND hwnd) const {
+		return this->pinnedToAllDesktops && hwnd != nullptr && this->pinnedHwnd == hwnd;
+	}
 	HWND explorerTaskbar = nullptr;
 	DWORD explorerTaskbarPid = 0;
 	DWORD explorerTaskbarThread = 0;

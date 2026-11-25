@@ -1195,6 +1195,12 @@ bool VirtualDesktops::pinWindow(HWND hwnd, bool pinned) {
 	return this->call(-1, pinned ? a.pinWindow : a.unPinWindow, hwnd) != -1;
 }
 
+OwnWindowPin VirtualDesktops::pinOwnWindow(HWND hwnd) {
+	if (hwnd == nullptr || !this->nativeAccessor || !isOwnWindow(hwnd))
+		return OwnWindowPin::Unavailable;
+	return pinNativeDesktopOwnWindow(hwnd);
+}
+
 std::optional<bool> VirtualDesktops::isWindowPinned(HWND hwnd) const {
 	const auto& a = this->accessor;
 	if (!this->pinSupported()) return std::nullopt;

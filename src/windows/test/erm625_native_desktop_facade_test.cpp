@@ -99,6 +99,8 @@ void fastRecovery() {
 class Erm625NativeDesktopFacadeTest: public QObject {
 	Q_OBJECT;
 	Fixture old, fresh;
+	// Outlives every worker: cleanup shuts the provider down before reset.
+	FakePinnedApps pinnedApps;
 	VirtualDesktops* desktops = nullptr;
 	VirtualDesktops::Accessor accessor;
 	int acquisitions = 0;
@@ -129,6 +131,7 @@ private slots:
 		qputenv("CAELESTIA_WINDOWS_HYPR", "1");
 		qputenv("CAELESTIA_WINDOWS_HYPR_DISPATCH", "1");
 		this->acquisitions = 0;
+		this->pinnedApps.expectedView = reinterpret_cast<ApplicationView*>(&this->old.views.view);
 		VirtualDesktops::TestHooks hooks;
 		hooks.desktops = {{.id = this->old.one.id}, {.id = this->old.two.id}};
 		this->desktops = VirtualDesktops::createForTest(std::move(hooks));
@@ -156,6 +159,12 @@ private slots:
 		QCOMPARE(nativeDesktopWorkerCountForTest(), 0);
 		this->old.clearFaults();
 		this->fresh.clearFaults();
+		// The shut-down provider released the pinned-apps fake it held.
+		QCOMPARE(this->pinnedApps.refs, 1UL);
+		this->pinnedApps.pinned = FALSE;
+		this->pinnedApps.queries = this->pinnedApps.pins = 0;
+		this->pinnedApps.pinResult = S_OK;
+		this->pinnedApps.beforePin = {};
 		if (this->desktops) this->desktops->destroyForTest();
 		this->desktops = nullptr;
 		this->old.manager.switches = this->fresh.manager.switches = 0;
@@ -178,6 +187,63 @@ private slots:
 		QCOMPARE(this->fresh.one.refs, 1UL);
 		QCOMPARE(qgetenv("CAELESTIA_WINDOWS_HYPR"), this->previousHypr);
 		QCOMPARE(qgetenv("CAELESTIA_WINDOWS_HYPR_DISPATCH"), this->previousDispatch);
+	}
+	void pinsAnOwnWindowOnceAndQueriesFirst() {
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xc1));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		auto& pinned = this->pinnedApps;
+		setNativeDesktopPinnedAppsForTest(&pinned);
+		QCOMPARE(pinNativeDesktopOwnWindow(window), OwnWindowPin::Pinned);
+		QCOMPARE(pinned.queries, 1);
+		QCOMPARE(pinned.pins, 1);
+		// Already pinned: the provider reads the state and changes nothing.
+		QCOMPARE(pinNativeDesktopOwnWindow(window), OwnWindowPin::Pinned);
+		QCOMPARE(pinned.queries, 2);
+		QCOMPARE(pinned.pins, 1);
+		// Every view the provider fetched was released again.
+		QCOMPARE(this->old.views.view.refs, 1UL);
+		// Pinning own panels never advertises Hyprland pin support.
+		QVERIFY(!this->desktops->pinSupported());
+	}
+	void pinWithoutTheServiceIsUnavailable() {
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xc2));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		const auto gets = this->old.views.gets;
+		QCOMPARE(pinNativeDesktopOwnWindow(window), OwnWindowPin::Unavailable);
+		QCOMPARE(this->old.views.gets, gets);
+		QCOMPARE(this->old.manager.moves, 0);
+	}
+	void refusedPinIsReportedAndKeepsTheProvider() {
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xc3));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		auto& pinned = this->pinnedApps;
+		pinned.pinResult = E_ACCESSDENIED;
+		setNativeDesktopPinnedAppsForTest(&pinned);
+		QCOMPARE(pinNativeDesktopOwnWindow(window), OwnWindowPin::Refused);
+		QCOMPARE(pinned.pins, 1);
+		QCOMPARE(this->old.views.view.refs, 1UL);
+		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
+		QVERIFY(this->desktops->switchTo(1));
+		QCOMPARE(this->old.manager.switches, 1);
+	}
+	void slowPinIsBusyAndNeverBlocksASwitchAsACommand() {
+		const auto window = reinterpret_cast<HWND>(ULONG_PTR(0xc4));
+		setNativeDesktopWindowValidatorForTest([](HWND) { return true; });
+		auto& pinned = this->pinnedApps;
+		pinned.beforePin = [] { std::this_thread::sleep_for(std::chrono::milliseconds(150)); };
+		setNativeDesktopPinnedAppsForTest(&pinned);
+		QElapsedTimer elapsed;
+		elapsed.start();
+		QCOMPARE(pinNativeDesktopOwnWindow(window), OwnWindowPin::Busy);
+		QVERIFY(elapsed.elapsed() < 145);
+		// The deferred pin is a probe: switches are not refused as provider-busy.
+		QVERIFY(!nativeDesktopCommandPending());
+		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
+		QCOMPARE(pinned.pins, 1);
+		pinned.beforePin = {};
+		QCOMPARE(pinNativeDesktopOwnWindow(window), OwnWindowPin::Pinned);
+		QCOMPARE(pinned.pins, 1);
+		QCOMPARE(this->old.views.view.refs, 1UL);
 	}
 	void switchFaultCannotReuseProviderAndRecovers() {
 		QSignalSpy capabilities(this->desktops, &VirtualDesktops::capabilityChanged);

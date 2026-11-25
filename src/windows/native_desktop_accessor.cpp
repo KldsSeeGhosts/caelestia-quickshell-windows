@@ -36,6 +36,9 @@ constexpr GUID desktopService =
     {0xc5e0cdca, 0x7b6e, 0x41b2, {0x9f, 0xc4, 0xd9, 0x39, 0x75, 0xcc, 0x46, 0x7b}};
 constexpr GUID publicManager =
     {0xaa509086, 0x5ca9, 0x4c25, {0x8f, 0x95, 0x58, 0x9d, 0x3c, 0x07, 0xb4, 0x8a}};
+// CLSID_VirtualDesktopPinnedApps, the immersive shell service for PinnedApps.
+constexpr GUID pinnedAppsService =
+    {0xb5a399e7, 0x1c87, 0x46b8, {0x88, 0xe9, 0xfc, 0x57, 0x47, 0xb1, 0x71, 0xbd}};
 
 // Catch at the COM boundary, not around the whole accessor operation: an SEH
 // unwind under /EHsc would otherwise skip local ComPtr destructors.
@@ -83,6 +86,8 @@ struct Provider {
 	ComPtr<DesktopManager> manager;
 	ComPtr<ViewCollection> views;
 	ComPtr<IVirtualDesktopManager> publicApi;
+	// Optional. Without it panels follow the current desktop instead.
+	ComPtr<PinnedApps> pinnedApps;
 	QList<ComPtr<Desktop>> snapshot;
 	QList<GUID> ids;
 	int current = -1;
@@ -97,6 +102,7 @@ struct Provider {
 		release(this->snapshot);
 		this->ids.clear();
 		this->current = -1;
+		release(this->pinnedApps);
 		release(this->views);
 		release(this->manager);
 	}
@@ -211,6 +217,7 @@ struct Provider {
 			             "ApplicationViewCollection GUID"
 			         )));
 			ok = publicOk && privateOk;
+			if (ok && this->privateEnabled) ok = this->acquirePinnedApps(shell.Get());
 		}
 		ok = ok && (!this->privateEnabled || this->refresh());
 		// Finish local cleanup before publishing acquisition success, including
@@ -235,6 +242,28 @@ struct Provider {
 			this->availability = DesktopAvailability::Available;
 		}
 		return ok;
+	}
+
+	// Pinning is optional: a refusal keeps desktop control available and leaves
+	// the shell's panels following the current desktop. Only a structured
+	// exception, which already invalidates the apartment, fails acquisition.
+	bool acquirePinnedApps(IServiceProvider* shell) {
+		HRESULT hr = S_OK;
+		if (!sehCall(
+		        [&] { return shell->QueryService(pinnedAppsService, IID_PPV_ARGS(&this->pinnedApps)); },
+		        hr
+		    ))
+		{
+			this->exception("PinnedApps 24H2 GUID");
+			return false;
+		}
+		if (FAILED(hr) || !this->pinnedApps) {
+			// QueryService does not transfer a half-written output on failure.
+			this->pinnedApps.Detach();
+			qCWarning(logNativeDesktops) << "Desktop pinning unavailable, HRESULT" << Qt::hex << hr
+			                             << "; panels will follow the current desktop";
+		}
+		return true;
 	}
 
 	bool refresh() {
@@ -357,6 +386,26 @@ int moveWindow(HWND window, int index) {
 	    )
 	    && movable
 	    && p.invoke([&] { return p.manager->MoveViewToDesktop(view, desktop); }, "MoveViewToDesktop");
+	return p.releaseLocal(unknown) && ok ? 0 : -1;
+}
+
+// 0: pinned (or already pinned), -1: refused, -2: pinning is unavailable.
+int pinOwnWindow(HWND window) {
+	auto& p = provider();
+	if (!p.pinnedApps || !p.views) return -2;
+	if (!p.validWindow(window)) return -1;
+	ApplicationView* view = nullptr;
+	const auto gotView =
+	    p.invoke([&] { return p.views->GetViewForHwnd(window, &view); }, "GetViewForHwnd");
+	if (!gotView || !view) return -1;
+	ComPtr<IUnknown> unknown;
+	unknown.Attach(reinterpret_cast<IUnknown*>(view));
+	BOOL pinned = FALSE;
+	// Query first so a repeated call never toggles anything.
+	auto ok = p.invoke([&] { return p.pinnedApps->IsViewPinned(view, &pinned); }, "IsViewPinned")
+	       && (pinned || p.invoke([&] { return p.pinnedApps->PinView(view); }, "PinView"));
+	// A structured exception in either call has already released the provider.
+	if (!p.pinnedApps) ok = false;
 	return p.releaseLocal(unknown) && ok ? 0 : -1;
 }
 
@@ -1080,7 +1129,9 @@ bool loadNativeDesktopAccessor(
 	accessor.goToDesktopNumber = &boundedSwitch;
 	accessor.moveWindowToDesktopNumber = &boundedMove;
 	accessor.createDesktop = &boundedCreate;
-	// Removal, pinning and notification hooks intentionally remain absent.
+	// Removal, notification hooks and pinning of other applications' windows
+	// intentionally remain absent. The shell pins only its own panels, through
+	// pinNativeDesktopOwnWindow, so toplevel queries never wait on COM.
 	p.shutdown();
 	p.privateEnabled = true;
 	if (p.acquire()) return true;
@@ -1225,6 +1276,20 @@ std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop) {
 	if (result == 0) channel().requestRefresh();
 	return result == -2 ? std::nullopt : std::optional<bool>(result == 0);
 }
+OwnWindowPin pinNativeDesktopOwnWindow(HWND hwnd) {
+	auto& c = channel();
+	if (!c.worker || !c.privateEnabled || c.snapshot.availability != DesktopAvailability::Available)
+		return OwnWindowPin::Unavailable;
+	if (c.waiting || c.pending) return OwnWindowPin::Busy;
+	// A probe, not a command: a pin past the GUI bound is reported busy rather
+	// than optimistically accepted, and never makes a switch provider-busy.
+	const auto result =
+	    c.execute([hwnd] { return pinOwnWindow(hwnd); }, false, false, Channel::Kind::Probe);
+	if (result == 0) return OwnWindowPin::Pinned;
+	if (result == -2) return OwnWindowPin::Unavailable;
+	if (c.pending || c.waiting) return OwnWindowPin::Busy;
+	return OwnWindowPin::Refused;
+}
 void shutdownNativeDesktopAccessor() { channel().shutdown(); }
 
 #ifdef QS_TEST
@@ -1256,6 +1321,13 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.factory = std::move(factory);
 	p.validator = {};
 	p.stallLimit = stuckBound;
+}
+
+void setNativeDesktopPinnedAppsForTest(PinnedApps* pinned) {
+	channel().execute([pinned] {
+		provider().pinnedApps = pinned;
+		return 0;
+	});
 }
 
 void setNativeDesktopWindowValidatorForTest(std::function<bool(HWND)> validator) {

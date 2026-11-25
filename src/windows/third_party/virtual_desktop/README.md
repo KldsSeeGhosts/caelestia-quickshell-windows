@@ -7,8 +7,11 @@ https://github.com/MScholtes/VirtualDesktop/blob/a725cbd3cdb9e977678eeaf034a7cc9
 Windows build families 26100, 26200 and 26300 are accepted only if QueryService
 accepts the exact 24H2 manager and application-view collection GUIDs. Other
 builds and mismatched interfaces are refused. No DLL is downloaded or loaded
-by this provider. Removal, pinning, special workspaces and UI automation are
-not implemented. Explorer disconnection disables the provider until restart.
+by this provider. The optional IVirtualDesktopPinnedApps service is used only
+to pin the shell's own panels to every desktop; when QueryService refuses it,
+panels follow the current desktop instead. Removal, pinning of other
+applications' windows, special workspaces and UI automation are not
+implemented. Explorer disconnection disables the provider until restart.
 
 Native control requires both CAELESTIA_WINDOWS_HYPR=1 and
 CAELESTIA_WINDOWS_HYPR_DISPATCH=1. `Hyprland.workspaceLimit` bounds on-demand

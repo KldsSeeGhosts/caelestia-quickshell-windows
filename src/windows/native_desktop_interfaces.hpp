@@ -38,6 +38,18 @@ struct __declspec(uuid("53F5CA0B-158F-4124-900C-057158060B27")) DesktopManager: 
 	virtual HRESULT STDMETHODCALLTYPE CreateDesktop(Desktop**) = 0;
 };
 
+// IVirtualDesktopPinnedApps, queried from the immersive shell with service
+// CLSID_VirtualDesktopPinnedApps. Its IID has not changed since Windows 10.
+// The provider only pins the shell's own panels by view.
+struct __declspec(uuid("4CE81583-1E4C-4632-A621-07A53543148F")) PinnedApps: IUnknown {
+	virtual HRESULT STDMETHODCALLTYPE IsAppIdPinned(PCWSTR, BOOL*) = 0;
+	virtual HRESULT STDMETHODCALLTYPE PinAppID(PCWSTR) = 0;
+	virtual HRESULT STDMETHODCALLTYPE UnpinAppID(PCWSTR) = 0;
+	virtual HRESULT STDMETHODCALLTYPE IsViewPinned(ApplicationView*, BOOL*) = 0;
+	virtual HRESULT STDMETHODCALLTYPE PinView(ApplicationView*) = 0;
+	virtual HRESULT STDMETHODCALLTYPE UnpinView(ApplicationView*) = 0;
+};
+
 } // namespace qs::windows::native_desktop
 
 #ifdef QS_TEST
@@ -48,5 +60,8 @@ using NativeDesktopFactory = std::function<HRESULT(
     IVirtualDesktopManager**
 )>;
 void setNativeDesktopFactoryForTest(NativeDesktopFactory factory);
+// Installs a pinned-apps fake in the live provider, after acquisition, like
+// the window validator. A recovery or a new factory drops it again.
+void setNativeDesktopPinnedAppsForTest(native_desktop::PinnedApps* pinned);
 } // namespace qs::windows
 #endif

@@ -42,6 +42,9 @@ int switchNativeDesktopByIdIfCurrent(
 );
 int moveNativeDesktopWindowById(HWND hwnd, GUID desktop);
 std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop);
+// Pins one of this process's windows to every desktop. Waits at most 100 ms;
+// a call still in flight, or one queued behind another, reports Busy.
+[[nodiscard]] OwnWindowPin pinNativeDesktopOwnWindow(HWND hwnd);
 void shutdownNativeDesktopAccessor();
 
 #ifdef QS_TEST

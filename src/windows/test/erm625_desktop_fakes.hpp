@@ -180,6 +180,31 @@ struct FakeViews: FakeCom<ViewCollection> {
 		return S_OK;
 	}
 };
+struct FakePinnedApps: FakeCom<PinnedApps> {
+	ApplicationView* expectedView = nullptr;
+	BOOL pinned = FALSE;
+	int queries = 0;
+	int pins = 0;
+	HRESULT pinResult = S_OK;
+	std::function<void()> beforePin;
+	HRESULT STDMETHODCALLTYPE IsAppIdPinned(PCWSTR, BOOL*) override { return E_NOTIMPL; }
+	HRESULT STDMETHODCALLTYPE PinAppID(PCWSTR) override { return E_NOTIMPL; }
+	HRESULT STDMETHODCALLTYPE UnpinAppID(PCWSTR) override { return E_NOTIMPL; }
+	HRESULT STDMETHODCALLTYPE IsViewPinned(ApplicationView* view, BOOL* out) override {
+		++this->queries;
+		if (view != this->expectedView) return E_INVALIDARG;
+		*out = this->pinned;
+		return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE PinView(ApplicationView* view) override {
+		if (this->beforePin) this->beforePin();
+		++this->pins;
+		if (view != this->expectedView) return E_INVALIDARG;
+		if (SUCCEEDED(this->pinResult)) this->pinned = TRUE;
+		return this->pinResult;
+	}
+	HRESULT STDMETHODCALLTYPE UnpinView(ApplicationView*) override { return E_NOTIMPL; }
+};
 struct FakePublic: FakeCom<IVirtualDesktopManager> {
 	bool faultOnRead = false;
 	std::function<void()> beforeQuery, beforeMove;
