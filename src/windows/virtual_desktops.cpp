@@ -287,6 +287,9 @@ void VirtualDesktops::applyNativeSnapshot() {
 		emit this->windowDesktopsChanged();
 	}
 	this->notifyCapability();
+	if (!nativeDesktopCommandPending()) {
+		emit this->desktopCommandIdle();
+	}
 }
 
 void VirtualDesktops::bindNativeDesktopQueries() {
@@ -302,6 +305,9 @@ void VirtualDesktops::bindNativeDesktopQueries() {
 	);
 	setNativeDesktopPinObserver(this, [this](quint64 requestId, HWND hwnd, OwnWindowPin result) {
 		this->onNativePinCompleted(requestId, hwnd, result);
+	});
+	setNativeDesktopPinDrainObserver(this, [this](HWND hwnd, bool stillPinned) {
+		emit this->ownWindowPinDrained(reinterpret_cast<quintptr>(hwnd), stillPinned);
 	});
 	initializeNativeDesktopQueries(this, [this] { this->applyNativeSnapshot(); });
 }
@@ -1220,6 +1226,16 @@ OwnWindowPin VirtualDesktops::pinOwnWindow(HWND hwnd, quint64* outRequestId) {
 void VirtualDesktops::cancelOwnWindowPin(quint64 requestId) {
 	if (requestId == 0 || !this->nativeAccessor) return;
 	cancelNativeDesktopOwnWindowPin(requestId);
+}
+
+void VirtualDesktops::cancelOwnWindowPinForHwnd(HWND hwnd) {
+	if (hwnd == nullptr || !this->nativeAccessor) return;
+	cancelNativeDesktopOwnWindowPinForHwnd(hwnd);
+}
+
+bool VirtualDesktops::isOwnWindowPinActive(HWND hwnd) const {
+	if (hwnd == nullptr || !this->nativeAccessor) return false;
+	return nativeDesktopOwnWindowPinActive(hwnd);
 }
 
 std::optional<bool> VirtualDesktops::isWindowPinned(HWND hwnd) const {

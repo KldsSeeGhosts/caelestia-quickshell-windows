@@ -25,6 +25,10 @@ void setNativeDesktopPinObserver(
     QObject* context,
     std::function<void(quint64, HWND, OwnWindowPin)> onPinCompleted
 );
+void setNativeDesktopPinDrainObserver(
+    QObject* context,
+    std::function<void(HWND, bool)> onPinDrained
+);
 void requestNativeDesktopRefresh();
 [[nodiscard]] bool nativeDesktopCommandPending();
 [[nodiscard]] quint64 nativeDesktopPendingMoveSequence(HWND hwnd = nullptr);
@@ -54,6 +58,8 @@ std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop);
 // or Unavailable when pinning is absent.
 [[nodiscard]] OwnWindowPin pinNativeDesktopOwnWindow(HWND hwnd, quint64* outRequestId = nullptr);
 void cancelNativeDesktopOwnWindowPin(quint64 requestId);
+void cancelNativeDesktopOwnWindowPinForHwnd(HWND hwnd);
+[[nodiscard]] bool nativeDesktopOwnWindowPinActive(HWND hwnd);
 void shutdownNativeDesktopAccessor();
 
 #ifdef QS_TEST

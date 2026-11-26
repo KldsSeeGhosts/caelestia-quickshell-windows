@@ -304,6 +304,7 @@ public:
 				    }
 				    stack->mFollowBusySinceMs.reset();
 				    stack->mFollowFirstBusyMs.reset();
+				    stack->mFollowNeedsFailureRetry = false;
 				    stack->mFollowRetryTimer.stop();
 				    stack->followCurrentDesktop();
 				    DesktopHost::instance()->refreshAfterDesktopSwitch();
@@ -314,6 +315,20 @@ public:
 			    &VirtualDesktops::windowDesktopsChanged,
 			    VirtualDesktops::instance(),
 			    [] { stack->followCurrentDesktop(); }
+			);
+			QObject::connect(
+			    VirtualDesktops::instance(),
+			    &VirtualDesktops::desktopCommandIdle,
+			    VirtualDesktops::instance(),
+			    [] {
+				    // Any completed desktop command (switch, create, move, or acquisition)
+				    // frees the worker command slot: wake panels that hit provider-busy even
+				    // if polling stopped at the busy deadline and no desktop change occurred.
+				    if (stack->hasWaitingFollowPanel()) {
+					    stack->mFollowBusySinceMs.reset();
+					    stack->mFollowRetryTimer.start(0);
+				    }
+			    }
 			);
 			QObject::connect(
 			    VirtualDesktops::instance(),
@@ -461,11 +476,13 @@ public:
 			{
 				this->mFollowBusySinceMs.reset();
 				this->mFollowFirstBusyMs.reset();
+				if (!this->mFollowNeedsFailureRetry) this->mFollowRetryTimer.stop();
 				return;
 			}
 			if (!this->mFollowRetryTimer.isActive()) this->mFollowRetryTimer.start(FOLLOW_RETRY_MS);
 			return;
 		}
+		this->mFollowNeedsFailureRetry = true;
 		if (!this->mFollowRetryTimer.isActive()) this->mFollowRetryTimer.start(FOLLOW_RETRY_MS);
 	}
 
@@ -602,6 +619,7 @@ public:
 			}
 		}
 
+		this->mFollowNeedsFailureRetry = needsFailureRetry;
 		if (needsBusyRetry) {
 			const auto now = static_cast<qint64>(GetTickCount64());
 			if (!this->mFollowFirstBusyMs) this->mFollowFirstBusyMs = now;
@@ -927,6 +945,7 @@ private:
 	QTimer mFollowRetryTimer;
 	std::optional<qint64> mFollowBusySinceMs;
 	std::optional<qint64> mFollowFirstBusyMs;
+	bool mFollowNeedsFailureRetry = false;
 	bool mRepairPending = false;
 };
 
@@ -1162,6 +1181,13 @@ void WinPanelWindow::connectWindow() {
 	    &VirtualDesktops::ownWindowPinCompleted,
 	    this,
 	    &WinPanelWindow::onOwnWindowPinCompleted,
+	    Qt::UniqueConnection
+	);
+	QObject::connect(
+	    VirtualDesktops::instance(),
+	    &VirtualDesktops::ownWindowPinDrained,
+	    this,
+	    &WinPanelWindow::onOwnWindowPinDrained,
 	    Qt::UniqueConnection
 	);
 
@@ -1461,10 +1487,9 @@ void WinPanelWindow::stickToAllDesktops() {
 		this->followWaitingBusy = false;
 		return;
 	}
-	if (this->embedWaitPinRequestId != 0) {
-		if (this->embedWaitPinHwnd == hwnd) return;
-		this->embedWaitPinRequestId = 0;
-		this->embedWaitPinHwnd = nullptr;
+	if (this->embedWaitingForPinHwnd != nullptr) {
+		if (this->embedWaitingForPinHwnd == hwnd) return;
+		this->embedWaitingForPinHwnd = nullptr;
 	}
 	if (this->pinnedHere(hwnd)) {
 		this->followWaitingBusy = false;
@@ -1564,8 +1589,7 @@ void WinPanelWindow::stickToAllDesktops() {
 void WinPanelWindow::attemptPin(quint64 expectedGeneration) {
 	auto* hwnd = this->hwnd();
 	if (hwnd == nullptr || this->window == nullptr || !this->window->isVisible()
-	    || this->mEmbedParent != nullptr
-	    || (this->embedWaitPinRequestId != 0 && this->embedWaitPinHwnd == hwnd))
+	    || this->mEmbedParent != nullptr || this->embedWaitingForPinHwnd == hwnd)
 	{
 		return;
 	}
@@ -1619,9 +1643,29 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 	auto* currentHwnd = this->hwnd();
 	const auto visible = this->window != nullptr && this->window->isVisible();
 	const auto embedded = this->mEmbedParent != nullptr;
-	if (this->embedWaitPinRequestId != 0 && requestId == this->embedWaitPinRequestId) {
-		this->embedWaitPinRequestId = 0;
-		this->embedWaitPinHwnd = nullptr;
+	auto* desktops = VirtualDesktops::instance();
+	if (completedHwnd != nullptr && completedHwnd == currentHwnd && !embedded
+	    && result == OwnWindowPin::Pinned)
+	{
+		// Preserve an unresolved pin even if hide or embed cancellation cleared
+		// inFlightRequestId before the worker finished.
+		this->pinState.pinned = true;
+		this->pinState.pinnedHwnd = currentHwnd;
+		this->pinState.failedHwnd = nullptr;
+		this->pinState.disconnectRetries = 0;
+	}
+	if (this->embedWaitingForPinHwnd != nullptr && this->embedWaitingForPinHwnd == completedHwnd) {
+		if (desktops->isOwnWindowPinActive(completedHwnd)) {
+			// Retirement notified early while the old pin worker is still running:
+			// keep the embedding fence until onOwnWindowPinDrained confirms exit.
+			return;
+		}
+		this->embedWaitingForPinHwnd = nullptr;
+		if (result == OwnWindowPin::Pinned || this->pinState.pinnedHere(completedHwnd)) {
+			qCWarning(logPanel) << "Deferring desktop embedding for" << this
+			                    << "because pin cancellation did not confirm unpin";
+			return;
+		}
 		if (this->wantsEmbedding()) {
 			this->updateEmbedding();
 			this->scheduleUpdateDimensions();
@@ -1630,7 +1674,6 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 		}
 		return;
 	}
-	auto* desktops = VirtualDesktops::instance();
 	const auto gen = this->pinState.generation;
 
 	const auto action = this->pinState.onAsyncCompletion(
@@ -1660,6 +1703,36 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 	case PanelPinState::CompletionAction::RetryLater:
 		this->schedulePinRetry(PanelPinState::BUSY_RETRY_MS);
 		break;
+	}
+}
+
+void WinPanelWindow::onOwnWindowPinDrained(quintptr hwndValue, bool stillPinned) {
+	auto* drainedHwnd = reinterpret_cast<HWND>(hwndValue);
+	auto* currentHwnd = this->hwnd();
+	auto* desktops = VirtualDesktops::instance();
+	if (stillPinned && drainedHwnd != nullptr && drainedHwnd == currentHwnd
+	    && this->mEmbedParent == nullptr)
+	{
+		this->pinState.pinned = true;
+		this->pinState.pinnedHwnd = currentHwnd;
+		this->pinState.failedHwnd = nullptr;
+		this->pinState.disconnectRetries = 0;
+	}
+	if (this->embedWaitingForPinHwnd == nullptr || this->embedWaitingForPinHwnd != drainedHwnd) {
+		return;
+	}
+	if (desktops->isOwnWindowPinActive(drainedHwnd)) return;
+	this->embedWaitingForPinHwnd = nullptr;
+	if (stillPinned || this->pinState.pinnedHere(drainedHwnd)) {
+		qCWarning(logPanel) << "Skipping desktop embedding for" << this
+		                    << "because drained pin request left window pinned";
+		return;
+	}
+	if (this->wantsEmbedding()) {
+		this->updateEmbedding();
+		this->scheduleUpdateDimensions();
+	} else if (this->window != nullptr && this->window->isVisible() && this->mEmbedParent == nullptr) {
+		this->stickToAllDesktops();
 	}
 }
 
@@ -2060,22 +2133,24 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 	auto wasEmbedded = this->mEmbedParent != nullptr;
 
 	if (!wasEmbedded) {
-		if (this->embedWaitPinRequestId != 0) {
-			if (this->embedWaitPinHwnd == hwnd) return;
-			this->embedWaitPinRequestId = 0;
-			this->embedWaitPinHwnd = nullptr;
-		}
-		// Defer child-style conversion and SetParent while a pin mutation for
-		// this HWND is still in flight on the pin worker. Cancel it first and
-		// resume embedding once onOwnWindowPinCompleted confirms it drained.
-		if (this->pinState.inFlightRequestId != 0 && this->pinState.inFlightHwnd == hwnd) {
-			this->embedWaitPinRequestId = this->pinState.inFlightRequestId;
-			this->embedWaitPinHwnd = hwnd;
-			this->resetPinState(true);
+		auto* desktops = VirtualDesktops::instance();
+		// Fence child-style conversion and SetParent while any pin worker
+		// (active, retired-but-draining, or pending completion delivery) still
+		// owns a request for this HWND, even if hide previously cleared pinState.
+		if (desktops->isOwnWindowPinActive(hwnd)) {
+			this->embedWaitingForPinHwnd = hwnd;
+			desktops->cancelOwnWindowPinForHwnd(hwnd);
+			this->resetPinState(false);
 			this->clearStuckFollowState();
 			this->clearPendingFollowMove();
 			this->followFailureCount = 0;
 			this->followWaitingBusy = false;
+			return;
+		}
+		this->embedWaitingForPinHwnd = nullptr;
+		if (this->pinState.pinnedHere(hwnd)) {
+			qCWarning(logPanel) << "Skipping desktop embedding for" << this
+			                    << "because window remains pinned in Explorer";
 			return;
 		}
 	}

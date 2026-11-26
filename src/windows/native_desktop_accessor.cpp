@@ -576,6 +576,10 @@ struct PinResult {
 	bool serviceAvailable = true;
 	bool disconnected = false;
 	bool optionalPinnedAppsFaulted = false;
+	// True whenever the window is confirmed pinned or a pin mutation succeeded
+	// without a confirmed UnpinView rollback (for example, late cancel during
+	// Release or an UnpinView refusal/fault).
+	bool viewPinned = false;
 };
 
 struct PinRequest {
@@ -585,6 +589,7 @@ struct PinRequest {
 	Clock::time_point submitted = Clock::now();
 	std::atomic<Clock::duration::rep> started = 0;
 	std::atomic<bool> cancelled {false};
+	std::atomic<bool> settled {false};
 
 	bool stalled(std::chrono::milliseconds bound) const {
 		const auto ticks = this->started.load();
@@ -810,23 +815,36 @@ struct PinProvider {
 				pinnedByCall = ok;
 			}
 		}
+		auto viewPinned = (ok && pinned != FALSE) || pinnedByCall;
 		if (pinnedByCall && cancelled.load()) {
 			// Cancellation raced a PinView that had already started: roll back the
-			// pin before returning so an embedding or replaced window does not stay pinned.
-			this->invoke([&] { return this->pinnedApps->UnpinView(view); }, "UnpinView");
-			ok = false;
+			// pin while we still hold the view. Only clear viewPinned when UnpinView
+			// confirms rollback (or Explorer disconnected); an ordinary refusal or
+			// fault leaves the pin unresolved and must not be reported as unpinned.
+			const auto unpinned =
+			    this->invoke([&] { return this->pinnedApps->UnpinView(view); }, "UnpinView");
+			if (unpinned || this->disconnected) {
+				viewPinned = false;
+				ok = false;
+			}
 		}
-		ok = this->releaseLocal(unknown) && ok;
+		const auto released = this->releaseLocal(unknown);
 		out.disconnected = this->disconnected;
 		out.optionalPinnedAppsFaulted = this->optionalPinnedAppsFaulted;
 		out.serviceAvailable = this->serviceAvailable;
+		out.viewPinned = viewPinned && !this->disconnected;
 		out.error = this->lastError;
-		if (cancelled.load() || this->disconnected || this->optionalPinnedAppsFaulted
-		    || !this->pinnedApps)
-		{
+		if (this->disconnected || this->optionalPinnedAppsFaulted || !this->pinnedApps) {
+			out.result = -2;
+		} else if (out.viewPinned) {
+			// Report Pinned honestly whenever the pin succeeded and was not rolled
+			// back before Release (including cancellation arriving during Release
+			// or an UnpinView refusal).
+			out.result = 0;
+		} else if (cancelled.load()) {
 			out.result = -2;
 		} else {
-			out.result = ok ? 0 : -1;
+			out.result = (ok && released) ? 0 : -1;
 		}
 		return out;
 	}
@@ -844,6 +862,9 @@ struct PinWorker {
 		{
 			std::lock_guard lock(this->mutex);
 			this->stopping = true;
+			for (const auto& req: this->queue) {
+				if (req) req->settled.store(true, std::memory_order_release);
+			}
 			this->queue.clear();
 		}
 		this->wake.notify_one();
@@ -855,6 +876,7 @@ struct PinWorker {
 			std::lock_guard lock(this->mutex);
 			Q_ASSERT(this->queue.empty());
 			if (!this->stopping) this->queue.push_back(request);
+			else request->settled.store(true, std::memory_order_release);
 		}
 		this->wake.notify_one();
 		return result;
@@ -904,6 +926,7 @@ struct PinWorker {
 				result.optionalPinnedAppsFaulted = true;
 			}
 			request->completion.set_value(std::move(result));
+			request->settled.store(true, std::memory_order_release);
 			if (request->completed) request->completed();
 		}
 		p.drop();
@@ -939,6 +962,7 @@ struct Channel {
 	std::function<void()> updated;
 	std::function<void(quint64, HWND, bool, DesktopAvailability, HRESULT)> moveCompleted;
 	std::function<void(quint64, HWND, OwnWindowPin)> pinCompleted;
+	std::function<void(HWND, bool)> pinDrained;
 	QTimer deadline;
 	QTimer pinDeadline;
 	std::atomic<bool> completionWake = false;
@@ -946,6 +970,9 @@ struct Channel {
 	std::optional<Pending> refresh;
 	std::optional<Pending> pending;
 	std::optional<PinPending> pin;
+	std::vector<PinPending> drainingPins;
+	QHash<quintptr, int> pendingPinDeliveries;
+	quint64 pinDeliveryGeneration = 0;
 	std::chrono::milliseconds stallLimit = stuckBound;
 	std::chrono::milliseconds pinStallLimit = stuckBound;
 	bool supported = false;
@@ -1001,11 +1028,17 @@ struct Channel {
 		this->pinDeadline.stop();
 		this->recovery.reset();
 		if (this->pin && this->pin->request) this->pin->request->cancelled.store(true);
+		for (auto& entry: this->drainingPins) {
+			if (entry.request) entry.request->cancelled.store(true);
+		}
 		if (auto previous = std::exchange(this->worker, {})) previous->stop();
 		if (auto previousPin = std::exchange(this->pinWorker, {})) previousPin->stop();
 		this->refresh.reset();
 		this->pending.reset();
 		this->pin.reset();
+		this->drainingPins.clear();
+		this->pendingPinDeliveries.clear();
+		++this->pinDeliveryGeneration;
 		this->refreshAgain = false;
 	}
 
@@ -1032,16 +1065,67 @@ struct Channel {
 
 	void notifyPinCompleted(quint64 requestId, HWND hwnd, OwnWindowPin result) {
 		if (requestId == 0 || hwnd == nullptr || !this->context || !this->pinCompleted) return;
-		QTimer::singleShot(0, this->context, [this, requestId, hwnd, result] {
+		const auto key = reinterpret_cast<quintptr>(hwnd);
+		const auto deliveryGen = this->pinDeliveryGeneration;
+		++this->pendingPinDeliveries[key];
+		QTimer::singleShot(0, this->context, [this, deliveryGen, key, requestId, hwnd, result] {
+			if (deliveryGen == this->pinDeliveryGeneration) {
+				auto it = this->pendingPinDeliveries.find(key);
+				if (it != this->pendingPinDeliveries.end()) {
+					if (--(*it) <= 0) this->pendingPinDeliveries.erase(it);
+				}
+			}
 			if (this->context && this->pinCompleted) {
 				this->pinCompleted(requestId, hwnd, result);
 			}
 		});
 	}
 
+	void notifyPinDrained(HWND hwnd, bool stillPinned) {
+		if (hwnd == nullptr || !this->context || !this->pinDrained) return;
+		const auto key = reinterpret_cast<quintptr>(hwnd);
+		const auto deliveryGen = this->pinDeliveryGeneration;
+		++this->pendingPinDeliveries[key];
+		QTimer::singleShot(0, this->context, [this, deliveryGen, key, hwnd, stillPinned] {
+			if (deliveryGen == this->pinDeliveryGeneration) {
+				auto it = this->pendingPinDeliveries.find(key);
+				if (it != this->pendingPinDeliveries.end()) {
+					if (--(*it) <= 0) this->pendingPinDeliveries.erase(it);
+				}
+			}
+			if (this->context && this->pinDrained) {
+				this->pinDrained(hwnd, stillPinned);
+			}
+		});
+	}
+
 	void cancelPin(quint64 requestId) {
-		if (requestId == 0 || !this->pin || this->pin->requestId != requestId) return;
-		if (this->pin->request) this->pin->request->cancelled.store(true);
+		if (requestId == 0) return;
+		if (this->pin && this->pin->requestId == requestId && this->pin->request) {
+			this->pin->request->cancelled.store(true);
+		}
+		for (auto& entry: this->drainingPins) {
+			if (entry.requestId == requestId && entry.request) entry.request->cancelled.store(true);
+		}
+	}
+
+	void cancelPinForHwnd(HWND hwnd) {
+		if (hwnd == nullptr) return;
+		if (this->pin && this->pin->target == hwnd && this->pin->request) {
+			this->pin->request->cancelled.store(true);
+		}
+		for (auto& entry: this->drainingPins) {
+			if (entry.target == hwnd && entry.request) entry.request->cancelled.store(true);
+		}
+	}
+
+	[[nodiscard]] bool isPinActiveFor(HWND hwnd) const {
+		if (hwnd == nullptr) return false;
+		if (this->pin && this->pin->target == hwnd) return true;
+		for (const auto& entry: this->drainingPins) {
+			if (entry.target == hwnd) return true;
+		}
+		return this->pendingPinDeliveries.value(reinterpret_cast<quintptr>(hwnd), 0) > 0;
 	}
 
 	OwnWindowPin classifyReadyPinResult(std::future<PinResult>& future) {
@@ -1051,7 +1135,7 @@ struct Channel {
 				qCWarning(logNativeDesktops)
 				    << "Optional desktop pinning faulted; retiring pin worker and disabling pinning";
 				this->skipOptionalPinnedApps = true;
-				return OwnWindowPin::Unavailable;
+				return value.viewPinned ? OwnWindowPin::Pinned : OwnWindowPin::Unavailable;
 			}
 			if (value.disconnected) {
 				qCWarning(logNativeDesktops)
@@ -1060,12 +1144,36 @@ struct Channel {
 				return OwnWindowPin::Disconnected;
 			}
 			if (!value.serviceAvailable) this->pinUnavailable = true;
+			if (value.viewPinned) return OwnWindowPin::Pinned;
 			return value.result == 0
 			         ? OwnWindowPin::Pinned
 			         : (value.result == -2 ? OwnWindowPin::Unavailable : OwnWindowPin::Refused);
 		} catch (...) {
 			this->skipOptionalPinnedApps = true;
 			return OwnWindowPin::Unavailable;
+		}
+	}
+
+	void drainRetiredPins() {
+		std::vector<std::pair<HWND, bool>> drained;
+		auto it = this->drainingPins.begin();
+		while (it != this->drainingPins.end()) {
+			if (!it->request || it->request->settled.load(std::memory_order_acquire)) {
+				auto stillPinned = false;
+				if (it->result.valid()
+				    && it->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+				{
+					const auto outcome = this->classifyReadyPinResult(it->result);
+					stillPinned = (outcome == OwnWindowPin::Pinned);
+				}
+				if (it->target != nullptr) drained.emplace_back(it->target, stillPinned);
+				it = this->drainingPins.erase(it);
+			} else {
+				++it;
+			}
+		}
+		for (const auto& [target, stillPinned]: drained) {
+			this->notifyPinDrained(target, stillPinned);
 		}
 	}
 
@@ -1080,8 +1188,23 @@ struct Channel {
 		this->pinDeadline.stop();
 		if (pendingPin && pendingPin->target != nullptr) {
 			auto pinOutcome = fallbackOutcome;
-			if (pendingPin->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-				pinOutcome = this->classifyReadyPinResult(pendingPin->result);
+			const auto settled =
+			    !pendingPin->request || pendingPin->request->settled.load(std::memory_order_acquire);
+			if (settled) {
+				if (pendingPin->result.wait_for(std::chrono::milliseconds(0))
+				    == std::future_status::ready)
+				{
+					pinOutcome = this->classifyReadyPinResult(pendingPin->result);
+				}
+			} else {
+				// The retired worker is still executing inside COM for this HWND:
+				// keep it fenced in drainingPins until settled becomes true.
+				this->drainingPins.push_back(PinPending {
+				    pendingPin->request,
+				    std::move(pendingPin->result),
+				    pendingPin->target,
+				    pendingPin->requestId,
+				});
 			}
 			this->notifyPinCompleted(pendingPin->requestId, pendingPin->target, pinOutcome);
 		}
@@ -1560,8 +1683,10 @@ struct Channel {
 	}
 
 	void collectPin() {
+		this->drainRetiredPins();
 		if (this->pin
-		    && this->pin->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+		    && this->pin->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready
+		    && (!this->pin->request || this->pin->request->settled.load(std::memory_order_acquire)))
 		{
 			auto finished = std::move(*this->pin);
 			this->pin.reset();
@@ -1731,6 +1856,7 @@ void initializeNativeDesktopQueries(QObject* context, std::function<void()> upda
 		c.updated = {};
 		c.moveCompleted = {};
 		c.pinCompleted = {};
+		c.pinDrained = {};
 	});
 	if (!c.worker && !c.recovery.active() && !c.acquire() && !c.pending) c.recovery.disconnected();
 }
@@ -1751,6 +1877,15 @@ void setNativeDesktopPinObserver(
 	auto& c = channel();
 	c.context = context;
 	c.pinCompleted = std::move(onPinCompleted);
+}
+
+void setNativeDesktopPinDrainObserver(
+    QObject* context,
+    std::function<void(HWND, bool)> onPinDrained
+) {
+	auto& c = channel();
+	c.context = context;
+	c.pinDrained = std::move(onPinDrained);
 }
 
 void requestNativeDesktopRefresh() { channel().requestRefresh(); }
@@ -1854,6 +1989,8 @@ OwnWindowPin pinNativeDesktopOwnWindow(HWND hwnd, quint64* outRequestId) {
 	return channel().requestPin(hwnd, outRequestId);
 }
 void cancelNativeDesktopOwnWindowPin(quint64 requestId) { channel().cancelPin(requestId); }
+void cancelNativeDesktopOwnWindowPinForHwnd(HWND hwnd) { channel().cancelPinForHwnd(hwnd); }
+bool nativeDesktopOwnWindowPinActive(HWND hwnd) { return channel().isPinActiveFor(hwnd); }
 void shutdownNativeDesktopAccessor() { channel().shutdown(); }
 
 #ifdef QS_TEST
@@ -1874,6 +2011,7 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.updated = {};
 	p.moveCompleted = {};
 	p.pinCompleted = {};
+	p.pinDrained = {};
 	p.supported = false;
 	p.privateEnabled = false;
 	p.refusedBuild = false;

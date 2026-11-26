@@ -129,6 +129,8 @@ public:
 	// queries keep reading cached state instead of waiting on COM.
 	OwnWindowPin pinOwnWindow(HWND hwnd, quint64* outRequestId = nullptr);
 	void cancelOwnWindowPin(quint64 requestId);
+	void cancelOwnWindowPinForHwnd(HWND hwnd);
+	[[nodiscard]] bool isOwnWindowPinActive(HWND hwnd) const;
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;
 	[[nodiscard]] DesktopAvailability availability() const;
 	[[nodiscard]] bool supports(DesktopOperation operation) const;
@@ -170,6 +172,8 @@ signals:
 	void commandResult(QVariantMap result);
 	void moveWindowCompleted(quint64 sequence, quintptr hwnd, bool succeeded, QString reason);
 	void ownWindowPinCompleted(quint64 requestId, quintptr hwnd, qs::windows::OwnWindowPin result);
+	void ownWindowPinDrained(quintptr hwnd, bool stillPinned);
+	void desktopCommandIdle();
 
 private:
 #ifdef QS_TEST

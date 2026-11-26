@@ -178,6 +178,7 @@ private slots:
 	void onWindowVisibleChanged();
 	void onDesktopAccessorReady();
 	void onOwnWindowPinCompleted(quint64 requestId, quintptr hwnd, qs::windows::OwnWindowPin result);
+	void onOwnWindowPinDrained(quintptr hwnd, bool stillPinned);
 	void updateScreen();
 	void followFocusedScreen();
 	void scheduleUpdateDimensions();
@@ -266,8 +267,7 @@ private:
 	bool dimensionsUpdatePending = false;
 	bool appBarRetryPending = false;
 	bool embedRetryPending = false;
-	quint64 embedWaitPinRequestId = 0;
-	HWND embedWaitPinHwnd = nullptr;
+	HWND embedWaitingForPinHwnd = nullptr;
 	bool scaleRecreatePending = false;
 	bool focusFlagPending = false;
 	bool focusOnExpose = false;
