@@ -216,7 +216,7 @@ struct FakePinnedApps: FakeCom<PinnedApps> {
 		++this->pins;
 		if (this->faultOnPin) fault();
 		if (view != this->expectedView) return E_INVALIDARG;
-		if (SUCCEEDED(this->pinResult)) this->pinned = TRUE;
+		if (this->pinResult == S_OK) this->pinned = TRUE;
 		return this->pinResult;
 	}
 	HRESULT STDMETHODCALLTYPE UnpinView(ApplicationView* view) override {
@@ -224,7 +224,7 @@ struct FakePinnedApps: FakeCom<PinnedApps> {
 		++this->unpins;
 		if (this->faultOnUnpin) fault();
 		if (view != this->expectedView) return E_INVALIDARG;
-		if (SUCCEEDED(this->unpinResult)) this->pinned = FALSE;
+		if (this->unpinResult == S_OK) this->pinned = FALSE;
 		return this->unpinResult;
 	}
 };

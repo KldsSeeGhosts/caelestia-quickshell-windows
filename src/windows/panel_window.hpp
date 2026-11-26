@@ -177,8 +177,19 @@ private slots:
 	void onSurfaceCreated();
 	void onWindowVisibleChanged();
 	void onDesktopAccessorReady();
-	void onOwnWindowPinCompleted(quint64 requestId, quintptr hwnd, qs::windows::OwnWindowPin result);
-	void onOwnWindowPinDrained(quintptr hwnd, bool stillPinned, bool confirmedUnpinned);
+	void onOwnWindowPinCompleted(
+	    quint64 requestId,
+	    quintptr hwnd,
+	    qs::windows::OwnWindowPin result,
+	    bool mayBePinned
+	);
+	void onOwnWindowPinDrained(
+	    quintptr hwnd,
+	    bool stillPinned,
+	    bool mayBePinned,
+	    bool confirmedUnpinned,
+	    bool disconnected
+	);
 	void updateScreen();
 	void followFocusedScreen();
 	void scheduleUpdateDimensions();

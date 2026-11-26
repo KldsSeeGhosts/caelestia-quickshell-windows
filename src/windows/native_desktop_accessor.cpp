@@ -580,8 +580,13 @@ struct PinResult {
 	// without a confirmed UnpinView rollback (for example, late cancel during
 	// Release or an UnpinView refusal/disconnect/fault).
 	bool viewPinned = false;
+	// True when PinView was invoked (or IsViewPinned returned non-S_OK success)
+	// and a disconnect, fault, or non-S_OK result left the final pin state unknown.
+	bool pinAttemptUncertain = false;
+	// True when cancellation prevented UnpinView from being invoked on a pinned view.
+	bool cancelledBeforeUnpin = false;
 	// True only when Explorer confirmed the window is not pinned (IsViewPinned
-	// returned FALSE or UnpinView returned S_OK).
+	// returned S_OK with FALSE or UnpinView returned S_OK).
 	bool unpinned = false;
 };
 
@@ -641,12 +646,14 @@ struct PinProvider {
 	}
 
 	template <typename F>
-	bool invoke(F&& call, const char* operation) {
+	bool invoke(F&& call, const char* operation, HRESULT* outHr = nullptr) {
 		HRESULT hr = S_OK;
+		if (outHr) *outHr = E_UNEXPECTED;
 		if (!sehCall(std::forward<F>(call), hr)) {
 			this->fault(operation);
 			return false;
 		}
+		if (outHr) *outHr = hr;
 		if (SUCCEEDED(hr)) return true;
 		this->lastError = hr;
 		qCWarning(logNativeDesktops) << operation << "refused, HRESULT" << Qt::hex << hr;
@@ -803,28 +810,54 @@ struct PinProvider {
 		ComPtr<IUnknown> unknown;
 		unknown.Attach(reinterpret_cast<IUnknown*>(view));
 		BOOL pinned = FALSE;
+		HRESULT isPinnedHr = E_UNEXPECTED;
 		// Query first so a repeated call never toggles anything. Never start
 		// PinView or UnpinView after the GUI has already retired or canceled this request.
 		auto ok = !cancelled.load()
 		       && this->invoke(
 		           [&] { return this->pinnedApps->IsViewPinned(view, &pinned); },
-		           "IsViewPinned"
+		           "IsViewPinned",
+		           &isPinnedHr
 		       );
+		const auto isPinnedExactOk = ok && isPinnedHr == S_OK;
 		if (unpin) {
 			auto unpinnedConfirmed = false;
 			auto viewPinned = false;
-			if (ok && !pinned) {
+			auto cancelledBeforeUnpin = false;
+			if (isPinnedExactOk && !pinned) {
 				unpinnedConfirmed = true;
-			} else if (ok && pinned) {
-				viewPinned = true;
+			} else if (ok) {
+				viewPinned = (isPinnedExactOk && pinned != FALSE);
 				if (cancelled.load()) {
+					cancelledBeforeUnpin = true;
 					ok = false;
 				} else {
-					const auto didUnpin =
-					    this->invoke([&] { return this->pinnedApps->UnpinView(view); }, "UnpinView");
-					if (didUnpin) {
+					HRESULT unpinHr = E_UNEXPECTED;
+					const auto didUnpin = this->invoke(
+					    [&] { return this->pinnedApps->UnpinView(view); },
+					    "UnpinView",
+					    &unpinHr
+					);
+					if (didUnpin && unpinHr == S_OK) {
 						viewPinned = false;
 						unpinnedConfirmed = true;
+					} else if (didUnpin) {
+						// S_FALSE or another non-S_OK success does not prove Explorer
+						// cleared the pin; re-check IsViewPinned before clearing the fence.
+						BOOL stillPinnedAfter = TRUE;
+						HRESULT recheckHr = E_UNEXPECTED;
+						const auto rechecked = this->invoke(
+						    [&] { return this->pinnedApps->IsViewPinned(view, &stillPinnedAfter); },
+						    "IsViewPinned",
+						    &recheckHr
+						);
+						if (rechecked && recheckHr == S_OK && !stillPinnedAfter) {
+							viewPinned = false;
+							unpinnedConfirmed = true;
+						} else {
+							if (rechecked && recheckHr == S_OK && stillPinnedAfter) viewPinned = true;
+							ok = false;
+						}
 					} else {
 						ok = false;
 					}
@@ -835,11 +868,14 @@ struct PinProvider {
 			out.optionalPinnedAppsFaulted = this->optionalPinnedAppsFaulted;
 			out.serviceAvailable = this->serviceAvailable;
 			out.viewPinned = viewPinned;
+			out.cancelledBeforeUnpin = cancelledBeforeUnpin;
 			out.unpinned = unpinnedConfirmed;
 			out.error = this->lastError;
 			if (unpinnedConfirmed) {
 				out.result = 0;
 			} else if (this->disconnected || this->optionalPinnedAppsFaulted || !this->pinnedApps) {
+				out.result = -2;
+			} else if (cancelledBeforeUnpin) {
 				out.result = -2;
 			} else if (viewPinned) {
 				out.result = -1;
@@ -851,28 +887,75 @@ struct PinProvider {
 			return out;
 		}
 		auto pinnedByCall = false;
-		auto unpinnedConfirmed = (ok && !pinned);
-		if (ok && !pinned) {
+		auto pinAttemptUncertain = false;
+		auto unpinnedConfirmed = (isPinnedExactOk && !pinned);
+		if (isPinnedExactOk && !pinned) {
 			if (cancelled.load()) {
 				ok = false;
 			} else {
 				unpinnedConfirmed = false;
-				ok = this->invoke([&] { return this->pinnedApps->PinView(view); }, "PinView");
-				pinnedByCall = ok;
+				HRESULT pinHr = E_UNEXPECTED;
+				ok = this->invoke([&] { return this->pinnedApps->PinView(view); }, "PinView", &pinHr);
+				if (ok && pinHr == S_OK) {
+					pinnedByCall = true;
+				} else if (ok) {
+					BOOL pinnedAfter = FALSE;
+					HRESULT recheckHr = E_UNEXPECTED;
+					const auto rechecked = this->invoke(
+					    [&] { return this->pinnedApps->IsViewPinned(view, &pinnedAfter); },
+					    "IsViewPinned",
+					    &recheckHr
+					);
+					if (rechecked && recheckHr == S_OK) {
+						if (pinnedAfter) {
+							pinnedByCall = true;
+						} else {
+							unpinnedConfirmed = true;
+							ok = false;
+						}
+					} else {
+						pinAttemptUncertain = true;
+						ok = false;
+					}
+				} else if (this->disconnected || this->optionalPinnedAppsFaulted) {
+					// PinView was invoked and lost its reply or faulted; Explorer may
+					// have applied the pin before the failure.
+					pinAttemptUncertain = true;
+				}
 			}
+		} else if (ok && !isPinnedExactOk) {
+			pinAttemptUncertain = true;
+			ok = false;
 		}
-		auto viewPinned = (ok && pinned != FALSE) || pinnedByCall;
+		auto viewPinned = (isPinnedExactOk && ok && pinned != FALSE) || pinnedByCall;
 		if (pinnedByCall && cancelled.load()) {
 			// Cancellation raced a PinView that had already started: roll back the
 			// pin while we still hold the view. Only clear viewPinned when UnpinView
-			// confirms rollback with S_OK; an RPC disconnect, refusal, or fault
-			// leaves the pin unresolved and must not be reported as unpinned.
-			const auto unpinned =
-			    this->invoke([&] { return this->pinnedApps->UnpinView(view); }, "UnpinView");
-			if (unpinned) {
+			// confirms rollback with S_OK (or a follow-up IsViewPinned confirms FALSE);
+			// an RPC disconnect, refusal, or fault leaves the pin unresolved.
+			HRESULT unpinHr = E_UNEXPECTED;
+			const auto unpinned = this->invoke(
+			    [&] { return this->pinnedApps->UnpinView(view); },
+			    "UnpinView",
+			    &unpinHr
+			);
+			if (unpinned && unpinHr == S_OK) {
 				viewPinned = false;
 				unpinnedConfirmed = true;
 				ok = false;
+			} else if (unpinned) {
+				BOOL stillPinnedAfter = TRUE;
+				HRESULT recheckHr = E_UNEXPECTED;
+				const auto rechecked = this->invoke(
+				    [&] { return this->pinnedApps->IsViewPinned(view, &stillPinnedAfter); },
+				    "IsViewPinned",
+				    &recheckHr
+				);
+				if (rechecked && recheckHr == S_OK && !stillPinnedAfter) {
+					viewPinned = false;
+					unpinnedConfirmed = true;
+					ok = false;
+				}
 			}
 		}
 		const auto released = this->releaseLocal(unknown);
@@ -880,6 +963,7 @@ struct PinProvider {
 		out.optionalPinnedAppsFaulted = this->optionalPinnedAppsFaulted;
 		out.serviceAvailable = this->serviceAvailable;
 		out.viewPinned = viewPinned;
+		out.pinAttemptUncertain = pinAttemptUncertain;
 		out.unpinned = !viewPinned && unpinnedConfirmed;
 		out.error = this->lastError;
 		if (this->disconnected || this->optionalPinnedAppsFaulted || !this->pinnedApps) {
@@ -1001,6 +1085,7 @@ struct Channel {
 		HWND target = nullptr;
 		quint64 requestId = 0;
 		bool unpin = false;
+		bool retiredOnDisconnect = false;
 	};
 	std::shared_ptr<Worker> worker;
 	std::shared_ptr<PinWorker> pinWorker;
@@ -1010,8 +1095,8 @@ struct Channel {
 	std::function<void()> recovered;
 	std::function<void()> updated;
 	std::function<void(quint64, HWND, bool, DesktopAvailability, HRESULT)> moveCompleted;
-	std::function<void(quint64, HWND, OwnWindowPin)> pinCompleted;
-	std::function<void(HWND, bool, bool)> pinDrained;
+	std::function<void(quint64, HWND, OwnWindowPin, bool)> pinCompleted;
+	std::function<void(HWND, bool, bool, bool, bool)> pinDrained;
 	std::function<void()> commandIdle;
 	bool commandIdleScheduled = false;
 	QTimer deadline;
@@ -1134,40 +1219,54 @@ struct Channel {
 		});
 	}
 
-	void notifyPinCompleted(quint64 requestId, HWND hwnd, OwnWindowPin result) {
+	void notifyPinCompleted(quint64 requestId, HWND hwnd, OwnWindowPin result, bool mayBePinned) {
 		if (requestId == 0 || hwnd == nullptr || !this->context || !this->pinCompleted) return;
 		const auto key = reinterpret_cast<quintptr>(hwnd);
 		const auto deliveryGen = this->pinDeliveryGeneration;
 		++this->pendingPinDeliveries[key];
-		QTimer::singleShot(0, this->context, [this, deliveryGen, key, requestId, hwnd, result] {
-			if (deliveryGen == this->pinDeliveryGeneration) {
-				auto it = this->pendingPinDeliveries.find(key);
-				if (it != this->pendingPinDeliveries.end()) {
-					if (--(*it) <= 0) this->pendingPinDeliveries.erase(it);
-				}
-			}
-			if (this->context && this->pinCompleted) {
-				this->pinCompleted(requestId, hwnd, result);
-			}
-		});
+		QTimer::singleShot(
+		    0,
+		    this->context,
+		    [this, deliveryGen, key, requestId, hwnd, result, mayBePinned] {
+			    if (deliveryGen == this->pinDeliveryGeneration) {
+				    auto it = this->pendingPinDeliveries.find(key);
+				    if (it != this->pendingPinDeliveries.end()) {
+					    if (--(*it) <= 0) this->pendingPinDeliveries.erase(it);
+				    }
+			    }
+			    if (this->context && this->pinCompleted) {
+				    this->pinCompleted(requestId, hwnd, result, mayBePinned);
+			    }
+		    }
+		);
 	}
 
-	void notifyPinDrained(HWND hwnd, bool stillPinned, bool confirmedUnpinned) {
+	void notifyPinDrained(
+	    HWND hwnd,
+	    bool stillPinned,
+	    bool mayBePinned,
+	    bool confirmedUnpinned,
+	    bool disconnected
+	) {
 		if (hwnd == nullptr || !this->context || !this->pinDrained) return;
 		const auto key = reinterpret_cast<quintptr>(hwnd);
 		const auto deliveryGen = this->pinDeliveryGeneration;
 		++this->pendingPinDeliveries[key];
-		QTimer::singleShot(0, this->context, [this, deliveryGen, key, hwnd, stillPinned, confirmedUnpinned] {
-			if (deliveryGen == this->pinDeliveryGeneration) {
-				auto it = this->pendingPinDeliveries.find(key);
-				if (it != this->pendingPinDeliveries.end()) {
-					if (--(*it) <= 0) this->pendingPinDeliveries.erase(it);
-				}
-			}
-			if (this->context && this->pinDrained) {
-				this->pinDrained(hwnd, stillPinned, confirmedUnpinned);
-			}
-		});
+		QTimer::singleShot(
+		    0,
+		    this->context,
+		    [this, deliveryGen, key, hwnd, stillPinned, mayBePinned, confirmedUnpinned, disconnected] {
+			    if (deliveryGen == this->pinDeliveryGeneration) {
+				    auto it = this->pendingPinDeliveries.find(key);
+				    if (it != this->pendingPinDeliveries.end()) {
+					    if (--(*it) <= 0) this->pendingPinDeliveries.erase(it);
+				    }
+			    }
+			    if (this->context && this->pinDrained) {
+				    this->pinDrained(hwnd, stillPinned, mayBePinned, confirmedUnpinned, disconnected);
+			    }
+		    }
+		);
 	}
 
 	void cancelPin(quint64 requestId) {
@@ -1203,6 +1302,9 @@ struct Channel {
 		OwnWindowPin outcome = OwnWindowPin::Unavailable;
 		bool retireDisconnected = false;
 		bool confirmedUnpinned = false;
+		bool mayBePinned = false;
+		bool faulted = false;
+		bool refused = false;
 	};
 
 	ClassifiedPinResult classifyReadyPinResult(std::future<PinResult>& future, bool isUnpin) {
@@ -1210,6 +1312,9 @@ struct Channel {
 			auto value = future.get();
 			ClassifiedPinResult out;
 			out.confirmedUnpinned = value.unpinned && !value.viewPinned;
+			out.mayBePinned =
+			    isUnpin ? !out.confirmedUnpinned : (value.viewPinned || value.pinAttemptUncertain);
+			out.faulted = value.optionalPinnedAppsFaulted;
 			if (value.optionalPinnedAppsFaulted) {
 				qCWarning(logNativeDesktops)
 				    << "Optional desktop pinning faulted; retiring pin worker and disabling pinning";
@@ -1232,8 +1337,13 @@ struct Channel {
 			if (!value.serviceAvailable) this->pinUnavailable = true;
 			if (isUnpin) {
 				if (out.confirmedUnpinned) out.outcome = OwnWindowPin::Unpinned;
-				else if (value.viewPinned) out.outcome = OwnWindowPin::Pinned;
-				else out.outcome = value.result == -2 ? OwnWindowPin::Unavailable : OwnWindowPin::Refused;
+				else if (value.viewPinned) {
+					out.outcome = OwnWindowPin::Pinned;
+					out.refused = !value.cancelledBeforeUnpin;
+				} else {
+					out.outcome = value.result == -2 ? OwnWindowPin::Unavailable : OwnWindowPin::Refused;
+					out.refused = (out.outcome == OwnWindowPin::Refused);
+				}
 				return out;
 			}
 			if (value.viewPinned) {
@@ -1243,10 +1353,11 @@ struct Channel {
 			out.outcome = value.result == 0
 			                ? OwnWindowPin::Pinned
 			                : (value.result == -2 ? OwnWindowPin::Unavailable : OwnWindowPin::Refused);
+			out.refused = (out.outcome == OwnWindowPin::Refused);
 			return out;
 		} catch (...) {
 			this->skipOptionalPinnedApps = true;
-			return {OwnWindowPin::Unavailable, false, false};
+			return {OwnWindowPin::Unavailable, false, false, true, true, false};
 		}
 	}
 
@@ -1254,24 +1365,39 @@ struct Channel {
 		struct DrainedPin {
 			HWND target = nullptr;
 			bool stillPinned = false;
+			bool mayBePinned = false;
 			bool confirmedUnpinned = false;
+			bool disconnected = false;
 		};
 		std::vector<DrainedPin> drained;
 		auto it = this->drainingPins.begin();
 		while (it != this->drainingPins.end()) {
 			if (!it->request || it->request->settled.load(std::memory_order_acquire)) {
-				auto stillPinned = it->unpin;
+				auto stillPinned = false;
+				auto mayBePinned = true;
 				auto confirmedUnpinned = false;
+				auto disconnected = it->retiredOnDisconnect;
 				if (it->result.valid()
 				    && it->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
 				{
 					const auto classified = this->classifyReadyPinResult(it->result, it->unpin);
 					confirmedUnpinned = classified.confirmedUnpinned;
 					stillPinned =
-					    it->unpin ? !confirmedUnpinned : (classified.outcome == OwnWindowPin::Pinned);
+					    !confirmedUnpinned && (classified.outcome == OwnWindowPin::Pinned);
+					mayBePinned = it->unpin ? !confirmedUnpinned : classified.mayBePinned;
+					disconnected =
+					    classified.retireDisconnected
+					    || (it->retiredOnDisconnect && !classified.faulted && !classified.refused
+					        && !confirmedUnpinned);
 				}
 				if (it->target != nullptr) {
-					drained.push_back(DrainedPin {it->target, stillPinned, confirmedUnpinned});
+					drained.push_back(DrainedPin {
+					    it->target,
+					    stillPinned,
+					    mayBePinned,
+					    confirmedUnpinned,
+					    disconnected,
+					});
 				}
 				it = this->drainingPins.erase(it);
 			} else {
@@ -1279,7 +1405,13 @@ struct Channel {
 			}
 		}
 		for (const auto& entry: drained) {
-			this->notifyPinDrained(entry.target, entry.stillPinned, entry.confirmedUnpinned);
+			this->notifyPinDrained(
+			    entry.target,
+			    entry.stillPinned,
+			    entry.mayBePinned,
+			    entry.confirmedUnpinned,
+			    entry.disconnected
+			);
 		}
 	}
 
@@ -1294,13 +1426,19 @@ struct Channel {
 		this->pinDeadline.stop();
 		if (pendingPin && pendingPin->target != nullptr) {
 			auto pinOutcome = fallbackOutcome;
+			auto mayBePinned = pendingPin->unpin;
+			const auto retiredOnDisconnect =
+			    !disableOptional && fallbackOutcome == OwnWindowPin::Disconnected;
 			const auto settled =
 			    !pendingPin->request || pendingPin->request->settled.load(std::memory_order_acquire);
 			if (settled) {
 				if (pendingPin->result.wait_for(std::chrono::milliseconds(0))
 				    == std::future_status::ready)
 				{
-					pinOutcome = this->classifyReadyPinResult(pendingPin->result, pendingPin->unpin).outcome;
+					const auto classified =
+					    this->classifyReadyPinResult(pendingPin->result, pendingPin->unpin);
+					pinOutcome = classified.outcome;
+					mayBePinned = classified.mayBePinned;
 				}
 			} else {
 				// The retired worker is still executing inside COM for this HWND:
@@ -1311,9 +1449,15 @@ struct Channel {
 				    pendingPin->target,
 				    pendingPin->requestId,
 				    pendingPin->unpin,
+				    retiredOnDisconnect,
 				});
 			}
-			this->notifyPinCompleted(pendingPin->requestId, pendingPin->target, pinOutcome);
+			this->notifyPinCompleted(
+			    pendingPin->requestId,
+			    pendingPin->target,
+			    pinOutcome,
+			    mayBePinned
+			);
 		}
 	}
 
@@ -1609,6 +1753,10 @@ struct Channel {
 		if (outRequestId) *outRequestId = 0;
 		if (this->waiting) return OwnWindowPin::Busy;
 		this->collectPin();
+		// Never admit a replacement request or fall back while this HWND still has
+		// an active, draining, or undelivered pin/unpin request, even if the
+		// channel is disconnected or optional pinning was disabled.
+		if (this->isPinActiveFor(hwnd)) return OwnWindowPin::Busy;
 		if (!this->worker || !this->privateEnabled
 		    || this->snapshot.availability != DesktopAvailability::Available
 		    || this->skipOptionalPinnedApps || this->pinUnavailable)
@@ -1620,17 +1768,21 @@ struct Channel {
 			return OwnWindowPin::Unavailable;
 		}
 #endif
-		// Never admit a replacement request while this HWND still has an active,
-		// draining, or undelivered pin/unpin request; otherwise a retired worker's
-		// rollback can race with the new worker on the same HWND.
-		if (this->pin || this->isPinActiveFor(hwnd)) return OwnWindowPin::Busy;
+		if (this->pin) return OwnWindowPin::Busy;
 		if (!this->ensurePinWorker()) return OwnWindowPin::Unavailable;
 		auto request = std::make_shared<PinRequest>();
 		request->window = hwnd;
 		request->unpin = unpin;
 		request->completed = [this] { this->wakeOnPinCompletion(); };
 		const auto reqId = ++this->pinSequence;
-		this->pin.emplace(PinPending {request, this->pinWorker->submit(request), hwnd, reqId, unpin});
+		this->pin.emplace(PinPending {
+		    request,
+		    this->pinWorker->submit(request),
+		    hwnd,
+		    reqId,
+		    unpin,
+		    false,
+		});
 		this->armPinDeadline();
 		if (outRequestId) *outRequestId = reqId;
 		return OwnWindowPin::Pending;
@@ -1815,7 +1967,12 @@ struct Channel {
 			} else if (classified.retireDisconnected) {
 				this->retirePinWorker(false, OwnWindowPin::Disconnected);
 			}
-			this->notifyPinCompleted(finished.requestId, finished.target, classified.outcome);
+			this->notifyPinCompleted(
+			    finished.requestId,
+			    finished.target,
+			    classified.outcome,
+			    classified.mayBePinned
+			);
 			this->armPinDeadline();
 			return;
 		}
@@ -1994,7 +2151,7 @@ void setNativeDesktopMoveObserver(
 
 void setNativeDesktopPinObserver(
     QObject* context,
-    std::function<void(quint64, HWND, OwnWindowPin)> onPinCompleted
+    std::function<void(quint64, HWND, OwnWindowPin, bool)> onPinCompleted
 ) {
 	auto& c = channel();
 	c.context = context;
@@ -2003,7 +2160,7 @@ void setNativeDesktopPinObserver(
 
 void setNativeDesktopPinDrainObserver(
     QObject* context,
-    std::function<void(HWND, bool, bool)> onPinDrained
+    std::function<void(HWND, bool, bool, bool, bool)> onPinDrained
 ) {
 	auto& c = channel();
 	c.context = context;

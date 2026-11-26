@@ -6,15 +6,33 @@
 // Windows QPA and a real HWND. desktop_zorder_test cannot catch this path: its
 // raw-HWND callback never creates a panel.
 
+#include <memory>
+
+#include <qelapsedtimer.h>
 #include <qguiapplication.h>
 #include <qscreen.h>
 #include <qsignalspy.h>
 #include <qtest.h>
+#include <qthread.h>
 #include <qt_windows.h>
 
 #include "desktop_host.hpp"
+#include "erm625_desktop_fakes.hpp"
+#include "native_desktop_accessor.hpp"
 #include "panel_window.hpp"
 #include "virtual_desktops.hpp"
+
+namespace qs::windows {
+struct NativeDesktopFacadeTestHook {
+	static void selectNative(VirtualDesktops& desktops) {
+		desktops.nativeAccessor = true;
+		desktops.testAvailability = DesktopAvailability::Disconnected;
+	}
+	static void observeSnapshots(VirtualDesktops& desktops) {
+		desktops.bindNativeDesktopQueries();
+	}
+};
+} // namespace qs::windows
 
 namespace {
 
@@ -350,7 +368,8 @@ private slots:
 		emit desktops->accessorReady();
 		QCoreApplication::processEvents();
 
-		host->adoptHostForTesting(m_hostA);
+		host->setDiscoveredHostForTesting(m_hostA);
+		host->setEnabled(true);
 		QCoreApplication::processEvents();
 		QTRY_VERIFY(g_unpinCalls >= 1);
 		QVERIFY(GetParent(hwnd) == nullptr);
@@ -364,6 +383,295 @@ private slots:
 
 		panel.deleteWindow();
 		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+	}
+
+	void reloadedPanelPreservesPinStateAndUnpinsBeforeEmbedding() {
+		auto* primary = QGuiApplication::primaryScreen();
+		QVERIFY(primary != nullptr);
+		QuickshellScreenInfo screenInfo(nullptr, primary);
+
+		auto* desktops = qs::windows::VirtualDesktops::instance();
+		g_fakePinnedHwnd = nullptr;
+		g_allowUnpin = false;
+		g_pinCalls = 0;
+		g_unpinCalls = 0;
+		qs::windows::VirtualDesktops::Accessor fakeAccessor {};
+		fakeAccessor.isPinnedWindow = &fakeIsPinnedWindow;
+		fakeAccessor.pinWindow = &fakePinWindow;
+		fakeAccessor.unPinWindow = &fakeUnpinWindow;
+		desktops->installAccessorForTest(fakeAccessor);
+		struct AccessorCleanup {
+			qs::windows::VirtualDesktops* desktops;
+			~AccessorCleanup() {
+				g_fakePinnedHwnd = nullptr;
+				g_allowUnpin = true;
+				this->desktops->loseAccessorForTest();
+			}
+		} accessorCleanup {desktops};
+
+		// Keep DesktopHost enabled (m_hostA from init()), and start with a Top-layer
+		// panel that pins as a top-level window.
+		qs::windows::WinPanelWindow oldPanel;
+		oldPanel.setLayer(qs::windows::PanelLayer::Top);
+		oldPanel.setExclusionMode(ExclusionMode::Ignore);
+		oldPanel.setScreen(&screenInfo);
+		oldPanel.createWindow();
+
+		auto* window = oldPanel.backingWindow();
+		QVERIFY(window != nullptr);
+		auto* hwnd = reinterpret_cast<HWND>(window->winId());
+		QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+		QVERIFY(SetWindowPos(
+		    hwnd,
+		    nullptr,
+		    -10000,
+		    -10000,
+		    200,
+		    100,
+		    SWP_NOACTIVATE | SWP_NOZORDER
+		));
+
+		oldPanel.setVisible(true);
+		oldPanel.setVisibleDirect(true);
+		QTRY_COMPARE(g_fakePinnedHwnd, hwnd);
+		QVERIFY(GetParent(hwnd) == nullptr);
+
+		// Simulate a QML reload that reuses the same native HWND while switching
+		// to a Background layer that wants desktop embedding. The reloaded panel
+		// must inherit mayBePinnedHwnd and refuse SetParent until unpin succeeds.
+		qs::windows::WinPanelWindow newPanel;
+		newPanel.setLayer(qs::windows::PanelLayer::Background);
+		newPanel.setExclusionMode(ExclusionMode::Ignore);
+		newPanel.setScreen(&screenInfo);
+		newPanel.setVisible(true);
+		newPanel.reload(&oldPanel);
+
+		QVERIFY(newPanel.backingWindow() != nullptr);
+		QCOMPARE(reinterpret_cast<HWND>(newPanel.backingWindow()->winId()), hwnd);
+		QTRY_VERIFY(g_unpinCalls >= 1);
+		QVERIFY(GetParent(hwnd) == nullptr);
+
+		g_allowUnpin = true;
+		emit desktops->accessorReady();
+		QTRY_COMPARE(GetParent(hwnd), m_hostA);
+		QCOMPARE(g_fakePinnedHwnd, nullptr);
+
+		newPanel.deleteWindow();
+		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+	}
+
+	void nativeAsyncPinAndDisconnectDrainRecoveryBeforeEmbedding() {
+		auto* primary = QGuiApplication::primaryScreen();
+		QVERIFY(primary != nullptr);
+		QuickshellScreenInfo screenInfo(nullptr, primary);
+
+		auto* desktops = qs::windows::VirtualDesktops::instance();
+		auto* host = qs::windows::DesktopHost::instance();
+		host->setEnabled(false);
+
+		const auto prevHypr = qgetenv("CAELESTIA_WINDOWS_HYPR");
+		const auto prevDispatch = qgetenv("CAELESTIA_WINDOWS_HYPR_DISPATCH");
+		// Prevent StartupCoordinator's deferred VirtualDesktops::loadAccessor()
+		// from calling loadNativeDesktopAccessor() a second time mid-test.
+		qunsetenv("CAELESTIA_WINDOWS_HYPR");
+		qunsetenv("CAELESTIA_WINDOWS_HYPR_DISPATCH");
+
+		erm625::Fixture oldFixture;
+		erm625::Fixture freshFixture;
+		erm625::FakePinnedApps pinned;
+		pinned.expectedView =
+		    reinterpret_cast<qs::windows::native_desktop::ApplicationView*>(&oldFixture.views.view);
+		std::shared_ptr<erm625::BlockingCall> activeBlock;
+		bool useFreshFixture = false;
+		int acquisitions = 0;
+		qs::windows::VirtualDesktops::Accessor nativeAccessor {};
+
+		struct NativeCleanup {
+			qs::windows::VirtualDesktops* desktops;
+			erm625::FakePinnedApps* pinned;
+			std::shared_ptr<erm625::BlockingCall>* block;
+			QByteArray prevHypr;
+			QByteArray prevDispatch;
+			~NativeCleanup() {
+				if (*this->block) (*this->block)->release();
+				this->pinned->beforeQuery = {};
+				this->pinned->beforePin = {};
+				this->pinned->beforeUnpin = {};
+				qs::windows::setNativeDesktopFactoryForTest({});
+				QElapsedTimer timer;
+				timer.start();
+				while (qs::windows::nativeDesktopWorkerCountForTest() > 0 && timer.elapsed() < 2000) {
+					QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+					QThread::msleep(1);
+				}
+				this->desktops->loseAccessorForTest();
+				if (this->prevHypr.isNull()) qunsetenv("CAELESTIA_WINDOWS_HYPR");
+				else qputenv("CAELESTIA_WINDOWS_HYPR", this->prevHypr);
+				if (this->prevDispatch.isNull()) qunsetenv("CAELESTIA_WINDOWS_HYPR_DISPATCH");
+				else qputenv("CAELESTIA_WINDOWS_HYPR_DISPATCH", this->prevDispatch);
+			}
+		} nativeCleanup {desktops, &pinned, &activeBlock, prevHypr, prevDispatch};
+
+		qs::windows::setNativeDesktopFactoryForTest(
+		    [&](qs::windows::native_desktop::DesktopManager** m,
+		        qs::windows::native_desktop::ViewCollection** v,
+		        IVirtualDesktopManager** p) {
+			    ++acquisitions;
+			    return (useFreshFixture ? freshFixture : oldFixture).acquire(m, v, p);
+		    }
+		);
+		qs::windows::setNativeDesktopRecoveryAgeForTest([] { return qint64(30000 - 40); });
+		auto installNative = [&] {
+			desktops->installAccessorForTest(nativeAccessor);
+			qs::windows::NativeDesktopFacadeTestHook::selectNative(*desktops);
+		};
+		if (!qs::windows::loadNativeDesktopAccessor(nativeAccessor, desktops, installNative)) {
+			QSKIP("Native desktop accessor requires Windows 11 24H2+ build.");
+		}
+		qs::windows::NativeDesktopFacadeTestHook::observeSnapshots(*desktops);
+		installNative();
+		qs::windows::setNativeDesktopPinnedAppsForTest(&pinned);
+		QCoreApplication::processEvents();
+
+		// Part A: PinView returns RPC_E_SERVER_DIED (unknown mutation outcome).
+		// Hide the panel so pinRetryTimer stops and pinState.pinned stays false;
+		// mayBePinnedHwnd alone must still fence SetParent until explicit UnpinView.
+		{
+			pinned.pinned = FALSE;
+			pinned.pinResult = RPC_E_SERVER_DIED;
+			pinned.unpinResult = S_OK;
+			pinned.pins = 0;
+			pinned.unpins = 0;
+
+			QSignalSpy pinDone(desktops, &qs::windows::VirtualDesktops::ownWindowPinCompleted);
+			qs::windows::WinPanelWindow panel;
+			panel.setLayer(qs::windows::PanelLayer::Background);
+			panel.setExclusionMode(ExclusionMode::Ignore);
+			panel.setScreen(&screenInfo);
+			panel.createWindow();
+
+			auto* window = panel.backingWindow();
+			QVERIFY(window != nullptr);
+			auto* hwnd = reinterpret_cast<HWND>(window->winId());
+			QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+			QVERIFY(SetWindowPos(
+			    hwnd, nullptr, -10000, -10000, 200, 100, SWP_NOACTIVATE | SWP_NOZORDER
+			));
+
+			panel.setVisible(true);
+			panel.setVisibleDirect(true);
+			QTRY_VERIFY(pinDone.size() >= 1);
+			QCOMPARE(
+			    pinDone.at(0).at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Disconnected
+			);
+			QCOMPARE(pinDone.at(0).at(3).toBool(), true);
+			panel.setVisible(false);
+			panel.setVisibleDirect(false);
+			QTRY_VERIFY(!IsWindowVisible(hwnd));
+			QCOMPARE(pinned.pins, 1);
+
+			// Simulate Explorer having applied the pin before the reply was lost.
+			pinned.pinned = TRUE;
+			pinned.pinResult = S_OK;
+			activeBlock = std::make_shared<erm625::BlockingCall>();
+			pinned.beforeUnpin = [blocked = activeBlock] { (*blocked)(); };
+
+			host->setDiscoveredHostForTesting(m_hostA);
+			host->setEnabled(true);
+			QTRY_COMPARE(WaitForSingleObject(activeBlock->entered, 0), WAIT_OBJECT_0);
+			QVERIFY(GetParent(hwnd) == nullptr);
+
+			activeBlock->release();
+			activeBlock.reset();
+			pinned.beforeUnpin = {};
+			QTRY_COMPARE(GetParent(hwnd), m_hostA);
+			QCOMPARE(pinned.pinned, FALSE);
+			QVERIFY(pinned.unpins >= 1);
+
+			panel.deleteWindow();
+			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+			host->setEnabled(false);
+			QCoreApplication::processEvents();
+		}
+
+		// Part B: Explicit UnpinView is blocked when desktop disconnects; desktop
+		// recovers BEFORE the old UnpinView drains and returns RPC_E_DISCONNECTED.
+		// The late disconnect drain must retry on the recovered worker instead of
+		// permanently blocking embedding via embedUnpinFailedHwnd.
+		{
+			pinned.pinned = FALSE;
+			pinned.pinResult = S_OK;
+			pinned.unpinResult = S_OK;
+			pinned.pins = 0;
+			pinned.unpins = 0;
+
+			QSignalSpy pinDone(desktops, &qs::windows::VirtualDesktops::ownWindowPinCompleted);
+			QSignalSpy pinDrained(desktops, &qs::windows::VirtualDesktops::ownWindowPinDrained);
+
+			qs::windows::WinPanelWindow panel;
+			panel.setLayer(qs::windows::PanelLayer::Background);
+			panel.setExclusionMode(ExclusionMode::Ignore);
+			panel.setScreen(&screenInfo);
+			panel.createWindow();
+
+			auto* window = panel.backingWindow();
+			QVERIFY(window != nullptr);
+			auto* hwnd = reinterpret_cast<HWND>(window->winId());
+			QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+			QVERIFY(SetWindowPos(
+			    hwnd, nullptr, -10000, -10000, 200, 100, SWP_NOACTIVATE | SWP_NOZORDER
+			));
+
+			panel.setVisible(true);
+			panel.setVisibleDirect(true);
+			QTRY_VERIFY(pinDone.size() >= 1);
+			QCOMPARE(
+			    pinDone.at(0).at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Pinned
+			);
+			QCOMPARE(pinned.pinned, TRUE);
+			QVERIFY(GetParent(hwnd) == nullptr);
+
+			activeBlock = std::make_shared<erm625::BlockingCall>();
+			pinned.beforeUnpin = [blocked = activeBlock] { (*blocked)(); };
+			pinned.unpinResult = RPC_E_DISCONNECTED;
+
+			host->setDiscoveredHostForTesting(m_hostA);
+			host->setEnabled(true);
+			QTRY_COMPARE(WaitForSingleObject(activeBlock->entered, 0), WAIT_OBJECT_0);
+			QVERIFY(GetParent(hwnd) == nullptr);
+
+			// Disconnect desktop while UnpinView is blocked, then let desktop recover
+			// BEFORE releasing the blocked old UnpinView.
+			const auto acquisitionsBeforeDisconnect = acquisitions;
+			useFreshFixture = true;
+			qs::windows::invalidateNativeDesktopAccessor(RPC_E_DISCONNECTED);
+			QTRY_VERIFY(acquisitions > acquisitionsBeforeDisconnect);
+			QTRY_VERIFY(desktops->accessorLoaded());
+			QVERIFY(desktops->isOwnWindowPinActive(hwnd));
+			QVERIFY(GetParent(hwnd) == nullptr);
+
+			// Let the old UnpinView return RPC_E_DISCONNECTED (still pinned), then
+			// switch FakePinnedApps to the recovered fixture's view and S_OK before
+			// the bounded retryEmbedding() timer fires.
+			pinned.beforeUnpin = {};
+			activeBlock->release();
+			activeBlock.reset();
+			QTRY_VERIFY(pinDrained.size() >= 1);
+			QCOMPARE(pinDrained.at(0).at(4).toBool(), true);
+			QVERIFY(GetParent(hwnd) == nullptr);
+
+			pinned.expectedView = reinterpret_cast<qs::windows::native_desktop::ApplicationView*>(
+			    &freshFixture.views.view
+			);
+			pinned.unpinResult = S_OK;
+			QTRY_COMPARE_WITH_TIMEOUT(GetParent(hwnd), m_hostA, 3000);
+			QCOMPARE(pinned.pinned, FALSE);
+
+			panel.deleteWindow();
+			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+		}
 	}
 
 private:

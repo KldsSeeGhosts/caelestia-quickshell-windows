@@ -23,11 +23,11 @@ void setNativeDesktopMoveObserver(
 );
 void setNativeDesktopPinObserver(
     QObject* context,
-    std::function<void(quint64, HWND, OwnWindowPin)> onPinCompleted
+    std::function<void(quint64, HWND, OwnWindowPin, bool)> onPinCompleted
 );
 void setNativeDesktopPinDrainObserver(
     QObject* context,
-    std::function<void(HWND, bool, bool)> onPinDrained
+    std::function<void(HWND, bool, bool, bool, bool)> onPinDrained
 );
 void setNativeDesktopCommandIdleObserver(QObject* context, std::function<void()> onCommandIdle);
 void requestNativeDesktopRefresh();

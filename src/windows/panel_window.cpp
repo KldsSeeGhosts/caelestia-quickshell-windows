@@ -1126,6 +1126,16 @@ ProxiedWindow* WinPanelWindow::retrieveWindow(QObject* oldInstance) {
 	auto* old = qobject_cast<WinPanelWindow*>(oldInstance);
 	if (old == nullptr) return nullptr;
 
+	auto* oldHwnd = old->hwnd();
+	auto* preservedPinHwnd =
+	    (oldHwnd != nullptr
+	     && (old->mayBePinnedHwnd == oldHwnd || old->pinState.pinnedHere(oldHwnd)))
+	      ? oldHwnd
+	      : nullptr;
+	auto* preservedTaskbar = old->explorerTaskbar;
+	const auto preservedTaskbarPid = old->explorerTaskbarPid;
+	const auto preservedTaskbarThread = old->explorerTaskbarThread;
+
 	this->appBar.adopt(old->appBar);
 	this->blur->adopt(old->blur);
 	this->mEmbedParent = old->mEmbedParent;
@@ -1138,7 +1148,12 @@ ProxiedWindow* WinPanelWindow::retrieveWindow(QObject* oldInstance) {
 	this->mAppliedRegion = old->mAppliedRegion;
 	this->mRegionApplied = old->mRegionApplied;
 
-	return old->disownWindow();
+	auto* adopted = old->disownWindow();
+	this->mayBePinnedHwnd = preservedPinHwnd;
+	this->explorerTaskbar = preservedTaskbar;
+	this->explorerTaskbarPid = preservedTaskbarPid;
+	this->explorerTaskbarThread = preservedTaskbarThread;
+	return adopted;
 }
 
 ProxiedWindow* WinPanelWindow::createQQuickWindow() { return new WinProxiedWindow(this); }
@@ -1193,12 +1208,15 @@ void WinPanelWindow::connectWindow() {
 
 	this->updateScreen();
 
-	if (this->hwnd() == nullptr) {
+	if (auto* currentHwnd = this->hwnd(); currentHwnd == nullptr) {
 		this->mEmbedParent = nullptr;
 		this->mEmbedInsertAfter = nullptr;
 		this->mEmbedAboveIcons = false;
 		this->mRegionApplied = false;
 		this->mAppliedRegion = QRegion();
+		this->mayBePinnedHwnd = nullptr;
+	} else if (this->mayBePinnedHwnd != nullptr && this->mayBePinnedHwnd != currentHwnd) {
+		this->mayBePinnedHwnd = nullptr;
 	}
 
 	Qt::WindowFlags flags = Qt::Tool | Qt::FramelessWindowHint;
@@ -1676,7 +1694,8 @@ void WinPanelWindow::attemptPin(quint64 expectedGeneration) {
 void WinPanelWindow::onOwnWindowPinCompleted(
     quint64 requestId,
     quintptr hwndValue,
-    OwnWindowPin result
+    OwnWindowPin result,
+    bool mayBePinned
 ) {
 	auto* completedHwnd = reinterpret_cast<HWND>(hwndValue);
 	auto* currentHwnd = this->hwnd();
@@ -1692,6 +1711,11 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 			this->pinState.pinnedHwnd = currentHwnd;
 			this->pinState.failedHwnd = nullptr;
 			this->pinState.disconnectRetries = 0;
+		} else if (mayBePinned) {
+			// PinView disconnected or faulted with an unknown mutation outcome, or an
+			// unpin failed: fence embedding until explicit unpin confirms removal, but
+			// do not mark pinState.pinned so top-level pinning can still retry/follow.
+			this->mayBePinnedHwnd = currentHwnd;
 		} else if (result == OwnWindowPin::Unpinned) {
 			if (this->mayBePinnedHwnd == currentHwnd) this->mayBePinnedHwnd = nullptr;
 			if (this->pinState.pinnedHwnd == currentHwnd) {
@@ -1722,6 +1746,10 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 						this->stickToAllDesktops();
 					}
 				} else if (result == OwnWindowPin::Disconnected) {
+					if (!this->wantsEmbedding()) {
+						if (visible && !embedded) this->stickToAllDesktops();
+						return;
+					}
 					if (desktops->accessorLoaded()
 					    && this->embedUnpinDisconnectRetries < PanelPinState::MAX_DISCONNECT_RETRIES)
 					{
@@ -1794,7 +1822,9 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 void WinPanelWindow::onOwnWindowPinDrained(
     quintptr hwndValue,
     bool stillPinned,
-    bool confirmedUnpinned
+    bool mayBePinned,
+    bool confirmedUnpinned,
+    bool disconnected
 ) {
 	auto* drainedHwnd = reinterpret_cast<HWND>(hwndValue);
 	auto* currentHwnd = this->hwnd();
@@ -1806,6 +1836,8 @@ void WinPanelWindow::onOwnWindowPinDrained(
 			this->pinState.pinnedHwnd = currentHwnd;
 			this->pinState.failedHwnd = nullptr;
 			this->pinState.disconnectRetries = 0;
+		} else if (mayBePinned) {
+			this->mayBePinnedHwnd = currentHwnd;
 		} else if (confirmedUnpinned) {
 			if (this->mayBePinnedHwnd == currentHwnd) this->mayBePinnedHwnd = nullptr;
 			if (this->pinState.pinnedHwnd == currentHwnd) {
@@ -1822,7 +1854,27 @@ void WinPanelWindow::onOwnWindowPinDrained(
 		this->embedWaitingForPinHwnd = nullptr;
 		this->embedUnpinRequestId = 0;
 		if (wasOurUnpin && !confirmedUnpinned) {
-			if (desktops->accessorLoaded()) {
+			if (disconnected) {
+				if (!this->wantsEmbedding()) {
+					if (this->window != nullptr && this->window->isVisible()
+					    && this->mEmbedParent == nullptr)
+					{
+						this->stickToAllDesktops();
+					}
+					return;
+				}
+				if (desktops->accessorLoaded()
+				    && this->embedUnpinDisconnectRetries < PanelPinState::MAX_DISCONNECT_RETRIES)
+				{
+					++this->embedUnpinDisconnectRetries;
+					this->embedWaitingForPinHwnd = drainedHwnd;
+					this->retryEmbedding();
+				} else if (desktops->accessorLoaded()) {
+					this->embedUnpinFailedHwnd = drainedHwnd;
+					qCWarning(logPanel) << "Skipping desktop embedding for" << this
+					                    << "because drained unpin request disconnected repeatedly";
+				}
+			} else if (desktops->accessorLoaded()) {
 				this->embedUnpinFailedHwnd = drainedHwnd;
 				qCWarning(logPanel) << "Skipping desktop embedding for" << this
 				                    << "because drained unpin request left window pinned";
@@ -2235,6 +2287,18 @@ void WinPanelWindow::updateEmbedding() {
 	if (parent != nullptr && parent == this->embedRefusedBy) parent = nullptr;
 	if (parent == nullptr) aboveIcons = false;
 	auto* insertAfter = parent == nullptr || aboveIcons ? nullptr : host->insertAfter();
+
+	if (parent == nullptr && this->mEmbedParent == nullptr && this->embedWaitingForPinHwnd != nullptr) {
+		auto* desktops = VirtualDesktops::instance();
+		if (this->embedUnpinRequestId != 0) {
+			desktops->cancelOwnWindowPin(this->embedUnpinRequestId);
+		}
+		if (!desktops->isOwnWindowPinActive(this->embedWaitingForPinHwnd)) {
+			this->embedWaitingForPinHwnd = nullptr;
+			this->embedUnpinRequestId = 0;
+			if (this->window != nullptr && this->window->isVisible()) this->stickToAllDesktops();
+		}
+	}
 
 	if (parent == this->mEmbedParent && insertAfter == this->mEmbedInsertAfter
 	    && aboveIcons == this->mEmbedAboveIcons)

@@ -300,16 +300,21 @@ void VirtualDesktops::bindNativeDesktopQueries() {
 	        HRESULT error
 	    ) { this->onNativeMoveCompleted(sequence, hwnd, succeeded, availability, error); }
 	);
-	setNativeDesktopPinObserver(this, [this](quint64 requestId, HWND hwnd, OwnWindowPin result) {
-		this->onNativePinCompleted(requestId, hwnd, result);
-	});
+	setNativeDesktopPinObserver(
+	    this,
+	    [this](quint64 requestId, HWND hwnd, OwnWindowPin result, bool mayBePinned) {
+		    this->onNativePinCompleted(requestId, hwnd, result, mayBePinned);
+	    }
+	);
 	setNativeDesktopPinDrainObserver(
 	    this,
-	    [this](HWND hwnd, bool stillPinned, bool confirmedUnpinned) {
+	    [this](HWND hwnd, bool stillPinned, bool mayBePinned, bool confirmedUnpinned, bool disconnected) {
 		    emit this->ownWindowPinDrained(
 		        reinterpret_cast<quintptr>(hwnd),
 		        stillPinned,
-		        confirmedUnpinned
+		        mayBePinned,
+		        confirmedUnpinned,
+		        disconnected
 		    );
 	    }
 	);
@@ -317,8 +322,13 @@ void VirtualDesktops::bindNativeDesktopQueries() {
 	initializeNativeDesktopQueries(this, [this] { this->applyNativeSnapshot(); });
 }
 
-void VirtualDesktops::onNativePinCompleted(quint64 requestId, HWND hwnd, OwnWindowPin result) {
-	emit this->ownWindowPinCompleted(requestId, reinterpret_cast<quintptr>(hwnd), result);
+void VirtualDesktops::onNativePinCompleted(
+    quint64 requestId,
+    HWND hwnd,
+    OwnWindowPin result,
+    bool mayBePinned
+) {
+	emit this->ownWindowPinCompleted(requestId, reinterpret_cast<quintptr>(hwnd), result, mayBePinned);
 }
 
 void VirtualDesktops::onNativeMoveCompleted(

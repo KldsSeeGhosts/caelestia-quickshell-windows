@@ -182,8 +182,19 @@ signals:
 	void lastCommandChanged();
 	void commandResult(QVariantMap result);
 	void moveWindowCompleted(quint64 sequence, quintptr hwnd, bool succeeded, QString reason);
-	void ownWindowPinCompleted(quint64 requestId, quintptr hwnd, qs::windows::OwnWindowPin result);
-	void ownWindowPinDrained(quintptr hwnd, bool stillPinned, bool confirmedUnpinned);
+	void ownWindowPinCompleted(
+	    quint64 requestId,
+	    quintptr hwnd,
+	    qs::windows::OwnWindowPin result,
+	    bool mayBePinned
+	);
+	void ownWindowPinDrained(
+	    quintptr hwnd,
+	    bool stillPinned,
+	    bool mayBePinned,
+	    bool confirmedUnpinned,
+	    bool disconnected
+	);
 	void desktopCommandIdle();
 
 private:
@@ -206,7 +217,7 @@ private:
 	    DesktopAvailability availability,
 	    HRESULT error
 	);
-	void onNativePinCompleted(quint64 requestId, HWND hwnd, OwnWindowPin result);
+	void onNativePinCompleted(quint64 requestId, HWND hwnd, OwnWindowPin result, bool mayBePinned);
 	void applyNativeSnapshot();
 	void notifyCapability();
 	bool readRegistry(QList<GUID>& ids, GUID& current) const;
