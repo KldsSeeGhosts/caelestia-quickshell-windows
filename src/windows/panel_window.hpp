@@ -332,7 +332,10 @@ private:
 	// process restart for the owning Explorer PID, or HWND replacement/teardown.
 	HWND mayBePinnedHwnd = nullptr;
 	DWORD mayBePinnedExplorerPid = 0;
-	quint64 mayBePinnedRequestId = 0;
+	// Monotonic request watermark per HWND across pin/unpin completions and
+	// drains so an older reply cannot overwrite a newer pin or confirmed unpin.
+	HWND pinWatermarkHwnd = nullptr;
+	quint64 pinWatermarkRequestId = 0;
 	DWORD inFlightPinExplorerPid = 0;
 	QSet<DWORD> retiredExplorerPids;
 	[[nodiscard]] bool isRetiredExplorerSession(quint32 explorerPid) const {

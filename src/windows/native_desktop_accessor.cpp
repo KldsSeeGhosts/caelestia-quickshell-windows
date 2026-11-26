@@ -104,12 +104,13 @@ bool isDisconnectError(HRESULT hr) {
 }
 
 DWORD liveExplorerTaskbarPid() {
+	const auto selfPid = GetCurrentProcessId();
 	HWND taskbar = nullptr;
 	while ((taskbar = FindWindowExW(nullptr, taskbar, L"Shell_TrayWnd", nullptr)) != nullptr) {
 		if (GetPropW(taskbar, TRAY_HOOK_PROP) != nullptr) continue;
 		DWORD pid = 0;
 		GetWindowThreadProcessId(taskbar, &pid);
-		if (pid != 0) return pid;
+		if (pid != 0 && pid != selfPid) return pid;
 	}
 	return 0;
 }
@@ -599,6 +600,8 @@ struct PinResult {
 	// True only when Explorer confirmed the window is not pinned (IsViewPinned
 	// returned S_OK with FALSE or UnpinView returned S_OK).
 	bool unpinned = false;
+	// Explorer PID verified around COM service acquisition for this pin worker.
+	DWORD explorerPid = 0;
 };
 
 struct PinRequest {
@@ -625,6 +628,7 @@ struct PinProvider {
 #ifdef QS_TEST
 	bool testMode = false;
 	std::function<bool(HWND)> windowValidator;
+	std::function<DWORD()> explorerPidProvider;
 	PinnedApps* testPinnedApps = nullptr;
 	IServiceProvider* pinnedAppsShell = nullptr;
 #endif
@@ -635,6 +639,14 @@ struct PinProvider {
 	bool disconnected = false;
 	bool optionalPinnedAppsFaulted = false;
 	HRESULT lastError = S_OK;
+	DWORD explorerPid = 0;
+
+	[[nodiscard]] DWORD currentExplorerPid() const {
+#ifdef QS_TEST
+		if (this->explorerPidProvider) return this->explorerPidProvider();
+#endif
+		return liveExplorerTaskbarPid();
+	}
 
 	void drop() {
 		release(this->pinnedApps);
@@ -717,6 +729,7 @@ struct PinProvider {
 	void ensureAcquired() {
 		if (this->acquired) return;
 		this->acquired = true;
+		const auto pidBefore = this->currentExplorerPid();
 #ifdef QS_TEST
 		if (this->testMode) {
 			if (!this->views) {
@@ -730,6 +743,17 @@ struct PinProvider {
 			} else {
 				this->serviceAvailable = false;
 			}
+			const auto pidAfter = this->currentExplorerPid();
+			if (pidBefore != 0 && pidAfter != 0 && pidBefore != pidAfter && !this->disconnected
+			    && !this->optionalPinnedAppsFaulted)
+			{
+				this->explorerPid = pidBefore;
+				this->disconnected = true;
+				this->lastError = RPC_E_DISCONNECTED;
+				this->drop();
+				return;
+			}
+			this->explorerPid = pidAfter != 0 ? pidAfter : pidBefore;
 			return;
 		}
 #endif
@@ -772,6 +796,18 @@ struct PinProvider {
 		}
 		if (ok) ok = this->acquirePinnedApps(shell.Get());
 		ok = this->releaseLocal(shell) && ok;
+		const auto pidAfter = this->currentExplorerPid();
+		if (ok && pidBefore != 0 && pidAfter != 0 && pidBefore != pidAfter) {
+			// Explorer restarted while acquiring the pin COM services; abort
+			// before mutating pin state so this worker never tags a replacement
+			// Explorer session with a stale PID.
+			this->explorerPid = pidBefore;
+			this->disconnected = true;
+			this->lastError = RPC_E_DISCONNECTED;
+			this->drop();
+			return;
+		}
+		this->explorerPid = pidAfter != 0 ? pidAfter : pidBefore;
 		if (!ok && !this->disconnected && !this->optionalPinnedAppsFaulted) {
 			this->serviceAvailable = false;
 			this->drop();
@@ -788,11 +824,13 @@ struct PinProvider {
 	PinResult pin(HWND window, bool unpin, const std::atomic<bool>& cancelled) {
 		this->lastError = S_OK;
 		PinResult out;
+		out.explorerPid = this->explorerPid;
 		if (cancelled.load()) {
 			out.result = -2;
 			return out;
 		}
 		this->ensureAcquired();
+		out.explorerPid = this->explorerPid;
 		out.serviceAvailable = this->serviceAvailable;
 		out.disconnected = this->disconnected;
 		out.optionalPinnedAppsFaulted = this->optionalPinnedAppsFaulted;
@@ -1045,6 +1083,7 @@ struct PinWorker {
 	    bool testMode,
 	    ViewCollection* ownedViews,
 	    std::function<bool(HWND)> validator,
+	    std::function<DWORD()> explorerPidProvider,
 	    PinnedApps* testPinnedApps,
 	    IServiceProvider* pinnedAppsShell
 #endif
@@ -1055,6 +1094,7 @@ struct PinWorker {
 		p.testMode = testMode;
 		p.views.Attach(ownedViews);
 		p.windowValidator = std::move(validator);
+		p.explorerPidProvider = std::move(explorerPidProvider);
 		p.testPinnedApps = testPinnedApps;
 		p.pinnedAppsShell = pinnedAppsShell;
 #endif
@@ -1379,6 +1419,7 @@ struct Channel {
 		bool mayBePinned = false;
 		bool faulted = false;
 		bool refused = false;
+		DWORD explorerPid = 0;
 	};
 
 	ClassifiedPinResult classifyReadyPinResult(
@@ -1389,6 +1430,7 @@ struct Channel {
 		try {
 			auto value = future.get();
 			ClassifiedPinResult out;
+			out.explorerPid = value.explorerPid;
 			out.confirmedUnpinned = value.unpinned && !value.viewPinned;
 			out.mayBePinned =
 			    isUnpin ? !out.confirmedUnpinned : (value.viewPinned || value.pinAttemptUncertain);
@@ -1437,7 +1479,7 @@ struct Channel {
 			return out;
 		} catch (...) {
 			this->skipOptionalPinnedApps = true;
-			return {OwnWindowPin::Unavailable, false, false, true, true, false};
+			return {OwnWindowPin::Unavailable, false, false, true, true, false, 0};
 		}
 	}
 
@@ -1462,6 +1504,7 @@ struct Channel {
 				auto mayBePinned = true;
 				auto confirmedUnpinned = false;
 				auto disconnected = it->retiredOnDisconnect;
+				auto explorerPid = it->explorerPid;
 				if (it->result.valid()
 				    && it->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
 				{
@@ -1474,6 +1517,7 @@ struct Channel {
 					    classified.retireDisconnected
 					    || (it->retiredOnDisconnect && !classified.faulted && !classified.refused
 					        && !confirmedUnpinned);
+					if (classified.explorerPid != 0) explorerPid = classified.explorerPid;
 				}
 				if (it->target != nullptr) {
 					drained.push_back(DrainedPin {
@@ -1483,7 +1527,7 @@ struct Channel {
 					    mayBePinned,
 					    confirmedUnpinned,
 					    disconnected,
-					    it->explorerPid,
+					    explorerPid,
 					});
 				}
 				it = this->drainingPins.erase(it);
@@ -1517,6 +1561,7 @@ struct Channel {
 		if (pendingPin && pendingPin->target != nullptr) {
 			auto pinOutcome = fallbackOutcome;
 			auto mayBePinned = pendingPin->unpin;
+			auto explorerPid = pendingPin->explorerPid;
 			const auto retiredOnDisconnect =
 			    !disableOptional && fallbackOutcome == OwnWindowPin::Disconnected;
 			const auto settled =
@@ -1529,6 +1574,7 @@ struct Channel {
 					    this->classifyReadyPinResult(pendingPin->result, pendingPin->unpin, false);
 					pinOutcome = classified.outcome;
 					mayBePinned = classified.mayBePinned;
+					if (classified.explorerPid != 0) explorerPid = classified.explorerPid;
 				}
 			} else {
 				// The retired worker is still executing this HWND's COM pin/unpin
@@ -1549,7 +1595,7 @@ struct Channel {
 			    pendingPin->target,
 			    pinOutcome,
 			    mayBePinned,
-			    static_cast<quint32>(pendingPin->explorerPid)
+			    static_cast<quint32>(explorerPid)
 			);
 		}
 	}
@@ -1817,6 +1863,7 @@ struct Channel {
 			             testMode,
 			             ownedViews,
 			             validator = this->validator,
+			             explorerPidProvider = this->explorerPidProvider,
 			             testPinned = this->testPinnedApps,
 			             pinnedShell = this->pinnedAppsShell
 #endif
@@ -1826,6 +1873,7 @@ struct Channel {
 				    testMode,
 				    ownedViews,
 				    validator,
+				    explorerPidProvider,
 				    testPinned,
 				    pinnedShell
 #endif
@@ -2064,6 +2112,11 @@ struct Channel {
 			this->pin.reset();
 			const auto wasDisabled = this->skipOptionalPinnedApps;
 			const auto classified = this->classifyReadyPinResult(finished.result, finished.unpin);
+			const auto explorerPid =
+			    classified.explorerPid != 0 ? classified.explorerPid : finished.explorerPid;
+			if (classified.explorerPid != 0 && this->pinWorker) {
+				this->pinWorkerExplorerPid = classified.explorerPid;
+			}
 			if (!wasDisabled && this->skipOptionalPinnedApps) {
 				this->retirePinWorker(true);
 			} else if (classified.retireDisconnected) {
@@ -2074,7 +2127,7 @@ struct Channel {
 			    finished.target,
 			    classified.outcome,
 			    classified.mayBePinned,
-			    static_cast<quint32>(finished.explorerPid)
+			    static_cast<quint32>(explorerPid)
 			);
 			this->armPinDeadline();
 			return;
@@ -2423,6 +2476,7 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.watchedWindows.clear();
 	p.factory = std::move(factory);
 	p.validator = {};
+	p.explorerPidProvider = {};
 	p.testPinnedApps = nullptr;
 	p.pinnedAppsShell = nullptr;
 	p.stallLimit = stuckBound;
@@ -2434,7 +2488,13 @@ void setNativeDesktopExplorerPidForTest(std::function<DWORD()> provider) {
 	c.explorerPidProvider = std::move(provider);
 	const auto detectedPid = c.currentExplorerPid();
 	if (c.worker) c.workerExplorerPid = detectedPid;
-	if (c.pinWorker) c.pinWorkerExplorerPid = detectedPid;
+	if (!c.pin) {
+		auto previousPin = c.pinWorker;
+		c.retirePinWorker(false);
+		if (previousPin) previousPin->exit.wait_for(callBound);
+	} else if (c.pinWorker) {
+		c.pinWorkerExplorerPid = detectedPid;
+	}
 }
 
 void setNativeDesktopPinnedAppsForTest(PinnedApps* pinned) {

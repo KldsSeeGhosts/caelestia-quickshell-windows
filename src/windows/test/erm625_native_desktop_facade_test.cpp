@@ -1023,10 +1023,11 @@ private slots:
 		//     while draining after recovery must not poison pinUnavailable for the
 		//     recovered worker, and Explorer PID tags follow restarts deterministically.
 		{
-			FakePinnedAppsShell shell;
+			auto shell = std::make_shared<FakePinnedAppsShell>();
 			auto queryBlocked = std::make_shared<BlockingCall>();
+			auto simulatedExplorerPid = std::make_shared<std::atomic<DWORD>>(4101);
 			struct ShellCleanup {
-				FakePinnedAppsShell* shell;
+				std::shared_ptr<FakePinnedAppsShell> shell;
 				FakePinnedApps* pinned;
 				std::shared_ptr<BlockingCall> block;
 				~ShellCleanup() {
@@ -1034,21 +1035,26 @@ private slots:
 					setNativeDesktopExplorerPidForTest({});
 					setNativeDesktopPinnedAppsShellForTest(nullptr);
 					setNativeDesktopPinnedAppsForTest(this->pinned);
-					QElapsedTimer timer;
-					timer.start();
-					while (nativeDesktopPinWorkerCountForTest() > 0 && timer.elapsed() < 2000) {
-						QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
-						QThread::msleep(1);
+					const auto exited =
+					    waitUntil([] { return nativeDesktopPinWorkerCountForTest() == 0; }, 5000);
+					if (exited) {
+						this->shell->beforeQuery = {};
+					} else {
+						// Keep the fake alive if a worker failed to exit before teardown.
+						new std::shared_ptr<FakePinnedAppsShell>(this->shell);
+						QTest::qFail(
+						    "Pin worker did not exit before shell cleanup", __FILE__, __LINE__
+						);
 					}
-					this->shell->beforeQuery = {};
 				}
-			} shellCleanup {&shell, &pinned, queryBlocked};
-			DWORD simulatedExplorerPid = 4101;
-			setNativeDesktopExplorerPidForTest([&simulatedExplorerPid] { return simulatedExplorerPid; });
-			shell.pinnedApps = &pinned;
-			shell.result = E_NOINTERFACE;
-			shell.beforeQuery = [queryBlocked] { (*queryBlocked)(); };
-			setNativeDesktopPinnedAppsShellForTest(&shell);
+			} shellCleanup {shell, &pinned, queryBlocked};
+			setNativeDesktopExplorerPidForTest(
+			    [simulatedExplorerPid] { return simulatedExplorerPid->load(); }
+			);
+			shell->pinnedApps = &pinned;
+			shell->result = E_NOINTERFACE;
+			shell->beforeQuery = [queryBlocked] { (*queryBlocked)(); };
+			setNativeDesktopPinnedAppsShellForTest(shell.get());
 
 			const auto doneBefore = pinDone.size();
 			const auto drainedBefore = pinDrained.size();
@@ -1057,7 +1063,7 @@ private slots:
 			QCOMPARE(nativeDesktopExplorerPid(), quint32(4101));
 			QCOMPARE(WaitForSingleObject(queryBlocked->entered, 1000), WAIT_OBJECT_0);
 
-			simulatedExplorerPid = 4202;
+			simulatedExplorerPid->store(4202);
 			invalidateNativeDesktopAccessor(RPC_E_DISCONNECTED);
 			QVERIFY(waitUntil([&pinDone, doneBefore] { return pinDone.size() == doneBefore + 1; }, 1000));
 			QCOMPARE(pinDone.at(doneBefore).at(4).toUInt(), quint32(4101));
@@ -1071,14 +1077,14 @@ private slots:
 			QVERIFY(
 			    waitUntil([&pinDrained, drainedBefore] { return pinDrained.size() == drainedBefore + 1; }, 1000)
 			);
-			shell.beforeQuery = {};
+			shell->beforeQuery = {};
 			QCOMPARE(pinDrained.at(drainedBefore).at(0).toULongLong(), reqOldUnavailable);
 			QCOMPARE(pinDrained.at(drainedBefore).at(6).toUInt(), quint32(4101));
 			QVERIFY(!this->desktops->isOwnWindowPinActive(window));
 
 			// The recovered provider now returns S_OK under the new Explorer PID and
 			// must NOT be poisoned by the retired worker's E_NOINTERFACE.
-			shell.result = S_OK;
+			shell->result = S_OK;
 			pinned.pinned = FALSE;
 			const auto recoveredIdx = pinDone.size();
 			quint64 reqRecoveredPin = 0;
@@ -1092,6 +1098,32 @@ private slots:
 			QCOMPARE(pinDone.at(recoveredIdx).at(3).toBool(), true);
 			QCOMPARE(pinDone.at(recoveredIdx).at(4).toUInt(), quint32(4202));
 			QCOMPARE(pinned.pinned, TRUE);
+
+			// 4d. If Explorer restarts mid-COM-acquisition (PID changes between
+			//     before/after QueryService), ensureAcquired aborts with Disconnected
+			//     and never calls PinView on the replacement Explorer under the old PID.
+			setNativeDesktopPinnedAppsShellForTest(shell.get());
+			auto midAcqBlocked = std::make_shared<BlockingCall>();
+			shellCleanup.block = midAcqBlocked;
+			shell->result = S_OK;
+			shell->beforeQuery = [midAcqBlocked] { (*midAcqBlocked)(); };
+			pinned.pinned = FALSE;
+			const auto pinsBeforeMidAcq = pinned.pins;
+			const auto doneBeforeMidAcq = pinDone.size();
+			quint64 reqMidAcq = 0;
+			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqMidAcq), OwnWindowPin::Pending);
+			QCOMPARE(WaitForSingleObject(midAcqBlocked->entered, 1000), WAIT_OBJECT_0);
+			simulatedExplorerPid->store(4303);
+			midAcqBlocked->release();
+			QVERIFY(
+			    waitUntil([&pinDone, doneBeforeMidAcq] { return pinDone.size() == doneBeforeMidAcq + 1; }, 1000)
+			);
+			shell->beforeQuery = {};
+			QCOMPARE(pinDone.at(doneBeforeMidAcq).at(0).toULongLong(), reqMidAcq);
+			QCOMPARE(pinDone.at(doneBeforeMidAcq).at(2).value<OwnWindowPin>(), OwnWindowPin::Disconnected);
+			QCOMPARE(pinDone.at(doneBeforeMidAcq).at(3).toBool(), false);
+			QCOMPARE(pinDone.at(doneBeforeMidAcq).at(4).toUInt(), quint32(4202));
+			QCOMPARE(pinned.pins, pinsBeforeMidAcq);
 		}
 
 		// 5. SEH fault inside UnpinView during rollback leaves rollback outcome

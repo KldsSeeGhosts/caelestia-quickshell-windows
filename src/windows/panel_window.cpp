@@ -1134,8 +1134,10 @@ ProxiedWindow* WinPanelWindow::retrieveWindow(QObject* oldInstance) {
 	      : nullptr;
 	const auto preservedPinExplorerPid =
 	    preservedPinHwnd != nullptr ? old->mayBePinnedExplorerPid : 0;
-	const auto preservedPinRequestId =
-	    preservedPinHwnd != nullptr ? old->mayBePinnedRequestId : 0;
+	auto* preservedWatermarkHwnd =
+	    (oldHwnd != nullptr && old->pinWatermarkHwnd == oldHwnd) ? oldHwnd : nullptr;
+	const auto preservedWatermarkRequestId =
+	    preservedWatermarkHwnd != nullptr ? old->pinWatermarkRequestId : 0;
 	auto* preservedTaskbar = old->explorerTaskbar;
 	const auto preservedTaskbarPid = old->explorerTaskbarPid;
 	const auto preservedTaskbarThread = old->explorerTaskbarThread;
@@ -1156,7 +1158,8 @@ ProxiedWindow* WinPanelWindow::retrieveWindow(QObject* oldInstance) {
 	auto* adopted = old->disownWindow();
 	this->mayBePinnedHwnd = preservedPinHwnd;
 	this->mayBePinnedExplorerPid = preservedPinExplorerPid;
-	this->mayBePinnedRequestId = preservedPinRequestId;
+	this->pinWatermarkHwnd = preservedWatermarkHwnd;
+	this->pinWatermarkRequestId = preservedWatermarkRequestId;
 	this->explorerTaskbar = preservedTaskbar;
 	this->explorerTaskbarPid = preservedTaskbarPid;
 	this->explorerTaskbarThread = preservedTaskbarThread;
@@ -1224,11 +1227,17 @@ void WinPanelWindow::connectWindow() {
 		this->mAppliedRegion = QRegion();
 		this->mayBePinnedHwnd = nullptr;
 		this->mayBePinnedExplorerPid = 0;
-		this->mayBePinnedRequestId = 0;
-	} else if (this->mayBePinnedHwnd != nullptr && this->mayBePinnedHwnd != currentHwnd) {
-		this->mayBePinnedHwnd = nullptr;
-		this->mayBePinnedExplorerPid = 0;
-		this->mayBePinnedRequestId = 0;
+		this->pinWatermarkHwnd = nullptr;
+		this->pinWatermarkRequestId = 0;
+	} else {
+		if (this->mayBePinnedHwnd != nullptr && this->mayBePinnedHwnd != currentHwnd) {
+			this->mayBePinnedHwnd = nullptr;
+			this->mayBePinnedExplorerPid = 0;
+		}
+		if (this->pinWatermarkHwnd != nullptr && this->pinWatermarkHwnd != currentHwnd) {
+			this->pinWatermarkHwnd = nullptr;
+			this->pinWatermarkRequestId = 0;
+		}
 	}
 
 	Qt::WindowFlags flags = Qt::Tool | Qt::FramelessWindowHint;
@@ -1285,7 +1294,8 @@ void WinPanelWindow::releaseNativeState() {
 	this->embedUnpinDisconnectRetries = 0;
 	this->mayBePinnedHwnd = nullptr;
 	this->mayBePinnedExplorerPid = 0;
-	this->mayBePinnedRequestId = 0;
+	this->pinWatermarkHwnd = nullptr;
+	this->pinWatermarkRequestId = 0;
 	this->inFlightPinExplorerPid = 0;
 	this->resetPinState(true);
 	this->clearStuckFollowState();
@@ -1515,7 +1525,6 @@ void WinPanelWindow::finishPinAttempt(HWND hwnd, quint64 expectedGeneration, boo
 	if (pinned) {
 		this->mayBePinnedHwnd = hwnd;
 		this->mayBePinnedExplorerPid = this->explorerTaskbarPid;
-		this->mayBePinnedRequestId = 0;
 		this->embedUnpinFailedHwnd = nullptr;
 		this->embedUnpinDisconnectRetries = 0;
 		return;
@@ -1538,7 +1547,10 @@ void WinPanelWindow::stickToAllDesktops() {
 		this->embedUnpinDisconnectRetries = 0;
 		this->mayBePinnedHwnd = nullptr;
 		this->mayBePinnedExplorerPid = 0;
-		this->mayBePinnedRequestId = 0;
+		if (hwnd == nullptr) {
+			this->pinWatermarkHwnd = nullptr;
+			this->pinWatermarkRequestId = 0;
+		}
 		this->resetPinState(true);
 		this->clearStuckFollowState();
 		this->clearPendingFollowMove();
@@ -1550,9 +1562,12 @@ void WinPanelWindow::stickToAllDesktops() {
 	if (this->mayBePinnedHwnd != nullptr && this->mayBePinnedHwnd != hwnd) {
 		this->mayBePinnedHwnd = nullptr;
 		this->mayBePinnedExplorerPid = 0;
-		this->mayBePinnedRequestId = 0;
 		this->embedUnpinFailedHwnd = nullptr;
 		this->embedUnpinDisconnectRetries = 0;
+	}
+	if (this->pinWatermarkHwnd != nullptr && this->pinWatermarkHwnd != hwnd) {
+		this->pinWatermarkHwnd = nullptr;
+		this->pinWatermarkRequestId = 0;
 	}
 	if (this->embedWaitingForPinHwnd != nullptr) {
 		if (this->embedWaitingForPinHwnd == hwnd) {
@@ -1701,7 +1716,12 @@ void WinPanelWindow::attemptPin(quint64 expectedGeneration) {
 	if (pinResult == OwnWindowPin::Pinned) {
 		this->mayBePinnedHwnd = hwnd;
 		this->mayBePinnedExplorerPid = resolvedPinExplorerPid;
-		this->mayBePinnedRequestId = requestId;
+		if (requestId != 0) {
+			if (this->pinWatermarkHwnd != hwnd || requestId >= this->pinWatermarkRequestId) {
+				this->pinWatermarkHwnd = hwnd;
+				this->pinWatermarkRequestId = requestId;
+			}
+		}
 		this->embedUnpinFailedHwnd = nullptr;
 		this->embedUnpinDisconnectRetries = 0;
 	} else if (pinResult == OwnWindowPin::Pending && requestId != 0) {
@@ -1747,8 +1767,14 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 	const auto fromPreviousExplorer = this->isRetiredExplorerSession(explorerPid);
 	if (!fromPreviousExplorer && completedHwnd != nullptr && completedHwnd == currentHwnd && !embedded) {
 		const auto isNewerOrEqualRequest =
-		    this->mayBePinnedHwnd != currentHwnd || this->mayBePinnedRequestId == 0
-		    || requestId == 0 || requestId >= this->mayBePinnedRequestId;
+		    this->pinWatermarkHwnd != currentHwnd || this->pinWatermarkRequestId == 0
+		    || requestId == 0 || requestId >= this->pinWatermarkRequestId;
+		auto advanceWatermark = [&] {
+			if (requestId != 0) {
+				this->pinWatermarkHwnd = currentHwnd;
+				this->pinWatermarkRequestId = requestId;
+			}
+		};
 		if (result == OwnWindowPin::Pinned) {
 			// Preserve an unresolved pin even if hide or embed cancellation cleared
 			// inFlightRequestId before the worker finished.
@@ -1756,7 +1782,7 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 				this->mayBePinnedHwnd = currentHwnd;
 				this->mayBePinnedExplorerPid =
 				    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
-				this->mayBePinnedRequestId = requestId;
+				advanceWatermark();
 				this->pinState.pinned = true;
 				this->pinState.pinnedHwnd = currentHwnd;
 				this->pinState.failedHwnd = nullptr;
@@ -1770,17 +1796,17 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 				this->mayBePinnedHwnd = currentHwnd;
 				this->mayBePinnedExplorerPid =
 				    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
-				this->mayBePinnedRequestId = requestId;
+				advanceWatermark();
 			}
 		} else if (result == OwnWindowPin::Unpinned) {
 			const auto matchesPinnedSession =
 			    this->mayBePinnedExplorerPid == 0 || explorerPid == 0
 			    || this->mayBePinnedExplorerPid == static_cast<DWORD>(explorerPid);
 			if (matchesPinnedSession && isNewerOrEqualRequest) {
+				advanceWatermark();
 				if (this->mayBePinnedHwnd == currentHwnd) {
 					this->mayBePinnedHwnd = nullptr;
 					this->mayBePinnedExplorerPid = 0;
-					this->mayBePinnedRequestId = 0;
 				}
 				if (this->pinState.pinnedHwnd == currentHwnd) {
 					this->pinState.pinned = false;
@@ -1915,14 +1941,20 @@ void WinPanelWindow::onOwnWindowPinDrained(
 	    && this->mEmbedParent == nullptr)
 	{
 		const auto isNewerOrEqualRequest =
-		    this->mayBePinnedHwnd != currentHwnd || this->mayBePinnedRequestId == 0
-		    || requestId == 0 || requestId >= this->mayBePinnedRequestId;
+		    this->pinWatermarkHwnd != currentHwnd || this->pinWatermarkRequestId == 0
+		    || requestId == 0 || requestId >= this->pinWatermarkRequestId;
+		auto advanceWatermark = [&] {
+			if (requestId != 0) {
+				this->pinWatermarkHwnd = currentHwnd;
+				this->pinWatermarkRequestId = requestId;
+			}
+		};
 		if (stillPinned) {
 			if (isNewerOrEqualRequest) {
 				this->mayBePinnedHwnd = currentHwnd;
 				this->mayBePinnedExplorerPid =
 				    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
-				this->mayBePinnedRequestId = requestId;
+				advanceWatermark();
 				this->pinState.pinned = true;
 				this->pinState.pinnedHwnd = currentHwnd;
 				this->pinState.failedHwnd = nullptr;
@@ -1933,17 +1965,17 @@ void WinPanelWindow::onOwnWindowPinDrained(
 				this->mayBePinnedHwnd = currentHwnd;
 				this->mayBePinnedExplorerPid =
 				    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
-				this->mayBePinnedRequestId = requestId;
+				advanceWatermark();
 			}
 		} else if (confirmedUnpinned) {
 			const auto matchesPinnedSession =
 			    this->mayBePinnedExplorerPid == 0 || explorerPid == 0
 			    || this->mayBePinnedExplorerPid == static_cast<DWORD>(explorerPid);
 			if (matchesPinnedSession && isNewerOrEqualRequest) {
+				advanceWatermark();
 				if (this->mayBePinnedHwnd == currentHwnd) {
 					this->mayBePinnedHwnd = nullptr;
 					this->mayBePinnedExplorerPid = 0;
-					this->mayBePinnedRequestId = 0;
 				}
 				if (this->pinState.pinnedHwnd == currentHwnd) {
 					this->pinState.pinned = false;
@@ -2068,7 +2100,6 @@ bool WinPanelWindow::recoverExplorer(HWND taskbar, DWORD pid, DWORD thread) {
 		if (!preserveCurrentExplorerPin) {
 			this->mayBePinnedHwnd = nullptr;
 			this->mayBePinnedExplorerPid = 0;
-			this->mayBePinnedRequestId = 0;
 			this->embedUnpinFailedHwnd = nullptr;
 			this->embedUnpinDisconnectRetries = 0;
 		}
@@ -2493,9 +2524,12 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 		if (this->mayBePinnedHwnd != nullptr && this->mayBePinnedHwnd != hwnd) {
 			this->mayBePinnedHwnd = nullptr;
 			this->mayBePinnedExplorerPid = 0;
-			this->mayBePinnedRequestId = 0;
 			this->embedUnpinFailedHwnd = nullptr;
 			this->embedUnpinDisconnectRetries = 0;
+		}
+		if (this->pinWatermarkHwnd != nullptr && this->pinWatermarkHwnd != hwnd) {
+			this->pinWatermarkHwnd = nullptr;
+			this->pinWatermarkRequestId = 0;
 		}
 		// Fence child-style conversion and SetParent while any pin worker
 		// (active, retired-but-draining, or pending completion delivery) still
@@ -2548,7 +2582,6 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 			case OwnWindowPin::Unpinned:
 				this->mayBePinnedHwnd = nullptr;
 				this->mayBePinnedExplorerPid = 0;
-				this->mayBePinnedRequestId = 0;
 				this->embedUnpinFailedHwnd = nullptr;
 				this->embedUnpinDisconnectRetries = 0;
 				break;
@@ -2572,7 +2605,6 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 				{
 					this->mayBePinnedHwnd = nullptr;
 					this->mayBePinnedExplorerPid = 0;
-					this->mayBePinnedRequestId = 0;
 					this->embedUnpinFailedHwnd = nullptr;
 					this->embedUnpinDisconnectRetries = 0;
 					break;
@@ -2598,7 +2630,6 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 	// child or calling SetParent, so PinView cannot run against an embedding HWND.
 	this->mayBePinnedHwnd = nullptr;
 	this->mayBePinnedExplorerPid = 0;
-	this->mayBePinnedRequestId = 0;
 	this->embedUnpinFailedHwnd = nullptr;
 	this->embedUnpinDisconnectRetries = 0;
 	this->resetPinState(true);

@@ -758,9 +758,9 @@ private slots:
 		// restart keeps the HWND fenced until the old worker settles, but must not
 		// restore pinned or mayBePinned state in the new Explorer session.
 		{
-			DWORD simulatedExplorerPid = 1001;
+			auto simulatedExplorerPid = std::make_shared<std::atomic<DWORD>>(1001);
 			qs::windows::setNativeDesktopExplorerPidForTest(
-			    [&simulatedExplorerPid] { return simulatedExplorerPid; }
+			    [simulatedExplorerPid] { return simulatedExplorerPid->load(); }
 			);
 			struct ResetPid {
 				~ResetPid() { qs::windows::setNativeDesktopExplorerPidForTest({}); }
@@ -802,7 +802,7 @@ private slots:
 			// Retire the old worker into drainingPins while blocked in PinView and
 			// simulate an Explorer process restart before the old worker drains.
 			const auto acquisitionsBeforeRestart = acquisitions;
-			simulatedExplorerPid = 2002;
+			simulatedExplorerPid->store(2002);
 			qs::windows::invalidateNativeDesktopAccessor(RPC_E_DISCONNECTED);
 			QVERIFY(panel.recoverExplorerForTesting(m_hostB, 2002, 2002));
 			QTRY_VERIFY(acquisitions > acquisitionsBeforeRestart);
@@ -845,9 +845,9 @@ private slots:
 		// runs. Delayed restart handling must preserve the new Explorer's pin/fence
 		// so embedding still calls UnpinView before SetParent.
 		{
-			DWORD simulatedExplorerPid = 1001;
+			auto simulatedExplorerPid = std::make_shared<std::atomic<DWORD>>(1001);
 			qs::windows::setNativeDesktopExplorerPidForTest(
-			    [&simulatedExplorerPid] { return simulatedExplorerPid; }
+			    [simulatedExplorerPid] { return simulatedExplorerPid->load(); }
 			);
 			struct ResetPid {
 				~ResetPid() { qs::windows::setNativeDesktopExplorerPidForTest({}); }
@@ -891,7 +891,7 @@ private slots:
 				pinned.pinned = FALSE;
 				const auto doneBeforeRestart = pinDone.size();
 				const auto acquisitionsBeforeRestart = acquisitions;
-				simulatedExplorerPid = 2002;
+				simulatedExplorerPid->store(2002);
 				qs::windows::invalidateNativeDesktopAccessor(RPC_E_DISCONNECTED);
 				QTRY_VERIFY(acquisitions > acquisitionsBeforeRestart);
 				QTRY_VERIFY(desktops->accessorLoaded());
@@ -930,9 +930,9 @@ private slots:
 			// recoverExplorer(2002) arrives; the 2002 pin must not be cancelled or
 			// discarded, and embedding afterwards must unpin before SetParent.
 			{
-				simulatedExplorerPid = 1001;
+				simulatedExplorerPid->store(1001);
 				qs::windows::setNativeDesktopExplorerPidForTest(
-				    [&simulatedExplorerPid] { return simulatedExplorerPid; }
+				    [simulatedExplorerPid] { return simulatedExplorerPid->load(); }
 				);
 				pinned.pinned = FALSE;
 				pinned.pinResult = S_OK;
@@ -970,7 +970,7 @@ private slots:
 				pinned.beforePin = [blocked = activeBlock] { (*blocked)(); };
 				const auto doneBeforeRestart = pinDone.size();
 				const auto acquisitionsBeforeRestart = acquisitions;
-				simulatedExplorerPid = 2002;
+				simulatedExplorerPid->store(2002);
 				qs::windows::invalidateNativeDesktopAccessor(RPC_E_DISCONNECTED);
 				QTRY_VERIFY(acquisitions > acquisitionsBeforeRestart);
 				QTRY_COMPARE(WaitForSingleObject(activeBlock->entered, 0), WAIT_OBJECT_0);
@@ -1010,9 +1010,9 @@ private slots:
 		// with an older requestId must not clear mayBePinned/pinned state established
 		// by a newer PinView request.
 		{
-			DWORD simulatedExplorerPid = 3003;
+			auto simulatedExplorerPid = std::make_shared<std::atomic<DWORD>>(3003);
 			qs::windows::setNativeDesktopExplorerPidForTest(
-			    [&simulatedExplorerPid] { return simulatedExplorerPid; }
+			    [simulatedExplorerPid] { return simulatedExplorerPid->load(); }
 			);
 			struct ResetPid {
 				~ResetPid() { qs::windows::setNativeDesktopExplorerPidForTest({}); }
@@ -1075,6 +1075,40 @@ private slots:
 			QTRY_COMPARE(GetParent(hwnd), m_hostA);
 			QVERIFY(pinned.unpins > unpinsBeforeEmbed);
 			QCOMPARE(pinned.pinned, FALSE);
+
+			// Reverse sequence: after a newer confirmed Unpinned, an older Pinned
+			// completion or stillPinned drain must not restore the pin fence.
+			host->setEnabled(false);
+			QTRY_VERIFY(GetParent(hwnd) == nullptr);
+			panel.setVisible(false);
+			panel.setVisibleDirect(false);
+			QTRY_VERIFY(!IsWindowVisible(hwnd));
+			const auto unpinWatermarkReqId = newerReqId + 10;
+			panel.simulatePinCompletionForTesting(
+			    unpinWatermarkReqId,
+			    qs::windows::OwnWindowPin::Unpinned,
+			    false,
+			    3003
+			);
+			QVERIFY(!panel.isPinnedHereForTesting());
+			QVERIFY(!panel.mayBePinnedHereForTesting());
+
+			panel.simulatePinCompletionForTesting(
+			    unpinWatermarkReqId - 1,
+			    qs::windows::OwnWindowPin::Pinned,
+			    true,
+			    3003
+			);
+			panel.simulatePinDrainForTesting(
+			    unpinWatermarkReqId - 1,
+			    true,
+			    true,
+			    false,
+			    false,
+			    3003
+			);
+			QVERIFY(!panel.isPinnedHereForTesting());
+			QVERIFY(!panel.mayBePinnedHereForTesting());
 
 			panel.deleteWindow();
 			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
