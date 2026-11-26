@@ -2457,6 +2457,9 @@ void WinPanelWindow::updateDimensions(const MonitorRects& nativeRects) {
 		++this->geometryPlacementCount;
 #endif
 		this->window->setGeometry(geometry);
+#ifdef QS_TEST
+		if (this->geometryChangeProbeForTesting) this->geometryChangeProbeForTesting();
+#endif
 	}
 
 	if (this->mEmbedParent != nullptr) {

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include <qt_windows.h>
@@ -161,6 +163,12 @@ public:
 	[[nodiscard]] int dimensionUpdatesForTesting() const { return this->dimensionUpdateCount; }
 	[[nodiscard]] int geometryPlacementsForTesting() const { return this->geometryPlacementCount; }
 	[[nodiscard]] int closeStartsForTesting() const { return this->closeStartCount; }
+	[[nodiscard]] bool dimensionsUpdateRunningForTesting() const {
+		return this->dimensionsUpdateRunning;
+	}
+	void setGeometryChangeProbeForTesting(std::function<void()> probe) {
+		this->geometryChangeProbeForTesting = std::move(probe);
+	}
 	bool recoverExplorerForTesting(HWND taskbar, DWORD pid, DWORD thread) {
 		return this->recoverExplorer(taskbar, pid, thread);
 	}
@@ -425,6 +433,7 @@ private:
 	int dimensionUpdateCount = 0;
 	int geometryPlacementCount = 0;
 	int closeStartCount = 0;
+	std::function<void()> geometryChangeProbeForTesting;
 #endif
 
 	QVariantAnimation* mAnimation = nullptr;
