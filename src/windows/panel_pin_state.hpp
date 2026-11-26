@@ -76,13 +76,18 @@ struct PanelPinState {
 
 	// Prepares for a pin attempt on `hwnd`. Returns true if the caller should
 	// ensure its single retry timer is armed (at 0 ms when not already active).
-	[[nodiscard]] bool prepare(HWND hwnd) {
+	// If an older HWND's in-flight pin was cleared, writes its request ID to
+	// `cancelledRequestId` so the caller can cancel it on the pin worker.
+	[[nodiscard]] bool prepare(HWND hwnd, quint64* cancelledRequestId = nullptr) {
+		if (cancelledRequestId != nullptr) *cancelledRequestId = 0;
 		if (hwnd == nullptr) {
+			if (cancelledRequestId != nullptr) *cancelledRequestId = this->inFlightRequestId;
 			this->reset(true);
 			return false;
 		}
 		if (this->pinnedHere(hwnd)) return false;
 		if (this->attemptHwnd != hwnd) {
+			if (cancelledRequestId != nullptr) *cancelledRequestId = this->inFlightRequestId;
 			this->reset(true);
 			this->attemptHwnd = hwnd;
 		}
@@ -90,10 +95,16 @@ struct PanelPinState {
 		return true;
 	}
 
-	[[nodiscard]] bool canAttempt(HWND hwnd, quint64 expectedGeneration) {
+	[[nodiscard]] bool canAttempt(
+	    HWND hwnd,
+	    quint64 expectedGeneration,
+	    quint64* cancelledRequestId = nullptr
+	) {
+		if (cancelledRequestId != nullptr) *cancelledRequestId = 0;
 		if (hwnd == nullptr || expectedGeneration != this->generation) return false;
 		if (this->pinnedHere(hwnd)) return false;
 		if (this->attemptHwnd != hwnd) {
+			if (cancelledRequestId != nullptr) *cancelledRequestId = this->inFlightRequestId;
 			this->reset(true);
 			this->attemptHwnd = hwnd;
 			return false;

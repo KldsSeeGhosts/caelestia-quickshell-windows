@@ -352,9 +352,10 @@ private slots:
 
 		// 2. A stalled pin retires only the pin worker, never invokes PinView
 		//    after retirement, and must not retire the desktop worker or drop
-		//    an in-flight switch.
+		//    an in-flight switch. Give only the pin worker a short deadline so
+		//    the check is deterministic regardless of scheduler jitter.
 		{
-			setNativeDesktopStuckBoundForTest(350);
+			setNativeDesktopPinStuckBoundForTest(80);
 			auto pinBlocked = std::make_shared<BlockingCall>();
 			Unblock unblockPin {pinBlocked};
 			auto switchBlocked = std::make_shared<BlockingCall>();
@@ -363,16 +364,13 @@ private slots:
 			pinned.beforeQuery = [pinBlocked] { (*pinBlocked)(); };
 			this->old.manager.beforeSwitch = [switchBlocked] { (*switchBlocked)(); };
 
-			quint64 reqStall = 0;
-			QCOMPARE(pinNativeDesktopOwnWindow(panelB, &reqStall), OwnWindowPin::Pending);
-			QCOMPARE(WaitForSingleObject(pinBlocked->entered, 1000), WAIT_OBJECT_0);
-			// Give the pin a head start so it stalls while switchTo is still well
-			// inside its own stall bound.
-			QTest::qWait(160);
-
 			QVERIFY(this->desktops->switchTo(1));
 			QCOMPARE(WaitForSingleObject(switchBlocked->entered, 1000), WAIT_OBJECT_0);
 			QVERIFY(nativeDesktopCommandPending());
+
+			quint64 reqStall = 0;
+			QCOMPARE(pinNativeDesktopOwnWindow(panelB, &reqStall), OwnWindowPin::Pending);
+			QCOMPARE(WaitForSingleObject(pinBlocked->entered, 1000), WAIT_OBJECT_0);
 
 			// Wait for the pin to stall and retire ONLY the pin worker while
 			// switchTo is still blocked in flight on the desktop worker.
@@ -448,16 +446,34 @@ private slots:
 		this->old.manager.beforeSwitch = {};
 		QCOMPARE(this->old.manager.switches, 1);
 
-		// A retry after the transient pin-only disconnect spawns a replacement pin
-		// worker and succeeds without re-acquiring desktop control.
+		// RPC_E_SERVER_DIED and RPC_E_SERVER_DIED_DNE are also retryable pin
+		// disconnects that retire only the pin worker and allow recovery.
+		for (const HRESULT hr: {RPC_E_SERVER_DIED, RPC_E_SERVER_DIED_DNE}) {
+			const auto beforeCount = pinDone.size();
+			pinned.pinned = FALSE;
+			pinned.pinResult = hr;
+			quint64 reqDied = 0;
+			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqDied), OwnWindowPin::Pending);
+			QVERIFY(reqDied != 0);
+			QVERIFY(waitUntil([&pinDone, beforeCount] { return pinDone.size() == beforeCount + 1; }, 1000));
+			QCOMPARE(pinDone.at(beforeCount).at(0).toULongLong(), reqDied);
+			QCOMPARE(pinDone.at(beforeCount).at(2).value<OwnWindowPin>(), OwnWindowPin::Disconnected);
+			QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
+			QVERIFY(waitUntil([] { return nativeDesktopWorkerCountForTest() == 1; }, 1000));
+		}
+
+		// A retry after the transient pin-only disconnects spawns a replacement
+		// pin worker and succeeds without re-acquiring desktop control.
+		pinned.pinned = FALSE;
 		pinned.pinResult = S_OK;
+		const auto recoverIdx = pinDone.size();
 		quint64 reqRecover = 0;
 		QCOMPARE(pinNativeDesktopOwnWindow(window, &reqRecover), OwnWindowPin::Pending);
 		QVERIFY(reqRecover != 0);
-		QVERIFY(waitUntil([&pinDone] { return pinDone.size() == 2; }, 1000));
-		QCOMPARE(pinDone.at(1).at(0).toULongLong(), reqRecover);
-		QCOMPARE(pinDone.at(1).at(1).toULongLong(), quintptr(window));
-		QCOMPARE(pinDone.at(1).at(2).value<OwnWindowPin>(), OwnWindowPin::Pinned);
+		QVERIFY(waitUntil([&pinDone, recoverIdx] { return pinDone.size() == recoverIdx + 1; }, 1000));
+		QCOMPARE(pinDone.at(recoverIdx).at(0).toULongLong(), reqRecover);
+		QCOMPARE(pinDone.at(recoverIdx).at(1).toULongLong(), quintptr(window));
+		QCOMPARE(pinDone.at(recoverIdx).at(2).value<OwnWindowPin>(), OwnWindowPin::Pinned);
 		QCOMPARE(this->acquisitions, 1);
 
 		// SEH fault during PinView delivers Unavailable, disables optional pinning,
@@ -466,13 +482,14 @@ private slots:
 		pinned.pinResult = S_OK;
 		pinned.faultOnPin = true;
 		setNativeDesktopPinnedAppsForTest(&pinned);
+		const auto faultIdx = pinDone.size();
 		quint64 reqFault = 0;
 		QCOMPARE(pinNativeDesktopOwnWindow(window, &reqFault), OwnWindowPin::Pending);
 		QVERIFY(reqFault != 0);
-		QVERIFY(waitUntil([&pinDone] { return pinDone.size() == 3; }, 1000));
-		QCOMPARE(pinDone.at(2).at(0).toULongLong(), reqFault);
-		QCOMPARE(pinDone.at(2).at(1).toULongLong(), quintptr(window));
-		QCOMPARE(pinDone.at(2).at(2).value<OwnWindowPin>(), OwnWindowPin::Unavailable);
+		QVERIFY(waitUntil([&pinDone, faultIdx] { return pinDone.size() == faultIdx + 1; }, 1000));
+		QCOMPARE(pinDone.at(faultIdx).at(0).toULongLong(), reqFault);
+		QCOMPARE(pinDone.at(faultIdx).at(1).toULongLong(), quintptr(window));
+		QCOMPARE(pinDone.at(faultIdx).at(2).value<OwnWindowPin>(), OwnWindowPin::Unavailable);
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
 		QCOMPARE(pinNativeDesktopOwnWindow(window), OwnWindowPin::Unavailable);
 		QVERIFY(this->desktops->switchTo(0));
@@ -566,6 +583,35 @@ private slots:
 		QVERIFY(this->desktops->switchTo(1));
 		QVERIFY(waitUntil([] { return !nativeDesktopRequestPending(); }, 1000));
 
+		// 1b. QueryService returning RPC_E_SERVER_DIED / RPC_E_SERVER_DIED_DNE
+		//     delivers Disconnected without latching pinUnavailable, and a
+		//     subsequent retry on a fresh pin worker succeeds.
+		shell->queries = 0;
+		shell->writeBogusOnFail = false;
+		QVERIFY(loadNativeDesktopAccessor(this->accessor, this->desktops, [this] { this->install(); }));
+		this->install();
+		for (const HRESULT hr: {RPC_E_SERVER_DIED, RPC_E_SERVER_DIED_DNE}) {
+			const auto idx = pinDone.size();
+			shell->result = hr;
+			quint64 reqDied = 0;
+			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqDied), OwnWindowPin::Pending);
+			QVERIFY(waitUntil([&pinDone, idx] { return pinDone.size() == idx + 1; }, 1000));
+			QCOMPARE(pinDone.at(idx).at(0).toULongLong(), reqDied);
+			QCOMPARE(pinDone.at(idx).at(2).value<OwnWindowPin>(), OwnWindowPin::Disconnected);
+			QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
+		}
+		{
+			const auto idx = pinDone.size();
+			shell->result = S_OK;
+			this->pinnedApps.expectedView = reinterpret_cast<ApplicationView*>(&this->fresh.views.view);
+			this->pinnedApps.pinned = FALSE;
+			quint64 reqOk = 0;
+			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqOk), OwnWindowPin::Pending);
+			QVERIFY(waitUntil([&pinDone, idx] { return pinDone.size() == idx + 1; }, 1000));
+			QCOMPARE(pinDone.at(idx).at(0).toULongLong(), reqOk);
+			QCOMPARE(pinDone.at(idx).at(2).value<OwnWindowPin>(), OwnWindowPin::Pinned);
+		}
+
 		// 2. SEH fault with a bogus non-owning out-pointer does not Release the bogus
 		//    pointer, retires only the pin worker, and keeps desktop control available.
 		shell->queries = 0;
@@ -574,11 +620,12 @@ private slots:
 		shell->writeBogusOnFail = true;
 		QVERIFY(loadNativeDesktopAccessor(this->accessor, this->desktops, [this] { this->install(); }));
 		this->install();
+		const auto faultIdx = pinDone.size();
 		quint64 reqFault = 0;
 		QCOMPARE(pinNativeDesktopOwnWindow(window, &reqFault), OwnWindowPin::Pending);
-		QVERIFY(waitUntil([&pinDone] { return pinDone.size() == 2; }, 1000));
-		QCOMPARE(pinDone.at(1).at(0).toULongLong(), reqFault);
-		QCOMPARE(pinDone.at(1).at(2).value<OwnWindowPin>(), OwnWindowPin::Unavailable);
+		QVERIFY(waitUntil([&pinDone, faultIdx] { return pinDone.size() == faultIdx + 1; }, 1000));
+		QCOMPARE(pinDone.at(faultIdx).at(0).toULongLong(), reqFault);
+		QCOMPARE(pinDone.at(faultIdx).at(2).value<OwnWindowPin>(), OwnWindowPin::Unavailable);
 		QCOMPARE(shell->queries, 1);
 		QCOMPARE(this->pinnedApps.refs, 1UL);
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
@@ -595,9 +642,10 @@ private slots:
 		shell->writeBogusOnFail = false;
 		activeBlock = std::make_shared<BlockingCall>();
 		shell->beforeQuery = [blocked = activeBlock] { (*blocked)(); };
-		setNativeDesktopStuckBoundForTest(60);
+		setNativeDesktopPinStuckBoundForTest(60);
 		QVERIFY(loadNativeDesktopAccessor(this->accessor, this->desktops, [this] { this->install(); }));
 		this->install();
+		const auto stallIdx = pinDone.size();
 		quint64 reqStall = 0;
 		QCOMPARE(pinNativeDesktopOwnWindow(window, &reqStall), OwnWindowPin::Pending);
 		QCOMPARE(WaitForSingleObject(activeBlock->entered, 1000), WAIT_OBJECT_0);
@@ -612,9 +660,9 @@ private slots:
 		    1000
 		));
 		// Pin worker retires on its own stall bound without disconnecting desktops.
-		QVERIFY(waitUntil([&pinDone] { return pinDone.size() == 3; }, 1000));
-		QCOMPARE(pinDone.at(2).at(0).toULongLong(), reqStall);
-		QCOMPARE(pinDone.at(2).at(2).value<OwnWindowPin>(), OwnWindowPin::Unavailable);
+		QVERIFY(waitUntil([&pinDone, stallIdx] { return pinDone.size() == stallIdx + 1; }, 1000));
+		QCOMPARE(pinDone.at(stallIdx).at(0).toULongLong(), reqStall);
+		QCOMPARE(pinDone.at(stallIdx).at(2).value<OwnWindowPin>(), OwnWindowPin::Unavailable);
 		QCOMPARE(nativeDesktopAvailability(), DesktopAvailability::Available);
 		QCOMPARE(shell->queries, 0);
 		QCOMPARE(pinNativeDesktopOwnWindow(window), OwnWindowPin::Unavailable);
@@ -745,9 +793,22 @@ private slots:
 		);
 		QCOMPARE(state.failedHwnd, hwndA);
 
+		// Replacing HWND while a pin is in flight returns the old request ID for
+		// worker cancellation before resetting state for the new HWND.
+		state.reset(true);
+		QVERIFY(state.prepare(hwndA));
+		const auto genReplace = state.generation;
+		QCOMPARE(
+		    state.onSubmitResult(hwndA, genReplace, OwnWindowPin::Pending, now, 125),
+		    PanelPinState::SubmitAction::None
+		);
+		quint64 cancelledId = 0;
+		QVERIFY(state.prepare(hwndB, &cancelledId));
+		QCOMPARE(cancelledId, quint64(125));
+		QCOMPARE(state.inFlightRequestId, quint64(0));
+
 		// HWND recreation resets failure/retry state; exceeding BUSY_WAIT_BUDGET_MS
 		// without a slot handoff falls back to TriggerFollow and records failedHwnd.
-		QVERIFY(state.prepare(hwndB));
 		const auto genB = state.generation;
 		QCOMPARE(
 		    state.onSubmitResult(hwndB, genB, OwnWindowPin::Busy, 20000),

@@ -98,7 +98,8 @@ struct TestViewsSlot {
 
 bool isDisconnectError(HRESULT hr) {
 	return hr == RPC_E_DISCONNECTED || hr == CO_E_OBJNOTCONNECTED
-	    || hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE);
+	    || hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE)
+	    || hr == RPC_E_SERVER_DIED || hr == RPC_E_SERVER_DIED_DNE;
 }
 
 struct Provider {
@@ -165,9 +166,7 @@ struct Provider {
 		this->lastError = hr;
 		this->operationError = hr;
 		qCWarning(logNativeDesktops) << operation << "refused, HRESULT" << Qt::hex << hr;
-		if (hr == RPC_E_DISCONNECTED || hr == CO_E_OBJNOTCONNECTED
-		    || hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE))
-		{
+		if (isDisconnectError(hr)) {
 			this->drop();
 			this->availability = DesktopAvailability::Disconnected;
 		}
@@ -939,6 +938,7 @@ struct Channel {
 	std::optional<Pending> pending;
 	std::optional<PinPending> pin;
 	std::chrono::milliseconds stallLimit = stuckBound;
+	std::chrono::milliseconds pinStallLimit = stuckBound;
 	bool supported = false;
 	bool privateEnabled = false;
 	bool refusedBuild = false;
@@ -1449,7 +1449,7 @@ struct Channel {
 		const auto ticks = this->pin->request->started.load();
 		const auto since =
 		    ticks ? Clock::time_point(Clock::duration(ticks)) : this->pin->request->submitted;
-		const auto next = since + this->stallLimit;
+		const auto next = since + this->pinStallLimit;
 		this->pinDeadline.start(std::max(
 		    std::chrono::ceil<std::chrono::milliseconds>(next - Clock::now()),
 		    std::chrono::milliseconds(1)
@@ -1587,7 +1587,7 @@ struct Channel {
 			this->armPinDeadline();
 			return;
 		}
-		if (this->pin && this->pin->request->stalled(this->stallLimit)) {
+		if (this->pin && this->pin->request->stalled(this->pinStallLimit)) {
 			qCWarning(logNativeDesktops)
 			    << "Optional desktop pinning stalled; retiring pin worker and disabling pinning";
 			this->retirePinWorker(true);
@@ -1904,6 +1904,7 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.testPinnedApps = nullptr;
 	p.pinnedAppsShell = nullptr;
 	p.stallLimit = stuckBound;
+	p.pinStallLimit = stuckBound;
 }
 
 void setNativeDesktopPinnedAppsForTest(PinnedApps* pinned) {
@@ -1953,7 +1954,12 @@ bool nativeDesktopPendingReadyForTest() {
 	return c.pending && c.pending->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
 }
 void setNativeDesktopStuckBoundForTest(int milliseconds) {
-	channel().stallLimit = std::chrono::milliseconds(milliseconds);
+	auto& c = channel();
+	c.stallLimit = std::chrono::milliseconds(milliseconds);
+	c.pinStallLimit = std::chrono::milliseconds(milliseconds);
+}
+void setNativeDesktopPinStuckBoundForTest(int milliseconds) {
+	channel().pinStallLimit = std::chrono::milliseconds(milliseconds);
 }
 #endif
 

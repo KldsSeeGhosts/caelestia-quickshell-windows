@@ -298,7 +298,10 @@ public:
 			    &VirtualDesktops::currentChanged,
 			    VirtualDesktops::instance(),
 			    [] {
-				    for (auto* panel: stack->mPanels) panel->followFailureCount = 0;
+				    for (auto* panel: stack->mPanels) {
+					    panel->followFailureCount = 0;
+					    panel->followWaitingBusy = false;
+				    }
 				    stack->mFollowBusySinceMs.reset();
 				    stack->mFollowFirstBusyMs.reset();
 				    stack->mFollowRetryTimer.stop();
@@ -333,6 +336,7 @@ public:
 						    const auto targetId = panel->pendingFollowMoveDesktopId;
 						    const auto targetDesktop = panel->pendingFollowMoveDesktop;
 						    panel->clearPendingFollowMove();
+						    panel->followWaitingBusy = false;
 						    matched = true;
 						    if (panel->hwnd() != target || panel->isEmbedded() || panel->pinnedHere(target)) {
 							    break;
@@ -355,8 +359,8 @@ public:
 				    }
 				    // Any completed move frees the desktop worker slot: renew the
 				    // per-handoff busy wait window and immediately wake waiting panels,
-				    // even if a failing panel just hit its own retry cap.
-				    if (stack->mFollowRetryTimer.isActive()) {
+				    // even if a failing panel hit its retry cap or the busy timer stopped.
+				    if (stack->mFollowRetryTimer.isActive() || stack->hasWaitingFollowPanel()) {
 					    stack->mFollowBusySinceMs.reset();
 					    stack->mFollowRetryTimer.start(0);
 					    return;
@@ -441,6 +445,12 @@ public:
 		});
 	}
 
+	[[nodiscard]] bool hasWaitingFollowPanel() const {
+		return std::ranges::any_of(this->mPanels, [](WinPanelWindow* panel) {
+			return !panel->isEmbedded() && panel->followWaitingBusy;
+		});
+	}
+
 	void scheduleFollowRetry(bool busyOnly) {
 		if (busyOnly) {
 			const auto now = static_cast<qint64>(GetTickCount64());
@@ -467,14 +477,23 @@ public:
 		auto needsBusyRetry = false;
 		auto needsFailureRetry = false;
 		auto anyPending = false;
+		QList<WinPanelWindow*> candidates;
+		candidates.reserve(this->mPanels.size());
 
 		for (auto* panel: this->mPanels) {
-			if (panel->isEmbedded()) continue;
+			if (panel->isEmbedded()) {
+				panel->followWaitingBusy = false;
+				continue;
+			}
 			auto* hwnd = panel->hwnd();
-			if (hwnd == nullptr || panel->pinnedHere(hwnd)) continue;
+			if (hwnd == nullptr || panel->pinnedHere(hwnd)) {
+				panel->followWaitingBusy = false;
+				continue;
+			}
 			if (panel->followAttemptHwnd != hwnd) {
 				panel->followAttemptHwnd = hwnd;
 				panel->followFailureCount = 0;
+				panel->followWaitingBusy = false;
 			}
 			if (desktops->isWindowOnCurrent(hwnd)) {
 				panel->clearPendingFollowMove();
@@ -483,6 +502,7 @@ public:
 				panel->stuckDesktop = current;
 				panel->stuckConfirmSeq = 0;
 				panel->followFailureCount = 0;
+				panel->followWaitingBusy = false;
 				continue;
 			}
 			// Honor a confirmed move to the current desktop until a window read
@@ -492,6 +512,7 @@ public:
 			    && sameFollowTarget(panel->stuckDesktopId, panel->stuckDesktop, currentId, current)
 			    && panel->stuckConfirmSeq != 0 && readSeq < panel->stuckConfirmSeq)
 			{
+				panel->followWaitingBusy = false;
 				continue;
 			}
 			if (panel->pendingFollowMoveSeq != 0 && panel->pendingFollowMoveHwnd == hwnd
@@ -502,10 +523,36 @@ public:
 			        current
 			    ))
 			{
+				panel->followWaitingBusy = false;
 				anyPending = true;
 				continue;
 			}
-			if (panel->followFailureCount >= FOLLOW_RETRY_MAX) continue;
+			if (panel->followFailureCount >= FOLLOW_RETRY_MAX) {
+				panel->followWaitingBusy = false;
+				continue;
+			}
+			candidates.push_back(panel);
+		}
+
+		// Give waiting siblings and panels with fewer failures the next free
+		// desktop worker slot before retrying a panel whose previous move failed.
+		std::stable_sort(
+		    candidates.begin(),
+		    candidates.end(),
+		    [](const WinPanelWindow* a, const WinPanelWindow* b) {
+			    if (a->followFailureCount != b->followFailureCount) {
+				    return a->followFailureCount < b->followFailureCount;
+			    }
+			    return a->followWaitingBusy && !b->followWaitingBusy;
+		    }
+		);
+
+		for (auto* panel: candidates) {
+			auto* hwnd = panel->hwnd();
+			if (hwnd == nullptr || panel->isEmbedded() || panel->pinnedHere(hwnd)) {
+				panel->followWaitingBusy = false;
+				continue;
+			}
 			quint64 pendingSeq = 0;
 			QString failureReason;
 			GUID targetId {};
@@ -520,6 +567,7 @@ public:
 			        isNullGuid(currentId) ? std::nullopt : std::optional<GUID>(currentId)
 			    ))
 			{
+				panel->followWaitingBusy = false;
 				const auto resolvedId = !isNullGuid(targetId) ? targetId : currentId;
 				if (pendingSeq != 0) {
 					// Async acceptance is not confirmation: preserve the retry
@@ -544,8 +592,10 @@ public:
 				if (panel->pendingFollowMoveHwnd != hwnd) panel->clearPendingFollowMove();
 				panel->clearStuckFollowState();
 				if (failureReason == QStringLiteral("provider-busy")) {
+					panel->followWaitingBusy = true;
 					needsBusyRetry = true;
 				} else {
+					panel->followWaitingBusy = false;
 					++panel->followFailureCount;
 					if (panel->followFailureCount < FOLLOW_RETRY_MAX) needsFailureRetry = true;
 				}
@@ -563,6 +613,9 @@ public:
 			} else {
 				this->mFollowBusySinceMs.reset();
 				this->mFollowFirstBusyMs.reset();
+				if (!anyPending) {
+					for (auto* panel: this->mPanels) panel->followWaitingBusy = false;
+				}
 				if (needsFailureRetry) {
 					if (!this->mFollowRetryTimer.isActive()) this->mFollowRetryTimer.start(FOLLOW_RETRY_MS);
 				} else {
@@ -1172,6 +1225,7 @@ void WinPanelWindow::releaseNativeState() {
 	this->clearPendingFollowMove();
 	this->followAttemptHwnd = nullptr;
 	this->followFailureCount = 0;
+	this->followWaitingBusy = false;
 	WinPanelStack::instance()->removePanel(this);
 
 	this->mEmbedParent = nullptr;
@@ -1405,13 +1459,18 @@ void WinPanelWindow::stickToAllDesktops() {
 		this->clearPendingFollowMove();
 		this->followAttemptHwnd = nullptr;
 		this->followFailureCount = 0;
+		this->followWaitingBusy = false;
 		return;
 	}
-	if (this->pinnedHere(hwnd)) return;
+	if (this->pinnedHere(hwnd)) {
+		this->followWaitingBusy = false;
+		return;
+	}
 
 	if (this->followAttemptHwnd != hwnd) {
 		this->followAttemptHwnd = hwnd;
 		this->followFailureCount = 0;
+		this->followWaitingBusy = false;
 	}
 
 	auto* desktops = VirtualDesktops::instance();
@@ -1431,6 +1490,7 @@ void WinPanelWindow::stickToAllDesktops() {
 		this->stuckDesktop = current;
 		this->stuckConfirmSeq = 0;
 		this->followFailureCount = 0;
+		this->followWaitingBusy = false;
 	} else if (!confirmedPendingRead) {
 		if ((this->pendingFollowMoveSeq == 0 || this->pendingFollowMoveHwnd != hwnd
 		     || !sameFollowTarget(
@@ -1455,6 +1515,7 @@ void WinPanelWindow::stickToAllDesktops() {
 			        isNullGuid(currentId) ? std::nullopt : std::optional<GUID>(currentId)
 			    ))
 			{
+				this->followWaitingBusy = false;
 				const auto resolvedId = !isNullGuid(targetId) ? targetId : currentId;
 				if (pendingSeq != 0) {
 					this->pendingFollowMoveSeq = pendingSeq;
@@ -1474,8 +1535,10 @@ void WinPanelWindow::stickToAllDesktops() {
 				if (this->pendingFollowMoveHwnd != hwnd) this->clearPendingFollowMove();
 				this->clearStuckFollowState();
 				if (failureReason == QStringLiteral("provider-busy")) {
+					this->followWaitingBusy = true;
 					WinPanelStack::instance()->scheduleFollowRetry(true);
 				} else {
+					this->followWaitingBusy = false;
 					++this->followFailureCount;
 					if (this->followFailureCount < FOLLOW_RETRY_MAX) {
 						WinPanelStack::instance()->scheduleFollowRetry(false);
@@ -1485,7 +1548,10 @@ void WinPanelWindow::stickToAllDesktops() {
 		}
 	}
 
-	if (this->pinState.prepare(hwnd) && !this->pinRetryTimer.isActive()) {
+	quint64 cancelledPinId = 0;
+	const auto shouldSchedule = this->pinState.prepare(hwnd, &cancelledPinId);
+	if (cancelledPinId != 0) desktops->cancelOwnWindowPin(cancelledPinId);
+	if (shouldSchedule && !this->pinRetryTimer.isActive()) {
 		this->schedulePinRetry(0);
 	}
 }
@@ -1501,7 +1567,10 @@ void WinPanelWindow::attemptPin(quint64 expectedGeneration) {
 		this->stickToAllDesktops();
 		return;
 	}
-	if (!this->pinState.canAttempt(hwnd, expectedGeneration)) return;
+	quint64 cancelledPinId = 0;
+	const auto allowed = this->pinState.canAttempt(hwnd, expectedGeneration, &cancelledPinId);
+	if (cancelledPinId != 0) VirtualDesktops::instance()->cancelOwnWindowPin(cancelledPinId);
+	if (!allowed) return;
 
 	auto* desktops = VirtualDesktops::instance();
 	if (!desktops->accessorLoaded()) return;
@@ -1585,6 +1654,7 @@ void WinPanelWindow::onDesktopAccessorReady() {
 	this->clearStuckFollowState();
 	this->clearPendingFollowMove();
 	this->followFailureCount = 0;
+	this->followWaitingBusy = false;
 	if (this->window != nullptr && this->window->isVisible()) this->stickToAllDesktops();
 }
 
@@ -1599,6 +1669,7 @@ bool WinPanelWindow::recoverExplorer(HWND taskbar, DWORD pid, DWORD thread) {
 	this->clearStuckFollowState();
 	this->clearPendingFollowMove();
 	this->followFailureCount = 0;
+	this->followWaitingBusy = false;
 	this->appBar.invalidate();
 	this->scheduleUpdateDimensions();
 	this->blur->syncPlacement();
@@ -1971,6 +2042,14 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 	}
 	auto wasEmbedded = this->mEmbedParent != nullptr;
 
+	// Cancel any in-flight pin or follow state before converting the window to a
+	// child or calling SetParent, so PinView cannot run against an embedding HWND.
+	this->resetPinState(true);
+	this->clearStuckFollowState();
+	this->clearPendingFollowMove();
+	this->followFailureCount = 0;
+	this->followWaitingBusy = false;
+
 	if (!wasEmbedded) {
 		RECT rect {};
 		if (GetWindowRect(hwnd, &rect)) this->mEmbedRect = toQRect(rect);
@@ -1993,6 +2072,7 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 			this->mEmbedInsertAfter = nullptr;
 			this->mEmbedAboveIcons = false;
 			setChildStyle(hwnd, false);
+			if (this->window != nullptr && this->window->isVisible()) this->stickToAllDesktops();
 		}
 		return;
 	}
@@ -2002,10 +2082,6 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 
 	this->embedRefusedBy = nullptr;
 	this->restackCount = 0;
-	this->resetPinState(true);
-	this->clearStuckFollowState();
-	this->clearPendingFollowMove();
-	this->followFailureCount = 0;
 	this->appBar.remove();
 	this->applyNativeStyles();
 	this->placeEmbedded();

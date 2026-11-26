@@ -304,6 +304,7 @@ private:
 	qsizetype pendingFollowMoveDesktop = -1;
 	HWND followAttemptHwnd = nullptr;
 	int followFailureCount = 0;
+	bool followWaitingBusy = false;
 
 	HWND mEmbedParent = nullptr;
 	HWND mEmbedInsertAfter = nullptr;
