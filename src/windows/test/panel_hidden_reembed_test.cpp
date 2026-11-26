@@ -1461,49 +1461,50 @@ private slots:
 			freshFixture.publicApi.desktopId = freshFixture.two.id;
 			freshFixture.publicApi.onCurrent = FALSE;
 			auto moveBlock = std::make_shared<erm625::BlockingCall>();
-			auto moveBlockExited = std::make_shared<std::atomic<bool>>(false);
 			auto blockOnceK = std::make_shared<std::atomic<bool>>(true);
-			freshFixture.publicApi.beforeMove = [moveBlock, moveBlockExited, blockOnceK] {
-				if (blockOnceK->exchange(false)) {
-					(*moveBlock)();
-					moveBlockExited->store(true, std::memory_order_release);
-				}
+			freshFixture.publicApi.beforeMove = [moveBlock, blockOnceK] {
+				if (blockOnceK->exchange(false)) (*moveBlock)();
 			};
 			freshFixture.manager.moveResult = E_ACCESSDENIED;
-			freshFixture.publicApi.moveResult = E_ACCESSDENIED;
+			freshFixture.publicApi.moveResult.store(E_ACCESSDENIED, std::memory_order_release);
 			struct ResetMoveFixture {
 				erm625::Fixture* fixture;
 				std::shared_ptr<erm625::BlockingCall>* block;
-				std::shared_ptr<std::atomic<bool>> exited;
 				std::shared_ptr<std::atomic<bool>> blockOnce;
 				~ResetMoveFixture() {
 					this->blockOnce->store(false);
 					if (*this->block) (*this->block)->release();
 					QElapsedTimer timer;
 					timer.start();
-					const auto entered =
-					    *this->block
-					    && WaitForSingleObject((*this->block)->entered, 0) == WAIT_OBJECT_0;
-					while (entered && !this->exited->load(std::memory_order_acquire)
+					// Wait for any active MoveWindowToDesktop call (including on a
+					// retired worker) to return completely and for pending requests
+					// to drain before modifying hooks or fixture fields.
+					while ((this->fixture->publicApi.activeMoves.load(std::memory_order_acquire) > 0
+					        || qs::windows::nativeDesktopRequestPending())
 					       && timer.elapsed() < 5000)
 					{
-						QThread::msleep(1);
-					}
-					// Drain any active desktop worker request via a synchronous probe
-					// barrier before touching fixture fields or hooks.
-					while (qs::windows::nativeDesktopRequestPending() && timer.elapsed() < 5000) {
 						QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
 						QThread::msleep(1);
 					}
-					(void)qs::windows::refreshNativeDesktopForTest();
-					this->fixture->manager.beforeMove = {};
-					this->fixture->publicApi.beforeMove = {};
-					this->fixture->manager.moveResult = S_OK;
-					this->fixture->publicApi.moveResult = S_OK;
-					this->fixture->publicApi.desktopId = this->fixture->one.id;
-					this->fixture->publicApi.onCurrent = TRUE;
+					const auto settled =
+					    this->fixture->publicApi.activeMoves.load(std::memory_order_acquire) == 0
+					    && !qs::windows::nativeDesktopRequestPending();
+					if (settled) {
+						this->fixture->manager.beforeMove = {};
+						this->fixture->publicApi.beforeMove = {};
+						this->fixture->manager.moveResult = S_OK;
+						this->fixture->publicApi.moveResult.store(S_OK, std::memory_order_release);
+						this->fixture->publicApi.desktopId = this->fixture->one.id;
+						this->fixture->publicApi.onCurrent = TRUE;
+					} else {
+						QTest::qFail(
+						    "MoveWindowToDesktop worker did not exit before fixture teardown",
+						    __FILE__,
+						    __LINE__
+						);
+					}
 				}
-			} resetMove {&freshFixture, &moveBlock, moveBlockExited, blockOnceK};
+			} resetMove {&freshFixture, &moveBlock, blockOnceK};
 
 			qs::windows::WinPanelWindow panel;
 			panel.setLayer(qs::windows::PanelLayer::Top);
@@ -1536,7 +1537,7 @@ private slots:
 
 			moveBlock->release();
 			QTRY_VERIFY(moveDone.size() >= 1);
-			QTRY_VERIFY(moveBlockExited->load(std::memory_order_acquire));
+			QTRY_COMPARE(freshFixture.publicApi.activeMoves.load(std::memory_order_acquire), 0);
 			QTRY_VERIFY(!qs::windows::nativeDesktopRequestPending());
 			freshFixture.publicApi.beforeMove = {};
 			moveBlock.reset();
@@ -1549,16 +1550,18 @@ private slots:
 			    freshFixture.publicApi.moves.load(std::memory_order_acquire);
 			const auto moveDoneBeforeReopen = moveDone.size();
 			freshFixture.manager.moveResult = S_OK;
-			freshFixture.publicApi.moveResult = S_OK;
+			freshFixture.publicApi.moveResult.store(S_OK, std::memory_order_release);
 			panel.setVisible(true);
 			panel.setVisibleDirect(true);
 			QTRY_VERIFY_WITH_TIMEOUT(
 			    moveDone.size() > moveDoneBeforeReopen
 			        || (freshFixture.publicApi.moves.load(std::memory_order_acquire)
 			                > movesBeforeReopen
+			            && freshFixture.publicApi.activeMoves.load(std::memory_order_acquire) == 0
 			            && !qs::windows::nativeDesktopRequestPending()),
 			    3000
 			);
+			QTRY_COMPARE(freshFixture.publicApi.activeMoves.load(std::memory_order_acquire), 0);
 			QVERIFY(freshFixture.publicApi.moves.load(std::memory_order_acquire) > movesBeforeReopen);
 
 			panel.deleteWindow();

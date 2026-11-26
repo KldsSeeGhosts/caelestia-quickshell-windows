@@ -256,8 +256,9 @@ struct FakePinnedAppsShell: FakeCom<IServiceProvider> {
 struct FakePublic: FakeCom<IVirtualDesktopManager> {
 	bool faultOnRead = false;
 	std::function<void()> beforeQuery, beforeMove;
-	HRESULT moveResult = S_OK;
+	std::atomic<HRESULT> moveResult {S_OK};
 	std::atomic<int> moves {0};
+	std::atomic<int> activeMoves {0};
 	GUID desktopId {};
 	BOOL onCurrent = TRUE;
 	HRESULT STDMETHODCALLTYPE IsWindowOnCurrentVirtualDesktop(HWND, BOOL* out) override {
@@ -273,10 +274,16 @@ struct FakePublic: FakeCom<IVirtualDesktopManager> {
 		return S_OK;
 	}
 	HRESULT STDMETHODCALLTYPE MoveWindowToDesktop(HWND, REFGUID id) override {
+		this->activeMoves.fetch_add(1, std::memory_order_acq_rel);
+		struct ActiveGuard {
+			std::atomic<int>& count;
+			~ActiveGuard() { this->count.fetch_sub(1, std::memory_order_release); }
+		} guard {this->activeMoves};
 		if (this->beforeMove) this->beforeMove();
 		this->moves.fetch_add(1, std::memory_order_relaxed);
-		if (SUCCEEDED(this->moveResult)) this->desktopId = id;
-		return this->moveResult;
+		const auto hr = this->moveResult.load(std::memory_order_acquire);
+		if (SUCCEEDED(hr)) this->desktopId = id;
+		return hr;
 	}
 };
 
