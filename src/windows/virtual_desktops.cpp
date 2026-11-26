@@ -584,11 +584,11 @@ bool VirtualDesktops::isWindowOnCurrent(HWND hwnd) const {
 }
 
 quint64 VirtualDesktops::windowReadSequence() const {
-	return this->nativeAccessor ? nativeDesktopWindowReadSequence() : 0;
+	return nativeDesktopWindowReadSequence();
 }
 
 quint64 VirtualDesktops::submittedSequence() const {
-	return this->nativeAccessor ? nativeDesktopSubmittedSequence() : 0;
+	return nativeDesktopSubmittedSequence();
 }
 
 void VirtualDesktops::sendShortcut(WORD key, int times) const {

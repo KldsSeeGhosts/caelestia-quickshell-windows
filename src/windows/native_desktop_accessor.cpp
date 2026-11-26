@@ -99,7 +99,8 @@ struct TestViewsSlot {
 bool isDisconnectError(HRESULT hr) {
 	return hr == RPC_E_DISCONNECTED || hr == CO_E_OBJNOTCONNECTED
 	    || hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE)
-	    || hr == RPC_E_SERVER_DIED || hr == RPC_E_SERVER_DIED_DNE;
+	    || hr == RPC_E_SERVER_DIED || hr == RPC_E_SERVER_DIED_DNE
+	    || hr == RPC_E_CONNECTION_TERMINATED;
 }
 
 struct Provider {
@@ -800,12 +801,20 @@ struct PinProvider {
 		           [&] { return this->pinnedApps->IsViewPinned(view, &pinned); },
 		           "IsViewPinned"
 		       );
+		auto pinnedByCall = false;
 		if (ok && !pinned) {
 			if (cancelled.load()) {
 				ok = false;
 			} else {
 				ok = this->invoke([&] { return this->pinnedApps->PinView(view); }, "PinView");
+				pinnedByCall = ok;
 			}
+		}
+		if (pinnedByCall && cancelled.load()) {
+			// Cancellation raced a PinView that had already started: roll back the
+			// pin before returning so an embedding or replaced window does not stay pinned.
+			this->invoke([&] { return this->pinnedApps->UnpinView(view); }, "UnpinView");
+			ok = false;
 		}
 		ok = this->releaseLocal(unknown) && ok;
 		out.disconnected = this->disconnected;
@@ -1035,6 +1044,31 @@ struct Channel {
 		if (this->pin->request) this->pin->request->cancelled.store(true);
 	}
 
+	OwnWindowPin classifyReadyPinResult(std::future<PinResult>& future) {
+		try {
+			auto value = future.get();
+			if (value.optionalPinnedAppsFaulted) {
+				qCWarning(logNativeDesktops)
+				    << "Optional desktop pinning faulted; retiring pin worker and disabling pinning";
+				this->skipOptionalPinnedApps = true;
+				return OwnWindowPin::Unavailable;
+			}
+			if (value.disconnected) {
+				qCWarning(logNativeDesktops)
+				    << "Optional desktop pinning disconnected, HRESULT" << Qt::hex << value.error
+				    << "; retiring pin worker without interrupting desktop control";
+				return OwnWindowPin::Disconnected;
+			}
+			if (!value.serviceAvailable) this->pinUnavailable = true;
+			return value.result == 0
+			         ? OwnWindowPin::Pinned
+			         : (value.result == -2 ? OwnWindowPin::Unavailable : OwnWindowPin::Refused);
+		} catch (...) {
+			this->skipOptionalPinnedApps = true;
+			return OwnWindowPin::Unavailable;
+		}
+	}
+
 	void retirePinWorker(
 	    bool disableOptional = false,
 	    OwnWindowPin fallbackOutcome = OwnWindowPin::Unavailable
@@ -1047,21 +1081,7 @@ struct Channel {
 		if (pendingPin && pendingPin->target != nullptr) {
 			auto pinOutcome = fallbackOutcome;
 			if (pendingPin->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-				try {
-					auto value = pendingPin->result.get();
-					if (value.optionalPinnedAppsFaulted) {
-						pinOutcome = OwnWindowPin::Unavailable;
-					} else if (value.disconnected) {
-						pinOutcome = OwnWindowPin::Disconnected;
-					} else {
-						pinOutcome = value.result == 0
-						               ? OwnWindowPin::Pinned
-						               : (value.result == -2 ? OwnWindowPin::Unavailable
-						                                     : OwnWindowPin::Refused);
-					}
-				} catch (...) {
-					pinOutcome = OwnWindowPin::Unavailable;
-				}
+				pinOutcome = this->classifyReadyPinResult(pendingPin->result);
 			}
 			this->notifyPinCompleted(pendingPin->requestId, pendingPin->target, pinOutcome);
 		}
@@ -1072,8 +1092,8 @@ struct Channel {
 		if (auto previous = std::exchange(this->worker, {})) previous->stop();
 		this->refresh.reset();
 		this->deadline.stop();
-		this->pinUnavailable = false;
 		this->retirePinWorker(false, OwnWindowPin::Disconnected);
+		this->pinUnavailable = false;
 		this->snapshot.availability = DesktopAvailability::Disconnected;
 		this->snapshot.error = error;
 		// Keep the last desktop/window values as explicitly stale state.
@@ -1131,8 +1151,8 @@ struct Channel {
 				this->snapshot.windows = std::move(result.windows);
 				this->snapshot.availability = state;
 				this->snapshot.error = error;
-				this->pinUnavailable = false;
 				this->retirePinWorker(false, OwnWindowPin::Disconnected);
+				this->pinUnavailable = false;
 				this->recovery.disconnected();
 				return false;
 			}
@@ -1545,45 +1565,14 @@ struct Channel {
 		{
 			auto finished = std::move(*this->pin);
 			this->pin.reset();
-			try {
-				auto value = finished.result.get();
-				if (value.optionalPinnedAppsFaulted) {
-					qCWarning(logNativeDesktops)
-					    << "Optional desktop pinning faulted; retiring pin worker and disabling pinning";
-					this->retirePinWorker(true);
-					this->notifyPinCompleted(
-					    finished.requestId,
-					    finished.target,
-					    OwnWindowPin::Unavailable
-					);
-					return;
-				}
-				if (value.disconnected) {
-					qCWarning(logNativeDesktops)
-					    << "Optional desktop pinning disconnected, HRESULT" << Qt::hex << value.error
-					    << "; retiring pin worker without interrupting desktop control";
-					this->retirePinWorker(false, OwnWindowPin::Disconnected);
-					this->notifyPinCompleted(
-					    finished.requestId,
-					    finished.target,
-					    OwnWindowPin::Disconnected
-					);
-					return;
-				}
-				if (!value.serviceAvailable) this->pinUnavailable = true;
-				const auto outcome = value.result == 0
-				                       ? OwnWindowPin::Pinned
-				                       : (value.result == -2 ? OwnWindowPin::Unavailable
-				                                             : OwnWindowPin::Refused);
-				this->notifyPinCompleted(finished.requestId, finished.target, outcome);
-			} catch (...) {
+			const auto wasDisabled = this->skipOptionalPinnedApps;
+			const auto outcome = this->classifyReadyPinResult(finished.result);
+			if (!wasDisabled && this->skipOptionalPinnedApps) {
 				this->retirePinWorker(true);
-				this->notifyPinCompleted(
-				    finished.requestId,
-				    finished.target,
-				    OwnWindowPin::Unavailable
-				);
+			} else if (outcome == OwnWindowPin::Disconnected) {
+				this->retirePinWorker(false, OwnWindowPin::Disconnected);
 			}
+			this->notifyPinCompleted(finished.requestId, finished.target, outcome);
 			this->armPinDeadline();
 			return;
 		}
@@ -1952,6 +1941,10 @@ int nativeDesktopWorkerCountForTest() { return liveWorkers().load() + livePinWor
 bool nativeDesktopPendingReadyForTest() {
 	const auto& c = channel();
 	return c.pending && c.pending->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+}
+bool nativeDesktopPinReadyForTest() {
+	const auto& c = channel();
+	return c.pin && c.pin->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
 }
 void setNativeDesktopStuckBoundForTest(int milliseconds) {
 	auto& c = channel();

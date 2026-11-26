@@ -613,9 +613,8 @@ public:
 			} else {
 				this->mFollowBusySinceMs.reset();
 				this->mFollowFirstBusyMs.reset();
-				if (!anyPending) {
-					for (auto* panel: this->mPanels) panel->followWaitingBusy = false;
-				}
+				// Stop timer polling at the busy deadline, but keep followWaitingBusy
+				// armed so a later unrelated moveWindowCompleted still wakes waiting panels.
 				if (needsFailureRetry) {
 					if (!this->mFollowRetryTimer.isActive()) this->mFollowRetryTimer.start(FOLLOW_RETRY_MS);
 				} else {
@@ -1462,10 +1461,20 @@ void WinPanelWindow::stickToAllDesktops() {
 		this->followWaitingBusy = false;
 		return;
 	}
+	if (this->embedWaitPinRequestId != 0) {
+		if (this->embedWaitPinHwnd == hwnd) return;
+		this->embedWaitPinRequestId = 0;
+		this->embedWaitPinHwnd = nullptr;
+	}
 	if (this->pinnedHere(hwnd)) {
 		this->followWaitingBusy = false;
 		return;
 	}
+
+	auto* desktops = VirtualDesktops::instance();
+	quint64 cancelledPinId = 0;
+	const auto shouldSchedulePin = this->pinState.prepare(hwnd, &cancelledPinId);
+	if (cancelledPinId != 0) desktops->cancelOwnWindowPin(cancelledPinId);
 
 	if (this->followAttemptHwnd != hwnd) {
 		this->followAttemptHwnd = hwnd;
@@ -1473,7 +1482,6 @@ void WinPanelWindow::stickToAllDesktops() {
 		this->followWaitingBusy = false;
 	}
 
-	auto* desktops = VirtualDesktops::instance();
 	const auto current = desktops->currentIndex();
 	const auto currentId = currentDesktopId(desktops);
 	const auto readSeq = desktops->windowReadSequence();
@@ -1548,10 +1556,7 @@ void WinPanelWindow::stickToAllDesktops() {
 		}
 	}
 
-	quint64 cancelledPinId = 0;
-	const auto shouldSchedule = this->pinState.prepare(hwnd, &cancelledPinId);
-	if (cancelledPinId != 0) desktops->cancelOwnWindowPin(cancelledPinId);
-	if (shouldSchedule && !this->pinRetryTimer.isActive()) {
+	if (shouldSchedulePin && !this->pinRetryTimer.isActive()) {
 		this->schedulePinRetry(0);
 	}
 }
@@ -1559,7 +1564,8 @@ void WinPanelWindow::stickToAllDesktops() {
 void WinPanelWindow::attemptPin(quint64 expectedGeneration) {
 	auto* hwnd = this->hwnd();
 	if (hwnd == nullptr || this->window == nullptr || !this->window->isVisible()
-	    || this->mEmbedParent != nullptr)
+	    || this->mEmbedParent != nullptr
+	    || (this->embedWaitPinRequestId != 0 && this->embedWaitPinHwnd == hwnd))
 	{
 		return;
 	}
@@ -1613,6 +1619,17 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 	auto* currentHwnd = this->hwnd();
 	const auto visible = this->window != nullptr && this->window->isVisible();
 	const auto embedded = this->mEmbedParent != nullptr;
+	if (this->embedWaitPinRequestId != 0 && requestId == this->embedWaitPinRequestId) {
+		this->embedWaitPinRequestId = 0;
+		this->embedWaitPinHwnd = nullptr;
+		if (this->wantsEmbedding()) {
+			this->updateEmbedding();
+			this->scheduleUpdateDimensions();
+		} else if (visible && !embedded) {
+			this->stickToAllDesktops();
+		}
+		return;
+	}
 	auto* desktops = VirtualDesktops::instance();
 	const auto gen = this->pinState.generation;
 
@@ -2041,6 +2058,27 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 		return;
 	}
 	auto wasEmbedded = this->mEmbedParent != nullptr;
+
+	if (!wasEmbedded) {
+		if (this->embedWaitPinRequestId != 0) {
+			if (this->embedWaitPinHwnd == hwnd) return;
+			this->embedWaitPinRequestId = 0;
+			this->embedWaitPinHwnd = nullptr;
+		}
+		// Defer child-style conversion and SetParent while a pin mutation for
+		// this HWND is still in flight on the pin worker. Cancel it first and
+		// resume embedding once onOwnWindowPinCompleted confirms it drained.
+		if (this->pinState.inFlightRequestId != 0 && this->pinState.inFlightHwnd == hwnd) {
+			this->embedWaitPinRequestId = this->pinState.inFlightRequestId;
+			this->embedWaitPinHwnd = hwnd;
+			this->resetPinState(true);
+			this->clearStuckFollowState();
+			this->clearPendingFollowMove();
+			this->followFailureCount = 0;
+			this->followWaitingBusy = false;
+			return;
+		}
+	}
 
 	// Cancel any in-flight pin or follow state before converting the window to a
 	// child or calling SetParent, so PinView cannot run against an embedding HWND.

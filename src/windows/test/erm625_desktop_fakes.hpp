@@ -189,12 +189,16 @@ struct FakePinnedApps: FakeCom<PinnedApps> {
 	BOOL pinned = FALSE;
 	int queries = 0;
 	int pins = 0;
+	int unpins = 0;
 	HRESULT queryResult = S_OK;
 	HRESULT pinResult = S_OK;
+	HRESULT unpinResult = S_OK;
 	bool faultOnQuery = false;
 	bool faultOnPin = false;
+	bool faultOnUnpin = false;
 	std::function<void()> beforeQuery;
 	std::function<void()> beforePin;
+	std::function<void()> beforeUnpin;
 	HRESULT STDMETHODCALLTYPE IsAppIdPinned(PCWSTR, BOOL*) override { return E_NOTIMPL; }
 	HRESULT STDMETHODCALLTYPE PinAppID(PCWSTR) override { return E_NOTIMPL; }
 	HRESULT STDMETHODCALLTYPE UnpinAppID(PCWSTR) override { return E_NOTIMPL; }
@@ -215,7 +219,14 @@ struct FakePinnedApps: FakeCom<PinnedApps> {
 		if (SUCCEEDED(this->pinResult)) this->pinned = TRUE;
 		return this->pinResult;
 	}
-	HRESULT STDMETHODCALLTYPE UnpinView(ApplicationView*) override { return E_NOTIMPL; }
+	HRESULT STDMETHODCALLTYPE UnpinView(ApplicationView* view) override {
+		if (this->beforeUnpin) this->beforeUnpin();
+		++this->unpins;
+		if (this->faultOnUnpin) fault();
+		if (view != this->expectedView) return E_INVALIDARG;
+		if (SUCCEEDED(this->unpinResult)) this->pinned = FALSE;
+		return this->unpinResult;
+	}
 };
 struct FakePinnedAppsShell: FakeCom<IServiceProvider> {
 	FakePinnedApps* pinnedApps = nullptr;

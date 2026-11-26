@@ -266,6 +266,8 @@ private:
 	bool dimensionsUpdatePending = false;
 	bool appBarRetryPending = false;
 	bool embedRetryPending = false;
+	quint64 embedWaitPinRequestId = 0;
+	HWND embedWaitPinHwnd = nullptr;
 	bool scaleRecreatePending = false;
 	bool focusFlagPending = false;
 	bool focusOnExpose = false;
