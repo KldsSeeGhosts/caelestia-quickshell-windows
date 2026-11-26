@@ -338,8 +338,19 @@ private:
 	quint64 pinWatermarkRequestId = 0;
 	DWORD inFlightPinExplorerPid = 0;
 	QSet<DWORD> retiredExplorerPids;
-	[[nodiscard]] bool isRetiredExplorerSession(quint32 explorerPid) const {
-		return explorerPid != 0 && this->retiredExplorerPids.contains(static_cast<DWORD>(explorerPid));
+	[[nodiscard]] bool isStaleExplorerSession(quint32 explorerPid, quint32 liveExplorerPid) const {
+		if (explorerPid == 0) return false;
+		const auto pid = static_cast<DWORD>(explorerPid);
+		if (this->retiredExplorerPids.contains(pid)) return true;
+		// Reject a completion/drain from an intermediate Explorer session that
+		// this panel never recorded (e.g. A -> hidden in B -> C): if Explorer
+		// is currently running under a different live PID (or the panel already
+		// observed a newer Explorer session while the taskbar is absent), this
+		// reply belongs to a dead session and must not mark the HWND pinned.
+		if (liveExplorerPid != 0 && pid != static_cast<DWORD>(liveExplorerPid)) {
+			return true;
+		}
+		return false;
 	}
 	bool scaleRecreatePending = false;
 	bool focusFlagPending = false;

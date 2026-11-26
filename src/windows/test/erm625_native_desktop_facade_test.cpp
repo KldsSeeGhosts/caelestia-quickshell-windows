@@ -1142,6 +1142,30 @@ private slots:
 				QCOMPARE(pinDone.at(doneBeforeMidAcq).at(4).toUInt(), tc.expectedReportedPid);
 				QCOMPARE(pinned.pins, pinsBeforeMidAcq);
 			}
+
+			// 4e. Submitting a pin during a taskbar gap (PID == 0) must report
+			//     nativeDesktopExplorerPid() == 0 rather than substituting the
+			//     desktop worker's stale cached PID.
+			simulatedExplorerPid->store(0);
+			setNativeDesktopPinnedAppsShellForTest(shell.get());
+			auto gapBlocked = std::make_shared<BlockingCall>();
+			shellCleanup.block = gapBlocked;
+			shell->result = S_OK;
+			shell->beforeQuery = [gapBlocked] { (*gapBlocked)(); };
+			pinned.pinned = FALSE;
+			const auto doneBeforeGap = pinDone.size();
+			quint64 reqGap = 0;
+			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqGap), OwnWindowPin::Pending);
+			QCOMPARE(nativeDesktopExplorerPid(), quint32(0));
+			QCOMPARE(WaitForSingleObject(gapBlocked->entered, 1000), WAIT_OBJECT_0);
+			simulatedExplorerPid->store(4505);
+			gapBlocked->release();
+			QVERIFY(
+			    waitUntil([&pinDone, doneBeforeGap] { return pinDone.size() == doneBeforeGap + 1; }, 1000)
+			);
+			shell->beforeQuery = {};
+			QCOMPARE(pinDone.at(doneBeforeGap).at(2).value<OwnWindowPin>(), OwnWindowPin::Disconnected);
+			QCOMPARE(pinDone.at(doneBeforeGap).at(4).toUInt(), quint32(0));
 		}
 
 		// 5. SEH fault inside UnpinView during rollback leaves rollback outcome

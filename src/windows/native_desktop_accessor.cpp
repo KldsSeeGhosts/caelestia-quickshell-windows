@@ -1228,9 +1228,9 @@ struct Channel {
 	}
 
 	[[nodiscard]] DWORD activePinExplorerPid() const {
-		if (this->pin && this->pin->explorerPid != 0) return this->pin->explorerPid;
-		if (this->pinWorkerExplorerPid != 0) return this->pinWorkerExplorerPid;
-		return this->currentWorkerExplorerPid();
+		if (this->pin) return this->pin->explorerPid;
+		if (this->pinWorker) return this->pinWorkerExplorerPid;
+		return this->currentExplorerPid();
 	}
 
 	Channel() {
@@ -2438,6 +2438,7 @@ void cancelNativeDesktopOwnWindowPin(quint64 requestId) { channel().cancelPin(re
 void cancelNativeDesktopOwnWindowPinForHwnd(HWND hwnd) { channel().cancelPinForHwnd(hwnd); }
 bool nativeDesktopOwnWindowPinActive(HWND hwnd) { return channel().isPinActiveFor(hwnd); }
 quint32 nativeDesktopExplorerPid() { return static_cast<quint32>(channel().activePinExplorerPid()); }
+quint32 nativeDesktopLiveExplorerPid() { return static_cast<quint32>(channel().currentExplorerPid()); }
 void shutdownNativeDesktopAccessor() { channel().shutdown(); }
 
 #ifdef QS_TEST

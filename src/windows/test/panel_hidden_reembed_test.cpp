@@ -1115,6 +1115,103 @@ private slots:
 			host->setEnabled(false);
 			QCoreApplication::processEvents();
 		}
+
+		// Part G: Intermediate Explorer session B that the panel never observed
+		// via recoverExplorer (panel saw A, submitted pin to B, hid before C):
+		// a late stillPinned drain from B must be rejected against live C so
+		// reopening the panel still pins in C instead of skipping PinView.
+		{
+			auto simulatedExplorerPid = std::make_shared<std::atomic<DWORD>>(5001);
+			qs::windows::setNativeDesktopExplorerPidForTest(
+			    [simulatedExplorerPid] { return simulatedExplorerPid->load(); }
+			);
+			struct ResetPid {
+				~ResetPid() { qs::windows::setNativeDesktopExplorerPidForTest({}); }
+			} resetPid;
+
+			pinned.pinned = FALSE;
+			pinned.pinResult = S_OK;
+			pinned.unpinResult = E_ACCESSDENIED;
+			pinned.pins = 0;
+			pinned.unpins = 0;
+
+			QSignalSpy pinDone(desktops, &qs::windows::VirtualDesktops::ownWindowPinCompleted);
+			QSignalSpy pinDrained(desktops, &qs::windows::VirtualDesktops::ownWindowPinDrained);
+
+			qs::windows::WinPanelWindow panel;
+			panel.setLayer(qs::windows::PanelLayer::Background);
+			panel.setExclusionMode(ExclusionMode::Ignore);
+			panel.setScreen(&screenInfo);
+			panel.createWindow();
+
+			auto* window = panel.backingWindow();
+			QVERIFY(window != nullptr);
+			auto* hwnd = reinterpret_cast<HWND>(window->winId());
+			QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+			QVERIFY(SetWindowPos(
+			    hwnd, nullptr, -10000, -10000, 200, 100, SWP_NOACTIVATE | SWP_NOZORDER
+			));
+
+			// Panel observes Explorer A (5001).
+			QVERIFY(panel.recoverExplorerForTesting(m_hostA, 5001, 5001));
+			QCoreApplication::processEvents();
+
+			// Explorer restarts to B (5002) without recoverExplorer(B) reaching panel;
+			// panel shows and starts PinView against B, then hides (clearing
+			// inFlightPinExplorerPid) before Explorer restarts again to C (5003).
+			simulatedExplorerPid->store(5002);
+			qs::windows::setNativeDesktopExplorerPidForTest(
+			    [simulatedExplorerPid] { return simulatedExplorerPid->load(); }
+			);
+			activeBlock = std::make_shared<erm625::BlockingCall>();
+			pinned.beforePin = [blocked = activeBlock] { (*blocked)(); };
+
+			panel.setVisible(true);
+			panel.setVisibleDirect(true);
+			QTRY_COMPARE(WaitForSingleObject(activeBlock->entered, 0), WAIT_OBJECT_0);
+
+			panel.setVisible(false);
+			panel.setVisibleDirect(false);
+			QTRY_VERIFY(!IsWindowVisible(hwnd));
+
+			// Explorer restarts to C (5003); panel recovers straight from A -> C
+			// without ever recording B in retiredExplorerPids.
+			const auto acquisitionsBeforeC = acquisitions;
+			simulatedExplorerPid->store(5003);
+			qs::windows::invalidateNativeDesktopAccessor(RPC_E_DISCONNECTED);
+			QVERIFY(panel.recoverExplorerForTesting(m_hostB, 5003, 5003));
+			QTRY_VERIFY(acquisitions > acquisitionsBeforeC);
+			QTRY_VERIFY(desktops->accessorLoaded());
+
+			// Let B's PinView drain with stillPinned=true (unobserved session B).
+			activeBlock->release();
+			QTRY_VERIFY(pinDrained.size() >= 1);
+			pinned.beforePin = {};
+			activeBlock.reset();
+			QCOMPARE(pinDrained.last().at(2).toBool(), true);
+			QCOMPARE(pinDrained.last().at(6).toUInt(), quint32(5002));
+			QVERIFY(!panel.isPinnedHereForTesting());
+			QVERIFY(!panel.mayBePinnedHereForTesting());
+
+			// Reopening the panel in C must submit a fresh PinView for C (5003).
+			pinned.pinned = FALSE;
+			const auto doneBeforeReopen = pinDone.size();
+			panel.setVisible(true);
+			panel.setVisibleDirect(true);
+			QTRY_VERIFY(pinDone.size() > doneBeforeReopen);
+			QCOMPARE(
+			    pinDone.last().at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Pinned
+			);
+			QCOMPARE(pinDone.last().at(4).toUInt(), quint32(5003));
+			QVERIFY(panel.isPinnedHereForTesting());
+			QVERIFY(panel.mayBePinnedHereForTesting());
+
+			panel.deleteWindow();
+			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+			host->setEnabled(false);
+			QCoreApplication::processEvents();
+		}
 	}
 
 private:

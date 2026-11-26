@@ -63,6 +63,7 @@ void cancelNativeDesktopOwnWindowPin(quint64 requestId);
 void cancelNativeDesktopOwnWindowPinForHwnd(HWND hwnd);
 [[nodiscard]] bool nativeDesktopOwnWindowPinActive(HWND hwnd);
 [[nodiscard]] quint32 nativeDesktopExplorerPid();
+[[nodiscard]] quint32 nativeDesktopLiveExplorerPid();
 void shutdownNativeDesktopAccessor();
 
 #ifdef QS_TEST

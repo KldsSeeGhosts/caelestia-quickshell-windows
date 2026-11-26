@@ -1711,11 +1711,10 @@ void WinPanelWindow::attemptPin(quint64 expectedGeneration) {
 	quint64 requestId = 0;
 	const auto pinResult = desktops->pinOwnWindow(hwnd, &requestId);
 	const auto pinExplorerPid = desktops->ownWindowPinExplorerPid();
-	const auto resolvedPinExplorerPid =
-	    pinExplorerPid != 0 ? static_cast<DWORD>(pinExplorerPid) : this->explorerTaskbarPid;
 	if (pinResult == OwnWindowPin::Pinned) {
 		this->mayBePinnedHwnd = hwnd;
-		this->mayBePinnedExplorerPid = resolvedPinExplorerPid;
+		this->mayBePinnedExplorerPid =
+		    pinExplorerPid != 0 ? static_cast<DWORD>(pinExplorerPid) : this->explorerTaskbarPid;
 		if (requestId != 0) {
 			if (this->pinWatermarkHwnd != hwnd || requestId >= this->pinWatermarkRequestId) {
 				this->pinWatermarkHwnd = hwnd;
@@ -1725,7 +1724,10 @@ void WinPanelWindow::attemptPin(quint64 expectedGeneration) {
 		this->embedUnpinFailedHwnd = nullptr;
 		this->embedUnpinDisconnectRetries = 0;
 	} else if (pinResult == OwnWindowPin::Pending && requestId != 0) {
-		this->inFlightPinExplorerPid = resolvedPinExplorerPid;
+		// Preserve 0 when submitted during a taskbar gap so delayed
+		// recoverExplorer(B) does not misattribute a fresh worker targeting B
+		// to the old Explorer A and cancel it.
+		this->inFlightPinExplorerPid = static_cast<DWORD>(pinExplorerPid);
 	}
 	const auto nowMs = static_cast<qint64>(GetTickCount64());
 	const auto action =
@@ -1764,7 +1766,8 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 	const auto visible = this->window != nullptr && this->window->isVisible();
 	const auto embedded = this->mEmbedParent != nullptr;
 	auto* desktops = VirtualDesktops::instance();
-	const auto fromPreviousExplorer = this->isRetiredExplorerSession(explorerPid);
+	const auto fromPreviousExplorer =
+	    this->isStaleExplorerSession(explorerPid, desktops->liveExplorerPid());
 	if (!fromPreviousExplorer && completedHwnd != nullptr && completedHwnd == currentHwnd && !embedded) {
 		const auto isNewerOrEqualRequest =
 		    this->pinWatermarkHwnd != currentHwnd || this->pinWatermarkRequestId == 0
@@ -1936,7 +1939,8 @@ void WinPanelWindow::onOwnWindowPinDrained(
 	auto* drainedHwnd = reinterpret_cast<HWND>(hwndValue);
 	auto* currentHwnd = this->hwnd();
 	auto* desktops = VirtualDesktops::instance();
-	const auto fromPreviousExplorer = this->isRetiredExplorerSession(explorerPid);
+	const auto fromPreviousExplorer =
+	    this->isStaleExplorerSession(explorerPid, desktops->liveExplorerPid());
 	if (!fromPreviousExplorer && drainedHwnd != nullptr && drainedHwnd == currentHwnd
 	    && this->mEmbedParent == nullptr)
 	{
@@ -2080,10 +2084,10 @@ bool WinPanelWindow::recoverExplorer(HWND taskbar, DWORD pid, DWORD thread) {
 	    preserveCurrentExplorerPin && this->pinState.pinnedHere(currentHwnd);
 	const auto preserveCurrentExplorerInFlight =
 	    explorerRestarted && pid != 0 && this->pinState.inFlightRequestId != 0
-	    && this->inFlightPinExplorerPid == pid;
+	    && (this->inFlightPinExplorerPid == pid || this->inFlightPinExplorerPid == 0);
 	const auto preserveCurrentExplorerUnpin =
 	    explorerRestarted && pid != 0 && this->embedUnpinRequestId != 0
-	    && this->embedUnpinExplorerPid == pid;
+	    && (this->embedUnpinExplorerPid == pid || this->embedUnpinExplorerPid == 0);
 	if (explorerRestarted) {
 		auto* desktops = VirtualDesktops::instance();
 		if (previousPid != 0 && previousPid != pid) this->retiredExplorerPids.insert(previousPid);
@@ -2560,9 +2564,7 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 				const auto unpinExplorerPid = desktops->ownWindowPinExplorerPid();
 				this->embedWaitingForPinHwnd = hwnd;
 				this->embedUnpinRequestId = unpinReqId;
-				this->embedUnpinExplorerPid = unpinExplorerPid != 0
-				                                ? static_cast<DWORD>(unpinExplorerPid)
-				                                : this->explorerTaskbarPid;
+				this->embedUnpinExplorerPid = static_cast<DWORD>(unpinExplorerPid);
 				this->resetPinState(false);
 				this->clearStuckFollowState();
 				this->clearPendingFollowMove();

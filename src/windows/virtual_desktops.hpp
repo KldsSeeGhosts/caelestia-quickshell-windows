@@ -143,6 +143,7 @@ public:
 	void cancelOwnWindowPinForHwnd(HWND hwnd);
 	[[nodiscard]] bool isOwnWindowPinActive(HWND hwnd) const;
 	[[nodiscard]] quint32 ownWindowPinExplorerPid() const;
+	[[nodiscard]] quint32 liveExplorerPid() const;
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;
 	[[nodiscard]] DesktopAvailability availability() const;
 	[[nodiscard]] bool supports(DesktopOperation operation) const;

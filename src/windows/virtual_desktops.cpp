@@ -1286,6 +1286,10 @@ quint32 VirtualDesktops::ownWindowPinExplorerPid() const {
 	return nativeDesktopExplorerPid();
 }
 
+quint32 VirtualDesktops::liveExplorerPid() const {
+	if (!this->nativeAccessor) return 0;
+	return nativeDesktopLiveExplorerPid();
+}
 std::optional<bool> VirtualDesktops::isWindowPinned(HWND hwnd) const {
 	const auto& a = this->accessor;
 	if (!this->pinSupported()) return std::nullopt;
