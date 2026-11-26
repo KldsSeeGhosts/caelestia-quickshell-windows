@@ -18,6 +18,7 @@
 #include <qrect.h>
 #include <qregion.h>
 #include <qscreen.h>
+#include <qset.h>
 #include <qstring.h>
 #include <qtclasshelpermacros.h>
 #include <qtimer.h>
@@ -35,6 +36,7 @@
 #include "panel_animation.hpp"
 #include "panel_effects.hpp"
 #include "panel_focus_style.hpp"
+#include "panel_pin_state.hpp"
 #include "screen_surface_guard.hpp"
 #include "util.hpp"
 
@@ -156,6 +158,46 @@ public:
 	// handback regression asserts a parent change requests a frame, and that a
 	// hidden panel is never shown just to do it.
 	[[nodiscard]] int presentResetsForTesting() const { return this->presentResetCount; }
+	bool recoverExplorerForTesting(HWND taskbar, DWORD pid, DWORD thread) {
+		return this->recoverExplorer(taskbar, pid, thread);
+	}
+	[[nodiscard]] bool isPinnedHereForTesting() const { return this->pinnedHere(this->hwnd()); }
+	[[nodiscard]] bool mayBePinnedHereForTesting() const {
+		auto* current = this->hwnd();
+		return current != nullptr && this->mayBePinnedHwnd == current;
+	}
+	void simulatePinCompletionForTesting(
+	    quint64 requestId,
+	    OwnWindowPin result,
+	    bool mayBePinned,
+	    quint32 explorerPid
+	) {
+		this->onOwnWindowPinCompleted(
+		    requestId,
+		    reinterpret_cast<quintptr>(this->hwnd()),
+		    result,
+		    mayBePinned,
+		    explorerPid
+		);
+	}
+	void simulatePinDrainForTesting(
+	    quint64 requestId,
+	    bool stillPinned,
+	    bool mayBePinned,
+	    bool confirmedUnpinned,
+	    bool disconnected,
+	    quint32 explorerPid
+	) {
+		this->onOwnWindowPinDrained(
+		    requestId,
+		    reinterpret_cast<quintptr>(this->hwnd()),
+		    stillPinned,
+		    mayBePinned,
+		    confirmedUnpinned,
+		    disconnected,
+		    explorerPid
+		);
+	}
 #endif
 
 signals:
@@ -176,6 +218,22 @@ private slots:
 	void onSurfaceCreated();
 	void onWindowVisibleChanged();
 	void onDesktopAccessorReady();
+	void onOwnWindowPinCompleted(
+	    quint64 requestId,
+	    quintptr hwnd,
+	    qs::windows::OwnWindowPin result,
+	    bool mayBePinned,
+	    quint32 explorerPid
+	);
+	void onOwnWindowPinDrained(
+	    quint64 requestId,
+	    quintptr hwnd,
+	    bool stillPinned,
+	    bool mayBePinned,
+	    bool confirmedUnpinned,
+	    bool disconnected,
+	    quint32 explorerPid
+	);
 	void updateScreen();
 	void followFocusedScreen();
 	void scheduleUpdateDimensions();
@@ -205,10 +263,15 @@ private:
 	void takeFocusOnExpose();
 	void grabKeyboardFocus();
 	void stickToAllDesktops();
+	void attemptPin(quint64 expectedGeneration);
+	void finishPinAttempt(HWND hwnd, quint64 expectedGeneration, bool pinned);
+	void resetPinState(bool clearPinned);
+	void schedulePinRetry(int delayMs);
 	bool recoverExplorer(HWND taskbar, DWORD pid, DWORD thread);
 	[[nodiscard]] bool reservesSpace() const;
 	[[nodiscard]] bool wantsEmbedding() const;
 	[[nodiscard]] bool wantsAboveIcons() const;
+	[[nodiscard]] bool hasEmbeddingTarget() const;
 	void updateEmbedding();
 	void retryEmbedding();
 	void embedInto(HWND parent, HWND insertAfter, bool aboveIcons);
@@ -260,6 +323,36 @@ private:
 	bool dimensionsUpdatePending = false;
 	bool appBarRetryPending = false;
 	bool embedRetryPending = false;
+	HWND embedWaitingForPinHwnd = nullptr;
+	quint64 embedUnpinRequestId = 0;
+	DWORD embedUnpinExplorerPid = 0;
+	HWND embedUnpinFailedHwnd = nullptr;
+	int embedUnpinDisconnectRetries = 0;
+	// Tracks an HWND that Explorer may currently have pinned. Survives
+	// accessor-only recovery and is cleared only on confirmed unpin, Explorer
+	// process restart for the owning Explorer PID, or HWND replacement/teardown.
+	HWND mayBePinnedHwnd = nullptr;
+	DWORD mayBePinnedExplorerPid = 0;
+	// Monotonic request watermark per HWND across pin/unpin completions and
+	// drains so an older reply cannot overwrite a newer pin or confirmed unpin.
+	HWND pinWatermarkHwnd = nullptr;
+	quint64 pinWatermarkRequestId = 0;
+	DWORD inFlightPinExplorerPid = 0;
+	QSet<DWORD> retiredExplorerPids;
+	[[nodiscard]] bool isStaleExplorerSession(quint32 explorerPid, quint32 liveExplorerPid) const {
+		if (explorerPid == 0) return false;
+		const auto pid = static_cast<DWORD>(explorerPid);
+		if (this->retiredExplorerPids.contains(pid)) return true;
+		// Reject a completion/drain from an intermediate Explorer session that
+		// this panel never recorded (e.g. A -> hidden in B -> C): if Explorer
+		// is currently running under a different live PID (or the panel already
+		// observed a newer Explorer session while the taskbar is absent), this
+		// reply belongs to a dead session and must not mark the HWND pinned.
+		if (liveExplorerPid != 0 && pid != static_cast<DWORD>(liveExplorerPid)) {
+			return true;
+		}
+		return false;
+	}
 	bool scaleRecreatePending = false;
 	bool focusFlagPending = false;
 	bool focusOnExpose = false;
@@ -269,14 +362,36 @@ private:
 	quint32 focusRequest = 0;
 	bool maskRouted = false;
 	bool appBarDeferred = false;
-	bool pinnedToAllDesktops = false;
-	HWND pinFailedHwnd = nullptr;
+	PanelPinState pinState;
+	QTimer pinRetryTimer;
+	[[nodiscard]] bool pinnedHere(HWND hwnd) const { return this->pinState.pinnedHere(hwnd); }
 	HWND explorerTaskbar = nullptr;
 	DWORD explorerTaskbarPid = 0;
 	DWORD explorerTaskbarThread = 0;
 	QTimer explorerRecoveryTimer;
+	void clearPendingFollowMove() {
+		this->pendingFollowMoveSeq = 0;
+		this->pendingFollowMoveHwnd = nullptr;
+		this->pendingFollowMoveDesktopId = {};
+		this->pendingFollowMoveDesktop = -1;
+	}
+	void clearStuckFollowState() {
+		this->stuckHwnd = nullptr;
+		this->stuckDesktopId = {};
+		this->stuckDesktop = -1;
+		this->stuckConfirmSeq = 0;
+	}
 	HWND stuckHwnd = nullptr;
+	GUID stuckDesktopId {};
 	qsizetype stuckDesktop = -1;
+	quint64 stuckConfirmSeq = 0;
+	quint64 pendingFollowMoveSeq = 0;
+	HWND pendingFollowMoveHwnd = nullptr;
+	GUID pendingFollowMoveDesktopId {};
+	qsizetype pendingFollowMoveDesktop = -1;
+	HWND followAttemptHwnd = nullptr;
+	int followFailureCount = 0;
+	bool followWaitingBusy = false;
 
 	HWND mEmbedParent = nullptr;
 	HWND mEmbedInsertAfter = nullptr;

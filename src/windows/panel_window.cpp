@@ -81,6 +81,12 @@ bool forceLayeredDesktopPanels() {
 }
 
 constexpr int MAX_RESTACKS = 20;
+constexpr int FOLLOW_RETRY_MS = 200;
+constexpr int FOLLOW_RETRY_MAX = 15;
+// Exceeds the desktop worker's 5 s stall bound so sibling panels waiting on
+// provider-busy do not exhaust retries while an earlier move is still in flight.
+constexpr qint64 FOLLOW_BUSY_WAIT_BUDGET_MS = 6000;
+constexpr qint64 FOLLOW_MAX_TOTAL_BUSY_WAIT_MS = 30000;
 constexpr DWORD RESTACK_WINDOW_MS = 5000;
 constexpr int FOCUS_EXPOSE_FALLBACK_MS = 500;
 constexpr int CLOSE_FRAMES = 2;
@@ -248,6 +254,28 @@ HRGN toHrgn(const QRegion& region) {
 
 	return hrgn;
 }
+
+bool isNullGuid(const GUID& guid) { return IsEqualGUID(guid, GUID {}) != FALSE; }
+
+GUID currentDesktopId(const VirtualDesktops* desktops) {
+	const auto current = desktops->currentIndex();
+	const auto& list = desktops->desktops();
+	if (current < 0 || current >= list.size()) return {};
+	return list.at(current).id;
+}
+
+bool sameFollowTarget(
+    const GUID& savedId,
+    qsizetype savedIndex,
+    const GUID& currentId,
+    qsizetype currentIndex
+) {
+	if (!isNullGuid(savedId) || !isNullGuid(currentId)) {
+		return !isNullGuid(savedId) && !isNullGuid(currentId)
+		    && IsEqualGUID(savedId, currentId) != FALSE;
+	}
+	return savedIndex >= 0 && savedIndex == currentIndex;
+}
 } // namespace
 
 class WinPanelStack {
@@ -257,12 +285,27 @@ public:
 
 		if (stack == nullptr) {
 			stack = new WinPanelStack();
+			stack->mFollowRetryTimer.setSingleShot(true);
+			QObject::connect(
+			    &stack->mFollowRetryTimer,
+			    &QTimer::timeout,
+			    VirtualDesktops::instance(),
+			    [] { stack->followCurrentDesktop(); }
+			);
 
 			QObject::connect(
 			    VirtualDesktops::instance(),
 			    &VirtualDesktops::currentChanged,
 			    VirtualDesktops::instance(),
 			    [] {
+				    for (auto* panel: stack->mPanels) {
+					    panel->followFailureCount = 0;
+					    panel->followWaitingBusy = false;
+				    }
+				    stack->mFollowBusySinceMs.reset();
+				    stack->mFollowFirstBusyMs.reset();
+				    stack->mFollowNeedsFailureRetry = false;
+				    stack->mFollowRetryTimer.stop();
 				    stack->followCurrentDesktop();
 				    DesktopHost::instance()->refreshAfterDesktopSwitch();
 			    }
@@ -272,6 +315,84 @@ public:
 			    &VirtualDesktops::windowDesktopsChanged,
 			    VirtualDesktops::instance(),
 			    [] { stack->followCurrentDesktop(); }
+			);
+			QObject::connect(
+			    VirtualDesktops::instance(),
+			    &VirtualDesktops::desktopCommandIdle,
+			    VirtualDesktops::instance(),
+			    [] {
+				    // Any completed desktop command (switch, create, move, or acquisition)
+				    // frees the worker command slot: wake panels that hit provider-busy even
+				    // if polling stopped at the busy deadline and no desktop change occurred.
+				    if (stack->hasWaitingFollowPanel()) {
+					    stack->mFollowBusySinceMs.reset();
+					    stack->mFollowNeedsImmediateRetry = true;
+					    stack->mFollowRetryTimer.start(0);
+				    }
+			    }
+			);
+			QObject::connect(
+			    VirtualDesktops::instance(),
+			    &VirtualDesktops::moveWindowCompleted,
+			    VirtualDesktops::instance(),
+			    [](quint64 sequence, quintptr hwndValue, bool succeeded, const QString&) {
+				    auto* target = reinterpret_cast<HWND>(hwndValue);
+				    auto* desktops = VirtualDesktops::instance();
+				    const auto current = desktops->currentIndex();
+				    const auto currentId = currentDesktopId(desktops);
+				    auto matched = false;
+				    auto panelNeedsRetry = false;
+				    if (sequence != 0 && target != nullptr) {
+					    for (auto* panel: stack->mPanels) {
+						    if (panel->pendingFollowMoveSeq != sequence
+						        || panel->pendingFollowMoveHwnd != target)
+						    {
+							    continue;
+						    }
+						    const auto targetId = panel->pendingFollowMoveDesktopId;
+						    const auto targetDesktop = panel->pendingFollowMoveDesktop;
+						    panel->clearPendingFollowMove();
+						    panel->followWaitingBusy = false;
+						    matched = true;
+						    if (panel->hwnd() != target || panel->isEmbedded() || panel->pinnedHere(target)) {
+							    break;
+						    }
+						    if (succeeded && sameFollowTarget(targetId, targetDesktop, currentId, current)) {
+							    panel->stuckHwnd = target;
+							    panel->stuckDesktopId = targetId;
+							    panel->stuckDesktop = targetDesktop;
+							    panel->stuckConfirmSeq = sequence;
+							    panel->followFailureCount = 0;
+						    } else {
+							    panel->clearStuckFollowState();
+							    if (!succeeded) ++panel->followFailureCount;
+							    if (panel->followFailureCount < FOLLOW_RETRY_MAX) {
+								    panelNeedsRetry = true;
+							    }
+						    }
+						    break;
+					    }
+				    }
+				    // Any completed move frees the desktop worker slot: renew the
+				    // per-handoff busy wait window and immediately wake waiting panels,
+				    // even if a failing panel hit its retry cap or the busy timer stopped.
+				    if (panelNeedsRetry) stack->mFollowNeedsFailureRetry = true;
+				    if (stack->mFollowRetryTimer.isActive() || stack->hasWaitingFollowPanel()) {
+					    stack->mFollowBusySinceMs.reset();
+					    stack->mFollowNeedsImmediateRetry = true;
+					    stack->mFollowRetryTimer.start(0);
+					    return;
+				    }
+				    if (panelNeedsRetry) {
+					    stack->mFollowRetryTimer.start(FOLLOW_RETRY_MS);
+					    return;
+				    }
+				    if (!matched) return;
+				    if (!stack->hasPendingFollowMove()) {
+					    stack->mFollowBusySinceMs.reset();
+					    stack->mFollowFirstBusyMs.reset();
+				    }
+			    }
 			);
 
 			auto* self = stack;
@@ -336,16 +457,260 @@ public:
 
 	[[nodiscard]] HWND externalForeground() const { return this->mExternalForeground.hwnd; }
 
+	[[nodiscard]] bool hasPendingFollowMove() const {
+		return std::ranges::any_of(this->mPanels, [](WinPanelWindow* panel) {
+			return !panel->isEmbedded() && panel->pendingFollowMoveSeq != 0;
+		});
+	}
+
+	[[nodiscard]] bool hasWaitingFollowPanel() const {
+		return std::ranges::any_of(this->mPanels, [](WinPanelWindow* panel) {
+			return !panel->isEmbedded() && panel->followWaitingBusy;
+		});
+	}
+
+	void scheduleFollowRetry(bool busyOnly) {
+		if (busyOnly) {
+			const auto now = static_cast<qint64>(GetTickCount64());
+			if (!this->mFollowFirstBusyMs) this->mFollowFirstBusyMs = now;
+			if (!this->mFollowBusySinceMs) this->mFollowBusySinceMs = now;
+			if (now - *this->mFollowBusySinceMs >= FOLLOW_BUSY_WAIT_BUDGET_MS
+			    || now - *this->mFollowFirstBusyMs >= FOLLOW_MAX_TOTAL_BUSY_WAIT_MS)
+			{
+				this->mFollowBusySinceMs.reset();
+				this->mFollowFirstBusyMs.reset();
+				if (!this->mFollowNeedsFailureRetry) this->mFollowRetryTimer.stop();
+				return;
+			}
+			if (!this->mFollowRetryTimer.isActive()) this->mFollowRetryTimer.start(FOLLOW_RETRY_MS);
+			return;
+		}
+		this->mFollowNeedsFailureRetry = true;
+		if (!this->mFollowRetryTimer.isActive()) this->mFollowRetryTimer.start(FOLLOW_RETRY_MS);
+	}
+
+	void scheduleFollowPass() {
+		this->mFollowNeedsImmediateRetry = true;
+		this->mFollowRetryTimer.start(0);
+	}
+
 	void followCurrentDesktop() {
+		const auto passGeneration = ++this->mFollowPassGeneration;
 		auto* desktops = VirtualDesktops::instance();
+		const auto current = desktops->currentIndex();
+		const auto currentId = currentDesktopId(desktops);
+		const auto readSeq = desktops->windowReadSequence();
+		auto needsBusyRetry = false;
+		auto needsFailureRetry = false;
+		auto anyPending = false;
+		this->mFollowNeedsFailureRetry = false;
+		this->mFollowNeedsImmediateRetry = false;
+		QList<QPointer<WinPanelWindow>> candidates;
+		candidates.reserve(this->mPanels.size());
 
 		for (auto* panel: this->mPanels) {
-			if (panel->pinnedToAllDesktops || panel->isEmbedded()) continue;
+			if (panel->isEmbedded()) {
+				panel->followWaitingBusy = false;
+				continue;
+			}
 			auto* hwnd = panel->hwnd();
-			if (hwnd == nullptr) continue;
-			if (!desktops->isWindowOnCurrent(hwnd)) desktops->moveWindow(hwnd, desktops->currentIndex());
-			panel->stuckHwnd = hwnd;
-			panel->stuckDesktop = desktops->currentIndex();
+			if (hwnd == nullptr || panel->pinnedHere(hwnd)) {
+				panel->followWaitingBusy = false;
+				continue;
+			}
+			if (panel->followAttemptHwnd != hwnd) {
+				panel->followAttemptHwnd = hwnd;
+				panel->followFailureCount = 0;
+				panel->followWaitingBusy = false;
+			}
+			if (desktops->isWindowOnCurrent(hwnd)) {
+				panel->clearPendingFollowMove();
+				panel->stuckHwnd = hwnd;
+				panel->stuckDesktopId = currentId;
+				panel->stuckDesktop = current;
+				panel->stuckConfirmSeq = 0;
+				panel->followFailureCount = 0;
+				panel->followWaitingBusy = false;
+				continue;
+			}
+			// Honor a confirmed move to the current desktop until a window read
+			// newer than that move has landed, so this panel does not reclaim the
+			// desktop worker slot ahead of a waiting sibling.
+			if (panel->stuckHwnd == hwnd
+			    && sameFollowTarget(panel->stuckDesktopId, panel->stuckDesktop, currentId, current)
+			    && panel->stuckConfirmSeq != 0 && readSeq < panel->stuckConfirmSeq)
+			{
+				panel->followWaitingBusy = false;
+				continue;
+			}
+			if (panel->pendingFollowMoveSeq != 0 && panel->pendingFollowMoveHwnd == hwnd
+			    && sameFollowTarget(
+			        panel->pendingFollowMoveDesktopId,
+			        panel->pendingFollowMoveDesktop,
+			        currentId,
+			        current
+			    ))
+			{
+				panel->followWaitingBusy = false;
+				anyPending = true;
+				continue;
+			}
+			if (panel->followFailureCount >= FOLLOW_RETRY_MAX) {
+				panel->followWaitingBusy = false;
+				continue;
+			}
+			candidates.push_back(panel);
+		}
+
+		// Give waiting siblings and panels with fewer failures the next free
+		// desktop worker slot before retrying a panel whose previous move failed.
+		std::stable_sort(
+		    candidates.begin(),
+		    candidates.end(),
+		    [](const QPointer<WinPanelWindow>& a, const QPointer<WinPanelWindow>& b) {
+			    if (a == nullptr || b == nullptr) return a != nullptr;
+			    if (a->followFailureCount != b->followFailureCount) {
+				    return a->followFailureCount < b->followFailureCount;
+			    }
+			    return a->followWaitingBusy && !b->followWaitingBusy;
+		    }
+		);
+
+		for (const auto& guard: candidates) {
+			if (this->mFollowPassGeneration != passGeneration
+			    || !sameFollowTarget(
+			        currentId, current, currentDesktopId(desktops), desktops->currentIndex()
+			    ))
+			{
+				return;
+			}
+			auto* panel = guard.data();
+			if (panel == nullptr || !this->mPanels.contains(panel)) continue;
+			auto* hwnd = panel->hwnd();
+			if (hwnd == nullptr || panel->isEmbedded() || panel->pinnedHere(hwnd)) {
+				panel->followWaitingBusy = false;
+				continue;
+			}
+			quint64 pendingSeq = 0;
+			QString failureReason;
+			GUID targetId {};
+			auto pendingRegistered = false;
+			const auto registerPending = [&](quint64 seq) {
+				if (guard == nullptr || !this->mPanels.contains(guard.data())
+				    || guard->hwnd() != hwnd || guard->isEmbedded() || guard->pinnedHere(hwnd))
+				{
+					return;
+				}
+				const auto resolvedId = !isNullGuid(targetId) ? targetId : currentId;
+				guard->pendingFollowMoveSeq = seq;
+				guard->pendingFollowMoveHwnd = hwnd;
+				guard->pendingFollowMoveDesktopId = resolvedId;
+				guard->pendingFollowMoveDesktop = current;
+				guard->clearStuckFollowState();
+				pendingRegistered = true;
+			};
+			const auto stillValidTarget = [&]() {
+				return this->mFollowPassGeneration == passGeneration && guard != nullptr
+				    && this->mPanels.contains(guard.data()) && guard->hwnd() == hwnd
+				    && !guard->isEmbedded() && !guard->pinnedHere(hwnd)
+				    && sameFollowTarget(
+				        currentId, current, currentDesktopId(desktops), desktops->currentIndex()
+				    );
+			};
+			if (desktops->moveWindow(
+			        hwnd,
+			        current,
+			        &pendingSeq,
+			        &failureReason,
+			        registerPending,
+			        stillValidTarget,
+			        &targetId,
+			        isNullGuid(currentId) ? std::nullopt : std::optional<GUID>(currentId)
+			    ))
+			{
+				if (this->mFollowPassGeneration != passGeneration) return;
+				if (guard == nullptr || !this->mPanels.contains(panel) || panel->hwnd() != hwnd
+				    || panel->isEmbedded() || panel->pinnedHere(hwnd))
+				{
+					continue;
+				}
+				panel->followWaitingBusy = false;
+				const auto resolvedId = !isNullGuid(targetId) ? targetId : currentId;
+				if (pendingSeq != 0) {
+					// Async acceptance is not confirmation: preserve the retry
+					// budget until moveWindowCompleted or a fresh snapshot. If
+					// completion already arrived during a nested event loop,
+					// registerPending registered and the handler already cleared it.
+					if (!pendingRegistered) registerPending(pendingSeq);
+					if (panel->pendingFollowMoveSeq == pendingSeq) anyPending = true;
+				} else {
+					panel->clearPendingFollowMove();
+					panel->stuckHwnd = hwnd;
+					panel->stuckDesktopId = resolvedId;
+					panel->stuckDesktop = current;
+					panel->stuckConfirmSeq = desktops->submittedSequence();
+					panel->followFailureCount = 0;
+				}
+			} else {
+				if (this->mFollowPassGeneration != passGeneration) return;
+				if (guard == nullptr || !this->mPanels.contains(panel) || panel->hwnd() != hwnd
+				    || panel->isEmbedded() || panel->pinnedHere(hwnd))
+				{
+					continue;
+				}
+				if (failureReason.isEmpty()) continue;
+				// Preserve any accepted move sequence so its completion can still
+				// be matched or discarded against its original target desktop.
+				if (panel->pendingFollowMoveHwnd != hwnd) panel->clearPendingFollowMove();
+				panel->clearStuckFollowState();
+				if (failureReason == QStringLiteral("provider-busy")) {
+					panel->followWaitingBusy = true;
+					needsBusyRetry = true;
+				} else {
+					panel->followWaitingBusy = false;
+					++panel->followFailureCount;
+					if (panel->followFailureCount < FOLLOW_RETRY_MAX) needsFailureRetry = true;
+				}
+			}
+		}
+
+		if (this->mFollowPassGeneration != passGeneration) return;
+		needsFailureRetry = needsFailureRetry || this->mFollowNeedsFailureRetry;
+		this->mFollowNeedsFailureRetry = needsFailureRetry;
+		if (this->mFollowNeedsImmediateRetry) {
+			this->mFollowNeedsImmediateRetry = false;
+			this->mFollowRetryTimer.start(0);
+			return;
+		}
+		if (needsBusyRetry) {
+			const auto now = static_cast<qint64>(GetTickCount64());
+			if (!this->mFollowFirstBusyMs) this->mFollowFirstBusyMs = now;
+			if (!this->mFollowBusySinceMs) this->mFollowBusySinceMs = now;
+			const auto withinBudget = now - *this->mFollowBusySinceMs < FOLLOW_BUSY_WAIT_BUDGET_MS
+			                       && now - *this->mFollowFirstBusyMs < FOLLOW_MAX_TOTAL_BUSY_WAIT_MS;
+			if (withinBudget) {
+				if (!this->mFollowRetryTimer.isActive()) this->mFollowRetryTimer.start(FOLLOW_RETRY_MS);
+			} else {
+				this->mFollowBusySinceMs.reset();
+				this->mFollowFirstBusyMs.reset();
+				// Stop timer polling at the busy deadline, but keep followWaitingBusy
+				// armed so a later unrelated moveWindowCompleted still wakes waiting panels.
+				if (needsFailureRetry) {
+					if (!this->mFollowRetryTimer.isActive()) this->mFollowRetryTimer.start(FOLLOW_RETRY_MS);
+				} else {
+					this->mFollowRetryTimer.stop();
+				}
+			}
+		} else if (needsFailureRetry) {
+			this->mFollowBusySinceMs.reset();
+			this->mFollowFirstBusyMs.reset();
+			if (!this->mFollowRetryTimer.isActive()) this->mFollowRetryTimer.start(FOLLOW_RETRY_MS);
+		} else if (!anyPending) {
+			this->mFollowBusySinceMs.reset();
+			this->mFollowFirstBusyMs.reset();
+			this->mFollowRetryTimer.stop();
+		} else {
+			this->mFollowRetryTimer.stop();
 		}
 	}
 
@@ -368,6 +733,11 @@ public:
 	void removePanel(WinPanelWindow* panel) {
 		this->mPanels.removeOne(panel);
 		this->mTopmostRepairs.remove(panel);
+		if (this->mPanels.isEmpty()) {
+			this->mFollowRetryTimer.stop();
+			this->mFollowBusySinceMs.reset();
+			this->mFollowFirstBusyMs.reset();
+		}
 
 		// Forget monitors with no panel left: a replugged display can reuse the
 		// handle and must seed afresh instead of inheriting a stale lowering.
@@ -634,6 +1004,12 @@ private:
 		int attempts = 0;
 	};
 	QHash<WinPanelWindow*, TopmostRepair> mTopmostRepairs;
+	QTimer mFollowRetryTimer;
+	std::optional<qint64> mFollowBusySinceMs;
+	std::optional<qint64> mFollowFirstBusyMs;
+	quint64 mFollowPassGeneration = 0;
+	bool mFollowNeedsFailureRetry = false;
+	bool mFollowNeedsImmediateRetry = false;
 	bool mRepairPending = false;
 };
 
@@ -707,6 +1083,11 @@ WinPanelWindow::WinPanelWindow(QObject* parent)
 	});
 
 	this->bcExclusionEdge.setBinding([this] { return this->bAnchors.value().exclusionEdge(); });
+
+	this->pinRetryTimer.setSingleShot(true);
+	QObject::connect(&this->pinRetryTimer, &QTimer::timeout, this, [this] {
+		this->attemptPin(this->pinState.generation);
+	});
 
 	this->explorerRecoveryTimer.setSingleShot(true);
 	this->explorerRecoveryTimer.setInterval(4000);
@@ -809,6 +1190,23 @@ ProxiedWindow* WinPanelWindow::retrieveWindow(QObject* oldInstance) {
 	auto* old = qobject_cast<WinPanelWindow*>(oldInstance);
 	if (old == nullptr) return nullptr;
 
+	auto* oldHwnd = old->hwnd();
+	auto* preservedPinHwnd =
+	    (oldHwnd != nullptr
+	     && (old->mayBePinnedHwnd == oldHwnd || old->pinState.pinnedHere(oldHwnd)))
+	      ? oldHwnd
+	      : nullptr;
+	const auto preservedPinExplorerPid =
+	    preservedPinHwnd != nullptr ? old->mayBePinnedExplorerPid : 0;
+	auto* preservedWatermarkHwnd =
+	    (oldHwnd != nullptr && old->pinWatermarkHwnd == oldHwnd) ? oldHwnd : nullptr;
+	const auto preservedWatermarkRequestId =
+	    preservedWatermarkHwnd != nullptr ? old->pinWatermarkRequestId : 0;
+	auto* preservedTaskbar = old->explorerTaskbar;
+	const auto preservedTaskbarPid = old->explorerTaskbarPid;
+	const auto preservedTaskbarThread = old->explorerTaskbarThread;
+	const auto preservedRetiredExplorerPids = old->retiredExplorerPids;
+
 	this->appBar.adopt(old->appBar);
 	this->blur->adopt(old->blur);
 	this->mEmbedParent = old->mEmbedParent;
@@ -821,7 +1219,16 @@ ProxiedWindow* WinPanelWindow::retrieveWindow(QObject* oldInstance) {
 	this->mAppliedRegion = old->mAppliedRegion;
 	this->mRegionApplied = old->mRegionApplied;
 
-	return old->disownWindow();
+	auto* adopted = old->disownWindow();
+	this->mayBePinnedHwnd = preservedPinHwnd;
+	this->mayBePinnedExplorerPid = preservedPinExplorerPid;
+	this->pinWatermarkHwnd = preservedWatermarkHwnd;
+	this->pinWatermarkRequestId = preservedWatermarkRequestId;
+	this->explorerTaskbar = preservedTaskbar;
+	this->explorerTaskbarPid = preservedTaskbarPid;
+	this->explorerTaskbarThread = preservedTaskbarThread;
+	this->retiredExplorerPids = preservedRetiredExplorerPids;
+	return adopted;
 }
 
 ProxiedWindow* WinPanelWindow::createQQuickWindow() { return new WinProxiedWindow(this); }
@@ -859,15 +1266,42 @@ void WinPanelWindow::connectWindow() {
 	    &WinPanelWindow::onDesktopAccessorReady,
 	    Qt::UniqueConnection
 	);
+	QObject::connect(
+	    VirtualDesktops::instance(),
+	    &VirtualDesktops::ownWindowPinCompleted,
+	    this,
+	    &WinPanelWindow::onOwnWindowPinCompleted,
+	    Qt::UniqueConnection
+	);
+	QObject::connect(
+	    VirtualDesktops::instance(),
+	    &VirtualDesktops::ownWindowPinDrained,
+	    this,
+	    &WinPanelWindow::onOwnWindowPinDrained,
+	    Qt::UniqueConnection
+	);
 
 	this->updateScreen();
 
-	if (this->hwnd() == nullptr) {
+	if (auto* currentHwnd = this->hwnd(); currentHwnd == nullptr) {
 		this->mEmbedParent = nullptr;
 		this->mEmbedInsertAfter = nullptr;
 		this->mEmbedAboveIcons = false;
 		this->mRegionApplied = false;
 		this->mAppliedRegion = QRegion();
+		this->mayBePinnedHwnd = nullptr;
+		this->mayBePinnedExplorerPid = 0;
+		this->pinWatermarkHwnd = nullptr;
+		this->pinWatermarkRequestId = 0;
+	} else {
+		if (this->mayBePinnedHwnd != nullptr && this->mayBePinnedHwnd != currentHwnd) {
+			this->mayBePinnedHwnd = nullptr;
+			this->mayBePinnedExplorerPid = 0;
+		}
+		if (this->pinWatermarkHwnd != nullptr && this->pinWatermarkHwnd != currentHwnd) {
+			this->pinWatermarkHwnd = nullptr;
+			this->pinWatermarkRequestId = 0;
+		}
 	}
 
 	Qt::WindowFlags flags = Qt::Tool | Qt::FramelessWindowHint;
@@ -914,6 +1348,25 @@ void WinPanelWindow::releaseNativeState() {
 
 	this->appBar.remove();
 	this->blur->release();
+	if (this->embedUnpinRequestId != 0) {
+		VirtualDesktops::instance()->cancelOwnWindowPin(this->embedUnpinRequestId);
+	}
+	this->embedWaitingForPinHwnd = nullptr;
+	this->embedUnpinRequestId = 0;
+	this->embedUnpinExplorerPid = 0;
+	this->embedUnpinFailedHwnd = nullptr;
+	this->embedUnpinDisconnectRetries = 0;
+	this->mayBePinnedHwnd = nullptr;
+	this->mayBePinnedExplorerPid = 0;
+	this->pinWatermarkHwnd = nullptr;
+	this->pinWatermarkRequestId = 0;
+	this->inFlightPinExplorerPid = 0;
+	this->resetPinState(true);
+	this->clearStuckFollowState();
+	this->clearPendingFollowMove();
+	this->followAttemptHwnd = nullptr;
+	this->followFailureCount = 0;
+	this->followWaitingBusy = false;
 	WinPanelStack::instance()->removePanel(this);
 
 	this->mEmbedParent = nullptr;
@@ -1074,7 +1527,9 @@ void WinPanelWindow::nativeInit() {
 
 	if (this->window->isVisible()) {
 		WinPanelStack::instance()->addPanel(this);
+		QPointer<WinPanelWindow> guard(this);
 		this->stickToAllDesktops();
+		if (guard == nullptr || this->hwnd() == nullptr) return;
 	}
 
 	applyPanelDwmAttributes(this->hwnd());
@@ -1121,60 +1576,643 @@ void WinPanelWindow::applyNativeStyles() {
 	}
 }
 
+void WinPanelWindow::resetPinState(bool clearPinned) {
+	const auto inFlightId = this->pinState.inFlightRequestId;
+	this->pinRetryTimer.stop();
+	this->pinState.reset(clearPinned);
+	this->inFlightPinExplorerPid = 0;
+	if (inFlightId != 0) VirtualDesktops::instance()->cancelOwnWindowPin(inFlightId);
+}
+
+void WinPanelWindow::schedulePinRetry(int delayMs) { this->pinRetryTimer.start(delayMs); }
+
+void WinPanelWindow::finishPinAttempt(HWND hwnd, quint64 expectedGeneration, bool pinned) {
+	if (!this->pinState.applyResult(hwnd, expectedGeneration, pinned)) return;
+	if (pinned) {
+		this->mayBePinnedHwnd = hwnd;
+		this->mayBePinnedExplorerPid = this->explorerTaskbarPid;
+		this->embedUnpinFailedHwnd = nullptr;
+		this->embedUnpinDisconnectRetries = 0;
+		return;
+	}
+	qCDebug(logPanel) << "Could not pin" << this
+	                  << "to all desktops; it will follow the current one";
+	WinPanelStack::instance()->followCurrentDesktop();
+}
+
 void WinPanelWindow::stickToAllDesktops() {
 	auto* hwnd = this->hwnd();
-	if (hwnd == nullptr || this->pinnedToAllDesktops || this->mEmbedParent != nullptr) return;
-
-	auto* desktops = VirtualDesktops::instance();
-	auto current = desktops->currentIndex();
-
-	if (this->stuckHwnd == hwnd && this->stuckDesktop != current
-	    && !desktops->isWindowOnCurrent(hwnd))
-	{
-		desktops->moveWindow(hwnd, current);
+	if (hwnd == nullptr || this->mEmbedParent != nullptr) {
+		if (this->embedUnpinRequestId != 0) {
+			VirtualDesktops::instance()->cancelOwnWindowPin(this->embedUnpinRequestId);
+		}
+		this->embedWaitingForPinHwnd = nullptr;
+		this->embedUnpinRequestId = 0;
+		this->embedUnpinExplorerPid = 0;
+		this->embedUnpinFailedHwnd = nullptr;
+		this->embedUnpinDisconnectRetries = 0;
+		this->mayBePinnedHwnd = nullptr;
+		this->mayBePinnedExplorerPid = 0;
+		if (hwnd == nullptr) {
+			this->pinWatermarkHwnd = nullptr;
+			this->pinWatermarkRequestId = 0;
+		}
+		this->resetPinState(true);
+		this->clearStuckFollowState();
+		this->clearPendingFollowMove();
+		this->followAttemptHwnd = nullptr;
+		this->followFailureCount = 0;
+		this->followWaitingBusy = false;
+		return;
+	}
+	if (this->mayBePinnedHwnd != nullptr && this->mayBePinnedHwnd != hwnd) {
+		this->mayBePinnedHwnd = nullptr;
+		this->mayBePinnedExplorerPid = 0;
+		this->embedUnpinFailedHwnd = nullptr;
+		this->embedUnpinDisconnectRetries = 0;
+	}
+	if (this->pinWatermarkHwnd != nullptr && this->pinWatermarkHwnd != hwnd) {
+		this->pinWatermarkHwnd = nullptr;
+		this->pinWatermarkRequestId = 0;
+	}
+	if (this->embedWaitingForPinHwnd != nullptr) {
+		if (this->embedWaitingForPinHwnd == hwnd) {
+			if (!this->hasEmbeddingTarget() && this->embedUnpinRequestId != 0) {
+				VirtualDesktops::instance()->cancelOwnWindowPin(this->embedUnpinRequestId);
+				this->embedUnpinRequestId = 0;
+				this->embedUnpinExplorerPid = 0;
+			}
+			return;
+		}
+		if (this->embedUnpinRequestId != 0) {
+			VirtualDesktops::instance()->cancelOwnWindowPin(this->embedUnpinRequestId);
+		}
+		this->embedWaitingForPinHwnd = nullptr;
+		this->embedUnpinRequestId = 0;
+		this->embedUnpinExplorerPid = 0;
+	}
+	if (this->pinnedHere(hwnd)) {
+		this->followWaitingBusy = false;
+		return;
 	}
 
-	this->stuckHwnd = hwnd;
-	this->stuckDesktop = current;
+	auto* desktops = VirtualDesktops::instance();
+	quint64 cancelledPinId = 0;
+	const auto shouldSchedulePin = this->pinState.prepare(hwnd, &cancelledPinId);
+	if (cancelledPinId != 0) {
+		this->inFlightPinExplorerPid = 0;
+		desktops->cancelOwnWindowPin(cancelledPinId);
+	}
 
-	QTimer::singleShot(0, this, [this] {
-		auto* hwnd = this->hwnd();
-		if (hwnd == nullptr || !this->window->isVisible() || this->pinnedToAllDesktops
-		    || this->mEmbedParent != nullptr)
-			return;
+	if (this->followAttemptHwnd != hwnd) {
+		this->followAttemptHwnd = hwnd;
+		this->followFailureCount = 0;
+		this->followWaitingBusy = false;
+	}
 
-		auto* desktops = VirtualDesktops::instance();
-		if (!desktops->accessorLoaded() || this->pinFailedHwnd == hwnd) return;
+	const auto current = desktops->currentIndex();
+	const auto currentId = currentDesktopId(desktops);
+	const auto readSeq = desktops->windowReadSequence();
 
-		this->pinnedToAllDesktops = desktops->isWindowPinned(hwnd).value_or(false)
-		    || desktops->pinWindow(hwnd, true);
+	const auto confirmedPendingRead =
+	    this->stuckHwnd == hwnd
+	    && sameFollowTarget(this->stuckDesktopId, this->stuckDesktop, currentId, current)
+	    && this->stuckConfirmSeq != 0 && readSeq < this->stuckConfirmSeq;
 
-		if (!this->pinnedToAllDesktops) {
-			this->pinFailedHwnd = hwnd;
-			qCDebug(logPanel) << "Could not pin" << this
-			                  << "to all desktops; it will follow the current one";
+	if (desktops->isWindowOnCurrent(hwnd)) {
+		this->clearPendingFollowMove();
+		this->stuckHwnd = hwnd;
+		this->stuckDesktopId = currentId;
+		this->stuckDesktop = current;
+		this->stuckConfirmSeq = 0;
+		this->followFailureCount = 0;
+		this->followWaitingBusy = false;
+	} else if (!confirmedPendingRead) {
+		if ((this->pendingFollowMoveSeq == 0 || this->pendingFollowMoveHwnd != hwnd
+		     || !sameFollowTarget(
+		         this->pendingFollowMoveDesktopId,
+		         this->pendingFollowMoveDesktop,
+		         currentId,
+		         current
+		     ))
+		    && this->followFailureCount < FOLLOW_RETRY_MAX)
+		{
+			// Queue the fallback follow move onto the next event-loop turn through
+			// WinPanelStack so synchronous callers (nativeInit, onWindowVisibleChanged,
+			// updateLayer, updateEmbedding) cannot be re-entered or destroyed mid-call
+			// by a VirtualDesktops::moveWindow() signal.
+			WinPanelStack::instance()->scheduleFollowPass();
 		}
-	});
+	}
+
+	if (shouldSchedulePin && !this->pinRetryTimer.isActive()) {
+		this->schedulePinRetry(0);
+	}
+}
+
+void WinPanelWindow::attemptPin(quint64 expectedGeneration) {
+	auto* hwnd = this->hwnd();
+	if (hwnd == nullptr || this->window == nullptr || !this->window->isVisible()
+	    || this->mEmbedParent != nullptr || this->embedWaitingForPinHwnd == hwnd)
+	{
+		return;
+	}
+	if (expectedGeneration == this->pinState.generation && this->pinState.attemptHwnd != hwnd) {
+		this->stickToAllDesktops();
+		return;
+	}
+	quint64 cancelledPinId = 0;
+	const auto allowed = this->pinState.canAttempt(hwnd, expectedGeneration, &cancelledPinId);
+	if (cancelledPinId != 0) {
+		this->inFlightPinExplorerPid = 0;
+		VirtualDesktops::instance()->cancelOwnWindowPin(cancelledPinId);
+	}
+	if (!allowed) return;
+
+	auto* desktops = VirtualDesktops::instance();
+	if (!desktops->accessorLoaded()) return;
+
+	// Pinned panels stay visible through a switch. Without a pin, Explorer
+	// cloaks them on SwitchDesktop and followCurrentDesktop() has to move
+	// each one back afterwards, which shows the bare desktop meanwhile.
+	quint64 requestId = 0;
+	const auto pinResult = desktops->pinOwnWindow(hwnd, &requestId);
+	const auto pinExplorerPid = desktops->ownWindowPinExplorerPid();
+	if (pinResult == OwnWindowPin::Pinned) {
+		this->mayBePinnedHwnd = hwnd;
+		this->mayBePinnedExplorerPid =
+		    pinExplorerPid != 0 ? static_cast<DWORD>(pinExplorerPid) : this->explorerTaskbarPid;
+		if (requestId != 0) {
+			if (this->pinWatermarkHwnd != hwnd || requestId >= this->pinWatermarkRequestId) {
+				this->pinWatermarkHwnd = hwnd;
+				this->pinWatermarkRequestId = requestId;
+			}
+		}
+		this->embedUnpinFailedHwnd = nullptr;
+		this->embedUnpinDisconnectRetries = 0;
+	} else if (pinResult == OwnWindowPin::Pending && requestId != 0) {
+		// Preserve 0 when submitted during a taskbar gap so delayed
+		// recoverExplorer(B) does not misattribute a fresh worker targeting B
+		// to the old Explorer A and cancel it.
+		this->inFlightPinExplorerPid = static_cast<DWORD>(pinExplorerPid);
+	}
+	const auto nowMs = static_cast<qint64>(GetTickCount64());
+	const auto action =
+	    this->pinState.onSubmitResult(hwnd, expectedGeneration, pinResult, nowMs, requestId);
+	if (this->pinState.inFlightRequestId == 0) this->inFlightPinExplorerPid = 0;
+	switch (action) {
+	case PanelPinState::SubmitAction::None: break;
+	case PanelPinState::SubmitAction::RetryLater:
+		// Another panel pin holds the pinning worker. Try again shortly
+		// instead of giving up on pinning this window for good.
+		this->schedulePinRetry(PanelPinState::BUSY_RETRY_MS);
+		break;
+	case PanelPinState::SubmitAction::FallbackLegacy: {
+		const auto pinned =
+		    desktops->isWindowPinned(hwnd).value_or(false) || desktops->pinWindow(hwnd, true);
+		this->finishPinAttempt(hwnd, expectedGeneration, pinned);
+		break;
+	}
+	case PanelPinState::SubmitAction::TriggerFollow:
+		qCDebug(logPanel) << "Could not pin" << this
+		                  << "to all desktops; it will follow the current one";
+		WinPanelStack::instance()->followCurrentDesktop();
+		break;
+	}
+}
+
+void WinPanelWindow::onOwnWindowPinCompleted(
+    quint64 requestId,
+    quintptr hwndValue,
+    OwnWindowPin result,
+    bool mayBePinned,
+    quint32 explorerPid
+) {
+	auto* completedHwnd = reinterpret_cast<HWND>(hwndValue);
+	auto* currentHwnd = this->hwnd();
+	const auto visible = this->window != nullptr && this->window->isVisible();
+	const auto embedded = this->mEmbedParent != nullptr;
+	auto* desktops = VirtualDesktops::instance();
+	const auto liveExplorerPid = desktops->liveExplorerPid();
+	const auto fromPreviousExplorer =
+	    this->isStaleExplorerSession(explorerPid, liveExplorerPid);
+	if (!fromPreviousExplorer && completedHwnd != nullptr && completedHwnd == currentHwnd && !embedded) {
+		const auto isNewerOrEqualRequest =
+		    this->pinWatermarkHwnd != currentHwnd || this->pinWatermarkRequestId == 0
+		    || requestId == 0 || requestId >= this->pinWatermarkRequestId;
+		auto advanceWatermark = [&] {
+			if (requestId != 0) {
+				this->pinWatermarkHwnd = currentHwnd;
+				this->pinWatermarkRequestId = requestId;
+			}
+		};
+		if (result == OwnWindowPin::Pinned) {
+			// Preserve an unresolved pin even if hide or embed cancellation cleared
+			// inFlightRequestId before the worker finished.
+			if (isNewerOrEqualRequest) {
+				this->mayBePinnedHwnd = currentHwnd;
+				this->mayBePinnedExplorerPid =
+				    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
+				advanceWatermark();
+				this->pinState.pinned = true;
+				this->pinState.pinnedHwnd = currentHwnd;
+				this->pinState.failedHwnd = nullptr;
+				this->pinState.disconnectRetries = 0;
+			}
+		} else if (mayBePinned) {
+			// PinView disconnected or faulted with an unknown mutation outcome, or an
+			// unpin failed: fence embedding until explicit unpin confirms removal, but
+			// clear any prior confirmed pin so top-level pinning re-verifies/retries.
+			if (isNewerOrEqualRequest) {
+				this->mayBePinnedHwnd = currentHwnd;
+				this->mayBePinnedExplorerPid =
+				    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
+				advanceWatermark();
+				if (this->pinState.pinnedHwnd == currentHwnd) {
+					this->pinState.pinned = false;
+					this->pinState.pinnedHwnd = nullptr;
+					this->pinState.failedHwnd = nullptr;
+					this->pinState.attemptHwnd = nullptr;
+				}
+			}
+		} else if (result == OwnWindowPin::Unpinned) {
+			const auto confirmedByLiveExplorer =
+			    liveExplorerPid != 0 && explorerPid != 0
+			    && static_cast<DWORD>(explorerPid) == static_cast<DWORD>(liveExplorerPid);
+			const auto matchesPinnedSession =
+			    confirmedByLiveExplorer || this->mayBePinnedExplorerPid == 0 || explorerPid == 0
+			    || this->mayBePinnedExplorerPid == static_cast<DWORD>(explorerPid);
+			if (matchesPinnedSession && isNewerOrEqualRequest) {
+				advanceWatermark();
+				if (this->mayBePinnedHwnd == currentHwnd) {
+					this->mayBePinnedHwnd = nullptr;
+					this->mayBePinnedExplorerPid = 0;
+				}
+				if (this->pinState.pinnedHwnd == currentHwnd) {
+					this->pinState.pinned = false;
+					this->pinState.pinnedHwnd = nullptr;
+					this->pinState.failedHwnd = nullptr;
+					this->pinState.attemptHwnd = nullptr;
+				}
+				this->embedUnpinFailedHwnd = nullptr;
+				this->embedUnpinDisconnectRetries = 0;
+			}
+		}
+	}
+	if (this->embedWaitingForPinHwnd != nullptr) {
+		if (this->embedWaitingForPinHwnd == completedHwnd) {
+			if (desktops->isOwnWindowPinActive(completedHwnd)) {
+				// Retirement notified early while the old pin worker is still running:
+				// keep the embedding fence until onOwnWindowPinDrained confirms the COM
+				// operation settled.
+				return;
+			}
+			const auto wasOurUnpin =
+			    this->embedUnpinRequestId != 0 && requestId == this->embedUnpinRequestId;
+			if (wasOurUnpin) {
+				this->embedUnpinRequestId = 0;
+				this->embedUnpinExplorerPid = 0;
+				this->embedWaitingForPinHwnd = nullptr;
+				if (!this->hasEmbeddingTarget()) {
+					if (visible && !embedded) this->stickToAllDesktops();
+					return;
+				}
+				if (fromPreviousExplorer || result == OwnWindowPin::Unpinned) {
+					this->updateEmbedding();
+					this->scheduleUpdateDimensions();
+				} else if (result == OwnWindowPin::Disconnected) {
+					if (desktops->accessorLoaded()
+					    && this->embedUnpinDisconnectRetries < PanelPinState::MAX_DISCONNECT_RETRIES)
+					{
+						++this->embedUnpinDisconnectRetries;
+						this->embedWaitingForPinHwnd = completedHwnd;
+						this->retryEmbedding();
+					} else if (desktops->accessorLoaded()) {
+						this->embedUnpinFailedHwnd = completedHwnd;
+						qCWarning(logPanel) << "Deferring desktop embedding for" << this
+						                    << "because unpinning disconnected repeatedly";
+					}
+				} else if (result != OwnWindowPin::Unavailable || desktops->accessorLoaded()) {
+					this->embedUnpinFailedHwnd = completedHwnd;
+					qCWarning(logPanel) << "Deferring desktop embedding for" << this
+					                    << "because window could not be unpinned";
+				}
+				return;
+			}
+			this->embedWaitingForPinHwnd = nullptr;
+			if (this->hasEmbeddingTarget()) {
+				this->updateEmbedding();
+				this->scheduleUpdateDimensions();
+			} else if (visible && !embedded) {
+				this->stickToAllDesktops();
+			}
+			return;
+		}
+		if (this->embedUnpinRequestId == 0
+		    && !desktops->isOwnWindowPinActive(this->embedWaitingForPinHwnd))
+		{
+			// Another panel freed the pin worker slot while we waited to submit an unpin.
+			this->embedWaitingForPinHwnd = nullptr;
+			if (this->hasEmbeddingTarget()) {
+				this->updateEmbedding();
+				this->scheduleUpdateDimensions();
+			} else if (visible && !embedded) {
+				this->stickToAllDesktops();
+			}
+			return;
+		}
+	}
+	if (fromPreviousExplorer) {
+		const auto matchedInFlight = this->pinState.inFlightRequestId != 0
+		                          && this->pinState.inFlightRequestId == requestId
+		                          && this->pinState.inFlightHwnd == completedHwnd
+		                          && this->pinState.inFlightGeneration == this->pinState.generation;
+		if (this->pinState.inFlightRequestId == requestId) {
+			this->pinState.inFlightHwnd = nullptr;
+			this->pinState.inFlightGeneration = 0;
+			this->pinState.inFlightRequestId = 0;
+			this->inFlightPinExplorerPid = 0;
+		}
+		if (matchedInFlight && completedHwnd != nullptr && completedHwnd == currentHwnd && visible
+		    && !embedded && !this->pinState.pinnedHere(currentHwnd))
+		{
+			if (desktops->accessorLoaded()) {
+				if (this->pinState.disconnectRetries < PanelPinState::MAX_DISCONNECT_RETRIES) {
+					++this->pinState.disconnectRetries;
+					this->schedulePinRetry(PanelPinState::BUSY_RETRY_MS);
+				} else {
+					this->pinState.applyResult(currentHwnd, this->pinState.generation, false);
+					qCDebug(logPanel) << "Could not pin" << this
+					                  << "to all desktops after Explorer restart; it will follow the current one";
+					WinPanelStack::instance()->followCurrentDesktop();
+				}
+			}
+		} else if (completedHwnd != nullptr && completedHwnd == currentHwnd
+		           && !desktops->isOwnWindowPinActive(currentHwnd) && this->pinRetryTimer.isActive()
+		           && visible && !embedded && !this->pinState.pinnedHere(currentHwnd)
+		           && !this->pinState.inFlightFor(currentHwnd))
+		{
+			this->pinState.busySinceMs.reset();
+			this->schedulePinRetry(0);
+		}
+		return;
+	}
+	const auto gen = this->pinState.generation;
+
+	const auto action = this->pinState.onAsyncCompletion(
+	    requestId,
+	    completedHwnd,
+	    result,
+	    currentHwnd,
+	    visible,
+	    embedded,
+	    desktops->accessorLoaded(),
+	    this->pinRetryTimer.isActive()
+	);
+	if (this->pinState.inFlightRequestId == 0) this->inFlightPinExplorerPid = 0;
+	switch (action) {
+	case PanelPinState::CompletionAction::None: break;
+	case PanelPinState::CompletionAction::FallbackLegacy: {
+		const auto pinned = desktops->isWindowPinned(completedHwnd).value_or(false)
+		                 || desktops->pinWindow(completedHwnd, true);
+		this->finishPinAttempt(completedHwnd, gen, pinned);
+		break;
+	}
+	case PanelPinState::CompletionAction::TriggerFollow:
+		qCDebug(logPanel) << "Could not pin" << this
+		                  << "to all desktops; it will follow the current one";
+		WinPanelStack::instance()->followCurrentDesktop();
+		break;
+	case PanelPinState::CompletionAction::RetryImmediate: this->schedulePinRetry(0); break;
+	case PanelPinState::CompletionAction::RetryLater:
+		this->schedulePinRetry(PanelPinState::BUSY_RETRY_MS);
+		break;
+	}
+}
+
+void WinPanelWindow::onOwnWindowPinDrained(
+    quint64 requestId,
+    quintptr hwndValue,
+    bool stillPinned,
+    bool mayBePinned,
+    bool confirmedUnpinned,
+    bool disconnected,
+    quint32 explorerPid
+) {
+	auto* drainedHwnd = reinterpret_cast<HWND>(hwndValue);
+	auto* currentHwnd = this->hwnd();
+	auto* desktops = VirtualDesktops::instance();
+	const auto liveExplorerPid = desktops->liveExplorerPid();
+	const auto fromPreviousExplorer =
+	    this->isStaleExplorerSession(explorerPid, liveExplorerPid);
+	if (!fromPreviousExplorer && drainedHwnd != nullptr && drainedHwnd == currentHwnd
+	    && this->mEmbedParent == nullptr)
+	{
+		const auto isNewerOrEqualRequest =
+		    this->pinWatermarkHwnd != currentHwnd || this->pinWatermarkRequestId == 0
+		    || requestId == 0 || requestId >= this->pinWatermarkRequestId;
+		auto advanceWatermark = [&] {
+			if (requestId != 0) {
+				this->pinWatermarkHwnd = currentHwnd;
+				this->pinWatermarkRequestId = requestId;
+			}
+		};
+		if (stillPinned) {
+			if (isNewerOrEqualRequest) {
+				this->mayBePinnedHwnd = currentHwnd;
+				this->mayBePinnedExplorerPid =
+				    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
+				advanceWatermark();
+				this->pinState.pinned = true;
+				this->pinState.pinnedHwnd = currentHwnd;
+				this->pinState.failedHwnd = nullptr;
+				this->pinState.disconnectRetries = 0;
+			}
+		} else if (mayBePinned) {
+			if (isNewerOrEqualRequest) {
+				this->mayBePinnedHwnd = currentHwnd;
+				this->mayBePinnedExplorerPid =
+				    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
+				advanceWatermark();
+				if (this->pinState.pinnedHwnd == currentHwnd) {
+					this->pinState.pinned = false;
+					this->pinState.pinnedHwnd = nullptr;
+				}
+			}
+		} else if (confirmedUnpinned) {
+			const auto confirmedByLiveExplorer =
+			    liveExplorerPid != 0 && explorerPid != 0
+			    && static_cast<DWORD>(explorerPid) == static_cast<DWORD>(liveExplorerPid);
+			const auto matchesPinnedSession =
+			    confirmedByLiveExplorer || this->mayBePinnedExplorerPid == 0 || explorerPid == 0
+			    || this->mayBePinnedExplorerPid == static_cast<DWORD>(explorerPid);
+			if (matchesPinnedSession && isNewerOrEqualRequest) {
+				advanceWatermark();
+				if (this->mayBePinnedHwnd == currentHwnd) {
+					this->mayBePinnedHwnd = nullptr;
+					this->mayBePinnedExplorerPid = 0;
+				}
+				if (this->pinState.pinnedHwnd == currentHwnd) {
+					this->pinState.pinned = false;
+					this->pinState.pinnedHwnd = nullptr;
+				}
+				this->embedUnpinFailedHwnd = nullptr;
+				this->embedUnpinDisconnectRetries = 0;
+			}
+		}
+	}
+	if (this->embedWaitingForPinHwnd != nullptr && this->embedWaitingForPinHwnd == drainedHwnd) {
+		if (desktops->isOwnWindowPinActive(drainedHwnd)) return;
+		const auto wasOurUnpin =
+		    this->embedUnpinRequestId != 0 && requestId == this->embedUnpinRequestId;
+		this->embedWaitingForPinHwnd = nullptr;
+		this->embedUnpinRequestId = 0;
+		this->embedUnpinExplorerPid = 0;
+		if (!fromPreviousExplorer && wasOurUnpin && !confirmedUnpinned) {
+			if (!this->hasEmbeddingTarget()) {
+				if (this->window != nullptr && this->window->isVisible()
+				    && this->mEmbedParent == nullptr)
+				{
+					this->stickToAllDesktops();
+				}
+				return;
+			}
+			if (disconnected) {
+				if (desktops->accessorLoaded()
+				    && this->embedUnpinDisconnectRetries < PanelPinState::MAX_DISCONNECT_RETRIES)
+				{
+					++this->embedUnpinDisconnectRetries;
+					this->embedWaitingForPinHwnd = drainedHwnd;
+					this->retryEmbedding();
+				} else if (desktops->accessorLoaded()) {
+					this->embedUnpinFailedHwnd = drainedHwnd;
+					qCWarning(logPanel) << "Skipping desktop embedding for" << this
+					                    << "because drained unpin request disconnected repeatedly";
+				}
+			} else if (desktops->accessorLoaded()) {
+				this->embedUnpinFailedHwnd = drainedHwnd;
+				qCWarning(logPanel) << "Skipping desktop embedding for" << this
+				                    << "because drained unpin request left window pinned";
+			}
+			return;
+		}
+		if (this->hasEmbeddingTarget()) {
+			this->updateEmbedding();
+			this->scheduleUpdateDimensions();
+		} else if (this->window != nullptr && this->window->isVisible() && this->mEmbedParent == nullptr) {
+			this->stickToAllDesktops();
+		}
+		return;
+	}
+	if (drainedHwnd != nullptr && drainedHwnd == currentHwnd
+	    && !desktops->isOwnWindowPinActive(currentHwnd) && this->pinRetryTimer.isActive()
+	    && this->window != nullptr && this->window->isVisible() && this->mEmbedParent == nullptr
+	    && !this->pinState.pinnedHere(currentHwnd) && !this->pinState.inFlightFor(currentHwnd))
+	{
+		// A draining request for this HWND just settled: wake any busy retry now.
+		this->pinState.busySinceMs.reset();
+		this->schedulePinRetry(0);
+	}
 }
 
 void WinPanelWindow::onDesktopAccessorReady() {
-	if (this->window != nullptr && this->window->isVisible()) this->stickToAllDesktops();
+	// A recovered provider may offer pinning/unpinning again. Re-verify via
+	// IsViewPinned before PinView, but keep mayBePinnedHwnd intact until Explorer
+	// actually restarts or UnpinView confirms removal.
+	this->embedUnpinFailedHwnd = nullptr;
+	this->embedUnpinDisconnectRetries = 0;
+	this->resetPinState(true);
+	this->clearStuckFollowState();
+	this->clearPendingFollowMove();
+	this->followFailureCount = 0;
+	this->followWaitingBusy = false;
+	if (this->mEmbedParent == nullptr && this->hasEmbeddingTarget()) {
+		this->updateEmbedding();
+	} else if (this->window != nullptr && this->window->isVisible()) {
+		this->stickToAllDesktops();
+	}
 }
 
 bool WinPanelWindow::recoverExplorer(HWND taskbar, DWORD pid, DWORD thread) {
 	if (!thread || (taskbar == this->explorerTaskbar && pid == this->explorerTaskbarPid
 	               && thread == this->explorerTaskbarThread))
 		return false;
+	const auto previousPid = this->explorerTaskbarPid;
+	const auto pinSessionChanged =
+	    pid != 0
+	    && ((this->mayBePinnedExplorerPid != 0 && this->mayBePinnedExplorerPid != pid)
+	        || (this->inFlightPinExplorerPid != 0 && this->inFlightPinExplorerPid != pid)
+	        || (this->embedUnpinExplorerPid != 0 && this->embedUnpinExplorerPid != pid));
+	const auto explorerRestarted = (previousPid != 0 && pid != previousPid) || pinSessionChanged;
 	this->explorerTaskbar = taskbar;
 	this->explorerTaskbarPid = pid;
 	this->explorerTaskbarThread = thread;
-	this->pinnedToAllDesktops = false;
-	this->pinFailedHwnd = nullptr;
-	this->stuckHwnd = nullptr;
+	auto* currentHwnd = this->hwnd();
+	const auto preserveCurrentExplorerPin =
+	    explorerRestarted && currentHwnd != nullptr && pid != 0
+	    && this->mayBePinnedHwnd == currentHwnd && this->mayBePinnedExplorerPid == pid;
+	const auto preserveCurrentExplorerConfirmedPin =
+	    preserveCurrentExplorerPin && this->pinState.pinnedHere(currentHwnd);
+	const auto preserveCurrentExplorerInFlight =
+	    explorerRestarted && pid != 0 && this->pinState.inFlightRequestId != 0
+	    && (this->inFlightPinExplorerPid == pid || this->inFlightPinExplorerPid == 0);
+	const auto preserveCurrentExplorerUnpin =
+	    explorerRestarted && pid != 0 && this->embedUnpinRequestId != 0
+	    && (this->embedUnpinExplorerPid == pid || this->embedUnpinExplorerPid == 0);
+	if (explorerRestarted) {
+		auto* desktops = VirtualDesktops::instance();
+		if (previousPid != 0 && previousPid != pid) this->retiredExplorerPids.insert(previousPid);
+		if (this->mayBePinnedExplorerPid != 0 && this->mayBePinnedExplorerPid != pid) {
+			this->retiredExplorerPids.insert(this->mayBePinnedExplorerPid);
+		}
+		if (this->inFlightPinExplorerPid != 0 && this->inFlightPinExplorerPid != pid) {
+			this->retiredExplorerPids.insert(this->inFlightPinExplorerPid);
+		}
+		if (this->embedUnpinExplorerPid != 0 && this->embedUnpinExplorerPid != pid) {
+			this->retiredExplorerPids.insert(this->embedUnpinExplorerPid);
+		}
+		if (pid != 0) this->retiredExplorerPids.remove(pid);
+		if (!preserveCurrentExplorerPin) {
+			this->mayBePinnedHwnd = nullptr;
+			this->mayBePinnedExplorerPid = 0;
+			this->embedUnpinFailedHwnd = nullptr;
+			this->embedUnpinDisconnectRetries = 0;
+		}
+		if (this->embedUnpinRequestId != 0 && !preserveCurrentExplorerUnpin) {
+			desktops->cancelOwnWindowPin(this->embedUnpinRequestId);
+			this->embedUnpinRequestId = 0;
+			this->embedUnpinExplorerPid = 0;
+		}
+		if (currentHwnd != nullptr && !preserveCurrentExplorerInFlight && !preserveCurrentExplorerUnpin) {
+			desktops->cancelOwnWindowPinForHwnd(currentHwnd);
+		}
+	}
+	if (preserveCurrentExplorerInFlight) {
+		if (!preserveCurrentExplorerPin) {
+			this->pinState.pinned = false;
+			this->pinState.pinnedHwnd = nullptr;
+			this->pinState.failedHwnd = nullptr;
+			this->pinState.disconnectRetries = 0;
+		}
+	} else if (!preserveCurrentExplorerConfirmedPin && !preserveCurrentExplorerUnpin) {
+		this->resetPinState(true);
+	}
+	this->clearStuckFollowState();
+	this->clearPendingFollowMove();
+	this->followFailureCount = 0;
+	this->followWaitingBusy = false;
 	this->appBar.invalidate();
 	this->scheduleUpdateDimensions();
 	this->blur->syncPlacement();
-	QTimer::singleShot(0, this, &WinPanelWindow::onDesktopAccessorReady);
+	if (preserveCurrentExplorerConfirmedPin || preserveCurrentExplorerInFlight
+	    || preserveCurrentExplorerUnpin)
+	{
+		if (this->mEmbedParent == nullptr && this->hasEmbeddingTarget()) {
+			QTimer::singleShot(0, this, &WinPanelWindow::updateEmbedding);
+		}
+	} else {
+		QTimer::singleShot(0, this, &WinPanelWindow::onDesktopAccessorReady);
+	}
 	return true;
 }
 
@@ -1199,10 +2237,17 @@ void WinPanelWindow::onWindowVisibleChanged() {
 		this->updateDimensions();
 		stack->seedFullscreenAppState(MonitorFromWindow(this->hwnd(), MONITOR_DEFAULTTONEAREST));
 		this->updateLayer();
+		QPointer<WinPanelWindow> guard(this);
 		this->stickToAllDesktops();
+		if (guard == nullptr) return;
 		this->focusWhenExposed();
 	} else {
 		this->focusOnExpose = false;
+		this->resetPinState(false);
+		this->clearPendingFollowMove();
+		this->clearStuckFollowState();
+		this->followFailureCount = 0;
+		this->followWaitingBusy = false;
 		this->appBar.remove();
 		WinPanelStack::instance()->removePanel(this);
 	}
@@ -1488,6 +2533,13 @@ bool WinPanelWindow::wantsAboveIcons() const {
 	return DesktopHost::instance()->allowsAboveIcons(this->bNamespace.value());
 }
 
+bool WinPanelWindow::hasEmbeddingTarget() const {
+	if (!this->wantsEmbedding()) return false;
+	auto* host = DesktopHost::instance();
+	auto* parent = this->wantsAboveIcons() ? host->iconsHost() : host->parentWindow();
+	return parent != nullptr && parent != this->embedRefusedBy;
+}
+
 void WinPanelWindow::updateEmbedding() {
 	auto* hwnd = this->hwnd();
 	if (hwnd == nullptr) return;
@@ -1521,6 +2573,33 @@ void WinPanelWindow::updateEmbedding() {
 	if (parent == nullptr) aboveIcons = false;
 	auto* insertAfter = parent == nullptr || aboveIcons ? nullptr : host->insertAfter();
 
+	if (parent == nullptr && this->mEmbedParent == nullptr && this->embedWaitingForPinHwnd != nullptr) {
+		auto* desktops = VirtualDesktops::instance();
+		if (this->embedUnpinRequestId != 0) {
+			desktops->cancelOwnWindowPin(this->embedUnpinRequestId);
+			this->embedUnpinRequestId = 0;
+			this->embedUnpinExplorerPid = 0;
+		}
+		if (!desktops->isOwnWindowPinActive(this->embedWaitingForPinHwnd)) {
+			this->embedWaitingForPinHwnd = nullptr;
+			if (this->window != nullptr && this->window->isVisible()) {
+				QPointer<WinPanelWindow> guard(this);
+				this->stickToAllDesktops();
+				if (guard == nullptr) return;
+			}
+		}
+	} else if (parent == nullptr && this->mEmbedParent == nullptr
+	           && this->embedWaitingForPinHwnd == nullptr && this->window != nullptr
+	           && this->window->isVisible() && !this->pinnedHere(hwnd))
+	{
+		// No embedding host remains (e.g., host disappeared after an inconclusive
+		// unpin cleared the confirmed pin while waiting to embed): restore
+		// top-level pinning for the visible panel.
+		QPointer<WinPanelWindow> guard(this);
+		this->stickToAllDesktops();
+		if (guard == nullptr) return;
+	}
+
 	if (parent == this->mEmbedParent && insertAfter == this->mEmbedInsertAfter
 	    && aboveIcons == this->mEmbedAboveIcons)
 	{
@@ -1541,6 +2620,123 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 		return;
 	}
 	auto wasEmbedded = this->mEmbedParent != nullptr;
+
+	if (!wasEmbedded) {
+		auto* desktops = VirtualDesktops::instance();
+		if (this->mayBePinnedHwnd != nullptr && this->mayBePinnedHwnd != hwnd) {
+			this->mayBePinnedHwnd = nullptr;
+			this->mayBePinnedExplorerPid = 0;
+			this->embedUnpinFailedHwnd = nullptr;
+			this->embedUnpinDisconnectRetries = 0;
+		}
+		if (this->pinWatermarkHwnd != nullptr && this->pinWatermarkHwnd != hwnd) {
+			this->pinWatermarkHwnd = nullptr;
+			this->pinWatermarkRequestId = 0;
+		}
+		// Fence child-style conversion and SetParent while any pin worker
+		// (active, retired-but-draining, or pending completion delivery) still
+		// owns a request for this HWND, even if hide previously cleared pinState.
+		if (desktops->isOwnWindowPinActive(hwnd)) {
+			if (this->embedUnpinRequestId != 0 && this->embedWaitingForPinHwnd == hwnd) {
+				// Wait for the unpin we already submitted for this embedding transition.
+				return;
+			}
+			this->embedWaitingForPinHwnd = hwnd;
+			desktops->cancelOwnWindowPinForHwnd(hwnd);
+			this->resetPinState(false);
+			this->clearStuckFollowState();
+			this->clearPendingFollowMove();
+			this->followFailureCount = 0;
+			this->followWaitingBusy = false;
+			return;
+		}
+		this->embedWaitingForPinHwnd = nullptr;
+		this->embedUnpinRequestId = 0;
+		this->embedUnpinExplorerPid = 0;
+		if (this->pinState.pinnedHere(hwnd) || this->mayBePinnedHwnd == hwnd) {
+			if (this->embedUnpinFailedHwnd == hwnd) return;
+			quint64 unpinReqId = 0;
+			const auto unpinResult = desktops->unpinOwnWindow(hwnd, &unpinReqId);
+			switch (unpinResult) {
+			case OwnWindowPin::Pending: {
+				const auto unpinExplorerPid = desktops->ownWindowPinExplorerPid();
+				this->embedWaitingForPinHwnd = hwnd;
+				this->embedUnpinRequestId = unpinReqId;
+				this->embedUnpinExplorerPid = static_cast<DWORD>(unpinExplorerPid);
+				this->resetPinState(false);
+				this->clearStuckFollowState();
+				this->clearPendingFollowMove();
+				this->followFailureCount = 0;
+				this->followWaitingBusy = false;
+				return;
+			}
+			case OwnWindowPin::Busy:
+				this->embedWaitingForPinHwnd = hwnd;
+				this->resetPinState(false);
+				this->clearStuckFollowState();
+				this->clearPendingFollowMove();
+				this->followFailureCount = 0;
+				this->followWaitingBusy = false;
+				this->retryEmbedding();
+				return;
+			case OwnWindowPin::Unpinned:
+				this->mayBePinnedHwnd = nullptr;
+				this->mayBePinnedExplorerPid = 0;
+				this->embedUnpinFailedHwnd = nullptr;
+				this->embedUnpinDisconnectRetries = 0;
+				break;
+			case OwnWindowPin::Disconnected:
+				if (desktops->accessorLoaded()
+				    && this->embedUnpinDisconnectRetries < PanelPinState::MAX_DISCONNECT_RETRIES)
+				{
+					++this->embedUnpinDisconnectRetries;
+					this->embedWaitingForPinHwnd = hwnd;
+					this->retryEmbedding();
+				} else if (desktops->accessorLoaded()) {
+					this->embedUnpinFailedHwnd = hwnd;
+					qCWarning(logPanel) << "Skipping desktop embedding for" << this
+					                    << "because unpinning disconnected repeatedly";
+				}
+				return;
+			case OwnWindowPin::Unavailable: {
+				if (desktops->pinSupported()
+				    && (!desktops->isWindowPinned(hwnd).value_or(true)
+				        || desktops->pinWindow(hwnd, false)))
+				{
+					this->mayBePinnedHwnd = nullptr;
+					this->mayBePinnedExplorerPid = 0;
+					this->embedUnpinFailedHwnd = nullptr;
+					this->embedUnpinDisconnectRetries = 0;
+					break;
+				}
+				if (desktops->accessorLoaded()) {
+					this->embedUnpinFailedHwnd = hwnd;
+					qCWarning(logPanel) << "Skipping desktop embedding for" << this
+					                    << "because window may remain pinned and unpinning is unavailable";
+				}
+				return;
+			}
+			case OwnWindowPin::Pinned:
+			case OwnWindowPin::Refused:
+				this->embedUnpinFailedHwnd = hwnd;
+				qCWarning(logPanel) << "Skipping desktop embedding for" << this
+				                    << "because Explorer refused to unpin it";
+				return;
+			}
+		}
+	}
+
+	// Cancel any in-flight pin or follow state before converting the window to a
+	// child or calling SetParent, so PinView cannot run against an embedding HWND.
+	this->mayBePinnedHwnd = nullptr;
+	this->mayBePinnedExplorerPid = 0;
+	this->embedUnpinFailedHwnd = nullptr;
+	this->embedUnpinDisconnectRetries = 0;
+	this->resetPinState(true);
+	this->clearStuckFollowState();
+	this->clearPendingFollowMove();
+	this->followFailureCount = 0;
+	this->followWaitingBusy = false;
 
 	if (!wasEmbedded) {
 		RECT rect {};
@@ -1564,6 +2760,7 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 			this->mEmbedInsertAfter = nullptr;
 			this->mEmbedAboveIcons = false;
 			setChildStyle(hwnd, false);
+			if (this->window != nullptr && this->window->isVisible()) this->stickToAllDesktops();
 		}
 		return;
 	}
@@ -1573,7 +2770,6 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 
 	this->embedRefusedBy = nullptr;
 	this->restackCount = 0;
-	this->pinnedToAllDesktops = false;
 	this->appBar.remove();
 	this->applyNativeStyles();
 	this->placeEmbedded();

@@ -19,6 +19,25 @@
 
 namespace qs::windows {
 
+// Result of pinning or unpinning one of the shell's own windows across
+// desktops. Pending means the native operation was submitted asynchronously and
+// will finish via ownWindowPinCompleted(). Unpinned means the window was
+// confirmed not pinned in Explorer (via IsViewPinned == FALSE or UnpinView
+// returning S_OK). Disconnected means a transient pin-worker RPC disconnect
+// occurred while desktop control remained available; callers may retry with
+// bounded backoff. Unavailable means the native pinning service is absent, so a
+// caller may fall back to the accessor table (tests) or follow the current
+// desktop.
+enum class OwnWindowPin : quint8 {
+	Pinned,
+	Unpinned,
+	Pending,
+	Refused,
+	Busy,
+	Disconnected,
+	Unavailable,
+};
+
 class RegistryWatcher: public QThread {
 	Q_OBJECT;
 
@@ -84,6 +103,8 @@ public:
 	[[nodiscard]] GUID windowDesktopId(HWND hwnd) const;
 	[[nodiscard]] qsizetype windowDesktopIndex(HWND hwnd) const;
 	[[nodiscard]] bool isWindowOnCurrent(HWND hwnd) const;
+	[[nodiscard]] quint64 windowReadSequence() const;
+	[[nodiscard]] quint64 submittedSequence() const;
 
 	[[nodiscard]] int workspaceLimit() const { return this->mWorkspaceLimit; }
 	void setWorkspaceLimit(int count) { this->mWorkspaceLimit = qBound(1, count, 20); }
@@ -114,6 +135,15 @@ public:
 	    std::optional<GUID> requestedTargetId = std::nullopt
 	);
 	bool pinWindow(HWND hwnd, bool pinned);
+	// Own panels only. Never exposed as Hyprland pin support, so toplevel
+	// queries keep reading cached state instead of waiting on COM.
+	OwnWindowPin pinOwnWindow(HWND hwnd, quint64* outRequestId = nullptr);
+	OwnWindowPin unpinOwnWindow(HWND hwnd, quint64* outRequestId = nullptr);
+	void cancelOwnWindowPin(quint64 requestId);
+	void cancelOwnWindowPinForHwnd(HWND hwnd);
+	[[nodiscard]] bool isOwnWindowPinActive(HWND hwnd) const;
+	[[nodiscard]] quint32 ownWindowPinExplorerPid() const;
+	[[nodiscard]] quint32 liveExplorerPid() const;
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;
 	[[nodiscard]] DesktopAvailability availability() const;
 	[[nodiscard]] bool supports(DesktopOperation operation) const;
@@ -154,6 +184,23 @@ signals:
 	void lastCommandChanged();
 	void commandResult(QVariantMap result);
 	void moveWindowCompleted(quint64 sequence, quintptr hwnd, bool succeeded, QString reason);
+	void ownWindowPinCompleted(
+	    quint64 requestId,
+	    quintptr hwnd,
+	    qs::windows::OwnWindowPin result,
+	    bool mayBePinned,
+	    quint32 explorerPid
+	);
+	void ownWindowPinDrained(
+	    quint64 requestId,
+	    quintptr hwnd,
+	    bool stillPinned,
+	    bool mayBePinned,
+	    bool confirmedUnpinned,
+	    bool disconnected,
+	    quint32 explorerPid
+	);
+	void desktopCommandIdle();
 
 private:
 #ifdef QS_TEST
@@ -174,6 +221,13 @@ private:
 	    bool succeeded,
 	    DesktopAvailability availability,
 	    HRESULT error
+	);
+	void onNativePinCompleted(
+	    quint64 requestId,
+	    HWND hwnd,
+	    OwnWindowPin result,
+	    bool mayBePinned,
+	    quint32 explorerPid
 	);
 	void applyNativeSnapshot();
 	void notifyCapability();

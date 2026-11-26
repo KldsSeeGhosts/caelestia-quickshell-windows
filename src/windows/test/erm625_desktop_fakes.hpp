@@ -4,6 +4,7 @@
 
 #include <objectarray.h>
 #include <qlist.h>
+#include <servprov.h>
 
 #include "native_desktop_interfaces.hpp"
 
@@ -44,11 +45,14 @@ struct FakeCom: Interface {
 		*out = nullptr;
 		return E_NOINTERFACE;
 	}
-	ULONG STDMETHODCALLTYPE AddRef() override { return ++this->refs; }
+	ULONG STDMETHODCALLTYPE AddRef() override {
+		return static_cast<ULONG>(InterlockedIncrement(reinterpret_cast<volatile LONG*>(&this->refs)));
+	}
 	ULONG STDMETHODCALLTYPE Release() override {
 		if (this->beforeRelease) this->beforeRelease();
-		++this->releases;
-		const auto remaining = --this->refs;
+		InterlockedIncrement(reinterpret_cast<volatile LONG*>(&this->releases));
+		const auto remaining =
+		    static_cast<ULONG>(InterlockedDecrement(reinterpret_cast<volatile LONG*>(&this->refs)));
 		if (this->faultOnRelease) fault();
 		return remaining;
 	}
@@ -180,9 +184,81 @@ struct FakeViews: FakeCom<ViewCollection> {
 		return S_OK;
 	}
 };
+struct FakePinnedApps: FakeCom<PinnedApps> {
+	ApplicationView* expectedView = nullptr;
+	BOOL pinned = FALSE;
+	int queries = 0;
+	int pins = 0;
+	int unpins = 0;
+	HRESULT queryResult = S_OK;
+	HRESULT pinResult = S_OK;
+	HRESULT unpinResult = S_OK;
+	bool faultOnQuery = false;
+	bool faultOnPin = false;
+	bool faultOnUnpin = false;
+	std::function<void()> beforeQuery;
+	std::function<void()> beforePin;
+	std::function<void()> beforeUnpin;
+	HRESULT STDMETHODCALLTYPE IsAppIdPinned(PCWSTR, BOOL*) override { return E_NOTIMPL; }
+	HRESULT STDMETHODCALLTYPE PinAppID(PCWSTR) override { return E_NOTIMPL; }
+	HRESULT STDMETHODCALLTYPE UnpinAppID(PCWSTR) override { return E_NOTIMPL; }
+	HRESULT STDMETHODCALLTYPE IsViewPinned(ApplicationView* view, BOOL* out) override {
+		if (this->beforeQuery) this->beforeQuery();
+		++this->queries;
+		if (this->faultOnQuery) fault();
+		if (FAILED(this->queryResult)) return this->queryResult;
+		if (view != this->expectedView) return E_INVALIDARG;
+		*out = this->pinned;
+		return this->queryResult;
+	}
+	HRESULT STDMETHODCALLTYPE PinView(ApplicationView* view) override {
+		if (this->beforePin) this->beforePin();
+		++this->pins;
+		if (this->faultOnPin) fault();
+		if (view != this->expectedView) return E_INVALIDARG;
+		if (this->pinResult == S_OK) this->pinned = TRUE;
+		return this->pinResult;
+	}
+	HRESULT STDMETHODCALLTYPE UnpinView(ApplicationView* view) override {
+		if (this->beforeUnpin) this->beforeUnpin();
+		++this->unpins;
+		if (this->faultOnUnpin) fault();
+		if (view != this->expectedView) return E_INVALIDARG;
+		if (this->unpinResult == S_OK) this->pinned = FALSE;
+		return this->unpinResult;
+	}
+};
+struct FakePinnedAppsShell: FakeCom<IServiceProvider> {
+	FakePinnedApps* pinnedApps = nullptr;
+	HRESULT result = S_OK;
+	int queries = 0;
+	bool faultOnQuery = false;
+	bool writeBogusOnFail = false;
+	std::function<void()> beforeQuery;
+	HRESULT STDMETHODCALLTYPE QueryService(REFGUID, REFIID, void** out) override {
+		if (this->beforeQuery) this->beforeQuery();
+		++this->queries;
+		if (this->writeBogusOnFail) {
+			// Deliberately write a non-owning pointer on failure or SEH so the
+			// caller must not adopt or Release it without a successful return.
+			*out = this->pinnedApps;
+		}
+		if (this->faultOnQuery) fault();
+		if (FAILED(this->result) || !this->pinnedApps) {
+			if (!this->writeBogusOnFail) *out = nullptr;
+			return FAILED(this->result) ? this->result : E_NOINTERFACE;
+		}
+		this->pinnedApps->AddRef();
+		*out = this->pinnedApps;
+		return S_OK;
+	}
+};
 struct FakePublic: FakeCom<IVirtualDesktopManager> {
 	bool faultOnRead = false;
 	std::function<void()> beforeQuery, beforeMove;
+	std::atomic<HRESULT> moveResult {S_OK};
+	std::atomic<int> moves {0};
+	std::atomic<int> activeMoves {0};
 	GUID desktopId {};
 	BOOL onCurrent = TRUE;
 	HRESULT STDMETHODCALLTYPE IsWindowOnCurrentVirtualDesktop(HWND, BOOL* out) override {
@@ -198,9 +274,16 @@ struct FakePublic: FakeCom<IVirtualDesktopManager> {
 		return S_OK;
 	}
 	HRESULT STDMETHODCALLTYPE MoveWindowToDesktop(HWND, REFGUID id) override {
+		this->activeMoves.fetch_add(1, std::memory_order_acq_rel);
+		struct ActiveGuard {
+			std::atomic<int>& count;
+			~ActiveGuard() { this->count.fetch_sub(1, std::memory_order_release); }
+		} guard {this->activeMoves};
 		if (this->beforeMove) this->beforeMove();
-		this->desktopId = id;
-		return S_OK;
+		this->moves.fetch_add(1, std::memory_order_relaxed);
+		const auto hr = this->moveResult.load(std::memory_order_acquire);
+		if (SUCCEEDED(hr)) this->desktopId = id;
+		return hr;
 	}
 };
 

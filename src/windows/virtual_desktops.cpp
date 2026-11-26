@@ -300,7 +300,56 @@ void VirtualDesktops::bindNativeDesktopQueries() {
 	        HRESULT error
 	    ) { this->onNativeMoveCompleted(sequence, hwnd, succeeded, availability, error); }
 	);
+	setNativeDesktopPinObserver(
+	    this,
+	    [this](
+	        quint64 requestId,
+	        HWND hwnd,
+	        OwnWindowPin result,
+	        bool mayBePinned,
+	        quint32 explorerPid
+	    ) { this->onNativePinCompleted(requestId, hwnd, result, mayBePinned, explorerPid); }
+	);
+	setNativeDesktopPinDrainObserver(
+	    this,
+	    [this](
+	        quint64 requestId,
+	        HWND hwnd,
+	        bool stillPinned,
+	        bool mayBePinned,
+	        bool confirmedUnpinned,
+	        bool disconnected,
+	        quint32 explorerPid
+	    ) {
+		    emit this->ownWindowPinDrained(
+		        requestId,
+		        reinterpret_cast<quintptr>(hwnd),
+		        stillPinned,
+		        mayBePinned,
+		        confirmedUnpinned,
+		        disconnected,
+		        explorerPid
+		    );
+	    }
+	);
+	setNativeDesktopCommandIdleObserver(this, [this] { emit this->desktopCommandIdle(); });
 	initializeNativeDesktopQueries(this, [this] { this->applyNativeSnapshot(); });
+}
+
+void VirtualDesktops::onNativePinCompleted(
+    quint64 requestId,
+    HWND hwnd,
+    OwnWindowPin result,
+    bool mayBePinned,
+    quint32 explorerPid
+) {
+	emit this->ownWindowPinCompleted(
+	    requestId,
+	    reinterpret_cast<quintptr>(hwnd),
+	    result,
+	    mayBePinned,
+	    explorerPid
+	);
 }
 
 void VirtualDesktops::onNativeMoveCompleted(
@@ -574,6 +623,14 @@ qsizetype VirtualDesktops::windowDesktopIndex(HWND hwnd) const {
 
 bool VirtualDesktops::isWindowOnCurrent(HWND hwnd) const {
 	return nativeWindowOnCurrentDesktop(hwnd) != 0;
+}
+
+quint64 VirtualDesktops::windowReadSequence() const {
+	return nativeDesktopWindowReadSequence();
+}
+
+quint64 VirtualDesktops::submittedSequence() const {
+	return nativeDesktopSubmittedSequence();
 }
 
 void VirtualDesktops::sendShortcut(WORD key, int times) const {
@@ -1195,6 +1252,44 @@ bool VirtualDesktops::pinWindow(HWND hwnd, bool pinned) {
 	return this->call(-1, pinned ? a.pinWindow : a.unPinWindow, hwnd) != -1;
 }
 
+OwnWindowPin VirtualDesktops::pinOwnWindow(HWND hwnd, quint64* outRequestId) {
+	if (outRequestId != nullptr) *outRequestId = 0;
+	if (hwnd == nullptr || !this->nativeAccessor || !isOwnWindow(hwnd))
+		return OwnWindowPin::Unavailable;
+	return pinNativeDesktopOwnWindow(hwnd, outRequestId);
+}
+
+OwnWindowPin VirtualDesktops::unpinOwnWindow(HWND hwnd, quint64* outRequestId) {
+	if (outRequestId != nullptr) *outRequestId = 0;
+	if (hwnd == nullptr || !this->nativeAccessor || !isOwnWindow(hwnd))
+		return OwnWindowPin::Unavailable;
+	return unpinNativeDesktopOwnWindow(hwnd, outRequestId);
+}
+
+void VirtualDesktops::cancelOwnWindowPin(quint64 requestId) {
+	if (requestId == 0 || !this->nativeAccessor) return;
+	cancelNativeDesktopOwnWindowPin(requestId);
+}
+
+void VirtualDesktops::cancelOwnWindowPinForHwnd(HWND hwnd) {
+	if (hwnd == nullptr || !this->nativeAccessor) return;
+	cancelNativeDesktopOwnWindowPinForHwnd(hwnd);
+}
+
+bool VirtualDesktops::isOwnWindowPinActive(HWND hwnd) const {
+	if (hwnd == nullptr || !this->nativeAccessor) return false;
+	return nativeDesktopOwnWindowPinActive(hwnd);
+}
+
+quint32 VirtualDesktops::ownWindowPinExplorerPid() const {
+	if (!this->nativeAccessor) return 0;
+	return nativeDesktopExplorerPid();
+}
+
+quint32 VirtualDesktops::liveExplorerPid() const {
+	if (!this->nativeAccessor) return 0;
+	return nativeDesktopLiveExplorerPid();
+}
 std::optional<bool> VirtualDesktops::isWindowPinned(HWND hwnd) const {
 	const auto& a = this->accessor;
 	if (!this->pinSupported()) return std::nullopt;

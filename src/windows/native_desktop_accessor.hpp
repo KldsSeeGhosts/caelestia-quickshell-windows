@@ -21,6 +21,15 @@ void setNativeDesktopMoveObserver(
     QObject* context,
     std::function<void(quint64, HWND, bool, DesktopAvailability, HRESULT)> onMoveCompleted
 );
+void setNativeDesktopPinObserver(
+    QObject* context,
+    std::function<void(quint64, HWND, OwnWindowPin, bool, quint32)> onPinCompleted
+);
+void setNativeDesktopPinDrainObserver(
+    QObject* context,
+    std::function<void(quint64, HWND, bool, bool, bool, bool, quint32)> onPinDrained
+);
+void setNativeDesktopCommandIdleObserver(QObject* context, std::function<void()> onCommandIdle);
 void requestNativeDesktopRefresh();
 [[nodiscard]] bool nativeDesktopCommandPending();
 [[nodiscard]] quint64 nativeDesktopPendingMoveSequence(HWND hwnd = nullptr);
@@ -28,6 +37,7 @@ void requestNativeDesktopRefresh();
 [[nodiscard]] bool nativeDesktopRequestPending();
 [[nodiscard]] quint64 nativeDesktopSubmittedSequence();
 [[nodiscard]] quint64 nativeDesktopReadSequence();
+[[nodiscard]] quint64 nativeDesktopWindowReadSequence();
 [[nodiscard]] quint64 nativeDesktopCancelledSequence();
 [[nodiscard]] quint64 nativeDesktopFailedSwitchSequence();
 [[nodiscard]] HRESULT nativeDesktopFailedSwitchError();
@@ -42,20 +52,38 @@ int switchNativeDesktopByIdIfCurrent(
 );
 int moveNativeDesktopWindowById(HWND hwnd, GUID desktop);
 std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop);
+// Submits an asynchronous pin for one of this process's windows on a dedicated
+// pinning worker without blocking the GUI thread or desktop commands. Returns
+// Pending when submitted (writing a unique request ID to outRequestId and
+// delivering the result to the pin observer), Busy if another pin is in flight,
+// or Unavailable when pinning is absent.
+[[nodiscard]] OwnWindowPin pinNativeDesktopOwnWindow(HWND hwnd, quint64* outRequestId = nullptr);
+[[nodiscard]] OwnWindowPin unpinNativeDesktopOwnWindow(HWND hwnd, quint64* outRequestId = nullptr);
+void cancelNativeDesktopOwnWindowPin(quint64 requestId);
+void cancelNativeDesktopOwnWindowPinForHwnd(HWND hwnd);
+[[nodiscard]] bool nativeDesktopOwnWindowPinActive(HWND hwnd);
+[[nodiscard]] quint32 nativeDesktopExplorerPid();
+[[nodiscard]] quint32 nativeDesktopLiveExplorerPid();
 void shutdownNativeDesktopAccessor();
 
 #ifdef QS_TEST
 // Allows generated handles to exercise the production move path without
 // creating a real window. Reset together with the injected provider factory.
 void setNativeDesktopWindowValidatorForTest(std::function<bool(HWND)> validator);
+// Allows tests to simulate Explorer process restarts deterministically.
+// Reset together with the injected provider factory.
+void setNativeDesktopExplorerPidForTest(std::function<DWORD()> provider);
 // Uses the existing elapsed-time seam; an empty callback restores the real clock.
 // Reset together with the injected provider factory.
 void setNativeDesktopRecoveryAgeForTest(std::function<qint64()> age);
 [[nodiscard]] int nativeDesktopRecoveryPendingDelayForTest();
 [[nodiscard]] int refreshNativeDesktopForTest();
 [[nodiscard]] int nativeDesktopWorkerCountForTest();
+[[nodiscard]] int nativeDesktopPinWorkerCountForTest();
 [[nodiscard]] bool nativeDesktopPendingReadyForTest();
+[[nodiscard]] bool nativeDesktopPinReadyForTest();
 void setNativeDesktopStuckBoundForTest(int milliseconds);
+void setNativeDesktopPinStuckBoundForTest(int milliseconds);
 #endif
 
 } // namespace qs::windows
