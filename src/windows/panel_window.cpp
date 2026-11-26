@@ -2315,8 +2315,7 @@ void WinPanelWindow::onScreenScaleChanged() {
 }
 
 void WinPanelWindow::scheduleUpdateDimensions() {
-	if (this->dimensionsUpdatePending || this->window == nullptr || this->mTrackedScreen == nullptr)
-		return;
+	if (this->dimensionsUpdatePending) return;
 	this->dimensionsUpdatePending = true;
 
 	QTimer::singleShot(0, this, [this]() {
