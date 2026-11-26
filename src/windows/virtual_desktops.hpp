@@ -142,6 +142,7 @@ public:
 	void cancelOwnWindowPin(quint64 requestId);
 	void cancelOwnWindowPinForHwnd(HWND hwnd);
 	[[nodiscard]] bool isOwnWindowPinActive(HWND hwnd) const;
+	[[nodiscard]] quint64 latestOwnWindowPinRequestId() const;
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;
 	[[nodiscard]] DesktopAvailability availability() const;
 	[[nodiscard]] bool supports(DesktopOperation operation) const;
@@ -189,6 +190,7 @@ signals:
 	    bool mayBePinned
 	);
 	void ownWindowPinDrained(
+	    quint64 requestId,
 	    quintptr hwnd,
 	    bool stillPinned,
 	    bool mayBePinned,

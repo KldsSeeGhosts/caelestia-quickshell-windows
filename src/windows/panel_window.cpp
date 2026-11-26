@@ -1135,6 +1135,7 @@ ProxiedWindow* WinPanelWindow::retrieveWindow(QObject* oldInstance) {
 	auto* preservedTaskbar = old->explorerTaskbar;
 	const auto preservedTaskbarPid = old->explorerTaskbarPid;
 	const auto preservedTaskbarThread = old->explorerTaskbarThread;
+	const auto preservedMinValidPinRequestId = old->minValidPinRequestId;
 
 	this->appBar.adopt(old->appBar);
 	this->blur->adopt(old->blur);
@@ -1153,6 +1154,7 @@ ProxiedWindow* WinPanelWindow::retrieveWindow(QObject* oldInstance) {
 	this->explorerTaskbar = preservedTaskbar;
 	this->explorerTaskbarPid = preservedTaskbarPid;
 	this->explorerTaskbarThread = preservedTaskbarThread;
+	this->minValidPinRequestId = preservedMinValidPinRequestId;
 	return adopted;
 }
 
@@ -1534,6 +1536,7 @@ void WinPanelWindow::stickToAllDesktops() {
 		if (this->embedWaitingForPinHwnd == hwnd) {
 			if (!this->wantsEmbedding() && this->embedUnpinRequestId != 0) {
 				VirtualDesktops::instance()->cancelOwnWindowPin(this->embedUnpinRequestId);
+				this->embedUnpinRequestId = 0;
 			}
 			return;
 		}
@@ -1702,7 +1705,9 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 	const auto visible = this->window != nullptr && this->window->isVisible();
 	const auto embedded = this->mEmbedParent != nullptr;
 	auto* desktops = VirtualDesktops::instance();
-	if (completedHwnd != nullptr && completedHwnd == currentHwnd && !embedded) {
+	const auto fromPreviousExplorer =
+	    requestId != 0 && requestId <= this->minValidPinRequestId;
+	if (!fromPreviousExplorer && completedHwnd != nullptr && completedHwnd == currentHwnd && !embedded) {
 		if (result == OwnWindowPin::Pinned) {
 			// Preserve an unresolved pin even if hide or embed cancellation cleared
 			// inFlightRequestId before the worker finished.
@@ -1738,18 +1743,14 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 			if (wasOurUnpin) {
 				this->embedUnpinRequestId = 0;
 				this->embedWaitingForPinHwnd = nullptr;
-				if (result == OwnWindowPin::Unpinned) {
-					if (this->wantsEmbedding()) {
-						this->updateEmbedding();
-						this->scheduleUpdateDimensions();
-					} else if (visible && !embedded) {
-						this->stickToAllDesktops();
-					}
+				if (!this->wantsEmbedding()) {
+					if (visible && !embedded) this->stickToAllDesktops();
+					return;
+				}
+				if (fromPreviousExplorer || result == OwnWindowPin::Unpinned) {
+					this->updateEmbedding();
+					this->scheduleUpdateDimensions();
 				} else if (result == OwnWindowPin::Disconnected) {
-					if (!this->wantsEmbedding()) {
-						if (visible && !embedded) this->stickToAllDesktops();
-						return;
-					}
 					if (desktops->accessorLoaded()
 					    && this->embedUnpinDisconnectRetries < PanelPinState::MAX_DISCONNECT_RETRIES)
 					{
@@ -1787,6 +1788,17 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 			return;
 		}
 	}
+	if (fromPreviousExplorer) {
+		if (completedHwnd != nullptr && completedHwnd == currentHwnd
+		    && !desktops->isOwnWindowPinActive(currentHwnd) && this->pinRetryTimer.isActive()
+		    && visible && !embedded && !this->pinState.pinnedHere(currentHwnd)
+		    && !this->pinState.inFlightFor(currentHwnd))
+		{
+			this->pinState.busySinceMs.reset();
+			this->schedulePinRetry(0);
+		}
+		return;
+	}
 	const auto gen = this->pinState.generation;
 
 	const auto action = this->pinState.onAsyncCompletion(
@@ -1820,6 +1832,7 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 }
 
 void WinPanelWindow::onOwnWindowPinDrained(
+    quint64 requestId,
     quintptr hwndValue,
     bool stillPinned,
     bool mayBePinned,
@@ -1829,7 +1842,11 @@ void WinPanelWindow::onOwnWindowPinDrained(
 	auto* drainedHwnd = reinterpret_cast<HWND>(hwndValue);
 	auto* currentHwnd = this->hwnd();
 	auto* desktops = VirtualDesktops::instance();
-	if (drainedHwnd != nullptr && drainedHwnd == currentHwnd && this->mEmbedParent == nullptr) {
+	const auto fromPreviousExplorer =
+	    requestId != 0 && requestId <= this->minValidPinRequestId;
+	if (!fromPreviousExplorer && drainedHwnd != nullptr && drainedHwnd == currentHwnd
+	    && this->mEmbedParent == nullptr)
+	{
 		if (stillPinned) {
 			this->mayBePinnedHwnd = currentHwnd;
 			this->pinState.pinned = true;
@@ -1850,19 +1867,20 @@ void WinPanelWindow::onOwnWindowPinDrained(
 	}
 	if (this->embedWaitingForPinHwnd != nullptr && this->embedWaitingForPinHwnd == drainedHwnd) {
 		if (desktops->isOwnWindowPinActive(drainedHwnd)) return;
-		const auto wasOurUnpin = this->embedUnpinRequestId != 0;
+		const auto wasOurUnpin =
+		    this->embedUnpinRequestId != 0 && requestId == this->embedUnpinRequestId;
 		this->embedWaitingForPinHwnd = nullptr;
 		this->embedUnpinRequestId = 0;
-		if (wasOurUnpin && !confirmedUnpinned) {
-			if (disconnected) {
-				if (!this->wantsEmbedding()) {
-					if (this->window != nullptr && this->window->isVisible()
-					    && this->mEmbedParent == nullptr)
-					{
-						this->stickToAllDesktops();
-					}
-					return;
+		if (!fromPreviousExplorer && wasOurUnpin && !confirmedUnpinned) {
+			if (!this->wantsEmbedding()) {
+				if (this->window != nullptr && this->window->isVisible()
+				    && this->mEmbedParent == nullptr)
+				{
+					this->stickToAllDesktops();
 				}
+				return;
+			}
+			if (disconnected) {
 				if (desktops->accessorLoaded()
 				    && this->embedUnpinDisconnectRetries < PanelPinState::MAX_DISCONNECT_RETRIES)
 				{
@@ -1928,9 +1946,16 @@ bool WinPanelWindow::recoverExplorer(HWND taskbar, DWORD pid, DWORD thread) {
 	this->explorerTaskbarPid = pid;
 	this->explorerTaskbarThread = thread;
 	if (explorerRestarted) {
+		auto* desktops = VirtualDesktops::instance();
+		this->minValidPinRequestId = desktops->latestOwnWindowPinRequestId();
 		this->mayBePinnedHwnd = nullptr;
 		this->embedUnpinFailedHwnd = nullptr;
 		this->embedUnpinDisconnectRetries = 0;
+		if (this->embedUnpinRequestId != 0) {
+			desktops->cancelOwnWindowPin(this->embedUnpinRequestId);
+			this->embedUnpinRequestId = 0;
+		}
+		if (auto* currentHwnd = this->hwnd()) desktops->cancelOwnWindowPinForHwnd(currentHwnd);
 	}
 	this->resetPinState(true);
 	this->clearStuckFollowState();
@@ -2292,10 +2317,10 @@ void WinPanelWindow::updateEmbedding() {
 		auto* desktops = VirtualDesktops::instance();
 		if (this->embedUnpinRequestId != 0) {
 			desktops->cancelOwnWindowPin(this->embedUnpinRequestId);
+			this->embedUnpinRequestId = 0;
 		}
 		if (!desktops->isOwnWindowPinActive(this->embedWaitingForPinHwnd)) {
 			this->embedWaitingForPinHwnd = nullptr;
-			this->embedUnpinRequestId = 0;
 			if (this->window != nullptr && this->window->isVisible()) this->stickToAllDesktops();
 		}
 	}

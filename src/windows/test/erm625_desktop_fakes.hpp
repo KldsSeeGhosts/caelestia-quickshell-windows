@@ -209,7 +209,7 @@ struct FakePinnedApps: FakeCom<PinnedApps> {
 		if (FAILED(this->queryResult)) return this->queryResult;
 		if (view != this->expectedView) return E_INVALIDARG;
 		*out = this->pinned;
-		return S_OK;
+		return this->queryResult;
 	}
 	HRESULT STDMETHODCALLTYPE PinView(ApplicationView* view) override {
 		if (this->beforePin) this->beforePin();

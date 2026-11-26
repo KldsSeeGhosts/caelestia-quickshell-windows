@@ -583,9 +583,9 @@ private slots:
 			QVERIFY(GetParent(hwnd) == nullptr);
 
 			activeBlock->release();
-			activeBlock.reset();
-			pinned.beforeUnpin = {};
 			QTRY_COMPARE(GetParent(hwnd), m_hostA);
+			pinned.beforeUnpin = {};
+			activeBlock.reset();
 			QCOMPARE(pinned.pinned, FALSE);
 			QVERIFY(pinned.unpins >= 1);
 
@@ -652,14 +652,15 @@ private slots:
 			QVERIFY(desktops->isOwnWindowPinActive(hwnd));
 			QVERIFY(GetParent(hwnd) == nullptr);
 
-			// Let the old UnpinView return RPC_E_DISCONNECTED (still pinned), then
+			// Let the old UnpinView return RPC_E_DISCONNECTED (still pinned), wait
+			// until the worker finishes draining before clearing beforeUnpin, then
 			// switch FakePinnedApps to the recovered fixture's view and S_OK before
 			// the bounded retryEmbedding() timer fires.
-			pinned.beforeUnpin = {};
 			activeBlock->release();
-			activeBlock.reset();
 			QTRY_VERIFY(pinDrained.size() >= 1);
-			QCOMPARE(pinDrained.at(0).at(4).toBool(), true);
+			pinned.beforeUnpin = {};
+			activeBlock.reset();
+			QCOMPARE(pinDrained.at(0).at(5).toBool(), true);
 			QVERIFY(GetParent(hwnd) == nullptr);
 
 			pinned.expectedView = reinterpret_cast<qs::windows::native_desktop::ApplicationView*>(
@@ -668,6 +669,154 @@ private slots:
 			pinned.unpinResult = S_OK;
 			QTRY_COMPARE_WITH_TIMEOUT(GetParent(hwnd), m_hostA, 3000);
 			QCOMPARE(pinned.pinned, FALSE);
+
+			panel.deleteWindow();
+			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+			host->setEnabled(false);
+			QCoreApplication::processEvents();
+		}
+
+		// Part C: Canceling an in-flight unpin by switching layer to Top while
+		// IsViewPinned is blocked must not latch embedUnpinFailedHwnd when the
+		// worker skips UnpinView and reports Pinned; switching back to Background
+		// must unpin and embed cleanly.
+		{
+			pinned.pinned = FALSE;
+			pinned.pinResult = S_OK;
+			pinned.unpinResult = S_OK;
+			pinned.pins = 0;
+			pinned.unpins = 0;
+
+			QSignalSpy pinDone(desktops, &qs::windows::VirtualDesktops::ownWindowPinCompleted);
+
+			qs::windows::WinPanelWindow panel;
+			panel.setLayer(qs::windows::PanelLayer::Background);
+			panel.setExclusionMode(ExclusionMode::Ignore);
+			panel.setScreen(&screenInfo);
+			panel.createWindow();
+
+			auto* window = panel.backingWindow();
+			QVERIFY(window != nullptr);
+			auto* hwnd = reinterpret_cast<HWND>(window->winId());
+			QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+			QVERIFY(SetWindowPos(
+			    hwnd, nullptr, -10000, -10000, 200, 100, SWP_NOACTIVATE | SWP_NOZORDER
+			));
+
+			panel.setVisible(true);
+			panel.setVisibleDirect(true);
+			QTRY_VERIFY(pinDone.size() >= 1);
+			QCOMPARE(
+			    pinDone.at(0).at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Pinned
+			);
+			QCOMPARE(pinned.pinned, TRUE);
+			QVERIFY(GetParent(hwnd) == nullptr);
+
+			activeBlock = std::make_shared<erm625::BlockingCall>();
+			pinned.beforeQuery = [blocked = activeBlock] { (*blocked)(); };
+
+			const auto doneBeforeCancel = pinDone.size();
+			host->setDiscoveredHostForTesting(m_hostA);
+			host->setEnabled(true);
+			QTRY_COMPARE(WaitForSingleObject(activeBlock->entered, 0), WAIT_OBJECT_0);
+			QVERIFY(GetParent(hwnd) == nullptr);
+
+			// Stop wanting embedding while IsViewPinned is still blocked.
+			panel.setLayer(qs::windows::PanelLayer::Top);
+			QCoreApplication::processEvents();
+
+			activeBlock->release();
+			QTRY_VERIFY(pinDone.size() >= doneBeforeCancel + 1);
+			pinned.beforeQuery = {};
+			activeBlock.reset();
+			QCOMPARE(
+			    pinDone.at(doneBeforeCancel).at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Pinned
+			);
+			QCOMPARE(pinned.unpins, 0);
+			QVERIFY(GetParent(hwnd) == nullptr);
+
+			// Switching back to Background must not be blocked by embedUnpinFailedHwnd.
+			panel.setLayer(qs::windows::PanelLayer::Background);
+			QTRY_COMPARE(GetParent(hwnd), m_hostA);
+			QCOMPARE(pinned.pinned, FALSE);
+			QVERIFY(pinned.unpins >= 1);
+
+			panel.deleteWindow();
+			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+			host->setEnabled(false);
+			QCoreApplication::processEvents();
+		}
+
+		// Part D: A late stillPinned=true drain from before an Explorer process
+		// restart keeps the HWND fenced until the old worker exits, but must not
+		// restore pinned or mayBePinned state in the new Explorer session.
+		{
+			pinned.pinned = FALSE;
+			pinned.pinResult = S_OK;
+			pinned.unpinResult = E_ACCESSDENIED;
+			pinned.pins = 0;
+			pinned.unpins = 0;
+
+			QSignalSpy pinDrained(desktops, &qs::windows::VirtualDesktops::ownWindowPinDrained);
+
+			qs::windows::WinPanelWindow panel;
+			panel.setLayer(qs::windows::PanelLayer::Background);
+			panel.setExclusionMode(ExclusionMode::Ignore);
+			panel.setScreen(&screenInfo);
+			panel.createWindow();
+
+			auto* window = panel.backingWindow();
+			QVERIFY(window != nullptr);
+			auto* hwnd = reinterpret_cast<HWND>(window->winId());
+			QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+			QVERIFY(SetWindowPos(
+			    hwnd, nullptr, -10000, -10000, 200, 100, SWP_NOACTIVATE | SWP_NOZORDER
+			));
+
+			// Seed initial Explorer identity, then block PinView in the old session.
+			QVERIFY(panel.recoverExplorerForTesting(m_hostA, 1001, 1001));
+			QCoreApplication::processEvents();
+
+			activeBlock = std::make_shared<erm625::BlockingCall>();
+			pinned.beforePin = [blocked = activeBlock] { (*blocked)(); };
+
+			panel.setVisible(true);
+			panel.setVisibleDirect(true);
+			QTRY_COMPARE(WaitForSingleObject(activeBlock->entered, 0), WAIT_OBJECT_0);
+
+			// Retire the old worker into drainingPins while blocked in PinView and
+			// simulate an Explorer process restart before the old worker drains.
+			const auto acquisitionsBeforeRestart = acquisitions;
+			qs::windows::invalidateNativeDesktopAccessor(RPC_E_DISCONNECTED);
+			QVERIFY(panel.recoverExplorerForTesting(m_hostB, 2002, 2002));
+			QTRY_VERIFY(acquisitions > acquisitionsBeforeRestart);
+			QTRY_VERIFY(desktops->accessorLoaded());
+			QVERIFY(desktops->isOwnWindowPinActive(hwnd));
+
+			// Hide so the recovered session does not immediately submit a fresh pin,
+			// then let the pre-restart PinView finish and drain with stillPinned=true.
+			panel.setVisible(false);
+			panel.setVisibleDirect(false);
+			QTRY_VERIFY(!IsWindowVisible(hwnd));
+
+			activeBlock->release();
+			QTRY_VERIFY(pinDrained.size() >= 1);
+			pinned.beforePin = {};
+			activeBlock.reset();
+			QCOMPARE(pinDrained.at(0).at(2).toBool(), true);
+			QVERIFY(!desktops->isOwnWindowPinActive(hwnd));
+			QVERIFY(!panel.isPinnedHereForTesting());
+			QVERIFY(!panel.mayBePinnedHereForTesting());
+
+			// Because the dead Explorer session's stillPinned result was rejected,
+			// embedding into the new Explorer proceeds without calling UnpinView.
+			const auto unpinsBeforeEmbed = pinned.unpins;
+			host->setDiscoveredHostForTesting(m_hostA);
+			host->setEnabled(true);
+			QTRY_COMPARE(GetParent(hwnd), m_hostA);
+			QCOMPARE(pinned.unpins, unpinsBeforeEmbed);
 
 			panel.deleteWindow();
 			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);

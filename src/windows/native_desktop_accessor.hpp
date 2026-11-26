@@ -27,7 +27,7 @@ void setNativeDesktopPinObserver(
 );
 void setNativeDesktopPinDrainObserver(
     QObject* context,
-    std::function<void(HWND, bool, bool, bool, bool)> onPinDrained
+    std::function<void(quint64, HWND, bool, bool, bool, bool)> onPinDrained
 );
 void setNativeDesktopCommandIdleObserver(QObject* context, std::function<void()> onCommandIdle);
 void requestNativeDesktopRefresh();
@@ -62,6 +62,7 @@ std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop);
 void cancelNativeDesktopOwnWindowPin(quint64 requestId);
 void cancelNativeDesktopOwnWindowPinForHwnd(HWND hwnd);
 [[nodiscard]] bool nativeDesktopOwnWindowPinActive(HWND hwnd);
+[[nodiscard]] quint64 latestNativeDesktopPinRequestId();
 void shutdownNativeDesktopAccessor();
 
 #ifdef QS_TEST

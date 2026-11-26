@@ -308,8 +308,16 @@ void VirtualDesktops::bindNativeDesktopQueries() {
 	);
 	setNativeDesktopPinDrainObserver(
 	    this,
-	    [this](HWND hwnd, bool stillPinned, bool mayBePinned, bool confirmedUnpinned, bool disconnected) {
+	    [this](
+	        quint64 requestId,
+	        HWND hwnd,
+	        bool stillPinned,
+	        bool mayBePinned,
+	        bool confirmedUnpinned,
+	        bool disconnected
+	    ) {
 		    emit this->ownWindowPinDrained(
+		        requestId,
 		        reinterpret_cast<quintptr>(hwnd),
 		        stillPinned,
 		        mayBePinned,
@@ -1258,6 +1266,11 @@ void VirtualDesktops::cancelOwnWindowPinForHwnd(HWND hwnd) {
 bool VirtualDesktops::isOwnWindowPinActive(HWND hwnd) const {
 	if (hwnd == nullptr || !this->nativeAccessor) return false;
 	return nativeDesktopOwnWindowPinActive(hwnd);
+}
+
+quint64 VirtualDesktops::latestOwnWindowPinRequestId() const {
+	if (!this->nativeAccessor) return 0;
+	return latestNativeDesktopPinRequestId();
 }
 
 std::optional<bool> VirtualDesktops::isWindowPinned(HWND hwnd) const {

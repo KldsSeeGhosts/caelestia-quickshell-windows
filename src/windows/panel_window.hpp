@@ -157,6 +157,14 @@ public:
 	// handback regression asserts a parent change requests a frame, and that a
 	// hidden panel is never shown just to do it.
 	[[nodiscard]] int presentResetsForTesting() const { return this->presentResetCount; }
+	bool recoverExplorerForTesting(HWND taskbar, DWORD pid, DWORD thread) {
+		return this->recoverExplorer(taskbar, pid, thread);
+	}
+	[[nodiscard]] bool isPinnedHereForTesting() const { return this->pinnedHere(this->hwnd()); }
+	[[nodiscard]] bool mayBePinnedHereForTesting() const {
+		auto* current = this->hwnd();
+		return current != nullptr && this->mayBePinnedHwnd == current;
+	}
 #endif
 
 signals:
@@ -184,6 +192,7 @@ private slots:
 	    bool mayBePinned
 	);
 	void onOwnWindowPinDrained(
+	    quint64 requestId,
 	    quintptr hwnd,
 	    bool stillPinned,
 	    bool mayBePinned,
@@ -286,6 +295,10 @@ private:
 	// accessor-only recovery and is cleared only on confirmed unpin, Explorer
 	// process restart, or HWND replacement/teardown.
 	HWND mayBePinnedHwnd = nullptr;
+	// Pin/unpin requests with requestId <= minValidPinRequestId were submitted
+	// before the most recent Explorer process restart and must not restore
+	// pinned or mayBePinned state in the new Explorer session.
+	quint64 minValidPinRequestId = 0;
 	bool scaleRecreatePending = false;
 	bool focusFlagPending = false;
 	bool focusOnExpose = false;
