@@ -1381,21 +1381,21 @@ void WinPanelWindow::releaseNativeState() {
 
 void WinPanelWindow::trySetWidth(qint32 implicitWidth) {
 	if (!this->bAnchors.value().horizontalConstraint()) {
-		if (this->hwnd() == nullptr || this->mTrackedScreen == nullptr) {
-			this->ProxyWindowBase::trySetWidth(implicitWidth);
-		}
+		const auto direct = this->hwnd() == nullptr || this->mTrackedScreen == nullptr;
+		if (direct) this->ProxyWindowBase::trySetWidth(implicitWidth);
 
-		this->updateDimensions();
+		if (direct) this->updateDimensions();
+		else this->scheduleUpdateDimensions();
 	}
 }
 
 void WinPanelWindow::trySetHeight(qint32 implicitHeight) {
 	if (!this->bAnchors.value().verticalConstraint()) {
-		if (this->hwnd() == nullptr || this->mTrackedScreen == nullptr) {
-			this->ProxyWindowBase::trySetHeight(implicitHeight);
-		}
+		const auto direct = this->hwnd() == nullptr || this->mTrackedScreen == nullptr;
+		if (direct) this->ProxyWindowBase::trySetHeight(implicitHeight);
 
-		this->updateDimensions();
+		if (direct) this->updateDimensions();
+		else this->scheduleUpdateDimensions();
 	}
 }
 
@@ -1503,7 +1503,6 @@ void WinPanelWindow::followFocusedScreen() {
 
 	this->window->setScreen(screen);
 	this->updateScreen();
-	this->updateDimensions();
 }
 
 void WinPanelWindow::setAboveWindows(bool aboveWindows) {
@@ -2316,7 +2315,8 @@ void WinPanelWindow::onScreenScaleChanged() {
 }
 
 void WinPanelWindow::scheduleUpdateDimensions() {
-	if (this->dimensionsUpdatePending) return;
+	if (this->dimensionsUpdatePending || this->window == nullptr || this->mTrackedScreen == nullptr)
+		return;
 	this->dimensionsUpdatePending = true;
 
 	QTimer::singleShot(0, this, [this]() {

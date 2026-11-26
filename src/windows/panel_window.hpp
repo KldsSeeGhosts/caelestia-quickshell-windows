@@ -258,7 +258,7 @@ private:
 	void applyCaptureExclusionCb() { this->applyCaptureExclusion(); }
 	void updateDimensions(const MonitorRects& nativeRects);
 	void onDisplayChange();
-	void updateDimensionsCb() { this->updateDimensions(); }
+	void scheduleUpdateDimensionsCb() { this->scheduleUpdateDimensions(); }
 	void updateFocusFlag();
 	void applyFocusFlag();
 	void focusWhenExposed();
@@ -459,10 +459,10 @@ private:
 	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bNamespace, updateLayerCb, onValueChanged);
 	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bKeyboardFocus, updateFocusCb, onValueChanged);
 	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bExcludeFromCapture, applyCaptureExclusionCb, onValueChanged);
-	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bAnchors, updateDimensionsCb, onValueChanged);
-	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bMargins, updateDimensionsCb, onValueChanged);
-	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bExclusionMode, updateDimensionsCb, onValueChanged);
-	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bcExclusiveZone, updateDimensionsCb, onValueChanged);
+	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bAnchors, scheduleUpdateDimensionsCb, onValueChanged);
+	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bMargins, scheduleUpdateDimensionsCb, onValueChanged);
+	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bExclusionMode, scheduleUpdateDimensionsCb, onValueChanged);
+	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bcExclusiveZone, scheduleUpdateDimensionsCb, onValueChanged);
 	// clang-format on
 
 	friend class WinPanelStack;
