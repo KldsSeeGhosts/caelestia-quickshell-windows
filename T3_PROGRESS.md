@@ -13,3 +13,7 @@
 - Branch `fix/coalesce-panel-geometry-updates-r2` created from `272700b0ab465c10c56de0c2e7814e9590d37ff0`.
 - Pending: flush queued geometry before animated close, strengthen geometry tests, remove this progress file before final validation.
 
+
+- Implemented the close-time geometry flush with a serial guard for stale zero-timeout callbacks and re-entry protection. Strengthened placement/coalescing coverage and added the animated-close regression.
+- Focused evidence: `panel_hidden_reembed_test.exe initialGeometryIsPlacedSynchronously sameTurnGeometryPropertiesCoalesce pendingGeometryAppliesBeforeAnimatedClose -o build\focused-panel.txt,txt` passed 5/5 (0 failed) in 1006 ms.
+

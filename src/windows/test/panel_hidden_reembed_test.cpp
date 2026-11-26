@@ -9,18 +9,25 @@
 #include <atomic>
 #include <memory>
 
+#include <qdir.h>
 #include <qelapsedtimer.h>
+#include <qfile.h>
 #include <qguiapplication.h>
 #include <qscreen.h>
 #include <qsignalspy.h>
+#include <qtemporarydir.h>
 #include <qtest.h>
 #include <qthread.h>
 #include <qt_windows.h>
 
+#include "blur.hpp"
 #include "desktop_host.hpp"
 #include "erm625_desktop_fakes.hpp"
 #include "native_desktop_accessor.hpp"
+#include "panel_geometry.hpp"
 #include "panel_window.hpp"
+#include "startup.hpp"
+#include "util.hpp"
 #include "virtual_desktops.hpp"
 
 namespace qs::windows {
@@ -258,6 +265,10 @@ private slots:
 		const QRect expected(primary->geometry().x() + 24, primary->geometry().y() + 36, 240, 170);
 		QCOMPARE(window->geometry(), expected);
 
+		panel.setVisible(true);
+		panel.setVisibleDirect(true);
+		QCOMPARE(window->geometry(), expected);
+
 		panel.deleteWindow();
 		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
 	}
@@ -287,19 +298,128 @@ private slots:
 
 		const auto updatesBefore = panel.dimensionUpdatesForTesting();
 		const auto placementsBefore = panel.geometryPlacementsForTesting();
+		Anchors liveAnchors;
+		liveAnchors.mRight = true;
+		liveAnchors.mBottom = true;
 		Margins margins;
-		margins.left = 31;
-		margins.top = 42;
+		margins.right = 17;
+		margins.bottom = 19;
+		panel.setAnchors(liveAnchors);
 		panel.setMargins(margins);
+		panel.setExclusionMode(ExclusionMode::Normal);
 		panel.setImplicitWidth(260);
 		panel.setImplicitHeight(180);
 
 		QCOMPARE(panel.dimensionUpdatesForTesting(), updatesBefore);
 		QTRY_COMPARE(panel.dimensionUpdatesForTesting(), updatesBefore + 1);
+
+		QCoreApplication::processEvents();
+		QCoreApplication::sendPostedEvents();
+		QCoreApplication::processEvents();
+		QCOMPARE(panel.dimensionUpdatesForTesting(), updatesBefore + 1);
 		QCOMPARE(panel.geometryPlacementsForTesting(), placementsBefore + 1);
-		const QRect expected(primary->geometry().x() + 31, primary->geometry().y() + 42, 260, 180);
+
+		auto base = primary->availableGeometry();
+		const auto rects = qs::windows::monitorRects(qs::windows::monitorForScreen(primary));
+		if (rects.valid) {
+			base =
+			    qs::windows::ScreenMapper(primary->geometry(), rects.monitor, primary->devicePixelRatio())
+			        .toLogical(rects.work);
+		}
+		const auto expected = qs::windows::anchoredPanelGeometry(
+		    base,
+		    {260, 180},
+		    Qt::RightEdge | Qt::BottomEdge,
+		    margins.qmargins()
+		);
 		QCOMPARE(window->geometry(), expected);
 
+		panel.deleteWindow();
+		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+	}
+
+	void pendingGeometryAppliesBeforeAnimatedClose() {
+		BOOL clientAreaAnimations = TRUE;
+		if (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &clientAreaAnimations, 0) != 0
+		    && clientAreaAnimations == FALSE)
+		{
+			QSKIP("Client-area animations are disabled on this machine.");
+		}
+
+		QTemporaryDir rulesRoot;
+		QVERIFY(rulesRoot.isValid());
+		QVERIFY(QDir().mkpath(rulesRoot.filePath(QStringLiteral("defaults/windows"))));
+		QFile rulesFile(rulesRoot.filePath(QStringLiteral("defaults/windows/layerrules.json")));
+		QVERIFY(rulesFile.open(QIODevice::WriteOnly));
+		rulesFile.write(
+		    R"json({"enable":true,"rules":[{"namespace":"geometry-close","animation":"slide bottom"}]})json"
+		);
+		rulesFile.close();
+
+		auto* blurManager = qs::windows::BlurManager::instance();
+		QVERIFY(blurManager != nullptr);
+		blurManager->setShellDir(rulesRoot.path());
+		blurManager->setPanelAnimations(true);
+		blurManager->setExpressiveAnimations(false);
+		QVERIFY(blurManager->ruleFor(QStringLiteral("geometry-close")).animation.animates());
+
+		auto* primary = QGuiApplication::primaryScreen();
+		QVERIFY(primary != nullptr);
+		QuickshellScreenInfo screenInfo(nullptr, primary);
+		qs::windows::WinPanelWindow panel;
+		panel.setNamespace(QStringLiteral("geometry-close"));
+		panel.setLayer(qs::windows::PanelLayer::Overlay);
+		panel.setExclusionMode(ExclusionMode::Ignore);
+		panel.setColor(Qt::transparent);
+		panel.setScreen(&screenInfo);
+
+		Anchors anchors;
+		anchors.mLeft = true;
+		anchors.mTop = true;
+		panel.setAnchors(anchors);
+		panel.setImplicitWidth(240);
+		panel.setImplicitHeight(170);
+		panel.createWindow();
+
+		auto* window = panel.backingWindow();
+		QVERIFY(window != nullptr);
+		auto* hwnd = reinterpret_cast<HWND>(window->winId());
+		QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+
+		panel.setVisible(true);
+		panel.setVisibleDirect(true);
+		QTRY_VERIFY(window->isExposed());
+		QTRY_VERIFY(qs::windows::startup::settled());
+		QCoreApplication::processEvents();
+		QCoreApplication::sendPostedEvents();
+		QCoreApplication::processEvents();
+
+		const auto updatesBefore = panel.dimensionUpdatesForTesting();
+		const auto placementsBefore = panel.geometryPlacementsForTesting();
+		Margins margins;
+		margins.left = 43;
+		margins.top = 54;
+		panel.setMargins(margins);
+		panel.setImplicitWidth(280);
+		panel.setImplicitHeight(190);
+		QCOMPARE(panel.dimensionUpdatesForTesting(), updatesBefore);
+
+		panel.setVisible(false);
+		panel.setVisibleDirect(false);
+
+		const QRect expected(primary->geometry().x() + 43, primary->geometry().y() + 54, 280, 190);
+		QCOMPARE(panel.dimensionUpdatesForTesting(), updatesBefore + 1);
+		QCOMPARE(panel.geometryPlacementsForTesting(), placementsBefore + 1);
+		QCOMPARE(window->geometry(), expected);
+		QVERIFY(!panel.isVisibleDirect());
+		QVERIFY(window->isVisible());
+		QVERIFY(IsWindowVisible(hwnd));
+
+		QCoreApplication::processEvents();
+		QCOMPARE(panel.dimensionUpdatesForTesting(), updatesBefore + 1);
+		QCOMPARE(panel.geometryPlacementsForTesting(), placementsBefore + 1);
+
+		QTRY_VERIFY(!window->isVisible());
 		panel.deleteWindow();
 		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
 	}

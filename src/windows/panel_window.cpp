@@ -23,6 +23,7 @@
 #include <qquickwindow.h>
 #include <qrect.h>
 #include <qregion.h>
+#include <qscopedvaluerollback.h>
 #include <qscreen.h>
 #include <qsgrendererinterface.h>
 #include <qt_windows.h>
@@ -2317,17 +2318,34 @@ void WinPanelWindow::onScreenScaleChanged() {
 void WinPanelWindow::scheduleUpdateDimensions() {
 	if (this->dimensionsUpdatePending) return;
 	this->dimensionsUpdatePending = true;
+	const auto serial = ++this->dimensionsUpdateSerial;
 
-	QTimer::singleShot(0, this, [this]() {
+	QTimer::singleShot(0, this, [this, serial]() {
+		if (!this->dimensionsUpdatePending || serial != this->dimensionsUpdateSerial) return;
+
 		this->dimensionsUpdatePending = false;
 		this->updateDimensions();
 	});
+}
+
+void WinPanelWindow::flushUpdateDimensions() {
+	if (!this->dimensionsUpdatePending) return;
+
+	++this->dimensionsUpdateSerial;
+	this->dimensionsUpdatePending = false;
+	this->updateDimensions();
 }
 
 void WinPanelWindow::updateDimensions() { this->updateDimensions(MonitorRects {}); }
 
 void WinPanelWindow::updateDimensions(const MonitorRects& nativeRects) {
 	if (this->window == nullptr || this->mTrackedScreen == nullptr) return;
+	if (this->dimensionsUpdateRunning) {
+		this->scheduleUpdateDimensions();
+		return;
+	}
+
+	const auto running = QScopedValueRollback(this->dimensionsUpdateRunning, true);
 
 #ifdef QS_TEST
 	++this->dimensionUpdateCount;
@@ -3721,6 +3739,8 @@ void WinPanelWindow::resetAnimation() {
 }
 
 void WinPanelWindow::beginClose(const PanelAnimationChoice& choice) {
+	this->flushUpdateDimensions();
+
 	if (this->mAnimationState.settled()) {
 		this->mAnimationStyle = choice.style;
 		this->mAnimationEffect = choice.effect;

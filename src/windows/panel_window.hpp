@@ -239,6 +239,7 @@ private slots:
 	void updateScreen();
 	void followFocusedScreen();
 	void scheduleUpdateDimensions();
+	void flushUpdateDimensions();
 	void onScreenScaleChanged();
 	void updateDimensions();
 	void onWindowExposed();
@@ -323,6 +324,8 @@ private:
 	PanelBlur* blur = nullptr;
 	QObject* mLayershellAttached = nullptr;
 	bool dimensionsUpdatePending = false;
+	quint64 dimensionsUpdateSerial = 0;
+	bool dimensionsUpdateRunning = false;
 	bool appBarRetryPending = false;
 	bool embedRetryPending = false;
 	HWND embedWaitingForPinHwnd = nullptr;
