@@ -1330,6 +1330,8 @@ ProxiedWindow* WinPanelWindow::disownWindow(bool keepItemOwnership) {
 }
 
 void WinPanelWindow::releaseNativeState() {
+	this->cancelDeferredClose();
+
 	if (this->mClosing && this->window != nullptr && this->window->isVisible()) {
 		this->quietVisibilityChange = true;
 		this->window->setVisible(false);
@@ -1429,6 +1431,7 @@ bool WinPanelWindow::isVisibleDirect() const {
 
 void WinPanelWindow::setVisibleDirect(bool visible) {
 	if (visible && this->screenGuard.isBlocked()) return;
+	if (visible) this->cancelDeferredClose();
 	if (!visible) {
 		if (this->mClosing) return;
 
@@ -3738,8 +3741,57 @@ void WinPanelWindow::resetAnimation() {
 	this->blur->setSuspended(false);
 }
 
+void WinPanelWindow::deferClose(const PanelAnimationChoice& choice) {
+	this->mDeferredCloseChoice = choice;
+	this->queueDeferredClose(++this->mDeferredCloseSerial);
+}
+
+void WinPanelWindow::cancelDeferredClose() {
+	if (!this->mDeferredCloseChoice.has_value()) return;
+
+	this->mDeferredCloseChoice.reset();
+	++this->mDeferredCloseSerial;
+}
+
+void WinPanelWindow::queueDeferredClose(quint64 serial) {
+	QTimer::singleShot(0, this, [this, serial]() { this->runDeferredClose(serial); });
+}
+
+void WinPanelWindow::runDeferredClose(quint64 serial) {
+	if (!this->mDeferredCloseChoice.has_value() || serial != this->mDeferredCloseSerial) return;
+
+	if (this->dimensionsUpdateRunning) {
+		this->queueDeferredClose(serial);
+		return;
+	}
+
+	if (this->dimensionsUpdatePending) {
+		this->flushUpdateDimensions();
+
+		if (!this->mDeferredCloseChoice.has_value() || serial != this->mDeferredCloseSerial) return;
+		if (this->dimensionsUpdateRunning || this->dimensionsUpdatePending) {
+			this->queueDeferredClose(serial);
+			return;
+		}
+	}
+
+	const auto choice = *this->mDeferredCloseChoice;
+	this->mDeferredCloseChoice.reset();
+	this->beginClose(choice);
+}
+
 void WinPanelWindow::beginClose(const PanelAnimationChoice& choice) {
+	if (this->dimensionsUpdateRunning) {
+		this->deferClose(choice);
+		return;
+	}
+
 	this->flushUpdateDimensions();
+
+	if (this->dimensionsUpdateRunning || this->dimensionsUpdatePending) {
+		this->deferClose(choice);
+		return;
+	}
 
 	if (this->mAnimationState.settled()) {
 		this->mAnimationStyle = choice.style;
@@ -3750,6 +3802,10 @@ void WinPanelWindow::beginClose(const PanelAnimationChoice& choice) {
 
 	qCDebug(logPanel) << "Closing" << this << "with" << this->mAnimationStyle.toString()
 	                  << panelEffectName(this->mAnimationEffect);
+
+#ifdef QS_TEST
+	++this->closeStartCount;
+#endif
 
 	this->mClosing = true;
 	this->focusOnExpose = false;

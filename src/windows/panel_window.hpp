@@ -160,6 +160,7 @@ public:
 	[[nodiscard]] int presentResetsForTesting() const { return this->presentResetCount; }
 	[[nodiscard]] int dimensionUpdatesForTesting() const { return this->dimensionUpdateCount; }
 	[[nodiscard]] int geometryPlacementsForTesting() const { return this->geometryPlacementCount; }
+	[[nodiscard]] int closeStartsForTesting() const { return this->closeStartCount; }
 	bool recoverExplorerForTesting(HWND taskbar, DWORD pid, DWORD thread) {
 		return this->recoverExplorer(taskbar, pid, thread);
 	}
@@ -309,6 +310,10 @@ private:
 	void resetAnimatedItem();
 	void resetAnimation();
 	void beginClose(const PanelAnimationChoice& choice);
+	void deferClose(const PanelAnimationChoice& choice);
+	void cancelDeferredClose();
+	void queueDeferredClose(quint64 serial);
+	void runDeferredClose(quint64 serial);
 	void reopen();
 	void waitForFrames(int frames, int timeoutMs, void (WinPanelWindow::*done)());
 	void cancelFrameWait();
@@ -419,6 +424,7 @@ private:
 	int presentResetCount = 0;
 	int dimensionUpdateCount = 0;
 	int geometryPlacementCount = 0;
+	int closeStartCount = 0;
 #endif
 
 	QVariantAnimation* mAnimation = nullptr;
@@ -444,6 +450,8 @@ private:
 	quint32 mFrameWaitRequest = 0;
 	int mFramesLeft = 0;
 	bool mClosing = false;
+	std::optional<PanelAnimationChoice> mDeferredCloseChoice;
+	quint64 mDeferredCloseSerial = 0;
 	bool mInstantVisibility = false;
 
 	// clang-format off
