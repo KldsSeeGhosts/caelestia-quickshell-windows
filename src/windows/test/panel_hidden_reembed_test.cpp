@@ -652,6 +652,114 @@ private slots:
 		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
 	}
 
+	void reShowDuringCloseFlushCancelsAnimatedClose() {
+		BOOL clientAreaAnimations = TRUE;
+		if (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &clientAreaAnimations, 0) != 0
+		    && clientAreaAnimations == FALSE)
+		{
+			QSKIP("Client-area animations are disabled on this machine.");
+		}
+
+		QTemporaryDir rulesRoot;
+		QVERIFY(rulesRoot.isValid());
+		QVERIFY(QDir().mkpath(rulesRoot.filePath(QStringLiteral("defaults/windows"))));
+		QFile rulesFile(rulesRoot.filePath(QStringLiteral("defaults/windows/layerrules.json")));
+		QVERIFY(rulesFile.open(QIODevice::WriteOnly));
+		rulesFile.write(
+		    R"json({"enable":true,"rules":[{"namespace":"geometry-close-reshow","animation":"slide bottom"}]})json"
+		);
+		rulesFile.close();
+
+		auto* blurManager = qs::windows::BlurManager::instance();
+		QVERIFY(blurManager != nullptr);
+		blurManager->setShellDir(rulesRoot.path());
+		blurManager->setPanelAnimations(true);
+		blurManager->setExpressiveAnimations(false);
+		QVERIFY(blurManager->ruleFor(QStringLiteral("geometry-close-reshow")).animation.animates());
+
+		auto* primary = QGuiApplication::primaryScreen();
+		QVERIFY(primary != nullptr);
+		QuickshellScreenInfo screenInfo(nullptr, primary);
+		qs::windows::WinPanelWindow panel;
+		panel.setNamespace(QStringLiteral("geometry-close-reshow"));
+		panel.setLayer(qs::windows::PanelLayer::Overlay);
+		panel.setExclusionMode(ExclusionMode::Ignore);
+		panel.setColor(Qt::transparent);
+		panel.setScreen(&screenInfo);
+
+		Anchors anchors;
+		anchors.mLeft = true;
+		anchors.mTop = true;
+		panel.setAnchors(anchors);
+		panel.setImplicitWidth(240);
+		panel.setImplicitHeight(170);
+		panel.createWindow();
+
+		auto* window = panel.backingWindow();
+		QVERIFY(window != nullptr);
+		auto* hwnd = reinterpret_cast<HWND>(window->winId());
+		QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+
+		panel.setVisible(true);
+		panel.setVisibleDirect(true);
+		QTRY_VERIFY(window->isExposed());
+		QTRY_VERIFY(qs::windows::startup::settled());
+		QCoreApplication::processEvents();
+		QCoreApplication::sendPostedEvents();
+		QCoreApplication::processEvents();
+
+		bool reShown = false;
+		bool reShowSawRunningUpdate = false;
+		QObject::connect(
+		    &panel,
+		    &qs::windows::WinPanelWindow::widthChanged,
+		    &panel,
+		    [&panel, &reShown, &reShowSawRunningUpdate]() {
+			    if (reShown) return;
+			    reShown = true;
+			    reShowSawRunningUpdate = panel.dimensionsUpdateRunningForTesting();
+			    panel.setGeometryChangeProbeForTesting({});
+			    panel.setVisible(true);
+			    panel.setVisibleDirect(true);
+		    }
+		);
+		panel.setGeometryChangeProbeForTesting([&panel] { emit panel.widthChanged(); });
+
+		const auto updatesBefore = panel.dimensionUpdatesForTesting();
+		const auto placementsBefore = panel.geometryPlacementsForTesting();
+		panel.setImplicitWidth(320);
+		QCOMPARE(panel.dimensionUpdatesForTesting(), updatesBefore);
+
+		panel.setVisible(false);
+		panel.setVisibleDirect(false);
+
+		QVERIFY(reShown);
+		QVERIFY(reShowSawRunningUpdate);
+		QCOMPARE(panel.closeStartsForTesting(), 0);
+		QCOMPARE(panel.dimensionUpdatesForTesting(), updatesBefore + 1);
+		QCOMPARE(panel.geometryPlacementsForTesting(), placementsBefore + 1);
+
+		QCoreApplication::processEvents();
+		QCoreApplication::sendPostedEvents();
+		QCoreApplication::processEvents();
+		QCOMPARE(panel.closeStartsForTesting(), 0);
+		QVERIFY(panel.isVisible());
+		QVERIFY(panel.isVisibleDirect());
+		QVERIFY(window->isVisible());
+		QVERIFY(IsWindowVisible(hwnd));
+
+		const auto expected = qs::windows::anchoredPanelGeometry(
+		    primary->geometry(),
+		    {320, 170},
+		    Qt::LeftEdge | Qt::TopEdge,
+		    QMargins()
+		);
+		QCOMPARE(window->geometry(), expected);
+
+		panel.deleteWindow();
+		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+	}
+
 	// excludeFromCapture is the QML-facing property on the production panel. The
 	// window is created but never shown, so this touches no visible window and
 	// needs no desktop host.
