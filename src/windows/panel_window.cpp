@@ -326,6 +326,7 @@ public:
 				    // if polling stopped at the busy deadline and no desktop change occurred.
 				    if (stack->hasWaitingFollowPanel()) {
 					    stack->mFollowBusySinceMs.reset();
+					    stack->mFollowNeedsImmediateRetry = true;
 					    stack->mFollowRetryTimer.start(0);
 				    }
 			    }
@@ -375,13 +376,14 @@ public:
 				    // Any completed move frees the desktop worker slot: renew the
 				    // per-handoff busy wait window and immediately wake waiting panels,
 				    // even if a failing panel hit its retry cap or the busy timer stopped.
+				    if (panelNeedsRetry) stack->mFollowNeedsFailureRetry = true;
 				    if (stack->mFollowRetryTimer.isActive() || stack->hasWaitingFollowPanel()) {
 					    stack->mFollowBusySinceMs.reset();
+					    stack->mFollowNeedsImmediateRetry = true;
 					    stack->mFollowRetryTimer.start(0);
 					    return;
 				    }
 				    if (panelNeedsRetry) {
-					    stack->mFollowNeedsFailureRetry = true;
 					    stack->mFollowRetryTimer.start(FOLLOW_RETRY_MS);
 					    return;
 				    }
@@ -488,6 +490,7 @@ public:
 	}
 
 	void followCurrentDesktop() {
+		const auto passGeneration = ++this->mFollowPassGeneration;
 		auto* desktops = VirtualDesktops::instance();
 		const auto current = desktops->currentIndex();
 		const auto currentId = currentDesktopId(desktops);
@@ -496,6 +499,7 @@ public:
 		auto needsFailureRetry = false;
 		auto anyPending = false;
 		this->mFollowNeedsFailureRetry = false;
+		this->mFollowNeedsImmediateRetry = false;
 		QList<QPointer<WinPanelWindow>> candidates;
 		candidates.reserve(this->mPanels.size());
 
@@ -568,6 +572,13 @@ public:
 		);
 
 		for (const auto& guard: candidates) {
+			if (this->mFollowPassGeneration != passGeneration
+			    || !sameFollowTarget(
+			        currentId, current, currentDesktopId(desktops), desktops->currentIndex()
+			    ))
+			{
+				return;
+			}
 			auto* panel = guard.data();
 			if (panel == nullptr || !this->mPanels.contains(panel)) continue;
 			auto* hwnd = panel->hwnd();
@@ -627,6 +638,7 @@ public:
 					panel->followFailureCount = 0;
 				}
 			} else {
+				if (this->mFollowPassGeneration != passGeneration) return;
 				if (guard == nullptr || !this->mPanels.contains(panel)) continue;
 				// Preserve any accepted move sequence so its completion can still
 				// be matched or discarded against its original target desktop.
@@ -643,8 +655,14 @@ public:
 			}
 		}
 
+		if (this->mFollowPassGeneration != passGeneration) return;
 		needsFailureRetry = needsFailureRetry || this->mFollowNeedsFailureRetry;
 		this->mFollowNeedsFailureRetry = needsFailureRetry;
+		if (this->mFollowNeedsImmediateRetry) {
+			this->mFollowNeedsImmediateRetry = false;
+			this->mFollowRetryTimer.start(0);
+			return;
+		}
 		if (needsBusyRetry) {
 			const auto now = static_cast<qint64>(GetTickCount64());
 			if (!this->mFollowFirstBusyMs) this->mFollowFirstBusyMs = now;
@@ -970,7 +988,9 @@ private:
 	QTimer mFollowRetryTimer;
 	std::optional<qint64> mFollowBusySinceMs;
 	std::optional<qint64> mFollowFirstBusyMs;
+	quint64 mFollowPassGeneration = 0;
 	bool mFollowNeedsFailureRetry = false;
+	bool mFollowNeedsImmediateRetry = false;
 	bool mRepairPending = false;
 };
 
@@ -1488,7 +1508,9 @@ void WinPanelWindow::nativeInit() {
 
 	if (this->window->isVisible()) {
 		WinPanelStack::instance()->addPanel(this);
+		QPointer<WinPanelWindow> guard(this);
 		this->stickToAllDesktops();
+		if (guard == nullptr || this->hwnd() == nullptr) return;
 	}
 
 	applyPanelDwmAttributes(this->hwnd());
@@ -2241,7 +2263,9 @@ void WinPanelWindow::onWindowVisibleChanged() {
 		this->updateDimensions();
 		stack->seedFullscreenAppState(MonitorFromWindow(this->hwnd(), MONITOR_DEFAULTTONEAREST));
 		this->updateLayer();
+		QPointer<WinPanelWindow> guard(this);
 		this->stickToAllDesktops();
+		if (guard == nullptr) return;
 		this->focusWhenExposed();
 	} else {
 		this->focusOnExpose = false;
@@ -2577,7 +2601,11 @@ void WinPanelWindow::updateEmbedding() {
 		}
 		if (!desktops->isOwnWindowPinActive(this->embedWaitingForPinHwnd)) {
 			this->embedWaitingForPinHwnd = nullptr;
-			if (this->window != nullptr && this->window->isVisible()) this->stickToAllDesktops();
+			if (this->window != nullptr && this->window->isVisible()) {
+				QPointer<WinPanelWindow> guard(this);
+				this->stickToAllDesktops();
+				if (guard == nullptr) return;
+			}
 		}
 	}
 
