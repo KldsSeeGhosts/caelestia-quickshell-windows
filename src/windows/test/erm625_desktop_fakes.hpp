@@ -257,7 +257,7 @@ struct FakePublic: FakeCom<IVirtualDesktopManager> {
 	bool faultOnRead = false;
 	std::function<void()> beforeQuery, beforeMove;
 	HRESULT moveResult = S_OK;
-	int moves = 0;
+	std::atomic<int> moves {0};
 	GUID desktopId {};
 	BOOL onCurrent = TRUE;
 	HRESULT STDMETHODCALLTYPE IsWindowOnCurrentVirtualDesktop(HWND, BOOL* out) override {
@@ -274,7 +274,7 @@ struct FakePublic: FakeCom<IVirtualDesktopManager> {
 	}
 	HRESULT STDMETHODCALLTYPE MoveWindowToDesktop(HWND, REFGUID id) override {
 		if (this->beforeMove) this->beforeMove();
-		++this->moves;
+		this->moves.fetch_add(1, std::memory_order_relaxed);
 		if (SUCCEEDED(this->moveResult)) this->desktopId = id;
 		return this->moveResult;
 	}
