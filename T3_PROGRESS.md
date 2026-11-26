@@ -6,5 +6,7 @@
 - Added `immediateHideDuringCloseFlushCancelsAnimatedClose` and built `panel_hidden_reembed_test` successfully.
 - Pre-fix evidence: running the new case exited 1 because `panel.closeStartsForTesting()` was 1 instead of 0.
 - Implemented close invalidation in both immediate-hide paths and added the hidden-backing-window guard after the geometry flush.
-- Post-fix evidence: the new regression case exits 0 with 3 passed and 0 failed.
-- Next: build the required targets and run the required CTest fixtures.
+- Post-fix evidence: the new regression case exited 0 with 3 passed and 0 failed.
+- Built `panel_hidden_reembed_test`, `portable_core`, `portable_display`, and `portable_clipboard` successfully.
+- Required CTest run passed 5 of 5: `panel_hidden_reembed`, `panel_animation`, `panel_topmost`, `panel_focus_style`, and `window_stack`.
+- Next: remove this transient progress artifact and verify the final diff and clean tree.
