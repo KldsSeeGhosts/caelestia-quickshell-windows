@@ -1523,6 +1523,89 @@ private slots:
 			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
 			host->setEnabled(false);
 			QCoreApplication::processEvents();
+			QTRY_VERIFY(!desktops->isOwnWindowPinActive(hwnd));
+		}
+
+		// Part L: If the desktop host disappears while an unpin is pending (so
+		// wantsEmbedding() stays true but no host parent remains), completing
+		// the unpin must restore the panel's top-level pin instead of leaving
+		// it unpinned without an embedding target.
+		{
+			auto simulatedExplorerPid = std::make_shared<std::atomic<DWORD>>(9101);
+			qs::windows::setNativeDesktopExplorerPidForTest(
+			    [simulatedExplorerPid] { return simulatedExplorerPid->load(); }
+			);
+			struct ResetPid {
+				~ResetPid() { qs::windows::setNativeDesktopExplorerPidForTest({}); }
+			} resetPid;
+
+			pinned.pinned = FALSE;
+			pinned.pinResult = S_OK;
+			pinned.unpinResult = S_OK;
+			pinned.queryResult = S_OK;
+			pinned.pins = 0;
+			pinned.unpins = 0;
+
+			QSignalSpy pinDone(desktops, &qs::windows::VirtualDesktops::ownWindowPinCompleted);
+
+			qs::windows::WinPanelWindow panel;
+			panel.setLayer(qs::windows::PanelLayer::Background);
+			panel.setExclusionMode(ExclusionMode::Ignore);
+			panel.setScreen(&screenInfo);
+			panel.createWindow();
+
+			auto* window = panel.backingWindow();
+			QVERIFY(window != nullptr);
+			auto* hwnd = reinterpret_cast<HWND>(window->winId());
+			QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+			QVERIFY(SetWindowPos(
+			    hwnd, nullptr, -10000, -10000, 200, 100, SWP_NOACTIVATE | SWP_NOZORDER
+			));
+
+			QVERIFY(panel.recoverExplorerForTesting(m_hostA, 9101, 9101));
+			QCoreApplication::processEvents();
+			panel.setVisible(true);
+			panel.setVisibleDirect(true);
+			QTRY_VERIFY(panel.isPinnedHereForTesting());
+
+			// Start embedding so UnpinView enters beforeUnpin, then drop the host
+			// parent window while keeping DesktopHost enabled (wantsEmbedding()==true).
+			activeBlock = std::make_shared<erm625::BlockingCall>();
+			pinned.beforeUnpin = [blocked = activeBlock] { (*blocked)(); };
+			host->setDiscoveredHostForTesting(m_hostA);
+			host->setEnabled(true);
+			QTRY_COMPARE(WaitForSingleObject(activeBlock->entered, 0), WAIT_OBJECT_0);
+			QVERIFY(GetParent(hwnd) == nullptr);
+
+			host->clearHostForTesting();
+			QCoreApplication::processEvents();
+			QVERIFY(host->enabled());
+			QVERIFY(host->parentWindow() == nullptr);
+
+			// Complete UnpinView: panel remains top-level and must re-pin.
+			const auto doneBeforeUnpinFinish = pinDone.size();
+			pinned.beforeUnpin = {};
+			activeBlock->release();
+			QTRY_VERIFY_WITH_TIMEOUT(
+			    pinDone.size() >= doneBeforeUnpinFinish + 2 && panel.isPinnedHereForTesting(),
+			    3000
+			);
+			activeBlock.reset();
+			QCOMPARE(
+			    pinDone.at(doneBeforeUnpinFinish).at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Unpinned
+			);
+			QCOMPARE(
+			    pinDone.last().at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Pinned
+			);
+			QVERIFY(GetParent(hwnd) == nullptr);
+			QCOMPARE(pinned.pinned, TRUE);
+
+			panel.deleteWindow();
+			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+			host->setEnabled(false);
+			QCoreApplication::processEvents();
 		}
 	}
 

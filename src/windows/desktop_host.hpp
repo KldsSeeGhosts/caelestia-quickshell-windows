@@ -89,6 +89,7 @@ public:
 	// way Explorer does on a handback. Passing nullptr restores the adopted
 	// host.
 	void setDiscoveredHostForTesting(HWND parent, HWND insertAfter = nullptr);
+	void clearHostForTesting();
 	// Re-run discovery now against the test host, as the handback edge does,
 	// so a test can replace the host without toggling the desktop layer off.
 	void refreshForTesting() { this->refresh(); }

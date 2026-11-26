@@ -1637,7 +1637,7 @@ void WinPanelWindow::stickToAllDesktops() {
 	}
 	if (this->embedWaitingForPinHwnd != nullptr) {
 		if (this->embedWaitingForPinHwnd == hwnd) {
-			if (!this->wantsEmbedding() && this->embedUnpinRequestId != 0) {
+			if (!this->hasEmbeddingTarget() && this->embedUnpinRequestId != 0) {
 				VirtualDesktops::instance()->cancelOwnWindowPin(this->embedUnpinRequestId);
 				this->embedUnpinRequestId = 0;
 				this->embedUnpinExplorerPid = 0;
@@ -1865,7 +1865,7 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 				this->embedUnpinRequestId = 0;
 				this->embedUnpinExplorerPid = 0;
 				this->embedWaitingForPinHwnd = nullptr;
-				if (!this->wantsEmbedding()) {
+				if (!this->hasEmbeddingTarget()) {
 					if (visible && !embedded) this->stickToAllDesktops();
 					return;
 				}
@@ -1892,7 +1892,7 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 				return;
 			}
 			this->embedWaitingForPinHwnd = nullptr;
-			if (this->wantsEmbedding()) {
+			if (this->hasEmbeddingTarget()) {
 				this->updateEmbedding();
 				this->scheduleUpdateDimensions();
 			} else if (visible && !embedded) {
@@ -1901,12 +1901,16 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 			return;
 		}
 		if (this->embedUnpinRequestId == 0
-		    && !desktops->isOwnWindowPinActive(this->embedWaitingForPinHwnd) && this->wantsEmbedding())
+		    && !desktops->isOwnWindowPinActive(this->embedWaitingForPinHwnd))
 		{
 			// Another panel freed the pin worker slot while we waited to submit an unpin.
 			this->embedWaitingForPinHwnd = nullptr;
-			this->updateEmbedding();
-			this->scheduleUpdateDimensions();
+			if (this->hasEmbeddingTarget()) {
+				this->updateEmbedding();
+				this->scheduleUpdateDimensions();
+			} else if (visible && !embedded) {
+				this->stickToAllDesktops();
+			}
 			return;
 		}
 	}
@@ -2053,7 +2057,7 @@ void WinPanelWindow::onOwnWindowPinDrained(
 		this->embedUnpinRequestId = 0;
 		this->embedUnpinExplorerPid = 0;
 		if (!fromPreviousExplorer && wasOurUnpin && !confirmedUnpinned) {
-			if (!this->wantsEmbedding()) {
+			if (!this->hasEmbeddingTarget()) {
 				if (this->window != nullptr && this->window->isVisible()
 				    && this->mEmbedParent == nullptr)
 				{
@@ -2080,7 +2084,7 @@ void WinPanelWindow::onOwnWindowPinDrained(
 			}
 			return;
 		}
-		if (this->wantsEmbedding()) {
+		if (this->hasEmbeddingTarget()) {
 			this->updateEmbedding();
 			this->scheduleUpdateDimensions();
 		} else if (this->window != nullptr && this->window->isVisible() && this->mEmbedParent == nullptr) {
@@ -2110,7 +2114,7 @@ void WinPanelWindow::onDesktopAccessorReady() {
 	this->clearPendingFollowMove();
 	this->followFailureCount = 0;
 	this->followWaitingBusy = false;
-	if (this->mEmbedParent == nullptr && this->wantsEmbedding()) {
+	if (this->mEmbedParent == nullptr && this->hasEmbeddingTarget()) {
 		this->updateEmbedding();
 	} else if (this->window != nullptr && this->window->isVisible()) {
 		this->stickToAllDesktops();
@@ -2191,7 +2195,7 @@ bool WinPanelWindow::recoverExplorer(HWND taskbar, DWORD pid, DWORD thread) {
 	if (preserveCurrentExplorerConfirmedPin || preserveCurrentExplorerInFlight
 	    || preserveCurrentExplorerUnpin)
 	{
-		if (this->mEmbedParent == nullptr && this->wantsEmbedding()) {
+		if (this->mEmbedParent == nullptr && this->hasEmbeddingTarget()) {
 			QTimer::singleShot(0, this, &WinPanelWindow::updateEmbedding);
 		}
 	} else {
@@ -2515,6 +2519,13 @@ bool WinPanelWindow::wantsEmbedding() const {
 
 bool WinPanelWindow::wantsAboveIcons() const {
 	return DesktopHost::instance()->allowsAboveIcons(this->bNamespace.value());
+}
+
+bool WinPanelWindow::hasEmbeddingTarget() const {
+	if (!this->wantsEmbedding()) return false;
+	auto* host = DesktopHost::instance();
+	auto* parent = this->wantsAboveIcons() ? host->iconsHost() : host->parentWindow();
+	return parent != nullptr && parent != this->embedRefusedBy;
 }
 
 void WinPanelWindow::updateEmbedding() {

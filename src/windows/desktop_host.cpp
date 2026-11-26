@@ -1083,6 +1083,12 @@ void DesktopHost::setDiscoveredHostForTesting(HWND parent, HWND insertAfter) {
 	this->testDiscoveredInsertAfter = insertAfter;
 }
 
+void DesktopHost::clearHostForTesting() {
+	this->testDiscoveredParent = nullptr;
+	this->testDiscoveredInsertAfter = nullptr;
+	this->applyLookup(nullptr, nullptr, nullptr, false, "test host cleared");
+}
+
 void DesktopHost::setReconcileSourcesForTesting(bool eventRoute, bool foreignHooks) {
 	this->eventRouteDisabledForTesting = !eventRoute;
 	this->foreignHooksDisabledForTesting = !foreignHooks;

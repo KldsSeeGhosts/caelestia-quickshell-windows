@@ -271,6 +271,7 @@ private:
 	[[nodiscard]] bool reservesSpace() const;
 	[[nodiscard]] bool wantsEmbedding() const;
 	[[nodiscard]] bool wantsAboveIcons() const;
+	[[nodiscard]] bool hasEmbeddingTarget() const;
 	void updateEmbedding();
 	void retryEmbedding();
 	void embedInto(HWND parent, HWND insertAfter, bool aboveIcons);
