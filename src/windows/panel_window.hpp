@@ -18,6 +18,7 @@
 #include <qrect.h>
 #include <qregion.h>
 #include <qscreen.h>
+#include <qset.h>
 #include <qstring.h>
 #include <qtclasshelpermacros.h>
 #include <qtimer.h>
@@ -189,7 +190,8 @@ private slots:
 	    quint64 requestId,
 	    quintptr hwnd,
 	    qs::windows::OwnWindowPin result,
-	    bool mayBePinned
+	    bool mayBePinned,
+	    quint32 explorerPid
 	);
 	void onOwnWindowPinDrained(
 	    quint64 requestId,
@@ -197,7 +199,8 @@ private slots:
 	    bool stillPinned,
 	    bool mayBePinned,
 	    bool confirmedUnpinned,
-	    bool disconnected
+	    bool disconnected,
+	    quint32 explorerPid
 	);
 	void updateScreen();
 	void followFocusedScreen();
@@ -289,16 +292,19 @@ private:
 	bool embedRetryPending = false;
 	HWND embedWaitingForPinHwnd = nullptr;
 	quint64 embedUnpinRequestId = 0;
+	DWORD embedUnpinExplorerPid = 0;
 	HWND embedUnpinFailedHwnd = nullptr;
 	int embedUnpinDisconnectRetries = 0;
 	// Tracks an HWND that Explorer may currently have pinned. Survives
 	// accessor-only recovery and is cleared only on confirmed unpin, Explorer
-	// process restart, or HWND replacement/teardown.
+	// process restart for the owning Explorer PID, or HWND replacement/teardown.
 	HWND mayBePinnedHwnd = nullptr;
-	// Pin/unpin requests with requestId <= minValidPinRequestId were submitted
-	// before the most recent Explorer process restart and must not restore
-	// pinned or mayBePinned state in the new Explorer session.
-	quint64 minValidPinRequestId = 0;
+	DWORD mayBePinnedExplorerPid = 0;
+	DWORD inFlightPinExplorerPid = 0;
+	QSet<DWORD> retiredExplorerPids;
+	[[nodiscard]] bool isRetiredExplorerSession(quint32 explorerPid) const {
+		return explorerPid != 0 && this->retiredExplorerPids.contains(static_cast<DWORD>(explorerPid));
+	}
 	bool scaleRecreatePending = false;
 	bool focusFlagPending = false;
 	bool focusOnExpose = false;

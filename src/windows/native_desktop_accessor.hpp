@@ -23,11 +23,11 @@ void setNativeDesktopMoveObserver(
 );
 void setNativeDesktopPinObserver(
     QObject* context,
-    std::function<void(quint64, HWND, OwnWindowPin, bool)> onPinCompleted
+    std::function<void(quint64, HWND, OwnWindowPin, bool, quint32)> onPinCompleted
 );
 void setNativeDesktopPinDrainObserver(
     QObject* context,
-    std::function<void(quint64, HWND, bool, bool, bool, bool)> onPinDrained
+    std::function<void(quint64, HWND, bool, bool, bool, bool, quint32)> onPinDrained
 );
 void setNativeDesktopCommandIdleObserver(QObject* context, std::function<void()> onCommandIdle);
 void requestNativeDesktopRefresh();
@@ -62,13 +62,16 @@ std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop);
 void cancelNativeDesktopOwnWindowPin(quint64 requestId);
 void cancelNativeDesktopOwnWindowPinForHwnd(HWND hwnd);
 [[nodiscard]] bool nativeDesktopOwnWindowPinActive(HWND hwnd);
-[[nodiscard]] quint64 latestNativeDesktopPinRequestId();
+[[nodiscard]] quint32 nativeDesktopExplorerPid();
 void shutdownNativeDesktopAccessor();
 
 #ifdef QS_TEST
 // Allows generated handles to exercise the production move path without
 // creating a real window. Reset together with the injected provider factory.
 void setNativeDesktopWindowValidatorForTest(std::function<bool(HWND)> validator);
+// Allows tests to simulate Explorer process restarts deterministically.
+// Reset together with the injected provider factory.
+void setNativeDesktopExplorerPidForTest(std::function<DWORD()> provider);
 // Uses the existing elapsed-time seam; an empty callback restores the real clock.
 // Reset together with the injected provider factory.
 void setNativeDesktopRecoveryAgeForTest(std::function<qint64()> age);

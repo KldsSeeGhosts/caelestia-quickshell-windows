@@ -142,7 +142,7 @@ public:
 	void cancelOwnWindowPin(quint64 requestId);
 	void cancelOwnWindowPinForHwnd(HWND hwnd);
 	[[nodiscard]] bool isOwnWindowPinActive(HWND hwnd) const;
-	[[nodiscard]] quint64 latestOwnWindowPinRequestId() const;
+	[[nodiscard]] quint32 ownWindowPinExplorerPid() const;
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;
 	[[nodiscard]] DesktopAvailability availability() const;
 	[[nodiscard]] bool supports(DesktopOperation operation) const;
@@ -187,7 +187,8 @@ signals:
 	    quint64 requestId,
 	    quintptr hwnd,
 	    qs::windows::OwnWindowPin result,
-	    bool mayBePinned
+	    bool mayBePinned,
+	    quint32 explorerPid
 	);
 	void ownWindowPinDrained(
 	    quint64 requestId,
@@ -195,7 +196,8 @@ signals:
 	    bool stillPinned,
 	    bool mayBePinned,
 	    bool confirmedUnpinned,
-	    bool disconnected
+	    bool disconnected,
+	    quint32 explorerPid
 	);
 	void desktopCommandIdle();
 
@@ -219,7 +221,13 @@ private:
 	    DesktopAvailability availability,
 	    HRESULT error
 	);
-	void onNativePinCompleted(quint64 requestId, HWND hwnd, OwnWindowPin result, bool mayBePinned);
+	void onNativePinCompleted(
+	    quint64 requestId,
+	    HWND hwnd,
+	    OwnWindowPin result,
+	    bool mayBePinned,
+	    quint32 explorerPid
+	);
 	void applyNativeSnapshot();
 	void notifyCapability();
 	bool readRegistry(QList<GUID>& ids, GUID& current) const;

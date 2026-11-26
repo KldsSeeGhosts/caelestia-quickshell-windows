@@ -494,9 +494,6 @@ private slots:
 			QByteArray prevDispatch;
 			~NativeCleanup() {
 				if (*this->block) (*this->block)->release();
-				this->pinned->beforeQuery = {};
-				this->pinned->beforePin = {};
-				this->pinned->beforeUnpin = {};
 				qs::windows::setNativeDesktopFactoryForTest({});
 				QElapsedTimer timer;
 				timer.start();
@@ -504,6 +501,9 @@ private slots:
 					QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
 					QThread::msleep(1);
 				}
+				this->pinned->beforeQuery = {};
+				this->pinned->beforePin = {};
+				this->pinned->beforeUnpin = {};
 				this->desktops->loseAccessorForTest();
 				if (this->prevHypr.isNull()) qunsetenv("CAELESTIA_WINDOWS_HYPR");
 				else qputenv("CAELESTIA_WINDOWS_HYPR", this->prevHypr);
@@ -525,7 +525,11 @@ private slots:
 			desktops->installAccessorForTest(nativeAccessor);
 			qs::windows::NativeDesktopFacadeTestHook::selectNative(*desktops);
 		};
-		if (!qs::windows::loadNativeDesktopAccessor(nativeAccessor, desktops, installNative)) {
+		auto onNativeRecovered = [&] {
+			installNative();
+			emit desktops->accessorReady();
+		};
+		if (!qs::windows::loadNativeDesktopAccessor(nativeAccessor, desktops, onNativeRecovered)) {
 			QSKIP("Native desktop accessor requires Windows 11 24H2+ build.");
 		}
 		qs::windows::NativeDesktopFacadeTestHook::observeSnapshots(*desktops);
@@ -750,9 +754,17 @@ private slots:
 		}
 
 		// Part D: A late stillPinned=true drain from before an Explorer process
-		// restart keeps the HWND fenced until the old worker exits, but must not
+		// restart keeps the HWND fenced until the old worker settles, but must not
 		// restore pinned or mayBePinned state in the new Explorer session.
 		{
+			DWORD simulatedExplorerPid = 1001;
+			qs::windows::setNativeDesktopExplorerPidForTest(
+			    [&simulatedExplorerPid] { return simulatedExplorerPid; }
+			);
+			struct ResetPid {
+				~ResetPid() { qs::windows::setNativeDesktopExplorerPidForTest({}); }
+			} resetPid;
+
 			pinned.pinned = FALSE;
 			pinned.pinResult = S_OK;
 			pinned.unpinResult = E_ACCESSDENIED;
@@ -789,6 +801,7 @@ private slots:
 			// Retire the old worker into drainingPins while blocked in PinView and
 			// simulate an Explorer process restart before the old worker drains.
 			const auto acquisitionsBeforeRestart = acquisitions;
+			simulatedExplorerPid = 2002;
 			qs::windows::invalidateNativeDesktopAccessor(RPC_E_DISCONNECTED);
 			QVERIFY(panel.recoverExplorerForTesting(m_hostB, 2002, 2002));
 			QTRY_VERIFY(acquisitions > acquisitionsBeforeRestart);
@@ -806,6 +819,7 @@ private slots:
 			pinned.beforePin = {};
 			activeBlock.reset();
 			QCOMPARE(pinDrained.at(0).at(2).toBool(), true);
+			QCOMPARE(pinDrained.at(0).at(6).toUInt(), quint32(1001));
 			QVERIFY(!desktops->isOwnWindowPinActive(hwnd));
 			QVERIFY(!panel.isPinnedHereForTesting());
 			QVERIFY(!panel.mayBePinnedHereForTesting());
@@ -820,6 +834,175 @@ private slots:
 
 			panel.deleteWindow();
 			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+			host->setEnabled(false);
+			QCoreApplication::processEvents();
+		}
+
+		// Part E: Reverse recovery order across an Explorer process restart.
+		// VirtualDesktops recovers against the new Explorer PID (2002) and pins
+		// (or has an in-flight pin for) the panel BEFORE delayed recoverExplorer(2002)
+		// runs. Delayed restart handling must preserve the new Explorer's pin/fence
+		// so embedding still calls UnpinView before SetParent.
+		{
+			DWORD simulatedExplorerPid = 1001;
+			qs::windows::setNativeDesktopExplorerPidForTest(
+			    [&simulatedExplorerPid] { return simulatedExplorerPid; }
+			);
+			struct ResetPid {
+				~ResetPid() { qs::windows::setNativeDesktopExplorerPidForTest({}); }
+			} resetPid;
+
+			// E1: New Explorer (2002) completes PinView BEFORE delayed recoverExplorer(2002).
+			{
+				pinned.pinned = FALSE;
+				pinned.pinResult = S_OK;
+				pinned.unpinResult = S_OK;
+				pinned.pins = 0;
+				pinned.unpins = 0;
+
+				QSignalSpy pinDone(desktops, &qs::windows::VirtualDesktops::ownWindowPinCompleted);
+
+				qs::windows::WinPanelWindow panel;
+				panel.setLayer(qs::windows::PanelLayer::Background);
+				panel.setExclusionMode(ExclusionMode::Ignore);
+				panel.setScreen(&screenInfo);
+				panel.createWindow();
+
+				auto* window = panel.backingWindow();
+				QVERIFY(window != nullptr);
+				auto* hwnd = reinterpret_cast<HWND>(window->winId());
+				QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+				QVERIFY(SetWindowPos(
+				    hwnd, nullptr, -10000, -10000, 200, 100, SWP_NOACTIVATE | SWP_NOZORDER
+				));
+
+				// Pin in old Explorer session (1001).
+				QVERIFY(panel.recoverExplorerForTesting(m_hostA, 1001, 1001));
+				QCoreApplication::processEvents();
+				panel.setVisible(true);
+				panel.setVisibleDirect(true);
+				QTRY_VERIFY(pinDone.size() >= 1);
+				QCOMPARE(pinDone.at(0).at(4).toUInt(), quint32(1001));
+				QVERIFY(panel.isPinnedHereForTesting());
+
+				// Explorer restarts to 2002; VirtualDesktops recovers and pins against
+				// 2002 BEFORE recoverExplorer(2002) reaches the panel.
+				pinned.pinned = FALSE;
+				const auto doneBeforeRestart = pinDone.size();
+				const auto acquisitionsBeforeRestart = acquisitions;
+				simulatedExplorerPid = 2002;
+				qs::windows::invalidateNativeDesktopAccessor(RPC_E_DISCONNECTED);
+				QTRY_VERIFY(acquisitions > acquisitionsBeforeRestart);
+				QTRY_VERIFY(desktops->accessorLoaded());
+				QTRY_VERIFY(pinDone.size() > doneBeforeRestart);
+				QCOMPARE(
+				    pinDone.last().at(2).value<qs::windows::OwnWindowPin>(),
+				    qs::windows::OwnWindowPin::Pinned
+				);
+				QCOMPARE(pinDone.last().at(4).toUInt(), quint32(2002));
+				QVERIFY(panel.isPinnedHereForTesting());
+				QVERIFY(panel.mayBePinnedHereForTesting());
+				QCOMPARE(pinned.pinned, TRUE);
+
+				// Now delayed recoverExplorer(2002) arrives: it must NOT discard the
+				// valid 2002 pin or mayBePinned fence.
+				QVERIFY(panel.recoverExplorerForTesting(m_hostB, 2002, 2002));
+				QCoreApplication::processEvents();
+				QVERIFY(panel.isPinnedHereForTesting());
+				QVERIFY(panel.mayBePinnedHereForTesting());
+
+				// Enabling desktop embedding must call UnpinView before SetParent.
+				const auto unpinsBeforeEmbed = pinned.unpins;
+				host->setDiscoveredHostForTesting(m_hostA);
+				host->setEnabled(true);
+				QTRY_COMPARE(GetParent(hwnd), m_hostA);
+				QVERIFY(pinned.unpins > unpinsBeforeEmbed);
+				QCOMPARE(pinned.pinned, FALSE);
+
+				panel.deleteWindow();
+				QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+				host->setEnabled(false);
+				QCoreApplication::processEvents();
+			}
+
+			// E2: New Explorer (2002) has an in-flight PinView when delayed
+			// recoverExplorer(2002) arrives; the 2002 pin must not be cancelled or
+			// discarded, and embedding afterwards must unpin before SetParent.
+			{
+				simulatedExplorerPid = 1001;
+				qs::windows::setNativeDesktopExplorerPidForTest(
+				    [&simulatedExplorerPid] { return simulatedExplorerPid; }
+				);
+				pinned.pinned = FALSE;
+				pinned.pinResult = S_OK;
+				pinned.unpinResult = S_OK;
+				pinned.pins = 0;
+				pinned.unpins = 0;
+
+				QSignalSpy pinDone(desktops, &qs::windows::VirtualDesktops::ownWindowPinCompleted);
+
+				qs::windows::WinPanelWindow panel;
+				panel.setLayer(qs::windows::PanelLayer::Background);
+				panel.setExclusionMode(ExclusionMode::Ignore);
+				panel.setScreen(&screenInfo);
+				panel.createWindow();
+
+				auto* window = panel.backingWindow();
+				QVERIFY(window != nullptr);
+				auto* hwnd = reinterpret_cast<HWND>(window->winId());
+				QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+				QVERIFY(SetWindowPos(
+				    hwnd, nullptr, -10000, -10000, 200, 100, SWP_NOACTIVATE | SWP_NOZORDER
+				));
+
+				QVERIFY(panel.recoverExplorerForTesting(m_hostA, 1001, 1001));
+				QCoreApplication::processEvents();
+				panel.setVisible(true);
+				panel.setVisibleDirect(true);
+				QTRY_VERIFY(pinDone.size() >= 1);
+				QCOMPARE(pinDone.at(0).at(4).toUInt(), quint32(1001));
+
+				// Explorer restarts to 2002; VirtualDesktops recovers first and enters
+				// PinView for 2002 while recoverExplorer(2002) is still delayed.
+				pinned.pinned = FALSE;
+				activeBlock = std::make_shared<erm625::BlockingCall>();
+				pinned.beforePin = [blocked = activeBlock] { (*blocked)(); };
+				const auto doneBeforeRestart = pinDone.size();
+				const auto acquisitionsBeforeRestart = acquisitions;
+				simulatedExplorerPid = 2002;
+				qs::windows::invalidateNativeDesktopAccessor(RPC_E_DISCONNECTED);
+				QTRY_VERIFY(acquisitions > acquisitionsBeforeRestart);
+				QTRY_COMPARE(WaitForSingleObject(activeBlock->entered, 0), WAIT_OBJECT_0);
+
+				// Delayed recoverExplorer(2002) arrives while the 2002 pin is in flight.
+				QVERIFY(panel.recoverExplorerForTesting(m_hostB, 2002, 2002));
+				QCoreApplication::processEvents();
+
+				activeBlock->release();
+				QTRY_VERIFY(pinDone.size() > doneBeforeRestart);
+				pinned.beforePin = {};
+				activeBlock.reset();
+				QCOMPARE(
+				    pinDone.last().at(2).value<qs::windows::OwnWindowPin>(),
+				    qs::windows::OwnWindowPin::Pinned
+				);
+				QCOMPARE(pinDone.last().at(4).toUInt(), quint32(2002));
+				QCOMPARE(pinned.unpins, 0);
+				QVERIFY(panel.isPinnedHereForTesting());
+				QVERIFY(panel.mayBePinnedHereForTesting());
+
+				const auto unpinsBeforeEmbed = pinned.unpins;
+				host->setDiscoveredHostForTesting(m_hostA);
+				host->setEnabled(true);
+				QTRY_COMPARE(GetParent(hwnd), m_hostA);
+				QVERIFY(pinned.unpins > unpinsBeforeEmbed);
+				QCOMPARE(pinned.pinned, FALSE);
+
+				panel.deleteWindow();
+				QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+				host->setEnabled(false);
+				QCoreApplication::processEvents();
+			}
 		}
 	}
 

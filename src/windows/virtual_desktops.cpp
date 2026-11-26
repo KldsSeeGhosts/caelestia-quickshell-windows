@@ -302,9 +302,13 @@ void VirtualDesktops::bindNativeDesktopQueries() {
 	);
 	setNativeDesktopPinObserver(
 	    this,
-	    [this](quint64 requestId, HWND hwnd, OwnWindowPin result, bool mayBePinned) {
-		    this->onNativePinCompleted(requestId, hwnd, result, mayBePinned);
-	    }
+	    [this](
+	        quint64 requestId,
+	        HWND hwnd,
+	        OwnWindowPin result,
+	        bool mayBePinned,
+	        quint32 explorerPid
+	    ) { this->onNativePinCompleted(requestId, hwnd, result, mayBePinned, explorerPid); }
 	);
 	setNativeDesktopPinDrainObserver(
 	    this,
@@ -314,7 +318,8 @@ void VirtualDesktops::bindNativeDesktopQueries() {
 	        bool stillPinned,
 	        bool mayBePinned,
 	        bool confirmedUnpinned,
-	        bool disconnected
+	        bool disconnected,
+	        quint32 explorerPid
 	    ) {
 		    emit this->ownWindowPinDrained(
 		        requestId,
@@ -322,7 +327,8 @@ void VirtualDesktops::bindNativeDesktopQueries() {
 		        stillPinned,
 		        mayBePinned,
 		        confirmedUnpinned,
-		        disconnected
+		        disconnected,
+		        explorerPid
 		    );
 	    }
 	);
@@ -334,9 +340,16 @@ void VirtualDesktops::onNativePinCompleted(
     quint64 requestId,
     HWND hwnd,
     OwnWindowPin result,
-    bool mayBePinned
+    bool mayBePinned,
+    quint32 explorerPid
 ) {
-	emit this->ownWindowPinCompleted(requestId, reinterpret_cast<quintptr>(hwnd), result, mayBePinned);
+	emit this->ownWindowPinCompleted(
+	    requestId,
+	    reinterpret_cast<quintptr>(hwnd),
+	    result,
+	    mayBePinned,
+	    explorerPid
+	);
 }
 
 void VirtualDesktops::onNativeMoveCompleted(
@@ -1268,9 +1281,9 @@ bool VirtualDesktops::isOwnWindowPinActive(HWND hwnd) const {
 	return nativeDesktopOwnWindowPinActive(hwnd);
 }
 
-quint64 VirtualDesktops::latestOwnWindowPinRequestId() const {
+quint32 VirtualDesktops::ownWindowPinExplorerPid() const {
 	if (!this->nativeAccessor) return 0;
-	return latestNativeDesktopPinRequestId();
+	return nativeDesktopExplorerPid();
 }
 
 std::optional<bool> VirtualDesktops::isWindowPinned(HWND hwnd) const {

@@ -1021,18 +1021,30 @@ private slots:
 
 		// 4c. A retired pin worker returning E_NOINTERFACE (serviceAvailable=false)
 		//     while draining after recovery must not poison pinUnavailable for the
-		//     recovered worker.
+		//     recovered worker, and Explorer PID tags follow restarts deterministically.
 		{
 			FakePinnedAppsShell shell;
 			auto queryBlocked = std::make_shared<BlockingCall>();
-			Unblock unblockQuery {queryBlocked};
-			struct ResetShell {
+			struct ShellCleanup {
+				FakePinnedAppsShell* shell;
 				FakePinnedApps* pinned;
-				~ResetShell() {
+				std::shared_ptr<BlockingCall> block;
+				~ShellCleanup() {
+					if (this->block) this->block->release();
+					setNativeDesktopExplorerPidForTest({});
 					setNativeDesktopPinnedAppsShellForTest(nullptr);
 					setNativeDesktopPinnedAppsForTest(this->pinned);
+					QElapsedTimer timer;
+					timer.start();
+					while (nativeDesktopWorkerCountForTest() > 1 && timer.elapsed() < 2000) {
+						QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+						QThread::msleep(1);
+					}
+					this->shell->beforeQuery = {};
 				}
-			} resetShell {&pinned};
+			} shellCleanup {&shell, &pinned, queryBlocked};
+			DWORD simulatedExplorerPid = 4101;
+			setNativeDesktopExplorerPidForTest([&simulatedExplorerPid] { return simulatedExplorerPid; });
 			shell.pinnedApps = &pinned;
 			shell.result = E_NOINTERFACE;
 			shell.beforeQuery = [queryBlocked] { (*queryBlocked)(); };
@@ -1042,10 +1054,13 @@ private slots:
 			const auto drainedBefore = pinDrained.size();
 			quint64 reqOldUnavailable = 0;
 			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqOldUnavailable), OwnWindowPin::Pending);
+			QCOMPARE(nativeDesktopExplorerPid(), quint32(4101));
 			QCOMPARE(WaitForSingleObject(queryBlocked->entered, 1000), WAIT_OBJECT_0);
 
+			simulatedExplorerPid = 4202;
 			invalidateNativeDesktopAccessor(RPC_E_DISCONNECTED);
 			QVERIFY(waitUntil([&pinDone, doneBefore] { return pinDone.size() == doneBefore + 1; }, 1000));
+			QCOMPARE(pinDone.at(doneBefore).at(4).toUInt(), quint32(4101));
 			QVERIFY(waitUntil(
 			    [] { return nativeDesktopAvailability() == DesktopAvailability::Available; },
 			    1500
@@ -1058,21 +1073,24 @@ private slots:
 			);
 			shell.beforeQuery = {};
 			QCOMPARE(pinDrained.at(drainedBefore).at(0).toULongLong(), reqOldUnavailable);
+			QCOMPARE(pinDrained.at(drainedBefore).at(6).toUInt(), quint32(4101));
 			QVERIFY(!this->desktops->isOwnWindowPinActive(window));
 
-			// The recovered provider now returns S_OK and must NOT be poisoned by the
-			// retired worker's E_NOINTERFACE.
+			// The recovered provider now returns S_OK under the new Explorer PID and
+			// must NOT be poisoned by the retired worker's E_NOINTERFACE.
 			shell.result = S_OK;
 			pinned.pinned = FALSE;
 			const auto recoveredIdx = pinDone.size();
 			quint64 reqRecoveredPin = 0;
 			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqRecoveredPin), OwnWindowPin::Pending);
+			QCOMPARE(nativeDesktopExplorerPid(), quint32(4202));
 			QVERIFY(
 			    waitUntil([&pinDone, recoveredIdx] { return pinDone.size() == recoveredIdx + 1; }, 1000)
 			);
 			QCOMPARE(pinDone.at(recoveredIdx).at(0).toULongLong(), reqRecoveredPin);
 			QCOMPARE(pinDone.at(recoveredIdx).at(2).value<OwnWindowPin>(), OwnWindowPin::Pinned);
 			QCOMPARE(pinDone.at(recoveredIdx).at(3).toBool(), true);
+			QCOMPARE(pinDone.at(recoveredIdx).at(4).toUInt(), quint32(4202));
 			QCOMPARE(pinned.pinned, TRUE);
 		}
 

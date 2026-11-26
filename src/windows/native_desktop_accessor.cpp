@@ -103,6 +103,14 @@ bool isDisconnectError(HRESULT hr) {
 	    || hr == RPC_E_CONNECTION_TERMINATED;
 }
 
+DWORD liveExplorerTaskbarPid() {
+	auto* taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+	if (!taskbar) return 0;
+	DWORD pid = 0;
+	GetWindowThreadProcessId(taskbar, &pid);
+	return pid;
+}
+
 struct Provider {
 #ifdef QS_TEST
 	NativeDesktopFactory factory;
@@ -1101,17 +1109,20 @@ struct Channel {
 		quint64 requestId = 0;
 		bool unpin = false;
 		bool retiredOnDisconnect = false;
+		DWORD explorerPid = 0;
 	};
 	std::shared_ptr<Worker> worker;
 	std::shared_ptr<PinWorker> pinWorker;
+	DWORD workerExplorerPid = 0;
+	DWORD pinWorkerExplorerPid = 0;
 	Snapshot snapshot;
 	QSet<quintptr> watchedWindows;
 	QPointer<QObject> context;
 	std::function<void()> recovered;
 	std::function<void()> updated;
 	std::function<void(quint64, HWND, bool, DesktopAvailability, HRESULT)> moveCompleted;
-	std::function<void(quint64, HWND, OwnWindowPin, bool)> pinCompleted;
-	std::function<void(quint64, HWND, bool, bool, bool, bool)> pinDrained;
+	std::function<void(quint64, HWND, OwnWindowPin, bool, quint32)> pinCompleted;
+	std::function<void(quint64, HWND, bool, bool, bool, bool, quint32)> pinDrained;
 	std::function<void()> commandIdle;
 	bool commandIdleScheduled = false;
 	QTimer deadline;
@@ -1145,6 +1156,7 @@ struct Channel {
 #ifdef QS_TEST
 	NativeDesktopFactory factory;
 	std::function<bool(HWND)> validator;
+	std::function<DWORD()> explorerPidProvider;
 	PinnedApps* testPinnedApps = nullptr;
 	IServiceProvider* pinnedAppsShell = nullptr;
 #endif
@@ -1155,6 +1167,23 @@ struct Channel {
 		    if (this->context && this->recovered) this->recovered();
 	    }
 	};
+
+	[[nodiscard]] DWORD currentExplorerPid() const {
+#ifdef QS_TEST
+		if (this->explorerPidProvider) return this->explorerPidProvider();
+#endif
+		return liveExplorerTaskbarPid();
+	}
+
+	[[nodiscard]] DWORD currentWorkerExplorerPid() const {
+		return this->workerExplorerPid != 0 ? this->workerExplorerPid : this->currentExplorerPid();
+	}
+
+	[[nodiscard]] DWORD activePinExplorerPid() const {
+		if (this->pin && this->pin->explorerPid != 0) return this->pin->explorerPid;
+		if (this->pinWorkerExplorerPid != 0) return this->pinWorkerExplorerPid;
+		return this->currentWorkerExplorerPid();
+	}
 
 	Channel() {
 		this->deadline.setSingleShot(true);
@@ -1184,6 +1213,8 @@ struct Channel {
 		}
 		if (auto previous = std::exchange(this->worker, {})) previous->stop();
 		if (auto previousPin = std::exchange(this->pinWorker, {})) previousPin->stop();
+		this->workerExplorerPid = 0;
+		this->pinWorkerExplorerPid = 0;
 		this->refresh.reset();
 		this->pending.reset();
 		this->pin.reset();
@@ -1234,7 +1265,13 @@ struct Channel {
 		});
 	}
 
-	void notifyPinCompleted(quint64 requestId, HWND hwnd, OwnWindowPin result, bool mayBePinned) {
+	void notifyPinCompleted(
+	    quint64 requestId,
+	    HWND hwnd,
+	    OwnWindowPin result,
+	    bool mayBePinned,
+	    quint32 explorerPid
+	) {
 		if (requestId == 0 || hwnd == nullptr || !this->context || !this->pinCompleted) return;
 		const auto key = reinterpret_cast<quintptr>(hwnd);
 		const auto deliveryGen = this->pinDeliveryGeneration;
@@ -1242,7 +1279,7 @@ struct Channel {
 		QTimer::singleShot(
 		    0,
 		    this->context,
-		    [this, deliveryGen, key, requestId, hwnd, result, mayBePinned] {
+		    [this, deliveryGen, key, requestId, hwnd, result, mayBePinned, explorerPid] {
 			    if (deliveryGen == this->pinDeliveryGeneration) {
 				    auto it = this->pendingPinDeliveries.find(key);
 				    if (it != this->pendingPinDeliveries.end()) {
@@ -1250,7 +1287,7 @@ struct Channel {
 				    }
 			    }
 			    if (this->context && this->pinCompleted) {
-				    this->pinCompleted(requestId, hwnd, result, mayBePinned);
+				    this->pinCompleted(requestId, hwnd, result, mayBePinned, explorerPid);
 			    }
 		    }
 		);
@@ -1262,7 +1299,8 @@ struct Channel {
 	    bool stillPinned,
 	    bool mayBePinned,
 	    bool confirmedUnpinned,
-	    bool disconnected
+	    bool disconnected,
+	    quint32 explorerPid
 	) {
 		if (hwnd == nullptr || !this->context || !this->pinDrained) return;
 		const auto key = reinterpret_cast<quintptr>(hwnd);
@@ -1279,7 +1317,8 @@ struct Channel {
 		     stillPinned,
 		     mayBePinned,
 		     confirmedUnpinned,
-		     disconnected] {
+		     disconnected,
+		     explorerPid] {
 			    if (deliveryGen == this->pinDeliveryGeneration) {
 				    auto it = this->pendingPinDeliveries.find(key);
 				    if (it != this->pendingPinDeliveries.end()) {
@@ -1293,7 +1332,8 @@ struct Channel {
 				        stillPinned,
 				        mayBePinned,
 				        confirmedUnpinned,
-				        disconnected
+				        disconnected,
+				        explorerPid
 				    );
 			    }
 		    }
@@ -1406,10 +1446,14 @@ struct Channel {
 			bool mayBePinned = false;
 			bool confirmedUnpinned = false;
 			bool disconnected = false;
+			DWORD explorerPid = 0;
 		};
 		std::vector<DrainedPin> drained;
 		auto it = this->drainingPins.begin();
 		while (it != this->drainingPins.end()) {
+			// request->settled becomes true once the retired request's per-HWND
+			// COM pin/unpin operation finishes (before the worker drops its COM
+			// proxies and exits).
 			if (!it->request || it->request->settled.load(std::memory_order_acquire)) {
 				auto stillPinned = false;
 				auto mayBePinned = true;
@@ -1436,6 +1480,7 @@ struct Channel {
 					    mayBePinned,
 					    confirmedUnpinned,
 					    disconnected,
+					    it->explorerPid,
 					});
 				}
 				it = this->drainingPins.erase(it);
@@ -1450,7 +1495,8 @@ struct Channel {
 			    entry.stillPinned,
 			    entry.mayBePinned,
 			    entry.confirmedUnpinned,
-			    entry.disconnected
+			    entry.disconnected,
+			    static_cast<quint32>(entry.explorerPid)
 			);
 		}
 	}
@@ -1463,6 +1509,7 @@ struct Channel {
 		auto pendingPin = std::exchange(this->pin, std::nullopt);
 		if (pendingPin && pendingPin->request) pendingPin->request->cancelled.store(true);
 		if (auto previousPin = std::exchange(this->pinWorker, {})) previousPin->stop();
+		this->pinWorkerExplorerPid = 0;
 		this->pinDeadline.stop();
 		if (pendingPin && pendingPin->target != nullptr) {
 			auto pinOutcome = fallbackOutcome;
@@ -1481,8 +1528,9 @@ struct Channel {
 					mayBePinned = classified.mayBePinned;
 				}
 			} else {
-				// The retired worker is still executing inside COM for this HWND:
-				// keep it fenced in drainingPins until settled becomes true.
+				// The retired worker is still executing this HWND's COM pin/unpin
+				// operation: keep it fenced in drainingPins until request->settled
+				// becomes true (before the worker drops its proxies and exits).
 				this->drainingPins.push_back(PinPending {
 				    pendingPin->request,
 				    std::move(pendingPin->result),
@@ -1490,13 +1538,15 @@ struct Channel {
 				    pendingPin->requestId,
 				    pendingPin->unpin,
 				    retiredOnDisconnect,
+				    pendingPin->explorerPid,
 				});
 			}
 			this->notifyPinCompleted(
 			    pendingPin->requestId,
 			    pendingPin->target,
 			    pinOutcome,
-			    mayBePinned
+			    mayBePinned,
+			    static_cast<quint32>(pendingPin->explorerPid)
 			);
 		}
 	}
@@ -1504,6 +1554,7 @@ struct Channel {
 	void retire(HRESULT error) {
 		auto pendingMove = std::exchange(this->pending, std::nullopt);
 		if (auto previous = std::exchange(this->worker, {})) previous->stop();
+		this->workerExplorerPid = 0;
 		this->refresh.reset();
 		this->deadline.stop();
 		this->retirePinWorker(false, OwnWindowPin::Disconnected);
@@ -1674,6 +1725,7 @@ struct Channel {
 			const auto available = this->apply(std::move(value));
 			if (kind == Kind::Acquisition && available) {
 				++this->windowRevision;
+				this->workerExplorerPid = this->currentExplorerPid();
 				this->pinUnavailable = false;
 				this->retirePinWorker(false, OwnWindowPin::Disconnected);
 			}
@@ -1786,6 +1838,8 @@ struct Channel {
 			return false;
 		}
 		this->pinWorker = std::move(next);
+		const auto detectedPid = this->currentExplorerPid();
+		this->pinWorkerExplorerPid = detectedPid != 0 ? detectedPid : this->workerExplorerPid;
 		return true;
 	}
 
@@ -1815,6 +1869,9 @@ struct Channel {
 		request->unpin = unpin;
 		request->completed = [this] { this->wakeOnPinCompletion(); };
 		const auto reqId = ++this->pinSequence;
+		const auto explorerPid =
+		    this->pinWorkerExplorerPid != 0 ? this->pinWorkerExplorerPid : this->currentWorkerExplorerPid();
+		if (this->pinWorkerExplorerPid == 0) this->pinWorkerExplorerPid = explorerPid;
 		this->pin.emplace(PinPending {
 		    request,
 		    this->pinWorker->submit(request),
@@ -1822,6 +1879,7 @@ struct Channel {
 		    reqId,
 		    unpin,
 		    false,
+		    explorerPid,
 		});
 		this->armPinDeadline();
 		if (outRequestId) *outRequestId = reqId;
@@ -1956,6 +2014,7 @@ struct Channel {
 			}
 			if (finished.kind == Kind::Acquisition && success && available) {
 				++this->windowRevision;
+				this->workerExplorerPid = this->currentExplorerPid();
 				this->pinUnavailable = false;
 				this->retirePinWorker(false, OwnWindowPin::Disconnected);
 				this->recovery.reset();
@@ -2011,7 +2070,8 @@ struct Channel {
 			    finished.requestId,
 			    finished.target,
 			    classified.outcome,
-			    classified.mayBePinned
+			    classified.mayBePinned,
+			    static_cast<quint32>(finished.explorerPid)
 			);
 			this->armPinDeadline();
 			return;
@@ -2191,7 +2251,7 @@ void setNativeDesktopMoveObserver(
 
 void setNativeDesktopPinObserver(
     QObject* context,
-    std::function<void(quint64, HWND, OwnWindowPin, bool)> onPinCompleted
+    std::function<void(quint64, HWND, OwnWindowPin, bool, quint32)> onPinCompleted
 ) {
 	auto& c = channel();
 	c.context = context;
@@ -2200,7 +2260,7 @@ void setNativeDesktopPinObserver(
 
 void setNativeDesktopPinDrainObserver(
     QObject* context,
-    std::function<void(quint64, HWND, bool, bool, bool, bool)> onPinDrained
+    std::function<void(quint64, HWND, bool, bool, bool, bool, quint32)> onPinDrained
 ) {
 	auto& c = channel();
 	c.context = context;
@@ -2319,7 +2379,7 @@ OwnWindowPin unpinNativeDesktopOwnWindow(HWND hwnd, quint64* outRequestId) {
 void cancelNativeDesktopOwnWindowPin(quint64 requestId) { channel().cancelPin(requestId); }
 void cancelNativeDesktopOwnWindowPinForHwnd(HWND hwnd) { channel().cancelPinForHwnd(hwnd); }
 bool nativeDesktopOwnWindowPinActive(HWND hwnd) { return channel().isPinActiveFor(hwnd); }
-quint64 latestNativeDesktopPinRequestId() { return channel().pinSequence; }
+quint32 nativeDesktopExplorerPid() { return static_cast<quint32>(channel().activePinExplorerPid()); }
 void shutdownNativeDesktopAccessor() { channel().shutdown(); }
 
 #ifdef QS_TEST
@@ -2328,6 +2388,7 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	// Clear an injected test clock first: it may capture a caller's local that
 	// is already out of scope when a RAII reset guard runs this.
 	p.recovery.setAgeForTest({});
+	p.explorerPidProvider = {};
 	auto previous = p.worker;
 	auto previousPin = p.pinWorker;
 	p.shutdown();
@@ -2363,6 +2424,14 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.pinnedAppsShell = nullptr;
 	p.stallLimit = stuckBound;
 	p.pinStallLimit = stuckBound;
+}
+
+void setNativeDesktopExplorerPidForTest(std::function<DWORD()> provider) {
+	auto& c = channel();
+	c.explorerPidProvider = std::move(provider);
+	const auto detectedPid = c.currentExplorerPid();
+	if (c.worker) c.workerExplorerPid = detectedPid;
+	if (c.pinWorker) c.pinWorkerExplorerPid = detectedPid;
 }
 
 void setNativeDesktopPinnedAppsForTest(PinnedApps* pinned) {
