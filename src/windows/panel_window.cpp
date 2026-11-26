@@ -1831,6 +1831,8 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 				if (this->pinState.pinnedHwnd == currentHwnd) {
 					this->pinState.pinned = false;
 					this->pinState.pinnedHwnd = nullptr;
+					this->pinState.failedHwnd = nullptr;
+					this->pinState.attemptHwnd = nullptr;
 				}
 			}
 		} else if (result == OwnWindowPin::Unpinned) {
@@ -1849,6 +1851,8 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 				if (this->pinState.pinnedHwnd == currentHwnd) {
 					this->pinState.pinned = false;
 					this->pinState.pinnedHwnd = nullptr;
+					this->pinState.failedHwnd = nullptr;
+					this->pinState.attemptHwnd = nullptr;
 				}
 				this->embedUnpinFailedHwnd = nullptr;
 				this->embedUnpinDisconnectRetries = 0;
@@ -2584,6 +2588,16 @@ void WinPanelWindow::updateEmbedding() {
 				if (guard == nullptr) return;
 			}
 		}
+	} else if (parent == nullptr && this->mEmbedParent == nullptr
+	           && this->embedWaitingForPinHwnd == nullptr && this->window != nullptr
+	           && this->window->isVisible() && !this->pinnedHere(hwnd))
+	{
+		// No embedding host remains (e.g., host disappeared after an inconclusive
+		// unpin cleared the confirmed pin while waiting to embed): restore
+		// top-level pinning for the visible panel.
+		QPointer<WinPanelWindow> guard(this);
+		this->stickToAllDesktops();
+		if (guard == nullptr) return;
 	}
 
 	if (parent == this->mEmbedParent && insertAfter == this->mEmbedInsertAfter

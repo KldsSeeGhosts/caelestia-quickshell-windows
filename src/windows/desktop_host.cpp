@@ -1084,9 +1084,18 @@ void DesktopHost::setDiscoveredHostForTesting(HWND parent, HWND insertAfter) {
 }
 
 void DesktopHost::clearHostForTesting() {
+	auto* oldParent = this->mParent;
+	auto* oldInsertAfter = this->mInsertAfter;
+	auto* oldIconsHost = this->mIconsHost;
 	this->testDiscoveredParent = nullptr;
 	this->testDiscoveredInsertAfter = nullptr;
 	this->applyLookup(nullptr, nullptr, nullptr, false, "test host cleared");
+	if (this->mParent != oldParent || this->mInsertAfter != oldInsertAfter
+	    || this->mIconsHost != oldIconsHost)
+	{
+		emit this->parentChanged();
+	}
+	this->updateReportedState();
 }
 
 void DesktopHost::setReconcileSourcesForTesting(bool eventRoute, bool foreignHooks) {

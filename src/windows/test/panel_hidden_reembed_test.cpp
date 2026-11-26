@@ -1469,6 +1469,12 @@ private slots:
 				std::shared_ptr<erm625::BlockingCall>* block;
 				~ResetMoveFixture() {
 					if (*this->block) (*this->block)->release();
+					QElapsedTimer timer;
+					timer.start();
+					while (qs::windows::nativeDesktopRequestPending() && timer.elapsed() < 2000) {
+						QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+						QThread::msleep(1);
+					}
 					this->fixture->manager.beforeMove = {};
 					this->fixture->publicApi.beforeMove = {};
 					this->fixture->manager.moveResult = S_OK;
@@ -1640,6 +1646,49 @@ private slots:
 			    qs::windows::OwnWindowPin::Disconnected
 			);
 			QCOMPARE(pinDone.at(doneBeforeLostUnpin).at(3).toBool(), true);
+			QCOMPARE(
+			    pinDone.last().at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Pinned
+			);
+			QVERIFY(GetParent(hwnd) == nullptr);
+			QCOMPARE(pinned.pinned, TRUE);
+
+			// L3: An inconclusive unpin (UnpinView applies the unpin, returns S_FALSE,
+			// and IsViewPinned recheck is inconclusive -> Refused + mayBePinned=true)
+			// finishes while the host is still present (clearing embedWaitingForPinHwnd
+			// and pinState.pinned). When the desktop host later disappears,
+			// updateEmbedding() must still restore top-level pinning.
+			pinned.unpinResult = S_FALSE;
+			auto l3QueryCalls = std::make_shared<std::atomic<int>>(0);
+			pinned.beforeQuery = [l3QueryCalls, &pinned] {
+				if (l3QueryCalls->fetch_add(1) == 1) pinned.queryResult = S_FALSE;
+			};
+			pinned.beforeUnpin = [&pinned] { pinned.pinned = FALSE; };
+			const auto doneBeforeL3Unpin = pinDone.size();
+			host->setDiscoveredHostForTesting(m_hostA);
+			host->refreshForTesting();
+			QTRY_VERIFY(pinDone.size() >= doneBeforeL3Unpin + 1);
+			pinned.beforeQuery = {};
+			pinned.beforeUnpin = {};
+			pinned.queryResult = S_OK;
+			pinned.unpinResult = S_OK;
+			QCOMPARE(
+			    pinDone.at(doneBeforeL3Unpin).at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Refused
+			);
+			QCOMPARE(pinDone.at(doneBeforeL3Unpin).at(3).toBool(), true);
+			QVERIFY(!panel.isPinnedHereForTesting());
+			QVERIFY(panel.mayBePinnedHereForTesting());
+			QVERIFY(GetParent(hwnd) == nullptr);
+			QCOMPARE(pinned.pinned, FALSE);
+
+			// Now the desktop host disappears after the unpin already completed.
+			const auto doneBeforeL3HostLoss = pinDone.size();
+			host->clearHostForTesting();
+			QTRY_VERIFY_WITH_TIMEOUT(
+			    pinDone.size() >= doneBeforeL3HostLoss + 1 && panel.isPinnedHereForTesting(),
+			    3000
+			);
 			QCOMPARE(
 			    pinDone.last().at(2).value<qs::windows::OwnWindowPin>(),
 			    qs::windows::OwnWindowPin::Pinned
