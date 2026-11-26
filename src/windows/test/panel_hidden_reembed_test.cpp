@@ -1602,6 +1602,47 @@ private slots:
 			QVERIFY(GetParent(hwnd) == nullptr);
 			QCOMPARE(pinned.pinned, TRUE);
 
+			// L2: Explorer applies UnpinView (pinned becomes FALSE) and loses the
+			// reply (RPC_E_DISCONNECTED -> mayBePinned=true) while the desktop host
+			// disappears. Clearing the stale confirmed pin lets stickToAllDesktops()
+			// re-verify and re-pin the panel cleanly.
+			activeBlock = std::make_shared<erm625::BlockingCall>();
+			pinned.beforeUnpin = [blocked = activeBlock, &pinned] {
+				(*blocked)();
+				pinned.pinned = FALSE;
+			};
+			pinned.unpinResult = RPC_E_DISCONNECTED;
+			host->setDiscoveredHostForTesting(m_hostA);
+			host->refreshForTesting();
+			QTRY_COMPARE(WaitForSingleObject(activeBlock->entered, 0), WAIT_OBJECT_0);
+			QVERIFY(GetParent(hwnd) == nullptr);
+
+			host->clearHostForTesting();
+			QCoreApplication::processEvents();
+			QVERIFY(host->enabled());
+			QVERIFY(host->parentWindow() == nullptr);
+
+			const auto doneBeforeLostUnpin = pinDone.size();
+			pinned.beforeUnpin = {};
+			activeBlock->release();
+			QTRY_VERIFY_WITH_TIMEOUT(
+			    pinDone.size() >= doneBeforeLostUnpin + 2 && panel.isPinnedHereForTesting(),
+			    3000
+			);
+			activeBlock.reset();
+			pinned.unpinResult = S_OK;
+			QCOMPARE(
+			    pinDone.at(doneBeforeLostUnpin).at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Disconnected
+			);
+			QCOMPARE(pinDone.at(doneBeforeLostUnpin).at(3).toBool(), true);
+			QCOMPARE(
+			    pinDone.last().at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Pinned
+			);
+			QVERIFY(GetParent(hwnd) == nullptr);
+			QCOMPARE(pinned.pinned, TRUE);
+
 			panel.deleteWindow();
 			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
 			host->setEnabled(false);

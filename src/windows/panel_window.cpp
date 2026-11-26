@@ -1822,12 +1822,16 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 		} else if (mayBePinned) {
 			// PinView disconnected or faulted with an unknown mutation outcome, or an
 			// unpin failed: fence embedding until explicit unpin confirms removal, but
-			// do not mark pinState.pinned so top-level pinning can still retry/follow.
+			// clear any prior confirmed pin so top-level pinning re-verifies/retries.
 			if (isNewerOrEqualRequest) {
 				this->mayBePinnedHwnd = currentHwnd;
 				this->mayBePinnedExplorerPid =
 				    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
 				advanceWatermark();
+				if (this->pinState.pinnedHwnd == currentHwnd) {
+					this->pinState.pinned = false;
+					this->pinState.pinnedHwnd = nullptr;
+				}
 			}
 		} else if (result == OwnWindowPin::Unpinned) {
 			const auto confirmedByLiveExplorer =
@@ -2026,6 +2030,10 @@ void WinPanelWindow::onOwnWindowPinDrained(
 				this->mayBePinnedExplorerPid =
 				    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
 				advanceWatermark();
+				if (this->pinState.pinnedHwnd == currentHwnd) {
+					this->pinState.pinned = false;
+					this->pinState.pinnedHwnd = nullptr;
+				}
 			}
 		} else if (confirmedUnpinned) {
 			const auto confirmedByLiveExplorer =
