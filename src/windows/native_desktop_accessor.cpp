@@ -911,7 +911,10 @@ struct PinProvider {
 							viewPinned = false;
 							unpinnedConfirmed = true;
 						} else {
-							if (rechecked && recheckHr == S_OK && stillPinnedAfter) viewPinned = true;
+							// Only report viewPinned=true when IsViewPinned confirms
+							// TRUE with S_OK; an inconclusive recheck keeps
+							// mayBePinned=true (Refused) without falsely reporting Pinned.
+							viewPinned = (rechecked && recheckHr == S_OK && stillPinnedAfter != FALSE);
 							ok = false;
 						}
 					} else {

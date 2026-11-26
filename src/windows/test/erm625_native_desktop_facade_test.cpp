@@ -988,6 +988,30 @@ private slots:
 		// 4b. Retired drain where PinView fails with RPC_E_SERVER_DIED reports
 		//     mayBePinned=true and disconnected=true so the panel stays fenced.
 		{
+			// 4a2. UnpinView returning S_FALSE with an inconclusive IsViewPinned
+			//      recheck (S_FALSE on the recheck) reports Refused + mayBePinned=true
+			//      instead of falsely confirming Pinned.
+			pinned.pinned = TRUE;
+			pinned.unpinResult = S_FALSE;
+			auto queryCalls = std::make_shared<std::atomic<int>>(0);
+			pinned.beforeQuery = [queryCalls, &pinned] {
+				if (queryCalls->fetch_add(1) == 1) pinned.queryResult = S_FALSE;
+			};
+			const auto sFalseInconcIdx = pinDone.size();
+			quint64 reqSFalseInconc = 0;
+			QCOMPARE(unpinNativeDesktopOwnWindow(window, &reqSFalseInconc), OwnWindowPin::Pending);
+			QVERIFY(waitUntil(
+			    [&pinDone, sFalseInconcIdx] { return pinDone.size() == sFalseInconcIdx + 1; },
+			    1000
+			));
+			pinned.beforeQuery = {};
+			pinned.queryResult = S_OK;
+			pinned.unpinResult = S_OK;
+			QCOMPARE(pinDone.at(sFalseInconcIdx).at(0).toULongLong(), reqSFalseInconc);
+			QCOMPARE(pinDone.at(sFalseInconcIdx).at(2).value<OwnWindowPin>(), OwnWindowPin::Refused);
+			QCOMPARE(pinDone.at(sFalseInconcIdx).at(3).toBool(), true);
+		}
+		{
 			auto pinBlocked = std::make_shared<BlockingCall>();
 			Unblock unblockPin {pinBlocked};
 			pinned.pinned = FALSE;

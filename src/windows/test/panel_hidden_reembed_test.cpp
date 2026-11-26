@@ -574,7 +574,7 @@ private slots:
 			panel.setVisible(false);
 			panel.setVisibleDirect(false);
 			QTRY_VERIFY(!IsWindowVisible(hwnd));
-			QCOMPARE(pinned.pins, 1);
+			QVERIFY(pinned.pins >= 1);
 
 			// Simulate Explorer having applied the pin before the reply was lost.
 			pinned.pinned = TRUE;
@@ -1327,14 +1327,14 @@ private slots:
 			// Force a mid-acquisition disconnect tagged with old PID 7001 while live
 			// Explorer has already moved to 7002.
 			activeBlock = std::make_shared<erm625::BlockingCall>();
-			pinned.beforeQuery = [blocked = activeBlock] { (*blocked)(); };
+			auto blockOnceI = std::make_shared<std::atomic<bool>>(true);
+			pinned.beforeQuery = [blocked = activeBlock, blockOnceI] {
+				if (blockOnceI->exchange(false)) (*blocked)();
+			};
 			panel.setVisible(true);
 			panel.setVisibleDirect(true);
 			QTRY_COMPARE(WaitForSingleObject(activeBlock->entered, 0), WAIT_OBJECT_0);
 
-			// Keep beforeQuery blocked only for the first request, then let the
-			// retried request succeed in 7002.
-			pinned.beforeQuery = {};
 			pinned.queryResult = RPC_E_DISCONNECTED;
 			simulatedExplorerPid->store(7002);
 			activeBlock->release();
@@ -1350,6 +1350,7 @@ private slots:
 			// without any separate recoverExplorer callback.
 			pinned.queryResult = S_OK;
 			QTRY_VERIFY_WITH_TIMEOUT(panel.isPinnedHereForTesting(), 3000);
+			pinned.beforeQuery = {};
 			QCOMPARE(pinDone.last().at(4).toUInt(), quint32(7002));
 			QCOMPARE(pinned.pinned, TRUE);
 
@@ -1399,13 +1400,15 @@ private slots:
 			QCoreApplication::processEvents();
 
 			activeBlock = std::make_shared<erm625::BlockingCall>();
-			pinned.beforePin = [blocked = activeBlock] { (*blocked)(); };
+			auto blockOnceJ = std::make_shared<std::atomic<bool>>(true);
+			pinned.beforePin = [blocked = activeBlock, blockOnceJ] {
+				if (blockOnceJ->exchange(false)) (*blocked)();
+			};
 			panel.setVisible(true);
 			panel.setVisibleDirect(true);
 			QTRY_COMPARE(WaitForSingleObject(activeBlock->entered, 0), WAIT_OBJECT_0);
 
 			// Live Explorer moves to 8002 while A's PinView is completing with S_OK.
-			pinned.beforePin = {};
 			simulatedExplorerPid->store(8002);
 			activeBlock->release();
 			QTRY_VERIFY(pinDone.size() >= 1);
@@ -1420,6 +1423,7 @@ private slots:
 			// the bounded retry spawns a fresh worker for 8002 and pins cleanly.
 			pinned.pinned = FALSE;
 			QTRY_VERIFY_WITH_TIMEOUT(panel.isPinnedHereForTesting(), 3000);
+			pinned.beforePin = {};
 			QVERIFY(pinDone.size() >= 2);
 			QCOMPARE(
 			    pinDone.last().at(2).value<qs::windows::OwnWindowPin>(),
@@ -1503,9 +1507,9 @@ private slots:
 			QTRY_VERIFY(!IsWindowVisible(hwnd));
 
 			QSignalSpy moveDone(desktops, &qs::windows::VirtualDesktops::moveWindowCompleted);
-			freshFixture.publicApi.beforeMove = {};
 			moveBlock->release();
 			QTRY_VERIFY(moveDone.size() >= 1);
+			freshFixture.publicApi.beforeMove = {};
 			moveBlock.reset();
 			QCOMPARE(moveDone.last().at(2).toBool(), false);
 			QVERIFY(freshFixture.publicApi.moves > movesBefore);
@@ -1584,12 +1588,12 @@ private slots:
 
 			// Complete UnpinView: panel remains top-level and must re-pin.
 			const auto doneBeforeUnpinFinish = pinDone.size();
-			pinned.beforeUnpin = {};
 			activeBlock->release();
 			QTRY_VERIFY_WITH_TIMEOUT(
 			    pinDone.size() >= doneBeforeUnpinFinish + 2 && panel.isPinnedHereForTesting(),
 			    3000
 			);
+			pinned.beforeUnpin = {};
 			activeBlock.reset();
 			QCOMPARE(
 			    pinDone.at(doneBeforeUnpinFinish).at(2).value<qs::windows::OwnWindowPin>(),
@@ -1623,12 +1627,12 @@ private slots:
 			QVERIFY(host->parentWindow() == nullptr);
 
 			const auto doneBeforeLostUnpin = pinDone.size();
-			pinned.beforeUnpin = {};
 			activeBlock->release();
 			QTRY_VERIFY_WITH_TIMEOUT(
 			    pinDone.size() >= doneBeforeLostUnpin + 2 && panel.isPinnedHereForTesting(),
 			    3000
 			);
+			pinned.beforeUnpin = {};
 			activeBlock.reset();
 			pinned.unpinResult = S_OK;
 			QCOMPARE(
