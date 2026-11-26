@@ -381,6 +381,7 @@ public:
 					    return;
 				    }
 				    if (panelNeedsRetry) {
+					    stack->mFollowNeedsFailureRetry = true;
 					    stack->mFollowRetryTimer.start(FOLLOW_RETRY_MS);
 					    return;
 				    }
@@ -494,7 +495,8 @@ public:
 		auto needsBusyRetry = false;
 		auto needsFailureRetry = false;
 		auto anyPending = false;
-		QList<WinPanelWindow*> candidates;
+		this->mFollowNeedsFailureRetry = false;
+		QList<QPointer<WinPanelWindow>> candidates;
 		candidates.reserve(this->mPanels.size());
 
 		for (auto* panel: this->mPanels) {
@@ -556,7 +558,8 @@ public:
 		std::stable_sort(
 		    candidates.begin(),
 		    candidates.end(),
-		    [](const WinPanelWindow* a, const WinPanelWindow* b) {
+		    [](const QPointer<WinPanelWindow>& a, const QPointer<WinPanelWindow>& b) {
+			    if (a == nullptr || b == nullptr) return a != nullptr;
 			    if (a->followFailureCount != b->followFailureCount) {
 				    return a->followFailureCount < b->followFailureCount;
 			    }
@@ -564,7 +567,9 @@ public:
 		    }
 		);
 
-		for (auto* panel: candidates) {
+		for (const auto& guard: candidates) {
+			auto* panel = guard.data();
+			if (panel == nullptr || !this->mPanels.contains(panel)) continue;
 			auto* hwnd = panel->hwnd();
 			if (hwnd == nullptr || panel->isEmbedded() || panel->pinnedHere(hwnd)) {
 				panel->followWaitingBusy = false;
@@ -574,9 +579,12 @@ public:
 			QString failureReason;
 			GUID targetId {};
 			auto pendingRegistered = false;
-			QPointer<WinPanelWindow> guard(panel);
 			const auto registerPending = [&](quint64 seq) {
-				if (guard == nullptr) return;
+				if (guard == nullptr || !this->mPanels.contains(guard.data())
+				    || guard->hwnd() != hwnd || guard->isEmbedded() || guard->pinnedHere(hwnd))
+				{
+					return;
+				}
 				const auto resolvedId = !isNullGuid(targetId) ? targetId : currentId;
 				guard->pendingFollowMoveSeq = seq;
 				guard->pendingFollowMoveHwnd = hwnd;
@@ -596,7 +604,11 @@ public:
 			        isNullGuid(currentId) ? std::nullopt : std::optional<GUID>(currentId)
 			    ))
 			{
-				if (guard == nullptr) continue;
+				if (guard == nullptr || !this->mPanels.contains(panel) || panel->hwnd() != hwnd
+				    || panel->isEmbedded() || panel->pinnedHere(hwnd))
+				{
+					continue;
+				}
 				panel->followWaitingBusy = false;
 				const auto resolvedId = !isNullGuid(targetId) ? targetId : currentId;
 				if (pendingSeq != 0) {
@@ -615,7 +627,7 @@ public:
 					panel->followFailureCount = 0;
 				}
 			} else {
-				if (guard == nullptr) continue;
+				if (guard == nullptr || !this->mPanels.contains(panel)) continue;
 				// Preserve any accepted move sequence so its completion can still
 				// be matched or discarded against its original target desktop.
 				if (panel->pendingFollowMoveHwnd != hwnd) panel->clearPendingFollowMove();
@@ -631,6 +643,7 @@ public:
 			}
 		}
 
+		needsFailureRetry = needsFailureRetry || this->mFollowNeedsFailureRetry;
 		this->mFollowNeedsFailureRetry = needsFailureRetry;
 		if (needsBusyRetry) {
 			const auto now = static_cast<qint64>(GetTickCount64());
@@ -1649,7 +1662,11 @@ void WinPanelWindow::stickToAllDesktops() {
 			auto pendingRegistered = false;
 			QPointer<WinPanelWindow> guard(this);
 			const auto registerPending = [&](quint64 seq) {
-				if (guard == nullptr) return;
+				if (guard == nullptr || guard->window == nullptr || !guard->window->isVisible()
+				    || guard->hwnd() != hwnd || guard->isEmbedded() || guard->pinnedHere(hwnd))
+				{
+					return;
+				}
 				const auto resolvedId = !isNullGuid(targetId) ? targetId : currentId;
 				guard->pendingFollowMoveSeq = seq;
 				guard->pendingFollowMoveHwnd = hwnd;
@@ -1669,7 +1686,11 @@ void WinPanelWindow::stickToAllDesktops() {
 			        isNullGuid(currentId) ? std::nullopt : std::optional<GUID>(currentId)
 			    ))
 			{
-				if (guard == nullptr) return;
+				if (guard == nullptr || this->window == nullptr || !this->window->isVisible()
+				    || this->hwnd() != hwnd || this->isEmbedded() || this->pinnedHere(hwnd))
+				{
+					return;
+				}
 				this->followWaitingBusy = false;
 				const auto resolvedId = !isNullGuid(targetId) ? targetId : currentId;
 				if (pendingSeq != 0) {
@@ -1683,7 +1704,11 @@ void WinPanelWindow::stickToAllDesktops() {
 					this->followFailureCount = 0;
 				}
 			} else {
-				if (guard == nullptr) return;
+				if (guard == nullptr || this->window == nullptr || !this->window->isVisible()
+				    || this->isEmbedded())
+				{
+					return;
+				}
 				if (this->pendingFollowMoveHwnd != hwnd) this->clearPendingFollowMove();
 				this->clearStuckFollowState();
 				if (failureReason == QStringLiteral("provider-busy")) {
