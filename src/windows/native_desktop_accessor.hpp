@@ -32,6 +32,7 @@ void requestNativeDesktopRefresh();
 [[nodiscard]] bool nativeDesktopRequestPending();
 [[nodiscard]] quint64 nativeDesktopSubmittedSequence();
 [[nodiscard]] quint64 nativeDesktopReadSequence();
+[[nodiscard]] quint64 nativeDesktopWindowReadSequence();
 [[nodiscard]] quint64 nativeDesktopCancelledSequence();
 [[nodiscard]] quint64 nativeDesktopFailedSwitchSequence();
 [[nodiscard]] HRESULT nativeDesktopFailedSwitchError();
@@ -52,6 +53,7 @@ std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop);
 // delivering the result to the pin observer), Busy if another pin is in flight,
 // or Unavailable when pinning is absent.
 [[nodiscard]] OwnWindowPin pinNativeDesktopOwnWindow(HWND hwnd, quint64* outRequestId = nullptr);
+void cancelNativeDesktopOwnWindowPin(quint64 requestId);
 void shutdownNativeDesktopAccessor();
 
 #ifdef QS_TEST

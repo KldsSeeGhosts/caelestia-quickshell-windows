@@ -416,6 +416,7 @@ struct Snapshot {
 	quint64 sequence = 0;
 	bool publicReady = false;
 	bool desktopRead = false;
+	bool windowRead = false;
 };
 
 struct Request {
@@ -426,6 +427,7 @@ struct Request {
 	std::function<int()> operation;
 	std::function<void()> completed;
 	QList<quintptr> windows;
+	bool queryWindows = false;
 	std::promise<Snapshot> completion;
 	Clock::time_point submitted = Clock::now();
 	std::atomic<Clock::duration::rep> started = 0;
@@ -547,6 +549,7 @@ struct Worker {
 				snapshot.error = p.lastError;
 				snapshot.publicReady = p.publicApi != nullptr;
 				snapshot.desktopRead = p.desktopRefreshed;
+				snapshot.windowRead = request->queryWindows;
 			} catch (...) {
 				snapshot.availability = DesktopAvailability::Disconnected;
 				snapshot.error = E_UNEXPECTED;
@@ -947,6 +950,7 @@ struct Channel {
 	quint64 pinSequence = 0;
 	quint64 applied = 0;
 	quint64 desktopReadApplied = 0;
+	quint64 windowReadApplied = 0;
 	quint64 cancelledCommandSequence = 0;
 	quint64 failedSwitchSequence = 0;
 	HRESULT failedSwitchError = S_OK;
@@ -1026,18 +1030,30 @@ struct Channel {
 		});
 	}
 
-	void retirePinWorker(bool disableOptional = false) {
+	void cancelPin(quint64 requestId) {
+		if (requestId == 0 || !this->pin || this->pin->requestId != requestId) return;
+		if (this->pin->request) this->pin->request->cancelled.store(true);
+	}
+
+	void retirePinWorker(
+	    bool disableOptional = false,
+	    OwnWindowPin fallbackOutcome = OwnWindowPin::Unavailable
+	) {
 		if (disableOptional) this->skipOptionalPinnedApps = true;
 		auto pendingPin = std::exchange(this->pin, std::nullopt);
 		if (pendingPin && pendingPin->request) pendingPin->request->cancelled.store(true);
 		if (auto previousPin = std::exchange(this->pinWorker, {})) previousPin->stop();
 		this->pinDeadline.stop();
 		if (pendingPin && pendingPin->target != nullptr) {
-			auto pinOutcome = OwnWindowPin::Unavailable;
+			auto pinOutcome = fallbackOutcome;
 			if (pendingPin->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
 				try {
 					auto value = pendingPin->result.get();
-					if (!value.disconnected && !value.optionalPinnedAppsFaulted) {
+					if (value.optionalPinnedAppsFaulted) {
+						pinOutcome = OwnWindowPin::Unavailable;
+					} else if (value.disconnected) {
+						pinOutcome = OwnWindowPin::Disconnected;
+					} else {
 						pinOutcome = value.result == 0
 						               ? OwnWindowPin::Pinned
 						               : (value.result == -2 ? OwnWindowPin::Unavailable
@@ -1057,7 +1073,7 @@ struct Channel {
 		this->refresh.reset();
 		this->deadline.stop();
 		this->pinUnavailable = false;
-		this->retirePinWorker(false);
+		this->retirePinWorker(false, OwnWindowPin::Disconnected);
 		this->snapshot.availability = DesktopAvailability::Disconnected;
 		this->snapshot.error = error;
 		// Keep the last desktop/window values as explicitly stale state.
@@ -1102,9 +1118,12 @@ struct Channel {
 	bool apply(Snapshot result) {
 		if (result.sequence < this->applied) return true;
 		this->applied = result.sequence;
-		if ((result.availability == DesktopAvailability::Available || result.publicReady)
-		    && result.windows != this->snapshot.windows)
-			++this->windowRevision;
+		if (result.availability == DesktopAvailability::Available || result.publicReady) {
+			if (result.windows != this->snapshot.windows) ++this->windowRevision;
+			if (result.windowRead && result.sequence > this->windowReadApplied) {
+				this->windowReadApplied = result.sequence;
+			}
+		}
 		if (result.availability != DesktopAvailability::Available) {
 			const auto state = result.availability;
 			const auto error = result.error;
@@ -1113,7 +1132,7 @@ struct Channel {
 				this->snapshot.availability = state;
 				this->snapshot.error = error;
 				this->pinUnavailable = false;
-				this->retirePinWorker(false);
+				this->retirePinWorker(false, OwnWindowPin::Disconnected);
 				this->recovery.disconnected();
 				return false;
 			}
@@ -1159,6 +1178,7 @@ struct Channel {
 		if (outSequence) *outSequence = request->sequence;
 		request->operation = std::move(operation);
 		request->completed = [this] { this->wakeOnCompletion(); };
+		request->queryWindows = queryWindows;
 		if (queryWindows) request->windows = this->watchedWindows.values();
 		auto result = owner->submit(request);
 		const auto guiDeadline = request->submitted + callBound;
@@ -1214,7 +1234,7 @@ struct Channel {
 			if (kind == Kind::Acquisition && available) {
 				++this->windowRevision;
 				this->pinUnavailable = false;
-				this->retirePinWorker(false);
+				this->retirePinWorker(false, OwnWindowPin::Disconnected);
 			}
 			return available || (publicOperation && publicReady) ? outcome : -1;
 		} catch (...) {
@@ -1381,6 +1401,7 @@ struct Channel {
 			return provider().privateEnabled ? (desktopCount() < 0 ? -1 : 0) : 0;
 		};
 		request->completed = [this] { this->wakeOnCompletion(); };
+		request->queryWindows = true;
 		request->windows = this->watchedWindows.values();
 		this->refresh.emplace(Pending {request, this->worker->submit(request), Kind::Probe, true});
 		this->armDeadline();
@@ -1483,7 +1504,7 @@ struct Channel {
 			if (finished.kind == Kind::Acquisition && success && available) {
 				++this->windowRevision;
 				this->pinUnavailable = false;
-				this->retirePinWorker(false);
+				this->retirePinWorker(false, OwnWindowPin::Disconnected);
 				this->recovery.reset();
 				const auto owner = this->worker;
 				if (this->context)
@@ -1541,11 +1562,11 @@ struct Channel {
 					qCWarning(logNativeDesktops)
 					    << "Optional desktop pinning disconnected, HRESULT" << Qt::hex << value.error
 					    << "; retiring pin worker without interrupting desktop control";
-					this->retirePinWorker(false);
+					this->retirePinWorker(false, OwnWindowPin::Disconnected);
 					this->notifyPinCompleted(
 					    finished.requestId,
 					    finished.target,
-					    OwnWindowPin::Unavailable
+					    OwnWindowPin::Disconnected
 					);
 					return;
 				}
@@ -1760,6 +1781,7 @@ bool nativeDesktopRequestPending() {
 }
 quint64 nativeDesktopSubmittedSequence() { return channel().sequence; }
 quint64 nativeDesktopReadSequence() { return channel().desktopReadApplied; }
+quint64 nativeDesktopWindowReadSequence() { return channel().windowReadApplied; }
 quint64 nativeDesktopCancelledSequence() { return channel().cancelledCommandSequence; }
 quint64 nativeDesktopFailedSwitchSequence() { return channel().failedSwitchSequence; }
 HRESULT nativeDesktopFailedSwitchError() { return channel().failedSwitchError; }
@@ -1842,6 +1864,7 @@ std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop) {
 OwnWindowPin pinNativeDesktopOwnWindow(HWND hwnd, quint64* outRequestId) {
 	return channel().requestPin(hwnd, outRequestId);
 }
+void cancelNativeDesktopOwnWindowPin(quint64 requestId) { channel().cancelPin(requestId); }
 void shutdownNativeDesktopAccessor() { channel().shutdown(); }
 
 #ifdef QS_TEST
@@ -1869,6 +1892,7 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.pinUnavailable = false;
 	p.applied = 0;
 	p.desktopReadApplied = 0;
+	p.windowReadApplied = 0;
 	p.cancelledCommandSequence = 0;
 	p.failedSwitchSequence = 0;
 	p.failedSwitchError = S_OK;

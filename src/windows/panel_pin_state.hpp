@@ -20,6 +20,7 @@ struct PanelPinState {
 	// Hard ceiling across consecutive slot handoffs.
 	static constexpr qint64 MAX_TOTAL_BUSY_WAIT_MS = 30000;
 	static constexpr int BUSY_RETRY_MS = 200;
+	static constexpr int MAX_DISCONNECT_RETRIES = 3;
 
 	enum class SubmitAction : quint8 {
 		None,
@@ -33,6 +34,7 @@ struct PanelPinState {
 		FallbackLegacy,
 		TriggerFollow,
 		RetryImmediate,
+		RetryLater,
 	};
 
 	quint64 generation = 0;
@@ -42,6 +44,7 @@ struct PanelPinState {
 	HWND inFlightHwnd = nullptr;
 	quint64 inFlightGeneration = 0;
 	quint64 inFlightRequestId = 0;
+	int disconnectRetries = 0;
 	std::optional<qint64> busySinceMs;
 	std::optional<qint64> firstBusyMs;
 	bool pinned = false;
@@ -67,6 +70,7 @@ struct PanelPinState {
 			this->pinnedHwnd = nullptr;
 			this->failedHwnd = nullptr;
 			this->attemptHwnd = nullptr;
+			this->disconnectRetries = 0;
 		}
 	}
 
@@ -133,6 +137,15 @@ struct PanelPinState {
 			this->applyResult(hwnd, expectedGeneration, false);
 			return SubmitAction::TriggerFollow;
 		}
+		case OwnWindowPin::Disconnected:
+			this->busySinceMs.reset();
+			this->firstBusyMs.reset();
+			if (this->disconnectRetries < MAX_DISCONNECT_RETRIES) {
+				++this->disconnectRetries;
+				return SubmitAction::RetryLater;
+			}
+			this->applyResult(hwnd, expectedGeneration, false);
+			return SubmitAction::TriggerFollow;
 		case OwnWindowPin::Refused:
 			this->busySinceMs.reset();
 			this->firstBusyMs.reset();
@@ -189,6 +202,19 @@ struct PanelPinState {
 			this->applyResult(completedHwnd, gen, true);
 			return CompletionAction::None;
 		}
+		if (result == OwnWindowPin::Disconnected) {
+			if (!accessorLoaded) {
+				// Desktop provider also disconnected: leave failedHwnd unset so
+				// onDesktopAccessorReady() retries pinning after recovery.
+				return CompletionAction::TriggerFollow;
+			}
+			if (this->disconnectRetries < MAX_DISCONNECT_RETRIES) {
+				++this->disconnectRetries;
+				return CompletionAction::RetryLater;
+			}
+			this->applyResult(completedHwnd, gen, false);
+			return CompletionAction::TriggerFollow;
+		}
 		if (result == OwnWindowPin::Unavailable) {
 			if (accessorLoaded) return CompletionAction::FallbackLegacy;
 			// Provider disconnected mid-pin: leave failedHwnd unset so
@@ -204,6 +230,7 @@ struct PanelPinState {
 		this->pinned = isPinned;
 		this->pinnedHwnd = isPinned ? hwnd : nullptr;
 		this->failedHwnd = isPinned ? nullptr : hwnd;
+		if (isPinned) this->disconnectRetries = 0;
 		return true;
 	}
 };

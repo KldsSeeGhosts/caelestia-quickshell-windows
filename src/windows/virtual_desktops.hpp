@@ -21,10 +21,12 @@ namespace qs::windows {
 
 // Result of pinning one of the shell's own windows to every desktop.
 // Pending means the native pin was submitted asynchronously and will finish via
-// ownWindowPinCompleted(). Unavailable means the native pinning service is
+// ownWindowPinCompleted(). Disconnected means a transient pin-worker RPC
+// disconnect occurred while desktop control remained available; callers may
+// retry with bounded backoff. Unavailable means the native pinning service is
 // absent, so a caller may fall back to the accessor table (tests) or follow the
 // current desktop.
-enum class OwnWindowPin : quint8 { Pinned, Pending, Refused, Busy, Unavailable };
+enum class OwnWindowPin : quint8 { Pinned, Pending, Refused, Busy, Disconnected, Unavailable };
 
 class RegistryWatcher: public QThread {
 	Q_OBJECT;
@@ -91,6 +93,8 @@ public:
 	[[nodiscard]] GUID windowDesktopId(HWND hwnd) const;
 	[[nodiscard]] qsizetype windowDesktopIndex(HWND hwnd) const;
 	[[nodiscard]] bool isWindowOnCurrent(HWND hwnd) const;
+	[[nodiscard]] quint64 windowReadSequence() const;
+	[[nodiscard]] quint64 submittedSequence() const;
 
 	[[nodiscard]] int workspaceLimit() const { return this->mWorkspaceLimit; }
 	void setWorkspaceLimit(int count) { this->mWorkspaceLimit = qBound(1, count, 20); }
@@ -124,6 +128,7 @@ public:
 	// Own panels only. Never exposed as Hyprland pin support, so toplevel
 	// queries keep reading cached state instead of waiting on COM.
 	OwnWindowPin pinOwnWindow(HWND hwnd, quint64* outRequestId = nullptr);
+	void cancelOwnWindowPin(quint64 requestId);
 	[[nodiscard]] std::optional<bool> isWindowPinned(HWND hwnd) const;
 	[[nodiscard]] DesktopAvailability availability() const;
 	[[nodiscard]] bool supports(DesktopOperation operation) const;

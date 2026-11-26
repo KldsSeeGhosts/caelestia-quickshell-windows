@@ -583,6 +583,14 @@ bool VirtualDesktops::isWindowOnCurrent(HWND hwnd) const {
 	return nativeWindowOnCurrentDesktop(hwnd) != 0;
 }
 
+quint64 VirtualDesktops::windowReadSequence() const {
+	return this->nativeAccessor ? nativeDesktopWindowReadSequence() : 0;
+}
+
+quint64 VirtualDesktops::submittedSequence() const {
+	return this->nativeAccessor ? nativeDesktopSubmittedSequence() : 0;
+}
+
 void VirtualDesktops::sendShortcut(WORD key, int times) const {
 	// Unreachable by design. Desktop control must never synthesize Ctrl+Win
 	// chords: an unmodified Win+D degrades into the show-desktop effect. The
@@ -1207,6 +1215,11 @@ OwnWindowPin VirtualDesktops::pinOwnWindow(HWND hwnd, quint64* outRequestId) {
 	if (hwnd == nullptr || !this->nativeAccessor || !isOwnWindow(hwnd))
 		return OwnWindowPin::Unavailable;
 	return pinNativeDesktopOwnWindow(hwnd, outRequestId);
+}
+
+void VirtualDesktops::cancelOwnWindowPin(quint64 requestId) {
+	if (requestId == 0 || !this->nativeAccessor) return;
+	cancelNativeDesktopOwnWindowPin(requestId);
 }
 
 std::optional<bool> VirtualDesktops::isWindowPinned(HWND hwnd) const {

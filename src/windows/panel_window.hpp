@@ -285,13 +285,25 @@ private:
 	void clearPendingFollowMove() {
 		this->pendingFollowMoveSeq = 0;
 		this->pendingFollowMoveHwnd = nullptr;
+		this->pendingFollowMoveDesktopId = {};
 		this->pendingFollowMoveDesktop = -1;
 	}
+	void clearStuckFollowState() {
+		this->stuckHwnd = nullptr;
+		this->stuckDesktopId = {};
+		this->stuckDesktop = -1;
+		this->stuckConfirmSeq = 0;
+	}
 	HWND stuckHwnd = nullptr;
+	GUID stuckDesktopId {};
 	qsizetype stuckDesktop = -1;
+	quint64 stuckConfirmSeq = 0;
 	quint64 pendingFollowMoveSeq = 0;
 	HWND pendingFollowMoveHwnd = nullptr;
+	GUID pendingFollowMoveDesktopId {};
 	qsizetype pendingFollowMoveDesktop = -1;
+	HWND followAttemptHwnd = nullptr;
+	int followFailureCount = 0;
 
 	HWND mEmbedParent = nullptr;
 	HWND mEmbedInsertAfter = nullptr;
