@@ -232,6 +232,78 @@ private slots:
 		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
 	}
 
+	void initialGeometryIsPlacedSynchronously() {
+		auto* primary = QGuiApplication::primaryScreen();
+		QVERIFY(primary != nullptr);
+		QuickshellScreenInfo screenInfo(nullptr, primary);
+		qs::windows::WinPanelWindow panel;
+		panel.setLayer(qs::windows::PanelLayer::Overlay);
+		panel.setExclusionMode(ExclusionMode::Ignore);
+		panel.setScreen(&screenInfo);
+
+		Anchors anchors;
+		anchors.mLeft = true;
+		anchors.mTop = true;
+		panel.setAnchors(anchors);
+		Margins margins;
+		margins.left = 24;
+		margins.top = 36;
+		panel.setMargins(margins);
+		panel.setImplicitWidth(240);
+		panel.setImplicitHeight(170);
+
+		panel.createWindow();
+		auto* window = panel.backingWindow();
+		QVERIFY(window != nullptr);
+		const QRect expected(primary->geometry().x() + 24, primary->geometry().y() + 36, 240, 170);
+		QCOMPARE(window->geometry(), expected);
+
+		panel.deleteWindow();
+		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+	}
+
+	void sameTurnGeometryPropertiesCoalesce() {
+		auto* primary = QGuiApplication::primaryScreen();
+		QVERIFY(primary != nullptr);
+		QuickshellScreenInfo screenInfo(nullptr, primary);
+		qs::windows::WinPanelWindow panel;
+		panel.setLayer(qs::windows::PanelLayer::Overlay);
+		panel.setExclusionMode(ExclusionMode::Ignore);
+		panel.setScreen(&screenInfo);
+
+		Anchors anchors;
+		anchors.mLeft = true;
+		anchors.mTop = true;
+		panel.setAnchors(anchors);
+		panel.setImplicitWidth(240);
+		panel.setImplicitHeight(170);
+		panel.createWindow();
+
+		auto* window = panel.backingWindow();
+		QVERIFY(window != nullptr);
+		auto* hwnd = reinterpret_cast<HWND>(window->winId());
+		QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+		QCoreApplication::processEvents();
+
+		const auto updatesBefore = panel.dimensionUpdatesForTesting();
+		const auto placementsBefore = panel.geometryPlacementsForTesting();
+		Margins margins;
+		margins.left = 31;
+		margins.top = 42;
+		panel.setMargins(margins);
+		panel.setImplicitWidth(260);
+		panel.setImplicitHeight(180);
+
+		QCOMPARE(panel.dimensionUpdatesForTesting(), updatesBefore);
+		QTRY_COMPARE(panel.dimensionUpdatesForTesting(), updatesBefore + 1);
+		QCOMPARE(panel.geometryPlacementsForTesting(), placementsBefore + 1);
+		const QRect expected(primary->geometry().x() + 31, primary->geometry().y() + 42, 260, 180);
+		QCOMPARE(window->geometry(), expected);
+
+		panel.deleteWindow();
+		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+	}
+
 	// excludeFromCapture is the QML-facing property on the production panel. The
 	// window is created but never shown, so this touches no visible window and
 	// needs no desktop host.

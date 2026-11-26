@@ -2330,6 +2330,10 @@ void WinPanelWindow::updateDimensions() { this->updateDimensions(MonitorRects {}
 void WinPanelWindow::updateDimensions(const MonitorRects& nativeRects) {
 	if (this->window == nullptr || this->mTrackedScreen == nullptr) return;
 
+#ifdef QS_TEST
+	++this->dimensionUpdateCount;
+#endif
+
 	auto* screen = this->mTrackedScreen.data();
 	auto screenGeometry = screen->geometry();
 	auto availableGeometry = screen->availableGeometry();
@@ -2429,6 +2433,9 @@ void WinPanelWindow::updateDimensions(const MonitorRects& nativeRects) {
 	if (this->window->geometry() != geometry) {
 		qCDebug(logPanel) << "Placing" << this << "at" << geometry << "on"
 		                  << qs::windows::logId(screenName(screen));
+#ifdef QS_TEST
+		++this->geometryPlacementCount;
+#endif
 		this->window->setGeometry(geometry);
 	}
 

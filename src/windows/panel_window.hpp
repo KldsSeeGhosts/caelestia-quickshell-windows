@@ -158,6 +158,8 @@ public:
 	// handback regression asserts a parent change requests a frame, and that a
 	// hidden panel is never shown just to do it.
 	[[nodiscard]] int presentResetsForTesting() const { return this->presentResetCount; }
+	[[nodiscard]] int dimensionUpdatesForTesting() const { return this->dimensionUpdateCount; }
+	[[nodiscard]] int geometryPlacementsForTesting() const { return this->geometryPlacementCount; }
 	bool recoverExplorerForTesting(HWND taskbar, DWORD pid, DWORD thread) {
 		return this->recoverExplorer(taskbar, pid, thread);
 	}
@@ -412,6 +414,8 @@ private:
 	bool visibleWhenDestroyed = false;
 #ifdef QS_TEST
 	int presentResetCount = 0;
+	int dimensionUpdateCount = 0;
+	int geometryPlacementCount = 0;
 #endif
 
 	QVariantAnimation* mAnimation = nullptr;
