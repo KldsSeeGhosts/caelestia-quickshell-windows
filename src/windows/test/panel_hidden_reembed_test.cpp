@@ -760,6 +760,109 @@ private slots:
 		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
 	}
 
+	void immediateHideDuringCloseFlushCancelsAnimatedClose() {
+		BOOL clientAreaAnimations = TRUE;
+		if (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &clientAreaAnimations, 0) != 0
+		    && clientAreaAnimations == FALSE)
+		{
+			QSKIP("Client-area animations are disabled on this machine.");
+		}
+
+		QTemporaryDir rulesRoot;
+		QVERIFY(rulesRoot.isValid());
+		QVERIFY(QDir().mkpath(rulesRoot.filePath(QStringLiteral("defaults/windows"))));
+		QFile rulesFile(rulesRoot.filePath(QStringLiteral("defaults/windows/layerrules.json")));
+		QVERIFY(rulesFile.open(QIODevice::WriteOnly));
+		rulesFile.write(
+		    R"json({"enable":true,"rules":[{"namespace":"geometry-close-immediate-hide","animation":"slide bottom"}]})json"
+		);
+		rulesFile.close();
+
+		auto* blurManager = qs::windows::BlurManager::instance();
+		QVERIFY(blurManager != nullptr);
+		blurManager->setShellDir(rulesRoot.path());
+		blurManager->setPanelAnimations(true);
+		blurManager->setExpressiveAnimations(false);
+		QVERIFY(blurManager->ruleFor(QStringLiteral("geometry-close-immediate-hide")).animation.animates());
+
+		auto* primary = QGuiApplication::primaryScreen();
+		QVERIFY(primary != nullptr);
+		QuickshellScreenInfo screenInfo(nullptr, primary);
+		qs::windows::WinPanelWindow panel;
+		panel.setNamespace(QStringLiteral("geometry-close-immediate-hide"));
+		panel.setLayer(qs::windows::PanelLayer::Overlay);
+		panel.setExclusionMode(ExclusionMode::Ignore);
+		panel.setColor(Qt::transparent);
+		panel.setScreen(&screenInfo);
+
+		Anchors anchors;
+		anchors.mLeft = true;
+		anchors.mTop = true;
+		panel.setAnchors(anchors);
+		panel.setImplicitWidth(240);
+		panel.setImplicitHeight(170);
+		panel.createWindow();
+
+		auto* window = panel.backingWindow();
+		QVERIFY(window != nullptr);
+		auto* hwnd = reinterpret_cast<HWND>(window->winId());
+		QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+
+		panel.setVisible(true);
+		panel.setVisibleDirect(true);
+		QTRY_VERIFY(window->isExposed());
+		QTRY_VERIFY(qs::windows::startup::settled());
+		QCoreApplication::processEvents();
+		QCoreApplication::sendPostedEvents();
+		QCoreApplication::processEvents();
+
+		QSignalSpy visibleChanged(&panel, &qs::windows::WinPanelWindow::visibleChanged);
+		bool immediateHide = false;
+		bool immediateHideSawRunningUpdate = false;
+		QObject::connect(
+		    &panel,
+		    &qs::windows::WinPanelWindow::widthChanged,
+		    &panel,
+		    [&panel, &immediateHide, &immediateHideSawRunningUpdate]() {
+			    if (immediateHide) return;
+			    immediateHide = true;
+			    immediateHideSawRunningUpdate = panel.dimensionsUpdateRunningForTesting();
+			    panel.setGeometryChangeProbeForTesting({});
+
+			    // The opaque color disables close animations, so this nested close takes
+			    // the immediate-hide branch while the outer animated close is flushing.
+			    panel.setColor(Qt::black);
+			    panel.setVisible(false);
+			    panel.setVisibleDirect(false);
+		    }
+		);
+		panel.setGeometryChangeProbeForTesting([&panel] { emit panel.widthChanged(); });
+
+		panel.setImplicitWidth(320);
+		panel.setVisible(false);
+		panel.setVisibleDirect(false);
+
+		QVERIFY(immediateHide);
+		QVERIFY(immediateHideSawRunningUpdate);
+		QCOMPARE(panel.closeStartsForTesting(), 0);
+		QVERIFY(!panel.isVisibleDirect());
+		QVERIFY(!window->isVisible());
+		QVERIFY(!IsWindowVisible(hwnd));
+		QCOMPARE(visibleChanged.count(), 1);
+
+		QCoreApplication::processEvents();
+		QCoreApplication::sendPostedEvents();
+		QCoreApplication::processEvents();
+		QCOMPARE(panel.closeStartsForTesting(), 0);
+		QVERIFY(!panel.isVisibleDirect());
+		QVERIFY(!window->isVisible());
+		QVERIFY(!IsWindowVisible(hwnd));
+		QCOMPARE(visibleChanged.count(), 1);
+
+		panel.deleteWindow();
+		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+	}
+
 	// excludeFromCapture is the QML-facing property on the production panel. The
 	// window is created but never shown, so this touches no visible window and
 	// needs no desktop host.
