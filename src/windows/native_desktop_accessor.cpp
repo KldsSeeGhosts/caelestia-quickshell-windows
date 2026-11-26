@@ -1845,7 +1845,16 @@ struct Channel {
 	}
 
 	bool ensurePinWorker() {
-		if (this->pinWorker) return true;
+		if (this->pinWorker) {
+			const auto livePid = this->currentExplorerPid();
+			if (livePid != 0 && this->pinWorkerExplorerPid != 0
+			    && livePid != this->pinWorkerExplorerPid)
+			{
+				this->retirePinWorker(false, OwnWindowPin::Disconnected);
+			} else {
+				return true;
+			}
+		}
 		auto count = livePinWorkers().load();
 		do {
 			if (count >= workerLimit) return false;
@@ -2119,9 +2128,12 @@ struct Channel {
 			if (classified.explorerPid != 0 && this->pinWorker) {
 				this->pinWorkerExplorerPid = classified.explorerPid;
 			}
+			const auto livePid = this->currentExplorerPid();
+			const auto workerPidStale =
+			    livePid != 0 && explorerPid != 0 && livePid != explorerPid;
 			if (!wasDisabled && this->skipOptionalPinnedApps) {
 				this->retirePinWorker(true);
-			} else if (classified.retireDisconnected) {
+			} else if (classified.retireDisconnected || workerPidStale) {
 				this->retirePinWorker(false, OwnWindowPin::Disconnected);
 			}
 			this->notifyPinCompleted(

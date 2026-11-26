@@ -1358,6 +1358,81 @@ private slots:
 			host->setEnabled(false);
 			QCoreApplication::processEvents();
 		}
+
+		// Part J: If Explorer A returns a successful Pinned reply just as
+		// live Explorer B takes over (without an RPC disconnect), the stale A
+		// worker must retire on PID mismatch so the panel's retry spawns a fresh
+		// worker for B and pins in B instead of exhausting retries against A.
+		{
+			auto simulatedExplorerPid = std::make_shared<std::atomic<DWORD>>(8001);
+			qs::windows::setNativeDesktopExplorerPidForTest(
+			    [simulatedExplorerPid] { return simulatedExplorerPid->load(); }
+			);
+			struct ResetPid {
+				~ResetPid() { qs::windows::setNativeDesktopExplorerPidForTest({}); }
+			} resetPid;
+
+			pinned.pinned = FALSE;
+			pinned.pinResult = S_OK;
+			pinned.unpinResult = S_OK;
+			pinned.queryResult = S_OK;
+			pinned.pins = 0;
+			pinned.unpins = 0;
+
+			QSignalSpy pinDone(desktops, &qs::windows::VirtualDesktops::ownWindowPinCompleted);
+
+			qs::windows::WinPanelWindow panel;
+			panel.setLayer(qs::windows::PanelLayer::Top);
+			panel.setExclusionMode(ExclusionMode::Ignore);
+			panel.setScreen(&screenInfo);
+			panel.createWindow();
+
+			auto* window = panel.backingWindow();
+			QVERIFY(window != nullptr);
+			auto* hwnd = reinterpret_cast<HWND>(window->winId());
+			QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+			QVERIFY(SetWindowPos(
+			    hwnd, nullptr, -10000, -10000, 200, 100, SWP_NOACTIVATE | SWP_NOZORDER
+			));
+
+			QVERIFY(panel.recoverExplorerForTesting(m_hostA, 8001, 8001));
+			QCoreApplication::processEvents();
+
+			activeBlock = std::make_shared<erm625::BlockingCall>();
+			pinned.beforePin = [blocked = activeBlock] { (*blocked)(); };
+			panel.setVisible(true);
+			panel.setVisibleDirect(true);
+			QTRY_COMPARE(WaitForSingleObject(activeBlock->entered, 0), WAIT_OBJECT_0);
+
+			// Live Explorer moves to 8002 while A's PinView is completing with S_OK.
+			pinned.beforePin = {};
+			simulatedExplorerPid->store(8002);
+			activeBlock->release();
+			QTRY_VERIFY(pinDone.size() >= 1);
+			activeBlock.reset();
+			QCOMPARE(
+			    pinDone.at(0).at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Pinned
+			);
+			QCOMPARE(pinDone.at(0).at(4).toUInt(), quint32(8001));
+
+			// The stale 8001 reply is rejected and 8001's pin worker retires, so
+			// the bounded retry spawns a fresh worker for 8002 and pins cleanly.
+			pinned.pinned = FALSE;
+			QTRY_VERIFY_WITH_TIMEOUT(panel.isPinnedHereForTesting(), 3000);
+			QVERIFY(pinDone.size() >= 2);
+			QCOMPARE(
+			    pinDone.last().at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Pinned
+			);
+			QCOMPARE(pinDone.last().at(4).toUInt(), quint32(8002));
+			QCOMPARE(pinned.pinned, TRUE);
+
+			panel.deleteWindow();
+			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+			host->setEnabled(false);
+			QCoreApplication::processEvents();
+		}
 	}
 
 private:
