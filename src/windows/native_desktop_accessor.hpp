@@ -27,8 +27,9 @@ void setNativeDesktopPinObserver(
 );
 void setNativeDesktopPinDrainObserver(
     QObject* context,
-    std::function<void(HWND, bool)> onPinDrained
+    std::function<void(HWND, bool, bool)> onPinDrained
 );
+void setNativeDesktopCommandIdleObserver(QObject* context, std::function<void()> onCommandIdle);
 void requestNativeDesktopRefresh();
 [[nodiscard]] bool nativeDesktopCommandPending();
 [[nodiscard]] quint64 nativeDesktopPendingMoveSequence(HWND hwnd = nullptr);
@@ -57,6 +58,7 @@ std::optional<bool> moveNativeDesktopOwnWindow(HWND hwnd, GUID desktop);
 // delivering the result to the pin observer), Busy if another pin is in flight,
 // or Unavailable when pinning is absent.
 [[nodiscard]] OwnWindowPin pinNativeDesktopOwnWindow(HWND hwnd, quint64* outRequestId = nullptr);
+[[nodiscard]] OwnWindowPin unpinNativeDesktopOwnWindow(HWND hwnd, quint64* outRequestId = nullptr);
 void cancelNativeDesktopOwnWindowPin(quint64 requestId);
 void cancelNativeDesktopOwnWindowPinForHwnd(HWND hwnd);
 [[nodiscard]] bool nativeDesktopOwnWindowPinActive(HWND hwnd);

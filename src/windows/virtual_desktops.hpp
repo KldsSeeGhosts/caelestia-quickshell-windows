@@ -19,14 +19,24 @@
 
 namespace qs::windows {
 
-// Result of pinning one of the shell's own windows to every desktop.
-// Pending means the native pin was submitted asynchronously and will finish via
-// ownWindowPinCompleted(). Disconnected means a transient pin-worker RPC
-// disconnect occurred while desktop control remained available; callers may
-// retry with bounded backoff. Unavailable means the native pinning service is
-// absent, so a caller may fall back to the accessor table (tests) or follow the
-// current desktop.
-enum class OwnWindowPin : quint8 { Pinned, Pending, Refused, Busy, Disconnected, Unavailable };
+// Result of pinning or unpinning one of the shell's own windows across
+// desktops. Pending means the native operation was submitted asynchronously and
+// will finish via ownWindowPinCompleted(). Unpinned means the window was
+// confirmed not pinned in Explorer (via IsViewPinned == FALSE or UnpinView
+// returning S_OK). Disconnected means a transient pin-worker RPC disconnect
+// occurred while desktop control remained available; callers may retry with
+// bounded backoff. Unavailable means the native pinning service is absent, so a
+// caller may fall back to the accessor table (tests) or follow the current
+// desktop.
+enum class OwnWindowPin : quint8 {
+	Pinned,
+	Unpinned,
+	Pending,
+	Refused,
+	Busy,
+	Disconnected,
+	Unavailable,
+};
 
 class RegistryWatcher: public QThread {
 	Q_OBJECT;
@@ -128,6 +138,7 @@ public:
 	// Own panels only. Never exposed as Hyprland pin support, so toplevel
 	// queries keep reading cached state instead of waiting on COM.
 	OwnWindowPin pinOwnWindow(HWND hwnd, quint64* outRequestId = nullptr);
+	OwnWindowPin unpinOwnWindow(HWND hwnd, quint64* outRequestId = nullptr);
 	void cancelOwnWindowPin(quint64 requestId);
 	void cancelOwnWindowPinForHwnd(HWND hwnd);
 	[[nodiscard]] bool isOwnWindowPinActive(HWND hwnd) const;
@@ -172,7 +183,7 @@ signals:
 	void commandResult(QVariantMap result);
 	void moveWindowCompleted(quint64 sequence, quintptr hwnd, bool succeeded, QString reason);
 	void ownWindowPinCompleted(quint64 requestId, quintptr hwnd, qs::windows::OwnWindowPin result);
-	void ownWindowPinDrained(quintptr hwnd, bool stillPinned);
+	void ownWindowPinDrained(quintptr hwnd, bool stillPinned, bool confirmedUnpinned);
 	void desktopCommandIdle();
 
 private:

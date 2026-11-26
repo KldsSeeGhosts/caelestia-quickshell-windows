@@ -1245,6 +1245,14 @@ void WinPanelWindow::releaseNativeState() {
 
 	this->appBar.remove();
 	this->blur->release();
+	if (this->embedUnpinRequestId != 0) {
+		VirtualDesktops::instance()->cancelOwnWindowPin(this->embedUnpinRequestId);
+	}
+	this->embedWaitingForPinHwnd = nullptr;
+	this->embedUnpinRequestId = 0;
+	this->embedUnpinFailedHwnd = nullptr;
+	this->embedUnpinDisconnectRetries = 0;
+	this->mayBePinnedHwnd = nullptr;
 	this->resetPinState(true);
 	this->clearStuckFollowState();
 	this->clearPendingFollowMove();
@@ -1469,16 +1477,28 @@ void WinPanelWindow::schedulePinRetry(int delayMs) { this->pinRetryTimer.start(d
 
 void WinPanelWindow::finishPinAttempt(HWND hwnd, quint64 expectedGeneration, bool pinned) {
 	if (!this->pinState.applyResult(hwnd, expectedGeneration, pinned)) return;
-	if (!pinned) {
-		qCDebug(logPanel) << "Could not pin" << this
-		                  << "to all desktops; it will follow the current one";
-		WinPanelStack::instance()->followCurrentDesktop();
+	if (pinned) {
+		this->mayBePinnedHwnd = hwnd;
+		this->embedUnpinFailedHwnd = nullptr;
+		this->embedUnpinDisconnectRetries = 0;
+		return;
 	}
+	qCDebug(logPanel) << "Could not pin" << this
+	                  << "to all desktops; it will follow the current one";
+	WinPanelStack::instance()->followCurrentDesktop();
 }
 
 void WinPanelWindow::stickToAllDesktops() {
 	auto* hwnd = this->hwnd();
 	if (hwnd == nullptr || this->mEmbedParent != nullptr) {
+		if (this->embedUnpinRequestId != 0) {
+			VirtualDesktops::instance()->cancelOwnWindowPin(this->embedUnpinRequestId);
+		}
+		this->embedWaitingForPinHwnd = nullptr;
+		this->embedUnpinRequestId = 0;
+		this->embedUnpinFailedHwnd = nullptr;
+		this->embedUnpinDisconnectRetries = 0;
+		this->mayBePinnedHwnd = nullptr;
 		this->resetPinState(true);
 		this->clearStuckFollowState();
 		this->clearPendingFollowMove();
@@ -1487,9 +1507,23 @@ void WinPanelWindow::stickToAllDesktops() {
 		this->followWaitingBusy = false;
 		return;
 	}
+	if (this->mayBePinnedHwnd != nullptr && this->mayBePinnedHwnd != hwnd) {
+		this->mayBePinnedHwnd = nullptr;
+		this->embedUnpinFailedHwnd = nullptr;
+		this->embedUnpinDisconnectRetries = 0;
+	}
 	if (this->embedWaitingForPinHwnd != nullptr) {
-		if (this->embedWaitingForPinHwnd == hwnd) return;
+		if (this->embedWaitingForPinHwnd == hwnd) {
+			if (!this->wantsEmbedding() && this->embedUnpinRequestId != 0) {
+				VirtualDesktops::instance()->cancelOwnWindowPin(this->embedUnpinRequestId);
+			}
+			return;
+		}
+		if (this->embedUnpinRequestId != 0) {
+			VirtualDesktops::instance()->cancelOwnWindowPin(this->embedUnpinRequestId);
+		}
 		this->embedWaitingForPinHwnd = nullptr;
+		this->embedUnpinRequestId = 0;
 	}
 	if (this->pinnedHere(hwnd)) {
 		this->followWaitingBusy = false;
@@ -1610,6 +1644,11 @@ void WinPanelWindow::attemptPin(quint64 expectedGeneration) {
 	// each one back afterwards, which shows the bare desktop meanwhile.
 	quint64 requestId = 0;
 	const auto pinResult = desktops->pinOwnWindow(hwnd, &requestId);
+	if (pinResult == OwnWindowPin::Pinned) {
+		this->mayBePinnedHwnd = hwnd;
+		this->embedUnpinFailedHwnd = nullptr;
+		this->embedUnpinDisconnectRetries = 0;
+	}
 	const auto nowMs = static_cast<qint64>(GetTickCount64());
 	const auto action =
 	    this->pinState.onSubmitResult(hwnd, expectedGeneration, pinResult, nowMs, requestId);
@@ -1644,35 +1683,81 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 	const auto visible = this->window != nullptr && this->window->isVisible();
 	const auto embedded = this->mEmbedParent != nullptr;
 	auto* desktops = VirtualDesktops::instance();
-	if (completedHwnd != nullptr && completedHwnd == currentHwnd && !embedded
-	    && result == OwnWindowPin::Pinned)
-	{
-		// Preserve an unresolved pin even if hide or embed cancellation cleared
-		// inFlightRequestId before the worker finished.
-		this->pinState.pinned = true;
-		this->pinState.pinnedHwnd = currentHwnd;
-		this->pinState.failedHwnd = nullptr;
-		this->pinState.disconnectRetries = 0;
+	if (completedHwnd != nullptr && completedHwnd == currentHwnd && !embedded) {
+		if (result == OwnWindowPin::Pinned) {
+			// Preserve an unresolved pin even if hide or embed cancellation cleared
+			// inFlightRequestId before the worker finished.
+			this->mayBePinnedHwnd = currentHwnd;
+			this->pinState.pinned = true;
+			this->pinState.pinnedHwnd = currentHwnd;
+			this->pinState.failedHwnd = nullptr;
+			this->pinState.disconnectRetries = 0;
+		} else if (result == OwnWindowPin::Unpinned) {
+			if (this->mayBePinnedHwnd == currentHwnd) this->mayBePinnedHwnd = nullptr;
+			if (this->pinState.pinnedHwnd == currentHwnd) {
+				this->pinState.pinned = false;
+				this->pinState.pinnedHwnd = nullptr;
+			}
+			this->embedUnpinFailedHwnd = nullptr;
+			this->embedUnpinDisconnectRetries = 0;
+		}
 	}
-	if (this->embedWaitingForPinHwnd != nullptr && this->embedWaitingForPinHwnd == completedHwnd) {
-		if (desktops->isOwnWindowPinActive(completedHwnd)) {
-			// Retirement notified early while the old pin worker is still running:
-			// keep the embedding fence until onOwnWindowPinDrained confirms exit.
+	if (this->embedWaitingForPinHwnd != nullptr) {
+		if (this->embedWaitingForPinHwnd == completedHwnd) {
+			if (desktops->isOwnWindowPinActive(completedHwnd)) {
+				// Retirement notified early while the old pin worker is still running:
+				// keep the embedding fence until onOwnWindowPinDrained confirms exit.
+				return;
+			}
+			const auto wasOurUnpin =
+			    this->embedUnpinRequestId != 0 && requestId == this->embedUnpinRequestId;
+			if (wasOurUnpin) {
+				this->embedUnpinRequestId = 0;
+				this->embedWaitingForPinHwnd = nullptr;
+				if (result == OwnWindowPin::Unpinned) {
+					if (this->wantsEmbedding()) {
+						this->updateEmbedding();
+						this->scheduleUpdateDimensions();
+					} else if (visible && !embedded) {
+						this->stickToAllDesktops();
+					}
+				} else if (result == OwnWindowPin::Disconnected) {
+					if (desktops->accessorLoaded()
+					    && this->embedUnpinDisconnectRetries < PanelPinState::MAX_DISCONNECT_RETRIES)
+					{
+						++this->embedUnpinDisconnectRetries;
+						this->embedWaitingForPinHwnd = completedHwnd;
+						this->retryEmbedding();
+					} else if (desktops->accessorLoaded()) {
+						this->embedUnpinFailedHwnd = completedHwnd;
+						qCWarning(logPanel) << "Deferring desktop embedding for" << this
+						                    << "because unpinning disconnected repeatedly";
+					}
+				} else if (result != OwnWindowPin::Unavailable || desktops->accessorLoaded()) {
+					this->embedUnpinFailedHwnd = completedHwnd;
+					qCWarning(logPanel) << "Deferring desktop embedding for" << this
+					                    << "because window could not be unpinned";
+				}
+				return;
+			}
+			this->embedWaitingForPinHwnd = nullptr;
+			if (this->wantsEmbedding()) {
+				this->updateEmbedding();
+				this->scheduleUpdateDimensions();
+			} else if (visible && !embedded) {
+				this->stickToAllDesktops();
+			}
 			return;
 		}
-		this->embedWaitingForPinHwnd = nullptr;
-		if (result == OwnWindowPin::Pinned || this->pinState.pinnedHere(completedHwnd)) {
-			qCWarning(logPanel) << "Deferring desktop embedding for" << this
-			                    << "because pin cancellation did not confirm unpin";
-			return;
-		}
-		if (this->wantsEmbedding()) {
+		if (this->embedUnpinRequestId == 0
+		    && !desktops->isOwnWindowPinActive(this->embedWaitingForPinHwnd) && this->wantsEmbedding())
+		{
+			// Another panel freed the pin worker slot while we waited to submit an unpin.
+			this->embedWaitingForPinHwnd = nullptr;
 			this->updateEmbedding();
 			this->scheduleUpdateDimensions();
-		} else if (visible && !embedded) {
-			this->stickToAllDesktops();
+			return;
 		}
-		return;
 	}
 	const auto gen = this->pinState.generation;
 
@@ -1706,55 +1791,95 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 	}
 }
 
-void WinPanelWindow::onOwnWindowPinDrained(quintptr hwndValue, bool stillPinned) {
+void WinPanelWindow::onOwnWindowPinDrained(
+    quintptr hwndValue,
+    bool stillPinned,
+    bool confirmedUnpinned
+) {
 	auto* drainedHwnd = reinterpret_cast<HWND>(hwndValue);
 	auto* currentHwnd = this->hwnd();
 	auto* desktops = VirtualDesktops::instance();
-	if (stillPinned && drainedHwnd != nullptr && drainedHwnd == currentHwnd
-	    && this->mEmbedParent == nullptr)
+	if (drainedHwnd != nullptr && drainedHwnd == currentHwnd && this->mEmbedParent == nullptr) {
+		if (stillPinned) {
+			this->mayBePinnedHwnd = currentHwnd;
+			this->pinState.pinned = true;
+			this->pinState.pinnedHwnd = currentHwnd;
+			this->pinState.failedHwnd = nullptr;
+			this->pinState.disconnectRetries = 0;
+		} else if (confirmedUnpinned) {
+			if (this->mayBePinnedHwnd == currentHwnd) this->mayBePinnedHwnd = nullptr;
+			if (this->pinState.pinnedHwnd == currentHwnd) {
+				this->pinState.pinned = false;
+				this->pinState.pinnedHwnd = nullptr;
+			}
+			this->embedUnpinFailedHwnd = nullptr;
+			this->embedUnpinDisconnectRetries = 0;
+		}
+	}
+	if (this->embedWaitingForPinHwnd != nullptr && this->embedWaitingForPinHwnd == drainedHwnd) {
+		if (desktops->isOwnWindowPinActive(drainedHwnd)) return;
+		const auto wasOurUnpin = this->embedUnpinRequestId != 0;
+		this->embedWaitingForPinHwnd = nullptr;
+		this->embedUnpinRequestId = 0;
+		if (wasOurUnpin && !confirmedUnpinned) {
+			if (desktops->accessorLoaded()) {
+				this->embedUnpinFailedHwnd = drainedHwnd;
+				qCWarning(logPanel) << "Skipping desktop embedding for" << this
+				                    << "because drained unpin request left window pinned";
+			}
+			return;
+		}
+		if (this->wantsEmbedding()) {
+			this->updateEmbedding();
+			this->scheduleUpdateDimensions();
+		} else if (this->window != nullptr && this->window->isVisible() && this->mEmbedParent == nullptr) {
+			this->stickToAllDesktops();
+		}
+		return;
+	}
+	if (drainedHwnd != nullptr && drainedHwnd == currentHwnd
+	    && !desktops->isOwnWindowPinActive(currentHwnd) && this->pinRetryTimer.isActive()
+	    && this->window != nullptr && this->window->isVisible() && this->mEmbedParent == nullptr
+	    && !this->pinState.pinnedHere(currentHwnd) && !this->pinState.inFlightFor(currentHwnd))
 	{
-		this->pinState.pinned = true;
-		this->pinState.pinnedHwnd = currentHwnd;
-		this->pinState.failedHwnd = nullptr;
-		this->pinState.disconnectRetries = 0;
-	}
-	if (this->embedWaitingForPinHwnd == nullptr || this->embedWaitingForPinHwnd != drainedHwnd) {
-		return;
-	}
-	if (desktops->isOwnWindowPinActive(drainedHwnd)) return;
-	this->embedWaitingForPinHwnd = nullptr;
-	if (stillPinned || this->pinState.pinnedHere(drainedHwnd)) {
-		qCWarning(logPanel) << "Skipping desktop embedding for" << this
-		                    << "because drained pin request left window pinned";
-		return;
-	}
-	if (this->wantsEmbedding()) {
-		this->updateEmbedding();
-		this->scheduleUpdateDimensions();
-	} else if (this->window != nullptr && this->window->isVisible() && this->mEmbedParent == nullptr) {
-		this->stickToAllDesktops();
+		// A draining request for this HWND just exited: wake any busy retry now.
+		this->pinState.busySinceMs.reset();
+		this->schedulePinRetry(0);
 	}
 }
 
 void WinPanelWindow::onDesktopAccessorReady() {
-	// A recovered provider (even after an accessor-only disconnect where the
-	// taskbar HWND did not change) may have lost Explorer's pin table or may
-	// offer pinning again. Re-verify via IsViewPinned before PinView.
+	// A recovered provider may offer pinning/unpinning again. Re-verify via
+	// IsViewPinned before PinView, but keep mayBePinnedHwnd intact until Explorer
+	// actually restarts or UnpinView confirms removal.
+	this->embedUnpinFailedHwnd = nullptr;
+	this->embedUnpinDisconnectRetries = 0;
 	this->resetPinState(true);
 	this->clearStuckFollowState();
 	this->clearPendingFollowMove();
 	this->followFailureCount = 0;
 	this->followWaitingBusy = false;
-	if (this->window != nullptr && this->window->isVisible()) this->stickToAllDesktops();
+	if (this->mEmbedParent == nullptr && this->wantsEmbedding()) {
+		this->updateEmbedding();
+	} else if (this->window != nullptr && this->window->isVisible()) {
+		this->stickToAllDesktops();
+	}
 }
 
 bool WinPanelWindow::recoverExplorer(HWND taskbar, DWORD pid, DWORD thread) {
 	if (!thread || (taskbar == this->explorerTaskbar && pid == this->explorerTaskbarPid
 	               && thread == this->explorerTaskbarThread))
 		return false;
+	const auto explorerRestarted =
+	    this->explorerTaskbarPid != 0 && pid != this->explorerTaskbarPid;
 	this->explorerTaskbar = taskbar;
 	this->explorerTaskbarPid = pid;
 	this->explorerTaskbarThread = thread;
+	if (explorerRestarted) {
+		this->mayBePinnedHwnd = nullptr;
+		this->embedUnpinFailedHwnd = nullptr;
+		this->embedUnpinDisconnectRetries = 0;
+	}
 	this->resetPinState(true);
 	this->clearStuckFollowState();
 	this->clearPendingFollowMove();
@@ -2134,10 +2259,19 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 
 	if (!wasEmbedded) {
 		auto* desktops = VirtualDesktops::instance();
+		if (this->mayBePinnedHwnd != nullptr && this->mayBePinnedHwnd != hwnd) {
+			this->mayBePinnedHwnd = nullptr;
+			this->embedUnpinFailedHwnd = nullptr;
+			this->embedUnpinDisconnectRetries = 0;
+		}
 		// Fence child-style conversion and SetParent while any pin worker
 		// (active, retired-but-draining, or pending completion delivery) still
 		// owns a request for this HWND, even if hide previously cleared pinState.
 		if (desktops->isOwnWindowPinActive(hwnd)) {
+			if (this->embedUnpinRequestId != 0 && this->embedWaitingForPinHwnd == hwnd) {
+				// Wait for the unpin we already submitted for this embedding transition.
+				return;
+			}
 			this->embedWaitingForPinHwnd = hwnd;
 			desktops->cancelOwnWindowPinForHwnd(hwnd);
 			this->resetPinState(false);
@@ -2148,15 +2282,80 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 			return;
 		}
 		this->embedWaitingForPinHwnd = nullptr;
-		if (this->pinState.pinnedHere(hwnd)) {
-			qCWarning(logPanel) << "Skipping desktop embedding for" << this
-			                    << "because window remains pinned in Explorer";
-			return;
+		this->embedUnpinRequestId = 0;
+		if (this->pinState.pinnedHere(hwnd) || this->mayBePinnedHwnd == hwnd) {
+			if (this->embedUnpinFailedHwnd == hwnd) return;
+			quint64 unpinReqId = 0;
+			const auto unpinResult = desktops->unpinOwnWindow(hwnd, &unpinReqId);
+			switch (unpinResult) {
+			case OwnWindowPin::Pending:
+				this->embedWaitingForPinHwnd = hwnd;
+				this->embedUnpinRequestId = unpinReqId;
+				this->resetPinState(false);
+				this->clearStuckFollowState();
+				this->clearPendingFollowMove();
+				this->followFailureCount = 0;
+				this->followWaitingBusy = false;
+				return;
+			case OwnWindowPin::Busy:
+				this->embedWaitingForPinHwnd = hwnd;
+				this->resetPinState(false);
+				this->clearStuckFollowState();
+				this->clearPendingFollowMove();
+				this->followFailureCount = 0;
+				this->followWaitingBusy = false;
+				this->retryEmbedding();
+				return;
+			case OwnWindowPin::Unpinned:
+				this->mayBePinnedHwnd = nullptr;
+				this->embedUnpinFailedHwnd = nullptr;
+				this->embedUnpinDisconnectRetries = 0;
+				break;
+			case OwnWindowPin::Disconnected:
+				if (desktops->accessorLoaded()
+				    && this->embedUnpinDisconnectRetries < PanelPinState::MAX_DISCONNECT_RETRIES)
+				{
+					++this->embedUnpinDisconnectRetries;
+					this->embedWaitingForPinHwnd = hwnd;
+					this->retryEmbedding();
+				} else if (desktops->accessorLoaded()) {
+					this->embedUnpinFailedHwnd = hwnd;
+					qCWarning(logPanel) << "Skipping desktop embedding for" << this
+					                    << "because unpinning disconnected repeatedly";
+				}
+				return;
+			case OwnWindowPin::Unavailable: {
+				if (desktops->pinSupported()
+				    && (!desktops->isWindowPinned(hwnd).value_or(true)
+				        || desktops->pinWindow(hwnd, false)))
+				{
+					this->mayBePinnedHwnd = nullptr;
+					this->embedUnpinFailedHwnd = nullptr;
+					this->embedUnpinDisconnectRetries = 0;
+					break;
+				}
+				if (desktops->accessorLoaded()) {
+					this->embedUnpinFailedHwnd = hwnd;
+					qCWarning(logPanel) << "Skipping desktop embedding for" << this
+					                    << "because window may remain pinned and unpinning is unavailable";
+				}
+				return;
+			}
+			case OwnWindowPin::Pinned:
+			case OwnWindowPin::Refused:
+				this->embedUnpinFailedHwnd = hwnd;
+				qCWarning(logPanel) << "Skipping desktop embedding for" << this
+				                    << "because Explorer refused to unpin it";
+				return;
+			}
 		}
 	}
 
 	// Cancel any in-flight pin or follow state before converting the window to a
 	// child or calling SetParent, so PinView cannot run against an embedding HWND.
+	this->mayBePinnedHwnd = nullptr;
+	this->embedUnpinFailedHwnd = nullptr;
+	this->embedUnpinDisconnectRetries = 0;
 	this->resetPinState(true);
 	this->clearStuckFollowState();
 	this->clearPendingFollowMove();

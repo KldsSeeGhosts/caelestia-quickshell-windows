@@ -178,7 +178,7 @@ private slots:
 	void onWindowVisibleChanged();
 	void onDesktopAccessorReady();
 	void onOwnWindowPinCompleted(quint64 requestId, quintptr hwnd, qs::windows::OwnWindowPin result);
-	void onOwnWindowPinDrained(quintptr hwnd, bool stillPinned);
+	void onOwnWindowPinDrained(quintptr hwnd, bool stillPinned, bool confirmedUnpinned);
 	void updateScreen();
 	void followFocusedScreen();
 	void scheduleUpdateDimensions();
@@ -268,6 +268,13 @@ private:
 	bool appBarRetryPending = false;
 	bool embedRetryPending = false;
 	HWND embedWaitingForPinHwnd = nullptr;
+	quint64 embedUnpinRequestId = 0;
+	HWND embedUnpinFailedHwnd = nullptr;
+	int embedUnpinDisconnectRetries = 0;
+	// Tracks an HWND that Explorer may currently have pinned. Survives
+	// accessor-only recovery and is cleared only on confirmed unpin, Explorer
+	// process restart, or HWND replacement/teardown.
+	HWND mayBePinnedHwnd = nullptr;
 	bool scaleRecreatePending = false;
 	bool focusFlagPending = false;
 	bool focusOnExpose = false;

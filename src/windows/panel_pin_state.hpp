@@ -157,6 +157,7 @@ struct PanelPinState {
 			}
 			this->applyResult(hwnd, expectedGeneration, false);
 			return SubmitAction::TriggerFollow;
+		case OwnWindowPin::Unpinned:
 		case OwnWindowPin::Refused:
 			this->busySinceMs.reset();
 			this->firstBusyMs.reset();

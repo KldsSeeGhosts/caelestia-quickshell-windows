@@ -14,8 +14,27 @@
 
 #include "desktop_host.hpp"
 #include "panel_window.hpp"
+#include "virtual_desktops.hpp"
 
 namespace {
+
+HWND g_fakePinnedHwnd = nullptr;
+bool g_allowUnpin = true;
+int g_pinCalls = 0;
+int g_unpinCalls = 0;
+
+int fakeIsPinnedWindow(HWND hwnd) { return hwnd != nullptr && hwnd == g_fakePinnedHwnd ? 1 : 0; }
+int fakePinWindow(HWND hwnd) {
+	++g_pinCalls;
+	g_fakePinnedHwnd = hwnd;
+	return 0;
+}
+int fakeUnpinWindow(HWND hwnd) {
+	++g_unpinCalls;
+	if (!g_allowUnpin) return -1;
+	if (g_fakePinnedHwnd == hwnd) g_fakePinnedHwnd = nullptr;
+	return 0;
+}
 
 constexpr const wchar_t* HOST_CLASS = L"CaelestiaPanelHiddenReembedTestHost";
 
@@ -264,6 +283,85 @@ private slots:
 		QCOMPARE(affinityOf(otherHwnd), static_cast<DWORD>(WDA_NONE));
 
 		other.deleteWindow();
+		panel.deleteWindow();
+		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+	}
+
+	void pinnedPanelUnpinsOrRefusesBeforeEmbeddingEvenAcrossHideAndRecovery() {
+		auto* primary = QGuiApplication::primaryScreen();
+		QVERIFY(primary != nullptr);
+		QuickshellScreenInfo screenInfo(nullptr, primary);
+
+		auto* desktops = qs::windows::VirtualDesktops::instance();
+		g_fakePinnedHwnd = nullptr;
+		g_allowUnpin = false;
+		g_pinCalls = 0;
+		g_unpinCalls = 0;
+		qs::windows::VirtualDesktops::Accessor fakeAccessor {};
+		fakeAccessor.isPinnedWindow = &fakeIsPinnedWindow;
+		fakeAccessor.pinWindow = &fakePinWindow;
+		fakeAccessor.unPinWindow = &fakeUnpinWindow;
+		desktops->installAccessorForTest(fakeAccessor);
+		struct AccessorCleanup {
+			qs::windows::VirtualDesktops* desktops;
+			~AccessorCleanup() {
+				g_fakePinnedHwnd = nullptr;
+				g_allowUnpin = true;
+				this->desktops->loseAccessorForTest();
+			}
+		} accessorCleanup {desktops};
+
+		// Start with DesktopHost disabled so the Background panel stays top-level and pins.
+		auto* host = qs::windows::DesktopHost::instance();
+		host->setEnabled(false);
+
+		qs::windows::WinPanelWindow panel;
+		panel.setLayer(qs::windows::PanelLayer::Background);
+		panel.setExclusionMode(ExclusionMode::Ignore);
+		panel.setScreen(&screenInfo);
+		panel.createWindow();
+
+		auto* window = panel.backingWindow();
+		QVERIFY(window != nullptr);
+		auto* hwnd = reinterpret_cast<HWND>(window->winId());
+		QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+		QVERIFY(SetWindowPos(
+		    hwnd,
+		    nullptr,
+		    -10000,
+		    -10000,
+		    200,
+		    100,
+		    SWP_NOACTIVATE | SWP_NOZORDER
+		));
+
+		panel.setVisible(true);
+		panel.setVisibleDirect(true);
+		QTRY_COMPARE(g_fakePinnedHwnd, hwnd);
+		QVERIFY(g_pinCalls >= 1);
+		QVERIFY(GetParent(hwnd) == nullptr);
+
+		// Hide the panel and simulate accessor-only recovery: the unresolved pin
+		// must survive both hide and accessorReady so SetParent stays fenced while
+		// unpinning is refused.
+		panel.setVisible(false);
+		panel.setVisibleDirect(false);
+		QTRY_VERIFY(!IsWindowVisible(hwnd));
+		emit desktops->accessorReady();
+		QCoreApplication::processEvents();
+
+		host->adoptHostForTesting(m_hostA);
+		QCoreApplication::processEvents();
+		QTRY_VERIFY(g_unpinCalls >= 1);
+		QVERIFY(GetParent(hwnd) == nullptr);
+
+		// Once unpinning succeeds (e.g. after provider recovery), the same HWND
+		// transitions cleanly into desktop embedding.
+		g_allowUnpin = true;
+		emit desktops->accessorReady();
+		QTRY_COMPARE(GetParent(hwnd), m_hostA);
+		QCOMPARE(g_fakePinnedHwnd, nullptr);
+
 		panel.deleteWindow();
 		QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
 	}
