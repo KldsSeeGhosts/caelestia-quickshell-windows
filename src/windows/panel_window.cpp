@@ -1430,8 +1430,8 @@ bool WinPanelWindow::isVisibleDirect() const {
 }
 
 void WinPanelWindow::setVisibleDirect(bool visible) {
-	if (visible && this->screenGuard.isBlocked()) return;
 	if (visible) this->cancelDeferredClose();
+	if (visible && this->screenGuard.isBlocked()) return;
 	if (!visible) {
 		if (this->mClosing) return;
 
@@ -3746,14 +3746,12 @@ void WinPanelWindow::resetAnimation() {
 
 void WinPanelWindow::deferClose(const PanelAnimationChoice& choice) {
 	this->mDeferredCloseChoice = choice;
-	this->queueDeferredClose(++this->mDeferredCloseSerial);
+	this->queueDeferredClose(++this->mCloseRequestSerial);
 }
 
 void WinPanelWindow::cancelDeferredClose() {
-	if (!this->mDeferredCloseChoice.has_value()) return;
-
 	this->mDeferredCloseChoice.reset();
-	++this->mDeferredCloseSerial;
+	++this->mCloseRequestSerial;
 }
 
 void WinPanelWindow::queueDeferredClose(quint64 serial) {
@@ -3761,7 +3759,7 @@ void WinPanelWindow::queueDeferredClose(quint64 serial) {
 }
 
 void WinPanelWindow::runDeferredClose(quint64 serial) {
-	if (!this->mDeferredCloseChoice.has_value() || serial != this->mDeferredCloseSerial) return;
+	if (!this->mDeferredCloseChoice.has_value() || serial != this->mCloseRequestSerial) return;
 
 	if (this->dimensionsUpdateRunning) {
 		this->queueDeferredClose(serial);
@@ -3771,7 +3769,7 @@ void WinPanelWindow::runDeferredClose(quint64 serial) {
 	if (this->dimensionsUpdatePending) {
 		this->flushUpdateDimensions();
 
-		if (!this->mDeferredCloseChoice.has_value() || serial != this->mDeferredCloseSerial) return;
+		if (!this->mDeferredCloseChoice.has_value() || serial != this->mCloseRequestSerial) return;
 		if (this->dimensionsUpdateRunning || this->dimensionsUpdatePending) {
 			this->queueDeferredClose(serial);
 			return;
@@ -3789,7 +3787,16 @@ void WinPanelWindow::beginClose(const PanelAnimationChoice& choice) {
 		return;
 	}
 
+	const auto closeRequest = ++this->mCloseRequestSerial;
+	const auto visibleBeforeClose = this->mVisible;
 	this->flushUpdateDimensions();
+
+	const auto showRequestedDuringFlush = !visibleBeforeClose && this->mVisible;
+	if (closeRequest != this->mCloseRequestSerial || this->window == nullptr
+	    || showRequestedDuringFlush)
+	{
+		return;
+	}
 
 	if (this->dimensionsUpdateRunning || this->dimensionsUpdatePending) {
 		this->deferClose(choice);

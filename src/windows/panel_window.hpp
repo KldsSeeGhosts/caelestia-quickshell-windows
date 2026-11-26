@@ -460,7 +460,7 @@ private:
 	int mFramesLeft = 0;
 	bool mClosing = false;
 	std::optional<PanelAnimationChoice> mDeferredCloseChoice;
-	quint64 mDeferredCloseSerial = 0;
+	quint64 mCloseRequestSerial = 0;
 	bool mInstantVisibility = false;
 
 	// clang-format off
