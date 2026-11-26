@@ -166,6 +166,38 @@ public:
 		auto* current = this->hwnd();
 		return current != nullptr && this->mayBePinnedHwnd == current;
 	}
+	void simulatePinCompletionForTesting(
+	    quint64 requestId,
+	    OwnWindowPin result,
+	    bool mayBePinned,
+	    quint32 explorerPid
+	) {
+		this->onOwnWindowPinCompleted(
+		    requestId,
+		    reinterpret_cast<quintptr>(this->hwnd()),
+		    result,
+		    mayBePinned,
+		    explorerPid
+		);
+	}
+	void simulatePinDrainForTesting(
+	    quint64 requestId,
+	    bool stillPinned,
+	    bool mayBePinned,
+	    bool confirmedUnpinned,
+	    bool disconnected,
+	    quint32 explorerPid
+	) {
+		this->onOwnWindowPinDrained(
+		    requestId,
+		    reinterpret_cast<quintptr>(this->hwnd()),
+		    stillPinned,
+		    mayBePinned,
+		    confirmedUnpinned,
+		    disconnected,
+		    explorerPid
+		);
+	}
 #endif
 
 signals:
@@ -300,6 +332,7 @@ private:
 	// process restart for the owning Explorer PID, or HWND replacement/teardown.
 	HWND mayBePinnedHwnd = nullptr;
 	DWORD mayBePinnedExplorerPid = 0;
+	quint64 mayBePinnedRequestId = 0;
 	DWORD inFlightPinExplorerPid = 0;
 	QSet<DWORD> retiredExplorerPids;
 	[[nodiscard]] bool isRetiredExplorerSession(quint32 explorerPid) const {

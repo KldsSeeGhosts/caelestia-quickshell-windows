@@ -78,6 +78,7 @@ void setNativeDesktopRecoveryAgeForTest(std::function<qint64()> age);
 [[nodiscard]] int nativeDesktopRecoveryPendingDelayForTest();
 [[nodiscard]] int refreshNativeDesktopForTest();
 [[nodiscard]] int nativeDesktopWorkerCountForTest();
+[[nodiscard]] int nativeDesktopPinWorkerCountForTest();
 [[nodiscard]] bool nativeDesktopPendingReadyForTest();
 [[nodiscard]] bool nativeDesktopPinReadyForTest();
 void setNativeDesktopStuckBoundForTest(int milliseconds);

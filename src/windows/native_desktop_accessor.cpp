@@ -104,11 +104,14 @@ bool isDisconnectError(HRESULT hr) {
 }
 
 DWORD liveExplorerTaskbarPid() {
-	auto* taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
-	if (!taskbar) return 0;
-	DWORD pid = 0;
-	GetWindowThreadProcessId(taskbar, &pid);
-	return pid;
+	HWND taskbar = nullptr;
+	while ((taskbar = FindWindowExW(nullptr, taskbar, L"Shell_TrayWnd", nullptr)) != nullptr) {
+		if (GetPropW(taskbar, TRAY_HOOK_PROP) != nullptr) continue;
+		DWORD pid = 0;
+		GetWindowThreadProcessId(taskbar, &pid);
+		if (pid != 0) return pid;
+	}
+	return 0;
 }
 
 struct Provider {
@@ -2476,6 +2479,7 @@ int refreshNativeDesktopForTest() {
 	return channel().execute([] { return desktopCount(); }, true, false, Channel::Kind::Probe);
 }
 int nativeDesktopWorkerCountForTest() { return liveWorkers().load() + livePinWorkers().load(); }
+int nativeDesktopPinWorkerCountForTest() { return livePinWorkers().load(); }
 bool nativeDesktopPendingReadyForTest() {
 	const auto& c = channel();
 	return c.pending && c.pending->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;

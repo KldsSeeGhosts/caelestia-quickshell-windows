@@ -6,6 +6,7 @@
 // Windows QPA and a real HWND. desktop_zorder_test cannot catch this path: its
 // raw-HWND callback never creates a panel.
 
+#include <atomic>
 #include <memory>
 
 #include <qelapsedtimer.h>
@@ -1003,6 +1004,82 @@ private slots:
 				host->setEnabled(false);
 				QCoreApplication::processEvents();
 			}
+		}
+
+		// Part F: Same-Explorer stale Unpinned completion or confirmedUnpinned drain
+		// with an older requestId must not clear mayBePinned/pinned state established
+		// by a newer PinView request.
+		{
+			DWORD simulatedExplorerPid = 3003;
+			qs::windows::setNativeDesktopExplorerPidForTest(
+			    [&simulatedExplorerPid] { return simulatedExplorerPid; }
+			);
+			struct ResetPid {
+				~ResetPid() { qs::windows::setNativeDesktopExplorerPidForTest({}); }
+			} resetPid;
+
+			pinned.pinned = FALSE;
+			pinned.pinResult = S_OK;
+			pinned.unpinResult = S_OK;
+			pinned.pins = 0;
+			pinned.unpins = 0;
+
+			QSignalSpy pinDone(desktops, &qs::windows::VirtualDesktops::ownWindowPinCompleted);
+
+			qs::windows::WinPanelWindow panel;
+			panel.setLayer(qs::windows::PanelLayer::Background);
+			panel.setExclusionMode(ExclusionMode::Ignore);
+			panel.setScreen(&screenInfo);
+			panel.createWindow();
+
+			auto* window = panel.backingWindow();
+			QVERIFY(window != nullptr);
+			auto* hwnd = reinterpret_cast<HWND>(window->winId());
+			QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+			QVERIFY(SetWindowPos(
+			    hwnd, nullptr, -10000, -10000, 200, 100, SWP_NOACTIVATE | SWP_NOZORDER
+			));
+
+			QVERIFY(panel.recoverExplorerForTesting(m_hostA, 3003, 3003));
+			QCoreApplication::processEvents();
+			panel.setVisible(true);
+			panel.setVisibleDirect(true);
+			QTRY_VERIFY(pinDone.size() >= 1);
+			const auto newerReqId = pinDone.last().at(0).toULongLong();
+			QVERIFY(newerReqId >= 2);
+			QVERIFY(panel.isPinnedHereForTesting());
+			QVERIFY(panel.mayBePinnedHereForTesting());
+
+			// Deliver an older same-session Unpinned completion and confirmedUnpinned drain.
+			panel.simulatePinCompletionForTesting(
+			    newerReqId - 1,
+			    qs::windows::OwnWindowPin::Unpinned,
+			    false,
+			    3003
+			);
+			panel.simulatePinDrainForTesting(
+			    newerReqId - 1,
+			    false,
+			    false,
+			    true,
+			    false,
+			    3003
+			);
+			QVERIFY(panel.isPinnedHereForTesting());
+			QVERIFY(panel.mayBePinnedHereForTesting());
+
+			// Embedding must still unpin before SetParent.
+			const auto unpinsBeforeEmbed = pinned.unpins;
+			host->setDiscoveredHostForTesting(m_hostA);
+			host->setEnabled(true);
+			QTRY_COMPARE(GetParent(hwnd), m_hostA);
+			QVERIFY(pinned.unpins > unpinsBeforeEmbed);
+			QCOMPARE(pinned.pinned, FALSE);
+
+			panel.deleteWindow();
+			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+			host->setEnabled(false);
+			QCoreApplication::processEvents();
 		}
 	}
 

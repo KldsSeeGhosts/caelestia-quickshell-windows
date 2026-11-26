@@ -1036,7 +1036,7 @@ private slots:
 					setNativeDesktopPinnedAppsForTest(this->pinned);
 					QElapsedTimer timer;
 					timer.start();
-					while (nativeDesktopWorkerCountForTest() > 1 && timer.elapsed() < 2000) {
+					while (nativeDesktopPinWorkerCountForTest() > 0 && timer.elapsed() < 2000) {
 						QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
 						QThread::msleep(1);
 					}

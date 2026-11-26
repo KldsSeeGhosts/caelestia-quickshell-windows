@@ -1134,6 +1134,8 @@ ProxiedWindow* WinPanelWindow::retrieveWindow(QObject* oldInstance) {
 	      : nullptr;
 	const auto preservedPinExplorerPid =
 	    preservedPinHwnd != nullptr ? old->mayBePinnedExplorerPid : 0;
+	const auto preservedPinRequestId =
+	    preservedPinHwnd != nullptr ? old->mayBePinnedRequestId : 0;
 	auto* preservedTaskbar = old->explorerTaskbar;
 	const auto preservedTaskbarPid = old->explorerTaskbarPid;
 	const auto preservedTaskbarThread = old->explorerTaskbarThread;
@@ -1154,6 +1156,7 @@ ProxiedWindow* WinPanelWindow::retrieveWindow(QObject* oldInstance) {
 	auto* adopted = old->disownWindow();
 	this->mayBePinnedHwnd = preservedPinHwnd;
 	this->mayBePinnedExplorerPid = preservedPinExplorerPid;
+	this->mayBePinnedRequestId = preservedPinRequestId;
 	this->explorerTaskbar = preservedTaskbar;
 	this->explorerTaskbarPid = preservedTaskbarPid;
 	this->explorerTaskbarThread = preservedTaskbarThread;
@@ -1221,9 +1224,11 @@ void WinPanelWindow::connectWindow() {
 		this->mAppliedRegion = QRegion();
 		this->mayBePinnedHwnd = nullptr;
 		this->mayBePinnedExplorerPid = 0;
+		this->mayBePinnedRequestId = 0;
 	} else if (this->mayBePinnedHwnd != nullptr && this->mayBePinnedHwnd != currentHwnd) {
 		this->mayBePinnedHwnd = nullptr;
 		this->mayBePinnedExplorerPid = 0;
+		this->mayBePinnedRequestId = 0;
 	}
 
 	Qt::WindowFlags flags = Qt::Tool | Qt::FramelessWindowHint;
@@ -1280,6 +1285,7 @@ void WinPanelWindow::releaseNativeState() {
 	this->embedUnpinDisconnectRetries = 0;
 	this->mayBePinnedHwnd = nullptr;
 	this->mayBePinnedExplorerPid = 0;
+	this->mayBePinnedRequestId = 0;
 	this->inFlightPinExplorerPid = 0;
 	this->resetPinState(true);
 	this->clearStuckFollowState();
@@ -1509,6 +1515,7 @@ void WinPanelWindow::finishPinAttempt(HWND hwnd, quint64 expectedGeneration, boo
 	if (pinned) {
 		this->mayBePinnedHwnd = hwnd;
 		this->mayBePinnedExplorerPid = this->explorerTaskbarPid;
+		this->mayBePinnedRequestId = 0;
 		this->embedUnpinFailedHwnd = nullptr;
 		this->embedUnpinDisconnectRetries = 0;
 		return;
@@ -1531,6 +1538,7 @@ void WinPanelWindow::stickToAllDesktops() {
 		this->embedUnpinDisconnectRetries = 0;
 		this->mayBePinnedHwnd = nullptr;
 		this->mayBePinnedExplorerPid = 0;
+		this->mayBePinnedRequestId = 0;
 		this->resetPinState(true);
 		this->clearStuckFollowState();
 		this->clearPendingFollowMove();
@@ -1542,6 +1550,7 @@ void WinPanelWindow::stickToAllDesktops() {
 	if (this->mayBePinnedHwnd != nullptr && this->mayBePinnedHwnd != hwnd) {
 		this->mayBePinnedHwnd = nullptr;
 		this->mayBePinnedExplorerPid = 0;
+		this->mayBePinnedRequestId = 0;
 		this->embedUnpinFailedHwnd = nullptr;
 		this->embedUnpinDisconnectRetries = 0;
 	}
@@ -1692,6 +1701,7 @@ void WinPanelWindow::attemptPin(quint64 expectedGeneration) {
 	if (pinResult == OwnWindowPin::Pinned) {
 		this->mayBePinnedHwnd = hwnd;
 		this->mayBePinnedExplorerPid = resolvedPinExplorerPid;
+		this->mayBePinnedRequestId = requestId;
 		this->embedUnpinFailedHwnd = nullptr;
 		this->embedUnpinDisconnectRetries = 0;
 	} else if (pinResult == OwnWindowPin::Pending && requestId != 0) {
@@ -1736,31 +1746,41 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 	auto* desktops = VirtualDesktops::instance();
 	const auto fromPreviousExplorer = this->isRetiredExplorerSession(explorerPid);
 	if (!fromPreviousExplorer && completedHwnd != nullptr && completedHwnd == currentHwnd && !embedded) {
+		const auto isNewerOrEqualRequest =
+		    this->mayBePinnedHwnd != currentHwnd || this->mayBePinnedRequestId == 0
+		    || requestId == 0 || requestId >= this->mayBePinnedRequestId;
 		if (result == OwnWindowPin::Pinned) {
 			// Preserve an unresolved pin even if hide or embed cancellation cleared
 			// inFlightRequestId before the worker finished.
-			this->mayBePinnedHwnd = currentHwnd;
-			this->mayBePinnedExplorerPid =
-			    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
-			this->pinState.pinned = true;
-			this->pinState.pinnedHwnd = currentHwnd;
-			this->pinState.failedHwnd = nullptr;
-			this->pinState.disconnectRetries = 0;
+			if (isNewerOrEqualRequest) {
+				this->mayBePinnedHwnd = currentHwnd;
+				this->mayBePinnedExplorerPid =
+				    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
+				this->mayBePinnedRequestId = requestId;
+				this->pinState.pinned = true;
+				this->pinState.pinnedHwnd = currentHwnd;
+				this->pinState.failedHwnd = nullptr;
+				this->pinState.disconnectRetries = 0;
+			}
 		} else if (mayBePinned) {
 			// PinView disconnected or faulted with an unknown mutation outcome, or an
 			// unpin failed: fence embedding until explicit unpin confirms removal, but
 			// do not mark pinState.pinned so top-level pinning can still retry/follow.
-			this->mayBePinnedHwnd = currentHwnd;
-			this->mayBePinnedExplorerPid =
-			    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
+			if (isNewerOrEqualRequest) {
+				this->mayBePinnedHwnd = currentHwnd;
+				this->mayBePinnedExplorerPid =
+				    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
+				this->mayBePinnedRequestId = requestId;
+			}
 		} else if (result == OwnWindowPin::Unpinned) {
 			const auto matchesPinnedSession =
 			    this->mayBePinnedExplorerPid == 0 || explorerPid == 0
 			    || this->mayBePinnedExplorerPid == static_cast<DWORD>(explorerPid);
-			if (matchesPinnedSession) {
+			if (matchesPinnedSession && isNewerOrEqualRequest) {
 				if (this->mayBePinnedHwnd == currentHwnd) {
 					this->mayBePinnedHwnd = nullptr;
 					this->mayBePinnedExplorerPid = 0;
+					this->mayBePinnedRequestId = 0;
 				}
 				if (this->pinState.pinnedHwnd == currentHwnd) {
 					this->pinState.pinned = false;
@@ -1894,26 +1914,36 @@ void WinPanelWindow::onOwnWindowPinDrained(
 	if (!fromPreviousExplorer && drainedHwnd != nullptr && drainedHwnd == currentHwnd
 	    && this->mEmbedParent == nullptr)
 	{
+		const auto isNewerOrEqualRequest =
+		    this->mayBePinnedHwnd != currentHwnd || this->mayBePinnedRequestId == 0
+		    || requestId == 0 || requestId >= this->mayBePinnedRequestId;
 		if (stillPinned) {
-			this->mayBePinnedHwnd = currentHwnd;
-			this->mayBePinnedExplorerPid =
-			    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
-			this->pinState.pinned = true;
-			this->pinState.pinnedHwnd = currentHwnd;
-			this->pinState.failedHwnd = nullptr;
-			this->pinState.disconnectRetries = 0;
+			if (isNewerOrEqualRequest) {
+				this->mayBePinnedHwnd = currentHwnd;
+				this->mayBePinnedExplorerPid =
+				    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
+				this->mayBePinnedRequestId = requestId;
+				this->pinState.pinned = true;
+				this->pinState.pinnedHwnd = currentHwnd;
+				this->pinState.failedHwnd = nullptr;
+				this->pinState.disconnectRetries = 0;
+			}
 		} else if (mayBePinned) {
-			this->mayBePinnedHwnd = currentHwnd;
-			this->mayBePinnedExplorerPid =
-			    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
+			if (isNewerOrEqualRequest) {
+				this->mayBePinnedHwnd = currentHwnd;
+				this->mayBePinnedExplorerPid =
+				    explorerPid != 0 ? static_cast<DWORD>(explorerPid) : this->explorerTaskbarPid;
+				this->mayBePinnedRequestId = requestId;
+			}
 		} else if (confirmedUnpinned) {
 			const auto matchesPinnedSession =
 			    this->mayBePinnedExplorerPid == 0 || explorerPid == 0
 			    || this->mayBePinnedExplorerPid == static_cast<DWORD>(explorerPid);
-			if (matchesPinnedSession) {
+			if (matchesPinnedSession && isNewerOrEqualRequest) {
 				if (this->mayBePinnedHwnd == currentHwnd) {
 					this->mayBePinnedHwnd = nullptr;
 					this->mayBePinnedExplorerPid = 0;
+					this->mayBePinnedRequestId = 0;
 				}
 				if (this->pinState.pinnedHwnd == currentHwnd) {
 					this->pinState.pinned = false;
@@ -2038,6 +2068,7 @@ bool WinPanelWindow::recoverExplorer(HWND taskbar, DWORD pid, DWORD thread) {
 		if (!preserveCurrentExplorerPin) {
 			this->mayBePinnedHwnd = nullptr;
 			this->mayBePinnedExplorerPid = 0;
+			this->mayBePinnedRequestId = 0;
 			this->embedUnpinFailedHwnd = nullptr;
 			this->embedUnpinDisconnectRetries = 0;
 		}
@@ -2462,6 +2493,7 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 		if (this->mayBePinnedHwnd != nullptr && this->mayBePinnedHwnd != hwnd) {
 			this->mayBePinnedHwnd = nullptr;
 			this->mayBePinnedExplorerPid = 0;
+			this->mayBePinnedRequestId = 0;
 			this->embedUnpinFailedHwnd = nullptr;
 			this->embedUnpinDisconnectRetries = 0;
 		}
@@ -2516,6 +2548,7 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 			case OwnWindowPin::Unpinned:
 				this->mayBePinnedHwnd = nullptr;
 				this->mayBePinnedExplorerPid = 0;
+				this->mayBePinnedRequestId = 0;
 				this->embedUnpinFailedHwnd = nullptr;
 				this->embedUnpinDisconnectRetries = 0;
 				break;
@@ -2539,6 +2572,7 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 				{
 					this->mayBePinnedHwnd = nullptr;
 					this->mayBePinnedExplorerPid = 0;
+					this->mayBePinnedRequestId = 0;
 					this->embedUnpinFailedHwnd = nullptr;
 					this->embedUnpinDisconnectRetries = 0;
 					break;
@@ -2564,6 +2598,7 @@ void WinPanelWindow::embedInto(HWND parent, HWND insertAfter, bool aboveIcons) {
 	// child or calling SetParent, so PinView cannot run against an embedding HWND.
 	this->mayBePinnedHwnd = nullptr;
 	this->mayBePinnedExplorerPid = 0;
+	this->mayBePinnedRequestId = 0;
 	this->embedUnpinFailedHwnd = nullptr;
 	this->embedUnpinDisconnectRetries = 0;
 	this->resetPinState(true);
