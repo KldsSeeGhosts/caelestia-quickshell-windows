@@ -726,27 +726,20 @@ struct PinProvider {
 		return false;
 	}
 
-	void ensureAcquired() {
-		if (this->acquired) return;
-		this->acquired = true;
-		const auto pidBefore = this->currentExplorerPid();
+	void finalizeAcquisition(bool ok, DWORD pidBefore) {
+		const auto pidAfter = this->currentExplorerPid();
 #ifdef QS_TEST
-		if (this->testMode) {
-			if (!this->views) {
-				this->serviceAvailable = false;
-				return;
-			}
-			if (this->pinnedAppsShell != nullptr) {
-				this->acquirePinnedApps(this->pinnedAppsShell);
-			} else if (this->testPinnedApps != nullptr) {
-				this->pinnedApps = this->testPinnedApps;
-			} else {
-				this->serviceAvailable = false;
-			}
-			const auto pidAfter = this->currentExplorerPid();
-			if (pidBefore != 0 && pidAfter != 0 && pidBefore != pidAfter && !this->disconnected
-			    && !this->optionalPinnedAppsFaulted)
-			{
+		const auto requireLivePid = !this->testMode || static_cast<bool>(this->explorerPidProvider);
+#else
+		constexpr auto requireLivePid = true;
+#endif
+		if (ok) {
+			const auto pidValid =
+			    requireLivePid ? (pidBefore != 0 && pidAfter == pidBefore) : (pidBefore == pidAfter);
+			if (!pidValid) {
+				// Explorer was absent or restarted while acquiring the pin COM
+				// services; abort before mutating pin state so this worker never
+				// tags a replacement Explorer session with a stale or zero PID.
 				this->explorerPid = pidBefore;
 				this->disconnected = true;
 				this->lastError = RPC_E_DISCONNECTED;
@@ -754,6 +747,33 @@ struct PinProvider {
 				return;
 			}
 			this->explorerPid = pidAfter != 0 ? pidAfter : pidBefore;
+			return;
+		}
+		this->explorerPid = pidBefore != 0 ? pidBefore : pidAfter;
+		if (!this->disconnected && !this->optionalPinnedAppsFaulted) {
+			this->serviceAvailable = false;
+			this->drop();
+		}
+	}
+
+	void ensureAcquired() {
+		if (this->acquired) return;
+		this->acquired = true;
+		const auto pidBefore = this->currentExplorerPid();
+#ifdef QS_TEST
+		if (this->testMode) {
+			auto ok = static_cast<bool>(this->views);
+			if (!ok) {
+				this->serviceAvailable = false;
+			} else if (this->pinnedAppsShell != nullptr) {
+				ok = this->acquirePinnedApps(this->pinnedAppsShell);
+			} else if (this->testPinnedApps != nullptr) {
+				this->pinnedApps = this->testPinnedApps;
+			} else {
+				ok = false;
+				this->serviceAvailable = false;
+			}
+			this->finalizeAcquisition(ok, pidBefore);
 			return;
 		}
 #endif
@@ -796,22 +816,7 @@ struct PinProvider {
 		}
 		if (ok) ok = this->acquirePinnedApps(shell.Get());
 		ok = this->releaseLocal(shell) && ok;
-		const auto pidAfter = this->currentExplorerPid();
-		if (ok && pidBefore != 0 && pidAfter != 0 && pidBefore != pidAfter) {
-			// Explorer restarted while acquiring the pin COM services; abort
-			// before mutating pin state so this worker never tags a replacement
-			// Explorer session with a stale PID.
-			this->explorerPid = pidBefore;
-			this->disconnected = true;
-			this->lastError = RPC_E_DISCONNECTED;
-			this->drop();
-			return;
-		}
-		this->explorerPid = pidAfter != 0 ? pidAfter : pidBefore;
-		if (!ok && !this->disconnected && !this->optionalPinnedAppsFaulted) {
-			this->serviceAvailable = false;
-			this->drop();
-		}
+		this->finalizeAcquisition(ok, pidBefore);
 	}
 
 	bool validWindow(HWND window) {
@@ -1889,8 +1894,7 @@ struct Channel {
 			return false;
 		}
 		this->pinWorker = std::move(next);
-		const auto detectedPid = this->currentExplorerPid();
-		this->pinWorkerExplorerPid = detectedPid != 0 ? detectedPid : this->workerExplorerPid;
+		this->pinWorkerExplorerPid = this->currentExplorerPid();
 		return true;
 	}
 
@@ -1920,9 +1924,7 @@ struct Channel {
 		request->unpin = unpin;
 		request->completed = [this] { this->wakeOnPinCompletion(); };
 		const auto reqId = ++this->pinSequence;
-		const auto explorerPid =
-		    this->pinWorkerExplorerPid != 0 ? this->pinWorkerExplorerPid : this->currentWorkerExplorerPid();
-		if (this->pinWorkerExplorerPid == 0) this->pinWorkerExplorerPid = explorerPid;
+		const auto explorerPid = this->pinWorkerExplorerPid;
 		this->pin.emplace(PinPending {
 		    request,
 		    this->pinWorker->submit(request),

@@ -343,9 +343,13 @@ TrayHookYield::~TrayHookYield() {
 }
 
 HWND explorerTaskbarWindow() {
+	const auto selfPid = GetCurrentProcessId();
 	HWND hwnd = nullptr;
 	while ((hwnd = FindWindowExW(nullptr, hwnd, L"Shell_TrayWnd", nullptr)) != nullptr) {
-		if (!isTrayHookWindow(hwnd)) return hwnd;
+		if (isTrayHookWindow(hwnd)) continue;
+		DWORD pid = 0;
+		GetWindowThreadProcessId(hwnd, &pid);
+		if (pid != 0 && pid != selfPid) return hwnd;
 	}
 	return nullptr;
 }

@@ -1101,29 +1101,47 @@ private slots:
 
 			// 4d. If Explorer restarts mid-COM-acquisition (PID changes between
 			//     before/after QueryService), ensureAcquired aborts with Disconnected
-			//     and never calls PinView on the replacement Explorer under the old PID.
-			setNativeDesktopPinnedAppsShellForTest(shell.get());
-			auto midAcqBlocked = std::make_shared<BlockingCall>();
-			shellCleanup.block = midAcqBlocked;
-			shell->result = S_OK;
-			shell->beforeQuery = [midAcqBlocked] { (*midAcqBlocked)(); };
-			pinned.pinned = FALSE;
-			const auto pinsBeforeMidAcq = pinned.pins;
-			const auto doneBeforeMidAcq = pinDone.size();
-			quint64 reqMidAcq = 0;
-			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqMidAcq), OwnWindowPin::Pending);
-			QCOMPARE(WaitForSingleObject(midAcqBlocked->entered, 1000), WAIT_OBJECT_0);
-			simulatedExplorerPid->store(4303);
-			midAcqBlocked->release();
-			QVERIFY(
-			    waitUntil([&pinDone, doneBeforeMidAcq] { return pinDone.size() == doneBeforeMidAcq + 1; }, 1000)
-			);
-			shell->beforeQuery = {};
-			QCOMPARE(pinDone.at(doneBeforeMidAcq).at(0).toULongLong(), reqMidAcq);
-			QCOMPARE(pinDone.at(doneBeforeMidAcq).at(2).value<OwnWindowPin>(), OwnWindowPin::Disconnected);
-			QCOMPARE(pinDone.at(doneBeforeMidAcq).at(3).toBool(), false);
-			QCOMPARE(pinDone.at(doneBeforeMidAcq).at(4).toUInt(), quint32(4202));
-			QCOMPARE(pinned.pins, pinsBeforeMidAcq);
+			//     or disappears before/after acquisition (A->B, A->0, 0->B),
+			//     ensureAcquired aborts with Disconnected and never calls PinView.
+			struct MidAcqCase {
+				DWORD before;
+				DWORD after;
+				quint32 expectedReportedPid;
+			};
+			const MidAcqCase cases[] = {
+			    {4202, 4303, 4202},
+			    {4303, 0, 4303},
+			    {0, 4404, 0},
+			};
+			for (const auto& tc: cases) {
+				simulatedExplorerPid->store(tc.before);
+				setNativeDesktopPinnedAppsShellForTest(shell.get());
+				auto midAcqBlocked = std::make_shared<BlockingCall>();
+				shellCleanup.block = midAcqBlocked;
+				shell->result = S_OK;
+				shell->beforeQuery = [midAcqBlocked] { (*midAcqBlocked)(); };
+				pinned.pinned = FALSE;
+				const auto pinsBeforeMidAcq = pinned.pins;
+				const auto doneBeforeMidAcq = pinDone.size();
+				quint64 reqMidAcq = 0;
+				QCOMPARE(pinNativeDesktopOwnWindow(window, &reqMidAcq), OwnWindowPin::Pending);
+				QCOMPARE(WaitForSingleObject(midAcqBlocked->entered, 1000), WAIT_OBJECT_0);
+				simulatedExplorerPid->store(tc.after);
+				midAcqBlocked->release();
+				QVERIFY(waitUntil(
+				    [&pinDone, doneBeforeMidAcq] { return pinDone.size() == doneBeforeMidAcq + 1; },
+				    1000
+				));
+				shell->beforeQuery = {};
+				QCOMPARE(pinDone.at(doneBeforeMidAcq).at(0).toULongLong(), reqMidAcq);
+				QCOMPARE(
+				    pinDone.at(doneBeforeMidAcq).at(2).value<OwnWindowPin>(),
+				    OwnWindowPin::Disconnected
+				);
+				QCOMPARE(pinDone.at(doneBeforeMidAcq).at(3).toBool(), false);
+				QCOMPARE(pinDone.at(doneBeforeMidAcq).at(4).toUInt(), tc.expectedReportedPid);
+				QCOMPARE(pinned.pins, pinsBeforeMidAcq);
+			}
 		}
 
 		// 5. SEH fault inside UnpinView during rollback leaves rollback outcome
