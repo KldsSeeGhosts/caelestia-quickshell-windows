@@ -7,3 +7,9 @@
 - Focused evidence after the change: `panel_hidden_reembed_test.exe initialGeometryIsPlacedSynchronously sameTurnGeometryPropertiesCoalesce` reports 4 passed, 0 failed.
 - Broader evidence: targeted build of `panel_hidden_reembed_test`, `portable_core`, `portable_display`, and `portable_clipboard` succeeded. CTest passed `panel_topmost`, `panel_focus_style`, `panel_animation`, and `window_stack` (4/4), and passed the full `panel_hidden_reembed` desktop fixture (1/1). `git diff --check origin/main...HEAD` is clean.
 - Done: final diff reviewed; synchronous placement remains in initial connection, native initialization, first visibility placement, screen migration, and display-change handling.
+
+## Round 2 review response
+
+- Branch `fix/coalesce-panel-geometry-updates-r2` created from `272700b0ab465c10c56de0c2e7814e9590d37ff0`.
+- Pending: flush queued geometry before animated close, strengthen geometry tests, remove this progress file before final validation.
+
