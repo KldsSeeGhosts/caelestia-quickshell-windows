@@ -1190,6 +1190,7 @@ struct Channel {
 	bool refusedBuild = false;
 	bool skipOptionalPinnedApps = false;
 	bool pinUnavailable = false;
+	DWORD pinUnavailableExplorerPid = 0;
 	bool refreshAgain = false;
 	bool waiting = false;
 	quint64 sequence = 0;
@@ -1424,13 +1425,13 @@ struct Channel {
 		bool mayBePinned = false;
 		bool faulted = false;
 		bool refused = false;
+		bool serviceUnavailable = false;
 		DWORD explorerPid = 0;
 	};
 
 	ClassifiedPinResult classifyReadyPinResult(
 	    std::future<PinResult>& future,
-	    bool isUnpin,
-	    bool updateAvailability = true
+	    bool isUnpin
 	) {
 		try {
 			auto value = future.get();
@@ -1459,9 +1460,7 @@ struct Channel {
 				else out.outcome = OwnWindowPin::Disconnected;
 				return out;
 			}
-			// Only the active worker may latch pinUnavailable; a retired worker
-			// draining after recovery must not poison the replacement provider.
-			if (updateAvailability && !value.serviceAvailable) this->pinUnavailable = true;
+			out.serviceUnavailable = !value.serviceAvailable;
 			if (isUnpin) {
 				if (out.confirmedUnpinned) out.outcome = OwnWindowPin::Unpinned;
 				else if (value.viewPinned) {
@@ -1484,7 +1483,7 @@ struct Channel {
 			return out;
 		} catch (...) {
 			this->skipOptionalPinnedApps = true;
-			return {OwnWindowPin::Unavailable, false, false, true, true, false, 0};
+			return {OwnWindowPin::Unavailable, false, false, true, true, false, false, 0};
 		}
 	}
 
@@ -1513,7 +1512,7 @@ struct Channel {
 				if (it->result.valid()
 				    && it->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
 				{
-					const auto classified = this->classifyReadyPinResult(it->result, it->unpin, false);
+					const auto classified = this->classifyReadyPinResult(it->result, it->unpin);
 					confirmedUnpinned = classified.confirmedUnpinned;
 					stillPinned =
 					    !confirmedUnpinned && (classified.outcome == OwnWindowPin::Pinned);
@@ -1576,7 +1575,7 @@ struct Channel {
 				    == std::future_status::ready)
 				{
 					const auto classified =
-					    this->classifyReadyPinResult(pendingPin->result, pendingPin->unpin, false);
+					    this->classifyReadyPinResult(pendingPin->result, pendingPin->unpin);
 					pinOutcome = classified.outcome;
 					mayBePinned = classified.mayBePinned;
 					if (classified.explorerPid != 0) explorerPid = classified.explorerPid;
@@ -1613,6 +1612,7 @@ struct Channel {
 		this->deadline.stop();
 		this->retirePinWorker(false, OwnWindowPin::Disconnected);
 		this->pinUnavailable = false;
+		this->pinUnavailableExplorerPid = 0;
 		this->snapshot.availability = DesktopAvailability::Disconnected;
 		this->snapshot.error = error;
 		// Keep the last desktop/window values as explicitly stale state.
@@ -1673,6 +1673,7 @@ struct Channel {
 				this->snapshot.error = error;
 				this->retirePinWorker(false, OwnWindowPin::Disconnected);
 				this->pinUnavailable = false;
+				this->pinUnavailableExplorerPid = 0;
 				this->recovery.disconnected();
 				return false;
 			}
@@ -1781,6 +1782,7 @@ struct Channel {
 				++this->windowRevision;
 				this->workerExplorerPid = this->currentExplorerPid();
 				this->pinUnavailable = false;
+				this->pinUnavailableExplorerPid = 0;
 				this->retirePinWorker(false, OwnWindowPin::Disconnected);
 			}
 			return available || (publicOperation && publicReady) ? outcome : -1;
@@ -1915,6 +1917,16 @@ struct Channel {
 		// an active, draining, or undelivered pin/unpin request, even if the
 		// channel is disconnected or optional pinning was disabled.
 		if (this->isPinActiveFor(hwnd)) return OwnWindowPin::Busy;
+		if (this->pinUnavailable) {
+			const auto livePid = this->currentExplorerPid();
+			if (livePid != 0 && this->pinUnavailableExplorerPid != 0
+			    && livePid != this->pinUnavailableExplorerPid)
+			{
+				this->pinUnavailable = false;
+				this->pinUnavailableExplorerPid = 0;
+				this->retirePinWorker(false, OwnWindowPin::Disconnected);
+			}
+		}
 		if (!this->worker || !this->privateEnabled
 		    || this->snapshot.availability != DesktopAvailability::Available
 		    || this->skipOptionalPinnedApps || this->pinUnavailable)
@@ -2078,6 +2090,7 @@ struct Channel {
 				++this->windowRevision;
 				this->workerExplorerPid = this->currentExplorerPid();
 				this->pinUnavailable = false;
+				this->pinUnavailableExplorerPid = 0;
 				this->retirePinWorker(false, OwnWindowPin::Disconnected);
 				this->recovery.reset();
 				const auto owner = this->worker;
@@ -2131,6 +2144,10 @@ struct Channel {
 			const auto livePid = this->currentExplorerPid();
 			const auto workerPidStale =
 			    livePid != 0 && explorerPid != 0 && livePid != explorerPid;
+			if (!workerPidStale && classified.serviceUnavailable) {
+				this->pinUnavailable = true;
+				this->pinUnavailableExplorerPid = explorerPid;
+			}
 			if (!wasDisabled && this->skipOptionalPinnedApps) {
 				this->retirePinWorker(true);
 			} else if (classified.retireDisconnected || workerPidStale) {
@@ -2269,6 +2286,7 @@ bool loadNativeDesktopAccessor(
 	p.privateEnabled = true;
 	p.skipOptionalPinnedApps = false;
 	p.pinUnavailable = false;
+	p.pinUnavailableExplorerPid = 0;
 	if (p.acquire()) return true;
 	if (!p.pending) p.recovery.disconnected();
 	return false;
@@ -2480,6 +2498,7 @@ void setNativeDesktopFactoryForTest(NativeDesktopFactory factory) {
 	p.refusedBuild = false;
 	p.skipOptionalPinnedApps = false;
 	p.pinUnavailable = false;
+	p.pinUnavailableExplorerPid = 0;
 	p.applied = 0;
 	p.desktopReadApplied = 0;
 	p.windowReadApplied = 0;
@@ -2519,6 +2538,7 @@ void setNativeDesktopPinnedAppsForTest(PinnedApps* pinned) {
 	if (previousPin) previousPin->exit.wait_for(callBound);
 	c.testPinnedApps = pinned;
 	c.pinUnavailable = (pinned == nullptr);
+	c.pinUnavailableExplorerPid = 0;
 }
 
 void setNativeDesktopPinnedAppsShellForTest(IServiceProvider* shell) {
@@ -2528,6 +2548,7 @@ void setNativeDesktopPinnedAppsShellForTest(IServiceProvider* shell) {
 	if (previousPin) previousPin->exit.wait_for(callBound);
 	c.pinnedAppsShell = shell;
 	c.pinUnavailable = false;
+	c.pinUnavailableExplorerPid = 0;
 }
 
 void setNativeDesktopWindowValidatorForTest(std::function<bool(HWND)> validator) {

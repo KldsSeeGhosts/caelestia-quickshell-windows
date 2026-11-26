@@ -1166,6 +1166,87 @@ private slots:
 			shell->beforeQuery = {};
 			QCOMPARE(pinDone.at(doneBeforeGap).at(2).value<OwnWindowPin>(), OwnWindowPin::Disconnected);
 			QCOMPARE(pinDone.at(doneBeforeGap).at(4).toUInt(), quint32(0));
+
+			// 4f. Stale E_NOINTERFACE from Explorer A as Explorer B takes over
+			//     (without a full accessor reset) must not latch pinUnavailable
+			//     against B; the follow-up pin on B creates a fresh worker and succeeds.
+			simulatedExplorerPid->store(4601);
+			setNativeDesktopPinnedAppsShellForTest(shell.get());
+			auto unavailBlocked = std::make_shared<BlockingCall>();
+			shellCleanup.block = unavailBlocked;
+			shell->result = E_NOINTERFACE;
+			shell->beforeQuery = [unavailBlocked] { (*unavailBlocked)(); };
+			pinned.pinned = FALSE;
+			const auto doneBeforeHandoff = pinDone.size();
+			quint64 reqHandoffA = 0;
+			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqHandoffA), OwnWindowPin::Pending);
+			QCOMPARE(WaitForSingleObject(unavailBlocked->entered, 1000), WAIT_OBJECT_0);
+			// Live Explorer moves to B (4602) before A's E_NOINTERFACE completes.
+			simulatedExplorerPid->store(4602);
+			unavailBlocked->release();
+			QVERIFY(waitUntil(
+			    [&pinDone, doneBeforeHandoff] { return pinDone.size() == doneBeforeHandoff + 1; },
+			    1000
+			));
+			shell->beforeQuery = {};
+			QCOMPARE(
+			    pinDone.at(doneBeforeHandoff).at(2).value<OwnWindowPin>(),
+			    OwnWindowPin::Unavailable
+			);
+			QCOMPARE(pinDone.at(doneBeforeHandoff).at(4).toUInt(), quint32(4601));
+
+			// Without resetting the desktop accessor, B (4602) succeeds.
+			shell->result = S_OK;
+			pinned.pinned = FALSE;
+			const auto doneBeforeHandoffB = pinDone.size();
+			quint64 reqHandoffB = 0;
+			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqHandoffB), OwnWindowPin::Pending);
+			QVERIFY(waitUntil(
+			    [&pinDone, doneBeforeHandoffB] { return pinDone.size() == doneBeforeHandoffB + 1; },
+			    1000
+			));
+			QCOMPARE(
+			    pinDone.at(doneBeforeHandoffB).at(2).value<OwnWindowPin>(),
+			    OwnWindowPin::Pinned
+			);
+			QCOMPARE(pinDone.at(doneBeforeHandoffB).at(4).toUInt(), quint32(4602));
+			QCOMPARE(pinned.pinned, TRUE);
+
+			// Also verify that even if A latches pinUnavailable before B appears,
+			// transitioning live PID from A -> B clears session-scoped pinUnavailable
+			// without a full accessor reset.
+			simulatedExplorerPid->store(4701);
+			setNativeDesktopPinnedAppsShellForTest(shell.get());
+			shell->result = E_NOINTERFACE;
+			const auto doneBeforeLatchA = pinDone.size();
+			quint64 reqLatchA = 0;
+			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqLatchA), OwnWindowPin::Pending);
+			QVERIFY(waitUntil(
+			    [&pinDone, doneBeforeLatchA] { return pinDone.size() == doneBeforeLatchA + 1; },
+			    1000
+			));
+			QCOMPARE(
+			    pinDone.at(doneBeforeLatchA).at(2).value<OwnWindowPin>(),
+			    OwnWindowPin::Unavailable
+			);
+			QCOMPARE(pinNativeDesktopOwnWindow(window), OwnWindowPin::Unavailable);
+			// Now Explorer B (4702) replaces A without an accessor reset.
+			simulatedExplorerPid->store(4702);
+			shell->result = S_OK;
+			pinned.pinned = FALSE;
+			const auto doneBeforeLatchB = pinDone.size();
+			quint64 reqLatchB = 0;
+			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqLatchB), OwnWindowPin::Pending);
+			QVERIFY(waitUntil(
+			    [&pinDone, doneBeforeLatchB] { return pinDone.size() == doneBeforeLatchB + 1; },
+			    1000
+			));
+			QCOMPARE(
+			    pinDone.at(doneBeforeLatchB).at(2).value<OwnWindowPin>(),
+			    OwnWindowPin::Pinned
+			);
+			QCOMPARE(pinDone.at(doneBeforeLatchB).at(4).toUInt(), quint32(4702));
+			QCOMPARE(pinned.pinned, TRUE);
 		}
 
 		// 5. SEH fault inside UnpinView during rollback leaves rollback outcome
