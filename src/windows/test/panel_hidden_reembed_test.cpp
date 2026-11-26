@@ -477,9 +477,12 @@ private slots:
 		qunsetenv("CAELESTIA_WINDOWS_HYPR");
 		qunsetenv("CAELESTIA_WINDOWS_HYPR_DISPATCH");
 
-		erm625::Fixture oldFixture;
-		erm625::Fixture freshFixture;
-		erm625::FakePinnedApps pinned;
+		auto oldFixtureHolder = std::make_shared<erm625::Fixture>();
+		auto freshFixtureHolder = std::make_shared<erm625::Fixture>();
+		auto pinnedHolder = std::make_shared<erm625::FakePinnedApps>();
+		auto& oldFixture = *oldFixtureHolder;
+		auto& freshFixture = *freshFixtureHolder;
+		auto& pinned = *pinnedHolder;
 		pinned.expectedView =
 		    reinterpret_cast<qs::windows::native_desktop::ApplicationView*>(&oldFixture.views.view);
 		std::shared_ptr<erm625::BlockingCall> activeBlock;
@@ -489,7 +492,9 @@ private slots:
 
 		struct NativeCleanup {
 			qs::windows::VirtualDesktops* desktops;
-			erm625::FakePinnedApps* pinned;
+			std::shared_ptr<erm625::Fixture> oldFixture;
+			std::shared_ptr<erm625::Fixture> freshFixture;
+			std::shared_ptr<erm625::FakePinnedApps> pinned;
 			std::shared_ptr<erm625::BlockingCall>* block;
 			QByteArray prevHypr;
 			QByteArray prevDispatch;
@@ -498,20 +503,32 @@ private slots:
 				qs::windows::setNativeDesktopFactoryForTest({});
 				QElapsedTimer timer;
 				timer.start();
-				while (qs::windows::nativeDesktopWorkerCountForTest() > 0 && timer.elapsed() < 2000) {
+				while (qs::windows::nativeDesktopWorkerCountForTest() > 0 && timer.elapsed() < 5000) {
 					QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
 					QThread::msleep(1);
 				}
-				this->pinned->beforeQuery = {};
-				this->pinned->beforePin = {};
-				this->pinned->beforeUnpin = {};
+				if (qs::windows::nativeDesktopWorkerCountForTest() == 0) {
+					this->pinned->beforeQuery = {};
+					this->pinned->beforePin = {};
+					this->pinned->beforeUnpin = {};
+					this->oldFixture->clearFaults();
+					this->freshFixture->clearFaults();
+				} else {
+					// Keep fakes alive if any worker failed to exit before teardown.
+					new std::shared_ptr<erm625::Fixture>(this->oldFixture);
+					new std::shared_ptr<erm625::Fixture>(this->freshFixture);
+					new std::shared_ptr<erm625::FakePinnedApps>(this->pinned);
+					QTest::qFail("Desktop worker did not exit before test teardown", __FILE__, __LINE__);
+				}
 				this->desktops->loseAccessorForTest();
 				if (this->prevHypr.isNull()) qunsetenv("CAELESTIA_WINDOWS_HYPR");
 				else qputenv("CAELESTIA_WINDOWS_HYPR", this->prevHypr);
 				if (this->prevDispatch.isNull()) qunsetenv("CAELESTIA_WINDOWS_HYPR_DISPATCH");
 				else qputenv("CAELESTIA_WINDOWS_HYPR_DISPATCH", this->prevDispatch);
 			}
-		} nativeCleanup {desktops, &pinned, &activeBlock, prevHypr, prevDispatch};
+		} nativeCleanup {
+		    desktops, oldFixtureHolder, freshFixtureHolder, pinnedHolder, &activeBlock, prevHypr, prevDispatch
+		};
 
 		qs::windows::setNativeDesktopFactoryForTest(
 		    [&](qs::windows::native_desktop::DesktopManager** m,
@@ -1461,33 +1478,47 @@ private slots:
 			freshFixture.publicApi.desktopId = freshFixture.two.id;
 			freshFixture.publicApi.onCurrent = FALSE;
 			auto moveBlock = std::make_shared<erm625::BlockingCall>();
+			activeBlock = moveBlock;
 			auto blockOnceK = std::make_shared<std::atomic<bool>>(true);
 			freshFixture.publicApi.beforeMove = [moveBlock, blockOnceK] {
 				if (blockOnceK->exchange(false)) (*moveBlock)();
 			};
 			freshFixture.manager.moveResult = E_ACCESSDENIED;
 			freshFixture.publicApi.moveResult.store(E_ACCESSDENIED, std::memory_order_release);
+			const auto initialMoves = freshFixture.publicApi.moves.load(std::memory_order_acquire);
 			struct ResetMoveFixture {
 				erm625::Fixture* fixture;
 				std::shared_ptr<erm625::BlockingCall>* block;
 				std::shared_ptr<std::atomic<bool>> blockOnce;
+				int initialMoves = 0;
 				~ResetMoveFixture() {
 					this->blockOnce->store(false);
 					if (*this->block) (*this->block)->release();
+					// If the first blocked move entered or was submitted, wait for the
+					// specific request to complete (and all workers to settle via a
+					// synchronous probe) before clearing hooks or mutating fake fields.
+					const auto entered =
+					    *this->block
+					    && WaitForSingleObject((*this->block)->entered, 0) == WAIT_OBJECT_0;
 					QElapsedTimer timer;
 					timer.start();
-					// Wait for any active MoveWindowToDesktop call (including on a
-					// retired worker) to return completely and for pending requests
-					// to drain before modifying hooks or fixture fields.
-					while ((this->fixture->publicApi.activeMoves.load(std::memory_order_acquire) > 0
+					while (((entered
+					         && this->fixture->publicApi.moves.load(std::memory_order_acquire)
+					                <= this->initialMoves)
+					        || this->fixture->publicApi.activeMoves.load(std::memory_order_acquire) > 0
 					        || qs::windows::nativeDesktopRequestPending())
 					       && timer.elapsed() < 5000)
 					{
 						QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
 						QThread::msleep(1);
 					}
+					const auto probeOk = qs::windows::refreshNativeDesktopForTest() >= 0;
 					const auto settled =
-					    this->fixture->publicApi.activeMoves.load(std::memory_order_acquire) == 0
+					    probeOk
+					    && (!entered
+					        || this->fixture->publicApi.moves.load(std::memory_order_acquire)
+					               > this->initialMoves)
+					    && this->fixture->publicApi.activeMoves.load(std::memory_order_acquire) == 0
 					    && !qs::windows::nativeDesktopRequestPending();
 					if (settled) {
 						this->fixture->manager.beforeMove = {};
@@ -1504,7 +1535,7 @@ private slots:
 						);
 					}
 				}
-			} resetMove {&freshFixture, &moveBlock, blockOnceK};
+			} resetMove {&freshFixture, &moveBlock, blockOnceK, initialMoves};
 
 			qs::windows::WinPanelWindow panel;
 			panel.setLayer(qs::windows::PanelLayer::Top);
@@ -1541,6 +1572,7 @@ private slots:
 			QTRY_VERIFY(!qs::windows::nativeDesktopRequestPending());
 			freshFixture.publicApi.beforeMove = {};
 			moveBlock.reset();
+			activeBlock.reset();
 			QCOMPARE(moveDone.last().at(2).toBool(), false);
 			QVERIFY(freshFixture.publicApi.moves.load(std::memory_order_acquire) > movesBefore);
 
