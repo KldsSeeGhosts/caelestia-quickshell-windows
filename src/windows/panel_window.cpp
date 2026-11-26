@@ -1766,8 +1766,9 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 	const auto visible = this->window != nullptr && this->window->isVisible();
 	const auto embedded = this->mEmbedParent != nullptr;
 	auto* desktops = VirtualDesktops::instance();
+	const auto liveExplorerPid = desktops->liveExplorerPid();
 	const auto fromPreviousExplorer =
-	    this->isStaleExplorerSession(explorerPid, desktops->liveExplorerPid());
+	    this->isStaleExplorerSession(explorerPid, liveExplorerPid);
 	if (!fromPreviousExplorer && completedHwnd != nullptr && completedHwnd == currentHwnd && !embedded) {
 		const auto isNewerOrEqualRequest =
 		    this->pinWatermarkHwnd != currentHwnd || this->pinWatermarkRequestId == 0
@@ -1802,8 +1803,11 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 				advanceWatermark();
 			}
 		} else if (result == OwnWindowPin::Unpinned) {
+			const auto confirmedByLiveExplorer =
+			    liveExplorerPid != 0 && explorerPid != 0
+			    && static_cast<DWORD>(explorerPid) == static_cast<DWORD>(liveExplorerPid);
 			const auto matchesPinnedSession =
-			    this->mayBePinnedExplorerPid == 0 || explorerPid == 0
+			    confirmedByLiveExplorer || this->mayBePinnedExplorerPid == 0 || explorerPid == 0
 			    || this->mayBePinnedExplorerPid == static_cast<DWORD>(explorerPid);
 			if (matchesPinnedSession && isNewerOrEqualRequest) {
 				advanceWatermark();
@@ -1880,14 +1884,34 @@ void WinPanelWindow::onOwnWindowPinCompleted(
 		}
 	}
 	if (fromPreviousExplorer) {
+		const auto matchedInFlight = this->pinState.inFlightRequestId != 0
+		                          && this->pinState.inFlightRequestId == requestId
+		                          && this->pinState.inFlightHwnd == completedHwnd
+		                          && this->pinState.inFlightGeneration == this->pinState.generation;
 		if (this->pinState.inFlightRequestId == requestId) {
+			this->pinState.inFlightHwnd = nullptr;
+			this->pinState.inFlightGeneration = 0;
 			this->pinState.inFlightRequestId = 0;
 			this->inFlightPinExplorerPid = 0;
 		}
-		if (completedHwnd != nullptr && completedHwnd == currentHwnd
-		    && !desktops->isOwnWindowPinActive(currentHwnd) && this->pinRetryTimer.isActive()
-		    && visible && !embedded && !this->pinState.pinnedHere(currentHwnd)
-		    && !this->pinState.inFlightFor(currentHwnd))
+		if (matchedInFlight && completedHwnd != nullptr && completedHwnd == currentHwnd && visible
+		    && !embedded && !this->pinState.pinnedHere(currentHwnd))
+		{
+			if (desktops->accessorLoaded()) {
+				if (this->pinState.disconnectRetries < PanelPinState::MAX_DISCONNECT_RETRIES) {
+					++this->pinState.disconnectRetries;
+					this->schedulePinRetry(PanelPinState::BUSY_RETRY_MS);
+				} else {
+					this->pinState.applyResult(currentHwnd, this->pinState.generation, false);
+					qCDebug(logPanel) << "Could not pin" << this
+					                  << "to all desktops after Explorer restart; it will follow the current one";
+					WinPanelStack::instance()->followCurrentDesktop();
+				}
+			}
+		} else if (completedHwnd != nullptr && completedHwnd == currentHwnd
+		           && !desktops->isOwnWindowPinActive(currentHwnd) && this->pinRetryTimer.isActive()
+		           && visible && !embedded && !this->pinState.pinnedHere(currentHwnd)
+		           && !this->pinState.inFlightFor(currentHwnd))
 		{
 			this->pinState.busySinceMs.reset();
 			this->schedulePinRetry(0);
@@ -1939,8 +1963,9 @@ void WinPanelWindow::onOwnWindowPinDrained(
 	auto* drainedHwnd = reinterpret_cast<HWND>(hwndValue);
 	auto* currentHwnd = this->hwnd();
 	auto* desktops = VirtualDesktops::instance();
+	const auto liveExplorerPid = desktops->liveExplorerPid();
 	const auto fromPreviousExplorer =
-	    this->isStaleExplorerSession(explorerPid, desktops->liveExplorerPid());
+	    this->isStaleExplorerSession(explorerPid, liveExplorerPid);
 	if (!fromPreviousExplorer && drainedHwnd != nullptr && drainedHwnd == currentHwnd
 	    && this->mEmbedParent == nullptr)
 	{
@@ -1972,8 +1997,11 @@ void WinPanelWindow::onOwnWindowPinDrained(
 				advanceWatermark();
 			}
 		} else if (confirmedUnpinned) {
+			const auto confirmedByLiveExplorer =
+			    liveExplorerPid != 0 && explorerPid != 0
+			    && static_cast<DWORD>(explorerPid) == static_cast<DWORD>(liveExplorerPid);
 			const auto matchesPinnedSession =
-			    this->mayBePinnedExplorerPid == 0 || explorerPid == 0
+			    confirmedByLiveExplorer || this->mayBePinnedExplorerPid == 0 || explorerPid == 0
 			    || this->mayBePinnedExplorerPid == static_cast<DWORD>(explorerPid);
 			if (matchesPinnedSession && isNewerOrEqualRequest) {
 				advanceWatermark();

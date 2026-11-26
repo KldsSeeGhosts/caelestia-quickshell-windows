@@ -1212,6 +1212,152 @@ private slots:
 			host->setEnabled(false);
 			QCoreApplication::processEvents();
 		}
+
+		// Part H: If the accessor recovers in live Explorer B before the panel
+		// observes the restart, B's confirmed Unpinned reply must clear the
+		// obsolete pin fence from A so embedding proceeds without looping.
+		{
+			auto simulatedExplorerPid = std::make_shared<std::atomic<DWORD>>(6001);
+			qs::windows::setNativeDesktopExplorerPidForTest(
+			    [simulatedExplorerPid] { return simulatedExplorerPid->load(); }
+			);
+			struct ResetPid {
+				~ResetPid() { qs::windows::setNativeDesktopExplorerPidForTest({}); }
+			} resetPid;
+
+			pinned.pinned = FALSE;
+			pinned.pinResult = S_OK;
+			pinned.unpinResult = S_OK;
+			pinned.pins = 0;
+			pinned.unpins = 0;
+
+			QSignalSpy pinDone(desktops, &qs::windows::VirtualDesktops::ownWindowPinCompleted);
+
+			qs::windows::WinPanelWindow panel;
+			panel.setLayer(qs::windows::PanelLayer::Background);
+			panel.setExclusionMode(ExclusionMode::Ignore);
+			panel.setScreen(&screenInfo);
+			panel.createWindow();
+
+			auto* window = panel.backingWindow();
+			QVERIFY(window != nullptr);
+			auto* hwnd = reinterpret_cast<HWND>(window->winId());
+			QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+			QVERIFY(SetWindowPos(
+			    hwnd, nullptr, -10000, -10000, 200, 100, SWP_NOACTIVATE | SWP_NOZORDER
+			));
+
+			QVERIFY(panel.recoverExplorerForTesting(m_hostA, 6001, 6001));
+			QCoreApplication::processEvents();
+			panel.setVisible(true);
+			panel.setVisibleDirect(true);
+			QTRY_VERIFY(pinDone.size() >= 1);
+			QCOMPARE(pinDone.last().at(4).toUInt(), quint32(6001));
+			QVERIFY(panel.mayBePinnedHereForTesting());
+
+			// Hide panel so accessor recovery in Explorer B (6002) does not
+			// immediately repin, and do NOT call recoverExplorer(6002) yet.
+			panel.setVisible(false);
+			panel.setVisibleDirect(false);
+			QTRY_VERIFY(!IsWindowVisible(hwnd));
+			pinned.pinned = FALSE;
+			simulatedExplorerPid->store(6002);
+			qs::windows::setNativeDesktopExplorerPidForTest(
+			    [simulatedExplorerPid] { return simulatedExplorerPid->load(); }
+			);
+
+			// Enabling embedding submits unpin against live Explorer B (6002).
+			// B's confirmed Unpinned must clear A's obsolete fence and embed in one pass.
+			const auto doneBeforeEmbed = pinDone.size();
+			host->setDiscoveredHostForTesting(m_hostA);
+			host->setEnabled(true);
+			QTRY_COMPARE(GetParent(hwnd), m_hostA);
+			QVERIFY(!panel.mayBePinnedHereForTesting());
+			QCOMPARE(pinDone.size(), doneBeforeEmbed + 1);
+			QCOMPARE(
+			    pinDone.last().at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Unpinned
+			);
+			QCOMPARE(pinDone.last().at(4).toUInt(), quint32(6002));
+
+			panel.deleteWindow();
+			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+			host->setEnabled(false);
+			QCoreApplication::processEvents();
+		}
+
+		// Part I: If Explorer changes mid-COM-acquisition and the in-flight pin
+		// returns Disconnected tagged with the old PID (before recoverExplorer),
+		// the visible panel must retry with bounded backoff and pin in the live
+		// Explorer session instead of stalling unpinned.
+		{
+			auto simulatedExplorerPid = std::make_shared<std::atomic<DWORD>>(7001);
+			qs::windows::setNativeDesktopExplorerPidForTest(
+			    [simulatedExplorerPid] { return simulatedExplorerPid->load(); }
+			);
+			struct ResetPid {
+				~ResetPid() { qs::windows::setNativeDesktopExplorerPidForTest({}); }
+			} resetPid;
+
+			pinned.pinned = FALSE;
+			pinned.pinResult = S_OK;
+			pinned.unpinResult = S_OK;
+			pinned.pins = 0;
+			pinned.unpins = 0;
+
+			QSignalSpy pinDone(desktops, &qs::windows::VirtualDesktops::ownWindowPinCompleted);
+
+			qs::windows::WinPanelWindow panel;
+			panel.setLayer(qs::windows::PanelLayer::Top);
+			panel.setExclusionMode(ExclusionMode::Ignore);
+			panel.setScreen(&screenInfo);
+			panel.createWindow();
+
+			auto* window = panel.backingWindow();
+			QVERIFY(window != nullptr);
+			auto* hwnd = reinterpret_cast<HWND>(window->winId());
+			QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+			QVERIFY(SetWindowPos(
+			    hwnd, nullptr, -10000, -10000, 200, 100, SWP_NOACTIVATE | SWP_NOZORDER
+			));
+
+			QVERIFY(panel.recoverExplorerForTesting(m_hostA, 7001, 7001));
+			QCoreApplication::processEvents();
+
+			// Force a mid-acquisition disconnect tagged with old PID 7001 while live
+			// Explorer has already moved to 7002.
+			activeBlock = std::make_shared<erm625::BlockingCall>();
+			pinned.beforeQuery = [blocked = activeBlock] { (*blocked)(); };
+			panel.setVisible(true);
+			panel.setVisibleDirect(true);
+			QTRY_COMPARE(WaitForSingleObject(activeBlock->entered, 0), WAIT_OBJECT_0);
+
+			// Keep beforeQuery blocked only for the first request, then let the
+			// retried request succeed in 7002.
+			pinned.beforeQuery = {};
+			pinned.queryResult = RPC_E_DISCONNECTED;
+			simulatedExplorerPid->store(7002);
+			activeBlock->release();
+			QTRY_VERIFY(pinDone.size() >= 1);
+			activeBlock.reset();
+			QCOMPARE(
+			    pinDone.at(0).at(2).value<qs::windows::OwnWindowPin>(),
+			    qs::windows::OwnWindowPin::Disconnected
+			);
+			QCOMPARE(pinDone.at(0).at(4).toUInt(), quint32(7001));
+
+			// Now allow the bounded retry to succeed against live Explorer 7002
+			// without any separate recoverExplorer callback.
+			pinned.queryResult = S_OK;
+			QTRY_VERIFY_WITH_TIMEOUT(panel.isPinnedHereForTesting(), 3000);
+			QCOMPARE(pinDone.last().at(4).toUInt(), quint32(7002));
+			QCOMPARE(pinned.pinned, TRUE);
+
+			panel.deleteWindow();
+			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+			host->setEnabled(false);
+			QCoreApplication::processEvents();
+		}
 	}
 
 private:
