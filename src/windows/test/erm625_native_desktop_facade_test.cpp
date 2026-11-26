@@ -1063,7 +1063,9 @@ private slots:
 			QCOMPARE(nativeDesktopExplorerPid(), quint32(4101));
 			QCOMPARE(WaitForSingleObject(queryBlocked->entered, 1000), WAIT_OBJECT_0);
 
-			simulatedExplorerPid->store(4202);
+			// Retire on accessor disconnect while Explorer 4101 is still live so
+			// the draining worker genuinely classifies QueryService E_NOINTERFACE
+			// as serviceAvailable=false (not a PID-mismatch disconnect).
 			invalidateNativeDesktopAccessor(RPC_E_DISCONNECTED);
 			QVERIFY(waitUntil([&pinDone, doneBefore] { return pinDone.size() == doneBefore + 1; }, 1000));
 			QCOMPARE(pinDone.at(doneBefore).at(4).toUInt(), quint32(4101));
@@ -1082,21 +1084,21 @@ private slots:
 			QCOMPARE(pinDrained.at(drainedBefore).at(6).toUInt(), quint32(4101));
 			QVERIFY(!this->desktops->isOwnWindowPinActive(window));
 
-			// The recovered provider now returns S_OK under the new Explorer PID and
-			// must NOT be poisoned by the retired worker's E_NOINTERFACE.
+			// The recovered provider under the SAME Explorer PID (4101) now returns
+			// S_OK and must NOT be poisoned by the retired worker's E_NOINTERFACE.
 			shell->result = S_OK;
 			pinned.pinned = FALSE;
 			const auto recoveredIdx = pinDone.size();
 			quint64 reqRecoveredPin = 0;
 			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqRecoveredPin), OwnWindowPin::Pending);
-			QCOMPARE(nativeDesktopExplorerPid(), quint32(4202));
+			QCOMPARE(nativeDesktopExplorerPid(), quint32(4101));
 			QVERIFY(
 			    waitUntil([&pinDone, recoveredIdx] { return pinDone.size() == recoveredIdx + 1; }, 1000)
 			);
 			QCOMPARE(pinDone.at(recoveredIdx).at(0).toULongLong(), reqRecoveredPin);
 			QCOMPARE(pinDone.at(recoveredIdx).at(2).value<OwnWindowPin>(), OwnWindowPin::Pinned);
 			QCOMPARE(pinDone.at(recoveredIdx).at(3).toBool(), true);
-			QCOMPARE(pinDone.at(recoveredIdx).at(4).toUInt(), quint32(4202));
+			QCOMPARE(pinDone.at(recoveredIdx).at(4).toUInt(), quint32(4101));
 			QCOMPARE(pinned.pinned, TRUE);
 
 			// 4d. If Explorer restarts mid-COM-acquisition (PID changes between
@@ -1167,6 +1169,50 @@ private slots:
 			QCOMPARE(pinDone.at(doneBeforeGap).at(2).value<OwnWindowPin>(), OwnWindowPin::Disconnected);
 			QCOMPARE(pinDone.at(doneBeforeGap).at(4).toUInt(), quint32(0));
 
+			// Also verify failed acquisition (E_NOINTERFACE) across a 0 -> B gap
+			// reports a retryable Disconnected instead of latching pinUnavailable
+			// against B, so B succeeds on the next request without an accessor reset.
+			simulatedExplorerPid->store(0);
+			setNativeDesktopPinnedAppsShellForTest(shell.get());
+			auto gapFailBlocked = std::make_shared<BlockingCall>();
+			shellCleanup.block = gapFailBlocked;
+			shell->result = E_NOINTERFACE;
+			shell->beforeQuery = [gapFailBlocked] { (*gapFailBlocked)(); };
+			pinned.pinned = FALSE;
+			const auto doneBeforeGapFail = pinDone.size();
+			quint64 reqGapFail = 0;
+			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqGapFail), OwnWindowPin::Pending);
+			QCOMPARE(nativeDesktopExplorerPid(), quint32(0));
+			QCOMPARE(WaitForSingleObject(gapFailBlocked->entered, 1000), WAIT_OBJECT_0);
+			simulatedExplorerPid->store(4506);
+			gapFailBlocked->release();
+			QVERIFY(waitUntil(
+			    [&pinDone, doneBeforeGapFail] { return pinDone.size() == doneBeforeGapFail + 1; },
+			    1000
+			));
+			shell->beforeQuery = {};
+			QCOMPARE(
+			    pinDone.at(doneBeforeGapFail).at(2).value<OwnWindowPin>(),
+			    OwnWindowPin::Disconnected
+			);
+			QCOMPARE(pinDone.at(doneBeforeGapFail).at(4).toUInt(), quint32(0));
+
+			shell->result = S_OK;
+			pinned.pinned = FALSE;
+			const auto doneBeforeGapRecover = pinDone.size();
+			quint64 reqGapRecover = 0;
+			QCOMPARE(pinNativeDesktopOwnWindow(window, &reqGapRecover), OwnWindowPin::Pending);
+			QVERIFY(waitUntil(
+			    [&pinDone, doneBeforeGapRecover] { return pinDone.size() == doneBeforeGapRecover + 1; },
+			    1000
+			));
+			QCOMPARE(
+			    pinDone.at(doneBeforeGapRecover).at(2).value<OwnWindowPin>(),
+			    OwnWindowPin::Pinned
+			);
+			QCOMPARE(pinDone.at(doneBeforeGapRecover).at(4).toUInt(), quint32(4506));
+			QCOMPARE(pinned.pinned, TRUE);
+
 			// 4f. Stale E_NOINTERFACE from Explorer A as Explorer B takes over
 			//     (without a full accessor reset) must not latch pinUnavailable
 			//     against B; the follow-up pin on B creates a fresh worker and succeeds.
@@ -1191,7 +1237,7 @@ private slots:
 			shell->beforeQuery = {};
 			QCOMPARE(
 			    pinDone.at(doneBeforeHandoff).at(2).value<OwnWindowPin>(),
-			    OwnWindowPin::Unavailable
+			    OwnWindowPin::Disconnected
 			);
 			QCOMPARE(pinDone.at(doneBeforeHandoff).at(4).toUInt(), quint32(4601));
 

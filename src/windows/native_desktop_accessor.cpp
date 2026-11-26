@@ -733,19 +733,21 @@ struct PinProvider {
 #else
 		constexpr auto requireLivePid = true;
 #endif
+		const auto pidValid =
+		    requireLivePid ? (pidBefore != 0 && pidAfter == pidBefore) : (pidBefore == pidAfter);
+		if (!this->optionalPinnedAppsFaulted && !pidValid) {
+			// Explorer was absent or restarted while acquiring the pin COM
+			// services; treat both success and failure without a verified
+			// Explorer PID as a retryable disconnect so we never mutate pin
+			// state or latch pinUnavailable against an unverified Explorer.
+			this->explorerPid = pidBefore;
+			this->serviceAvailable = true;
+			this->disconnected = true;
+			this->lastError = RPC_E_DISCONNECTED;
+			this->drop();
+			return;
+		}
 		if (ok) {
-			const auto pidValid =
-			    requireLivePid ? (pidBefore != 0 && pidAfter == pidBefore) : (pidBefore == pidAfter);
-			if (!pidValid) {
-				// Explorer was absent or restarted while acquiring the pin COM
-				// services; abort before mutating pin state so this worker never
-				// tags a replacement Explorer session with a stale or zero PID.
-				this->explorerPid = pidBefore;
-				this->disconnected = true;
-				this->lastError = RPC_E_DISCONNECTED;
-				this->drop();
-				return;
-			}
 			this->explorerPid = pidAfter != 0 ? pidAfter : pidBefore;
 			return;
 		}
