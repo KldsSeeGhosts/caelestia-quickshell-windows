@@ -1445,6 +1445,7 @@ void WinPanelWindow::setVisibleDirect(bool visible) {
 			return;
 		}
 
+		this->cancelDeferredClose();
 		this->resetAnimation();
 		this->releaseForeground();
 		this->ProxyWindowBase::setVisibleDirect(false);
@@ -1483,6 +1484,7 @@ void WinPanelWindow::hideForScreenLoss() {
 	if (this->window == nullptr || !this->window->isVisible()) return;
 	// Keep the requested visibility: Qt's fallback must not turn a temporary
 	// screen loss into a QML close, or animate the old surface on another screen.
+	this->cancelDeferredClose();
 	auto requested = std::exchange(this->mVisible, false);
 	this->quietVisibilityChange = true;
 	this->window->setVisible(false);
@@ -3793,7 +3795,7 @@ void WinPanelWindow::beginClose(const PanelAnimationChoice& choice) {
 
 	const auto showRequestedDuringFlush = !visibleBeforeClose && this->mVisible;
 	if (closeRequest != this->mCloseRequestSerial || this->window == nullptr
-	    || showRequestedDuringFlush)
+	    || !this->window->isVisible() || showRequestedDuringFlush)
 	{
 		return;
 	}
