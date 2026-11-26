@@ -573,28 +573,39 @@ public:
 			quint64 pendingSeq = 0;
 			QString failureReason;
 			GUID targetId {};
+			auto pendingRegistered = false;
+			QPointer<WinPanelWindow> guard(panel);
+			const auto registerPending = [&](quint64 seq) {
+				if (guard == nullptr) return;
+				const auto resolvedId = !isNullGuid(targetId) ? targetId : currentId;
+				guard->pendingFollowMoveSeq = seq;
+				guard->pendingFollowMoveHwnd = hwnd;
+				guard->pendingFollowMoveDesktopId = resolvedId;
+				guard->pendingFollowMoveDesktop = current;
+				guard->clearStuckFollowState();
+				pendingRegistered = true;
+			};
 			if (desktops->moveWindow(
 			        hwnd,
 			        current,
 			        &pendingSeq,
 			        &failureReason,
-			        {},
+			        registerPending,
 			        {},
 			        &targetId,
 			        isNullGuid(currentId) ? std::nullopt : std::optional<GUID>(currentId)
 			    ))
 			{
+				if (guard == nullptr) continue;
 				panel->followWaitingBusy = false;
 				const auto resolvedId = !isNullGuid(targetId) ? targetId : currentId;
 				if (pendingSeq != 0) {
 					// Async acceptance is not confirmation: preserve the retry
-					// budget until moveWindowCompleted or a fresh snapshot.
-					panel->pendingFollowMoveSeq = pendingSeq;
-					panel->pendingFollowMoveHwnd = hwnd;
-					panel->pendingFollowMoveDesktopId = resolvedId;
-					panel->pendingFollowMoveDesktop = current;
-					panel->clearStuckFollowState();
-					anyPending = true;
+					// budget until moveWindowCompleted or a fresh snapshot. If
+					// completion already arrived during a nested event loop,
+					// registerPending registered and the handler already cleared it.
+					if (!pendingRegistered) registerPending(pendingSeq);
+					if (panel->pendingFollowMoveSeq == pendingSeq) anyPending = true;
 				} else {
 					panel->clearPendingFollowMove();
 					panel->stuckHwnd = hwnd;
@@ -604,6 +615,7 @@ public:
 					panel->followFailureCount = 0;
 				}
 			} else {
+				if (guard == nullptr) continue;
 				// Preserve any accepted move sequence so its completion can still
 				// be matched or discarded against its original target desktop.
 				if (panel->pendingFollowMoveHwnd != hwnd) panel->clearPendingFollowMove();
@@ -1634,25 +1646,34 @@ void WinPanelWindow::stickToAllDesktops() {
 			quint64 pendingSeq = 0;
 			QString failureReason;
 			GUID targetId {};
+			auto pendingRegistered = false;
+			QPointer<WinPanelWindow> guard(this);
+			const auto registerPending = [&](quint64 seq) {
+				if (guard == nullptr) return;
+				const auto resolvedId = !isNullGuid(targetId) ? targetId : currentId;
+				guard->pendingFollowMoveSeq = seq;
+				guard->pendingFollowMoveHwnd = hwnd;
+				guard->pendingFollowMoveDesktopId = resolvedId;
+				guard->pendingFollowMoveDesktop = current;
+				guard->clearStuckFollowState();
+				pendingRegistered = true;
+			};
 			if (desktops->moveWindow(
 			        hwnd,
 			        current,
 			        &pendingSeq,
 			        &failureReason,
-			        {},
+			        registerPending,
 			        {},
 			        &targetId,
 			        isNullGuid(currentId) ? std::nullopt : std::optional<GUID>(currentId)
 			    ))
 			{
+				if (guard == nullptr) return;
 				this->followWaitingBusy = false;
 				const auto resolvedId = !isNullGuid(targetId) ? targetId : currentId;
 				if (pendingSeq != 0) {
-					this->pendingFollowMoveSeq = pendingSeq;
-					this->pendingFollowMoveHwnd = hwnd;
-					this->pendingFollowMoveDesktopId = resolvedId;
-					this->pendingFollowMoveDesktop = current;
-					this->clearStuckFollowState();
+					if (!pendingRegistered) registerPending(pendingSeq);
 				} else {
 					this->clearPendingFollowMove();
 					this->stuckHwnd = hwnd;
@@ -1662,6 +1683,7 @@ void WinPanelWindow::stickToAllDesktops() {
 					this->followFailureCount = 0;
 				}
 			} else {
+				if (guard == nullptr) return;
 				if (this->pendingFollowMoveHwnd != hwnd) this->clearPendingFollowMove();
 				this->clearStuckFollowState();
 				if (failureReason == QStringLiteral("provider-busy")) {
@@ -2199,6 +2221,10 @@ void WinPanelWindow::onWindowVisibleChanged() {
 	} else {
 		this->focusOnExpose = false;
 		this->resetPinState(false);
+		this->clearPendingFollowMove();
+		this->clearStuckFollowState();
+		this->followFailureCount = 0;
+		this->followWaitingBusy = false;
 		this->appBar.remove();
 		WinPanelStack::instance()->removePanel(this);
 	}

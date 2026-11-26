@@ -256,6 +256,8 @@ struct FakePinnedAppsShell: FakeCom<IServiceProvider> {
 struct FakePublic: FakeCom<IVirtualDesktopManager> {
 	bool faultOnRead = false;
 	std::function<void()> beforeQuery, beforeMove;
+	HRESULT moveResult = S_OK;
+	int moves = 0;
 	GUID desktopId {};
 	BOOL onCurrent = TRUE;
 	HRESULT STDMETHODCALLTYPE IsWindowOnCurrentVirtualDesktop(HWND, BOOL* out) override {
@@ -272,8 +274,9 @@ struct FakePublic: FakeCom<IVirtualDesktopManager> {
 	}
 	HRESULT STDMETHODCALLTYPE MoveWindowToDesktop(HWND, REFGUID id) override {
 		if (this->beforeMove) this->beforeMove();
-		this->desktopId = id;
-		return S_OK;
+		++this->moves;
+		if (SUCCEEDED(this->moveResult)) this->desktopId = id;
+		return this->moveResult;
 	}
 };
 

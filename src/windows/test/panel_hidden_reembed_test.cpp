@@ -1433,6 +1433,97 @@ private slots:
 			host->setEnabled(false);
 			QCoreApplication::processEvents();
 		}
+
+		// Part K: Hiding a panel while a fallback follow move is pending clears
+		// its pendingFollowMove state so reopening on the same desktop retries
+		// instead of being suppressed by a stale sequence whose failure arrived
+		// while the panel was removed from WinPanelStack.
+		{
+			auto simulatedExplorerPid = std::make_shared<std::atomic<DWORD>>(9001);
+			qs::windows::setNativeDesktopExplorerPidForTest(
+			    [simulatedExplorerPid] { return simulatedExplorerPid->load(); }
+			);
+			struct ResetPid {
+				~ResetPid() { qs::windows::setNativeDesktopExplorerPidForTest({}); }
+			} resetPid;
+
+			// Force pinning refused so the panel falls back to following current desktop,
+			// and place the window on desktop two while current is desktop one.
+			pinned.pinned = FALSE;
+			pinned.pinResult = E_ACCESSDENIED;
+			pinned.unpinResult = S_OK;
+			pinned.queryResult = S_OK;
+			freshFixture.manager.current = &freshFixture.one;
+			freshFixture.publicApi.desktopId = freshFixture.two.id;
+			freshFixture.publicApi.onCurrent = FALSE;
+			auto moveBlock = std::make_shared<erm625::BlockingCall>();
+			freshFixture.publicApi.beforeMove = [moveBlock] { (*moveBlock)(); };
+			freshFixture.manager.moveResult = E_ACCESSDENIED;
+			freshFixture.publicApi.moveResult = E_ACCESSDENIED;
+			struct ResetMoveFixture {
+				erm625::Fixture* fixture;
+				std::shared_ptr<erm625::BlockingCall>* block;
+				~ResetMoveFixture() {
+					if (*this->block) (*this->block)->release();
+					this->fixture->manager.beforeMove = {};
+					this->fixture->publicApi.beforeMove = {};
+					this->fixture->manager.moveResult = S_OK;
+					this->fixture->publicApi.moveResult = S_OK;
+					this->fixture->publicApi.desktopId = this->fixture->one.id;
+					this->fixture->publicApi.onCurrent = TRUE;
+				}
+			} resetMove {&freshFixture, &moveBlock};
+
+			qs::windows::WinPanelWindow panel;
+			panel.setLayer(qs::windows::PanelLayer::Top);
+			panel.setExclusionMode(ExclusionMode::Ignore);
+			panel.setScreen(&screenInfo);
+			panel.createWindow();
+
+			auto* window = panel.backingWindow();
+			QVERIFY(window != nullptr);
+			auto* hwnd = reinterpret_cast<HWND>(window->winId());
+			QVERIFY(hwnd != nullptr && IsWindow(hwnd));
+			QVERIFY(SetWindowPos(
+			    hwnd, nullptr, -10000, -10000, 200, 100, SWP_NOACTIVATE | SWP_NOZORDER
+			));
+
+			QVERIFY(panel.recoverExplorerForTesting(m_hostA, 9001, 9001));
+			QCoreApplication::processEvents();
+
+			const auto movesBefore = freshFixture.publicApi.moves;
+			panel.setVisible(true);
+			panel.setVisibleDirect(true);
+			QTRY_COMPARE(WaitForSingleObject(moveBlock->entered, 0), WAIT_OBJECT_0);
+			QCOMPARE(freshFixture.publicApi.moves, movesBefore);
+
+			// Hide panel while the move is pending, then let the move fail while hidden.
+			panel.setVisible(false);
+			panel.setVisibleDirect(false);
+			QTRY_VERIFY(!IsWindowVisible(hwnd));
+
+			QSignalSpy moveDone(desktops, &qs::windows::VirtualDesktops::moveWindowCompleted);
+			freshFixture.publicApi.beforeMove = {};
+			moveBlock->release();
+			QTRY_VERIFY(moveDone.size() >= 1);
+			moveBlock.reset();
+			QCOMPARE(moveDone.last().at(2).toBool(), false);
+			QVERIFY(freshFixture.publicApi.moves > movesBefore);
+
+			// Reopen on the same desktop with move succeeding: must issue a new move
+			// instead of being suppressed by the stale hidden sequence.
+			const auto movesBeforeReopen = freshFixture.publicApi.moves;
+			freshFixture.manager.moveResult = S_OK;
+			freshFixture.publicApi.moveResult = S_OK;
+			panel.setVisible(true);
+			panel.setVisibleDirect(true);
+			QTRY_VERIFY_WITH_TIMEOUT(freshFixture.publicApi.moves > movesBeforeReopen, 3000);
+
+			panel.deleteWindow();
+			QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+			host->setEnabled(false);
+			QCoreApplication::processEvents();
+		}
 	}
 
 private:
