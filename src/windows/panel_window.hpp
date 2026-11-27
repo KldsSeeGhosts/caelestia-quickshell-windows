@@ -1,7 +1,9 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include <qt_windows.h>
@@ -158,6 +160,15 @@ public:
 	// handback regression asserts a parent change requests a frame, and that a
 	// hidden panel is never shown just to do it.
 	[[nodiscard]] int presentResetsForTesting() const { return this->presentResetCount; }
+	[[nodiscard]] int dimensionUpdatesForTesting() const { return this->dimensionUpdateCount; }
+	[[nodiscard]] int geometryPlacementsForTesting() const { return this->geometryPlacementCount; }
+	[[nodiscard]] int closeStartsForTesting() const { return this->closeStartCount; }
+	[[nodiscard]] bool dimensionsUpdateRunningForTesting() const {
+		return this->dimensionsUpdateRunning;
+	}
+	void setGeometryChangeProbeForTesting(std::function<void()> probe) {
+		this->geometryChangeProbeForTesting = std::move(probe);
+	}
 	bool recoverExplorerForTesting(HWND taskbar, DWORD pid, DWORD thread) {
 		return this->recoverExplorer(taskbar, pid, thread);
 	}
@@ -237,6 +248,7 @@ private slots:
 	void updateScreen();
 	void followFocusedScreen();
 	void scheduleUpdateDimensions();
+	void flushUpdateDimensions();
 	void onScreenScaleChanged();
 	void updateDimensions();
 	void onWindowExposed();
@@ -256,7 +268,7 @@ private:
 	void applyCaptureExclusionCb() { this->applyCaptureExclusion(); }
 	void updateDimensions(const MonitorRects& nativeRects);
 	void onDisplayChange();
-	void updateDimensionsCb() { this->updateDimensions(); }
+	void scheduleUpdateDimensionsCb() { this->scheduleUpdateDimensions(); }
 	void updateFocusFlag();
 	void applyFocusFlag();
 	void focusWhenExposed();
@@ -306,6 +318,10 @@ private:
 	void resetAnimatedItem();
 	void resetAnimation();
 	void beginClose(const PanelAnimationChoice& choice);
+	void deferClose(const PanelAnimationChoice& choice);
+	void cancelDeferredClose();
+	void queueDeferredClose(quint64 serial);
+	void runDeferredClose(quint64 serial);
 	void reopen();
 	void waitForFrames(int frames, int timeoutMs, void (WinPanelWindow::*done)());
 	void cancelFrameWait();
@@ -321,6 +337,8 @@ private:
 	PanelBlur* blur = nullptr;
 	QObject* mLayershellAttached = nullptr;
 	bool dimensionsUpdatePending = false;
+	quint64 dimensionsUpdateSerial = 0;
+	bool dimensionsUpdateRunning = false;
 	bool appBarRetryPending = false;
 	bool embedRetryPending = false;
 	HWND embedWaitingForPinHwnd = nullptr;
@@ -412,6 +430,10 @@ private:
 	bool visibleWhenDestroyed = false;
 #ifdef QS_TEST
 	int presentResetCount = 0;
+	int dimensionUpdateCount = 0;
+	int geometryPlacementCount = 0;
+	int closeStartCount = 0;
+	std::function<void()> geometryChangeProbeForTesting;
 #endif
 
 	QVariantAnimation* mAnimation = nullptr;
@@ -437,6 +459,8 @@ private:
 	quint32 mFrameWaitRequest = 0;
 	int mFramesLeft = 0;
 	bool mClosing = false;
+	std::optional<PanelAnimationChoice> mDeferredCloseChoice;
+	quint64 mCloseRequestSerial = 0;
 	bool mInstantVisibility = false;
 
 	// clang-format off
@@ -455,10 +479,10 @@ private:
 	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bNamespace, updateLayerCb, onValueChanged);
 	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bKeyboardFocus, updateFocusCb, onValueChanged);
 	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bExcludeFromCapture, applyCaptureExclusionCb, onValueChanged);
-	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bAnchors, updateDimensionsCb, onValueChanged);
-	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bMargins, updateDimensionsCb, onValueChanged);
-	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bExclusionMode, updateDimensionsCb, onValueChanged);
-	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bcExclusiveZone, updateDimensionsCb, onValueChanged);
+	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bAnchors, scheduleUpdateDimensionsCb, onValueChanged);
+	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bMargins, scheduleUpdateDimensionsCb, onValueChanged);
+	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bExclusionMode, scheduleUpdateDimensionsCb, onValueChanged);
+	QS_BINDING_SUBSCRIBE_METHOD(WinPanelWindow, bcExclusiveZone, scheduleUpdateDimensionsCb, onValueChanged);
 	// clang-format on
 
 	friend class WinPanelStack;

@@ -23,6 +23,7 @@
 #include <qquickwindow.h>
 #include <qrect.h>
 #include <qregion.h>
+#include <qscopedvaluerollback.h>
 #include <qscreen.h>
 #include <qsgrendererinterface.h>
 #include <qt_windows.h>
@@ -1329,6 +1330,8 @@ ProxiedWindow* WinPanelWindow::disownWindow(bool keepItemOwnership) {
 }
 
 void WinPanelWindow::releaseNativeState() {
+	this->cancelDeferredClose();
+
 	if (this->mClosing && this->window != nullptr && this->window->isVisible()) {
 		this->quietVisibilityChange = true;
 		this->window->setVisible(false);
@@ -1381,21 +1384,21 @@ void WinPanelWindow::releaseNativeState() {
 
 void WinPanelWindow::trySetWidth(qint32 implicitWidth) {
 	if (!this->bAnchors.value().horizontalConstraint()) {
-		if (this->hwnd() == nullptr || this->mTrackedScreen == nullptr) {
-			this->ProxyWindowBase::trySetWidth(implicitWidth);
-		}
+		const auto direct = this->hwnd() == nullptr || this->mTrackedScreen == nullptr;
+		if (direct) this->ProxyWindowBase::trySetWidth(implicitWidth);
 
-		this->updateDimensions();
+		if (direct) this->updateDimensions();
+		else this->scheduleUpdateDimensions();
 	}
 }
 
 void WinPanelWindow::trySetHeight(qint32 implicitHeight) {
 	if (!this->bAnchors.value().verticalConstraint()) {
-		if (this->hwnd() == nullptr || this->mTrackedScreen == nullptr) {
-			this->ProxyWindowBase::trySetHeight(implicitHeight);
-		}
+		const auto direct = this->hwnd() == nullptr || this->mTrackedScreen == nullptr;
+		if (direct) this->ProxyWindowBase::trySetHeight(implicitHeight);
 
-		this->updateDimensions();
+		if (direct) this->updateDimensions();
+		else this->scheduleUpdateDimensions();
 	}
 }
 
@@ -1427,6 +1430,7 @@ bool WinPanelWindow::isVisibleDirect() const {
 }
 
 void WinPanelWindow::setVisibleDirect(bool visible) {
+	if (visible) this->cancelDeferredClose();
 	if (visible && this->screenGuard.isBlocked()) return;
 	if (!visible) {
 		if (this->mClosing) return;
@@ -1441,6 +1445,7 @@ void WinPanelWindow::setVisibleDirect(bool visible) {
 			return;
 		}
 
+		this->cancelDeferredClose();
 		this->resetAnimation();
 		this->releaseForeground();
 		this->ProxyWindowBase::setVisibleDirect(false);
@@ -1479,6 +1484,7 @@ void WinPanelWindow::hideForScreenLoss() {
 	if (this->window == nullptr || !this->window->isVisible()) return;
 	// Keep the requested visibility: Qt's fallback must not turn a temporary
 	// screen loss into a QML close, or animate the old surface on another screen.
+	this->cancelDeferredClose();
 	auto requested = std::exchange(this->mVisible, false);
 	this->quietVisibilityChange = true;
 	this->window->setVisible(false);
@@ -1503,7 +1509,6 @@ void WinPanelWindow::followFocusedScreen() {
 
 	this->window->setScreen(screen);
 	this->updateScreen();
-	this->updateDimensions();
 }
 
 void WinPanelWindow::setAboveWindows(bool aboveWindows) {
@@ -2318,17 +2323,38 @@ void WinPanelWindow::onScreenScaleChanged() {
 void WinPanelWindow::scheduleUpdateDimensions() {
 	if (this->dimensionsUpdatePending) return;
 	this->dimensionsUpdatePending = true;
+	const auto serial = ++this->dimensionsUpdateSerial;
 
-	QTimer::singleShot(0, this, [this]() {
+	QTimer::singleShot(0, this, [this, serial]() {
+		if (!this->dimensionsUpdatePending || serial != this->dimensionsUpdateSerial) return;
+
 		this->dimensionsUpdatePending = false;
 		this->updateDimensions();
 	});
+}
+
+void WinPanelWindow::flushUpdateDimensions() {
+	if (!this->dimensionsUpdatePending) return;
+
+	++this->dimensionsUpdateSerial;
+	this->dimensionsUpdatePending = false;
+	this->updateDimensions();
 }
 
 void WinPanelWindow::updateDimensions() { this->updateDimensions(MonitorRects {}); }
 
 void WinPanelWindow::updateDimensions(const MonitorRects& nativeRects) {
 	if (this->window == nullptr || this->mTrackedScreen == nullptr) return;
+	if (this->dimensionsUpdateRunning) {
+		this->scheduleUpdateDimensions();
+		return;
+	}
+
+	const auto running = QScopedValueRollback(this->dimensionsUpdateRunning, true);
+
+#ifdef QS_TEST
+	++this->dimensionUpdateCount;
+#endif
 
 	auto* screen = this->mTrackedScreen.data();
 	auto screenGeometry = screen->geometry();
@@ -2429,7 +2455,13 @@ void WinPanelWindow::updateDimensions(const MonitorRects& nativeRects) {
 	if (this->window->geometry() != geometry) {
 		qCDebug(logPanel) << "Placing" << this << "at" << geometry << "on"
 		                  << qs::windows::logId(screenName(screen));
+#ifdef QS_TEST
+		++this->geometryPlacementCount;
+#endif
 		this->window->setGeometry(geometry);
+#ifdef QS_TEST
+		if (this->geometryChangeProbeForTesting) this->geometryChangeProbeForTesting();
+#endif
 	}
 
 	if (this->mEmbedParent != nullptr) {
@@ -3714,7 +3746,65 @@ void WinPanelWindow::resetAnimation() {
 	this->blur->setSuspended(false);
 }
 
+void WinPanelWindow::deferClose(const PanelAnimationChoice& choice) {
+	this->mDeferredCloseChoice = choice;
+	this->queueDeferredClose(++this->mCloseRequestSerial);
+}
+
+void WinPanelWindow::cancelDeferredClose() {
+	this->mDeferredCloseChoice.reset();
+	++this->mCloseRequestSerial;
+}
+
+void WinPanelWindow::queueDeferredClose(quint64 serial) {
+	QTimer::singleShot(0, this, [this, serial]() { this->runDeferredClose(serial); });
+}
+
+void WinPanelWindow::runDeferredClose(quint64 serial) {
+	if (!this->mDeferredCloseChoice.has_value() || serial != this->mCloseRequestSerial) return;
+
+	if (this->dimensionsUpdateRunning) {
+		this->queueDeferredClose(serial);
+		return;
+	}
+
+	if (this->dimensionsUpdatePending) {
+		this->flushUpdateDimensions();
+
+		if (!this->mDeferredCloseChoice.has_value() || serial != this->mCloseRequestSerial) return;
+		if (this->dimensionsUpdateRunning || this->dimensionsUpdatePending) {
+			this->queueDeferredClose(serial);
+			return;
+		}
+	}
+
+	const auto choice = *this->mDeferredCloseChoice;
+	this->mDeferredCloseChoice.reset();
+	this->beginClose(choice);
+}
+
 void WinPanelWindow::beginClose(const PanelAnimationChoice& choice) {
+	if (this->dimensionsUpdateRunning) {
+		this->deferClose(choice);
+		return;
+	}
+
+	const auto closeRequest = ++this->mCloseRequestSerial;
+	const auto visibleBeforeClose = this->mVisible;
+	this->flushUpdateDimensions();
+
+	const auto showRequestedDuringFlush = !visibleBeforeClose && this->mVisible;
+	if (closeRequest != this->mCloseRequestSerial || this->window == nullptr
+	    || !this->window->isVisible() || showRequestedDuringFlush)
+	{
+		return;
+	}
+
+	if (this->dimensionsUpdateRunning || this->dimensionsUpdatePending) {
+		this->deferClose(choice);
+		return;
+	}
+
 	if (this->mAnimationState.settled()) {
 		this->mAnimationStyle = choice.style;
 		this->mAnimationEffect = choice.effect;
@@ -3724,6 +3814,10 @@ void WinPanelWindow::beginClose(const PanelAnimationChoice& choice) {
 
 	qCDebug(logPanel) << "Closing" << this << "with" << this->mAnimationStyle.toString()
 	                  << panelEffectName(this->mAnimationEffect);
+
+#ifdef QS_TEST
+	++this->closeStartCount;
+#endif
 
 	this->mClosing = true;
 	this->focusOnExpose = false;
